@@ -1,0 +1,52 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "V1",
+      "severity": "major",
+      "title": "Le sondage des hooks ne définit pas de repli pour damage_taken",
+      "evidence": "R3 : « un enregistrement réussi ne vaut pas preuve », mais aucune source alternative de damage_taken ni règle de retrait de caps.atoms n'est définie lorsqu'OnWeaponHitCharacter ne produit aucun hook_seen. Le contrat peut donc accepter cet atome sans observation fonctionnelle ; AC58 vérifie seulement son affichage."
+    },
+    {
+      "id": "V2",
+      "severity": "major",
+      "title": "Le contenu de supply_drop exige une décision d'équilibrage non spécifiée",
+      "evidence": "R3 interdit « aucune règle ni valeur d'équilibrage » dans le mod. R4 ne permet pour supply_drop que distance, warn_s et target : aucun champ ne définit les objets ni leurs quantités. AC25 impose pourtant l'application de cet effet."
+    },
+    {
+      "id": "V3",
+      "severity": "blocker",
+      "title": "AC28 exige davantage de types d'effets que le catalogue autorisé",
+      "evidence": "AC28 exige « 8 lots de types différents ». R3/R4 déclarent seulement six types d'effets de table ; probe_spawn est réservé au service et combo_reset est interne. Ce scénario ne peut pas être construit avec une table conforme."
+    },
+    {
+      "id": "V4",
+      "severity": "major",
+      "title": "Le blocage du plus ancien lot contredit la poursuite des commandes vers l'autre serveur",
+      "evidence": "R4 : « le plus ancien lot part » seulement si sa cible est hors restarting. AC65 exige simultanément que « les commandes vers B continuent ». Si le plus ancien lot vise A en redémarrage, aucune règle n'autorise explicitement à le dépasser pour émettre vers B."
+    },
+    {
+      "id": "V5",
+      "severity": "blocker",
+      "title": "Des fichiers explicitement nommés par les AC sont absents de targets",
+      "evidence": "AC6 nomme duel_A_out.txt, AC40 nomme duelA.db et AC52 nomme journal.jsonl et server_A.log. Leurs emplacements générés ne figurent pas dans targets ; .gitignore ne constitue pas une déclaration de ces cibles. La couverture exigée des fichiers cités par les AC est donc incomplète."
+    },
+    {
+      "id": "V6",
+      "severity": "major",
+      "title": "L'articulation entre temps source, réception et ticks reste indéterminée",
+      "evidence": "R4 définit mt comme « tiré de t_ms et jamais de l'horloge système », tout en exigeant des émissions sur ticks de 250 ms sans nouvel événement (AC26). R6/AC45 imposent le rejeu à ±250 ms, sans définir l'avancement de mt pendant le silence, le traitement d'événements reçus tardivement ni l'ordre entre événement et tick au même instant. Ces choix changent les commandes et leurs horaires."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "docs/campaigns/phase1/spec.md",
+    "docs/campaigns/phase1/BRIEF.md",
+    "service/engine.py",
+    "service/state.py",
+    "service/api.py",
+    "07-spec-mvp.md",
+    "02-archi-deux-serveurs.md",
+    "05-observable-vs-generable.md"
+  ]
+}
