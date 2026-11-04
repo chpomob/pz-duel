@@ -1,0 +1,63 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "V1",
+      "status": "RESOLVED",
+      "evidence": "R2/R3, § Fenêtre de contrat, AC67–AC68 : sans hook_seen sur les deux camps, damage_taken est retiré des atomes actifs ; toute table qui le déclare est refusée après revalidation, avec arrêt des serveurs. Une table dont il serait l'unique atome est donc également refusée."
+    },
+    {
+      "id": "V2",
+      "status": "RESOLVED",
+      "evidence": "R3/R4, AC69–AC71 : items est obligatoire pour supply_drop, y compris dans defender_bonus, avec catalogue autorisé, quantités explicites et bornes dans limits ; le mod reçoit ce contenu par commande. effects.json, runtime.json, les presets et le Lua sont couverts par targets."
+    },
+    {
+      "id": "V3",
+      "status": "RESOLVED",
+      "evidence": "R4/AC28 : les huit lots utilisent désormais les six types autorisés et deux variantes de paramètres, sans exiger huit types distincts."
+    },
+    {
+      "id": "V4",
+      "status": "RESOLVED",
+      "evidence": "R4, § Budgets, AC65/AC72 : les files FIFO sont distinctes par cible et une tête bloquée vers A ne bloque explicitement jamais la file de B."
+    },
+    {
+      "id": "V5",
+      "status": "RESOLVED",
+      "evidence": "§ Portée de targets, AC6/AC40/AC52 : les quatre fichiers sont explicitement classés comme produits d'exécution, avec leurs emplacements, producteurs et tests ; leurs producteurs sont couverts par targets."
+    },
+    {
+      "id": "V6",
+      "status": "RESOLVED",
+      "evidence": "R4/R6, § Horloge du moteur, AC73–AC76 : les ticks avancent en silence depuis l'instant courant, les événements conservent leur temps source, les retards et l'ordre événement/échéance/émission sont définis et le rejeu utilise les ticks journalisés."
+    }
+  ],
+  "new_findings": [
+    {
+      "severity": "blocker",
+      "title": "AC28 et AC75 imposent deux ticks d'émission différents après un résultat",
+      "evidence": "AC28 exige que le cinquième lot parte « au tick suivant le premier cmd_result ». R4, § Horloge du moteur et § Budgets, impose de traiter les résultats avant l'émission du même tick ; AC75 exige explicitement que la place libérée permette une émission dans ce tick. Pour un cmd_result traité au tick T libérant la seule place nécessaire, les textes imposent respectivement T+0,25 et T."
+    },
+    {
+      "severity": "major",
+      "title": "AC76 interdit les mt nuls pourtant obligatoires avant running",
+      "evidence": "AC76 exige que « toutes les lignes du match » aient un mt multiple de 0,25. R4 précise qu'avant running mt est null et aucun tick n'existe ; R6 impose notamment les enregistrements préalables match_start, state et event, ainsi que atom_withdrawn à la clôture du contrat. Un journal complet conforme à R6 ne peut donc satisfaire cette assertion d'AC76."
+    },
+    {
+      "severity": "major",
+      "title": "AC19 reste inconditionnel malgré le fonctionnement autorisé sans damage_taken",
+      "evidence": "R2/R3 et AC67 autorisent un match avec une table sans damage_taken lorsque OnWeaponHitCharacter n'est pas observé, et interdisent toute source de remplacement. AC19 exige néanmoins qu'une blessure apparaisse au journal lors de la vérification réelle, sans branche applicable au retrait de cet atome. Dans cette configuration explicitement autorisée, le critère exige un événement que le mod ne peut produire."
+    }
+  ],
+  "read_files": [
+    "docs/campaigns/phase1/spec.md",
+    "docs/campaigns/phase1/BRIEF.md",
+    "docs/campaigns/phase1/verify-by-hand-1.json",
+    "service/engine.py",
+    "service/state.py",
+    "service/api.py",
+    "07-spec-mvp.md",
+    "02-archi-deux-serveurs.md",
+    "05-observable-vs-generable.md"
+  ]
+}

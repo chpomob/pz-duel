@@ -1,0 +1,39 @@
+{
+  "verdict": "APPROVE",
+  "findings": [
+    {
+      "id": "R3-B1",
+      "status": "RESOLVED",
+      "evidence": "R4, AC28 borne l'attente sans résultat aux ticks mt=0 à 0,75 avec cmd_result_timeout_s=1 ; AC77 exige ensuite, à mt=1, quatre cmd_timeout distincts par seq puis l'émission de la cinquième et dernière commande dans la même passe, conformément à l'ordre intrants → échéances → émission du § Horloge point 5 et à la libération unique du § Budgets point 4."
+    }
+  ],
+  "regressions": [
+    {
+      "id": "B1",
+      "status": "OK",
+      "evidence": "R4, AC28 et AC75 : le cmd_result traité à mt=0,5 permet l'émission à mt=0,5, dans la même passe."
+    },
+    {
+      "id": "M1",
+      "status": "OK",
+      "evidence": "R6, § Journal et AC76 : toutes les lignes avant running ont mt=null ; le state d'entrée ouvre mt=0, puis toute ligne suit la grille de 250 ms, y compris au rejeu."
+    },
+    {
+      "id": "M2",
+      "status": "OK",
+      "evidence": "R3, AC19 et AC67 : damage_taken actif exige un événement de blessure ; son retrait exige des preuves concordantes dans capabilities.withdrawn et atom_withdrawn, sans blessure exigée."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "docs/campaigns/phase1/spec.md",
+    "docs/campaigns/phase1/BRIEF.md",
+    "docs/campaigns/phase1/verify-by-hand-3.json",
+    "service/engine.py",
+    "service/state.py",
+    "service/api.py",
+    "07-spec-mvp.md",
+    "02-archi-deux-serveurs.md",
+    "05-observable-vs-generable.md"
+  ]
+}

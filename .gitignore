@@ -4,3 +4,4 @@ __pycache__/
 .duel-service.json
 docs/campaigns/**/logs/
 docs/campaigns/**/loop-out/
+/docs/campaigns/phase1/run/

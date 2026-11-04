@@ -1,0 +1,38 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "B1",
+      "status": "RESOLVED",
+      "evidence": "R4, § Horloge du moteur et § Budgets, AC28/AC75 : AC28 exige désormais l'émission au tick T qui traite le premier cmd_result, après les intrants et les échéances, conformément à AC75."
+    },
+    {
+      "id": "M1",
+      "status": "RESOLVED",
+      "evidence": "R6, § Journal, AC44/AC45/AC76 : les lignes précédant l'entrée en running ont mt=null ; le state de transition ouvre le tick 0, puis les lignes suivent la grille de 250 ms, également reproduite au rejeu."
+    },
+    {
+      "id": "M2",
+      "status": "RESOLVED",
+      "evidence": "R3, AC19/AC67 : la branche active exige un event damage_taken ; la branche retirée exige les preuves concordantes du retrait dans capabilities.withdrawn et atom_withdrawn, sans observation de blessure."
+    }
+  ],
+  "new_findings": [
+    {
+      "severity": "blocker",
+      "title": "AC28 interdit l'émission après expiration du délai de résultat",
+      "evidence": "R4, § Budgets point 4, impose que cmd_result_timeout_s libère une place même sans cmd_result. AC28 exige pourtant, pour cinq lots sans duration_s et concurrent_effects=4, seulement quatre commandes tant qu'aucun cmd_result n'arrive. Si le match continue sans résultat jusqu'à cette échéance, les places sont libérées avant l'émission selon § Horloge point 5 : le cinquième lot admissible doit partir, alors qu'AC28 l'interdit toujours."
+    }
+  ],
+  "read_files": [
+    "docs/campaigns/phase1/spec.md",
+    "docs/campaigns/phase1/BRIEF.md",
+    "docs/campaigns/phase1/verify-by-hand-2.json",
+    "service/engine.py",
+    "service/state.py",
+    "service/api.py",
+    "07-spec-mvp.md",
+    "02-archi-deux-serveurs.md",
+    "05-observable-vs-generable.md"
+  ]
+}
