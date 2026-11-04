@@ -1,0 +1,20 @@
+{
+  "id": "pression",
+  "label": "Pression",
+  "tagline": "25 min, combos et ambiance",
+  "duration_s": 1500,
+  "day_length": 1,
+  "rules": [
+    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "cap_per_min": 60}]},
+    {"when": "atom(zombie_kill).count(3).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 1}]},
+    {"when": "atom(zombie_kill).count(10).within(60s).and(not atom(damage_taken).within(60s))", "effects": [{"kind": "fog", "duration_s": 90}]},
+    {"when": "atom(build).count(3).within(120s).then(atom(zombie_kill), within=30s)", "effects": [{"kind": "horde_area", "n": 25}]},
+    {"when": "atom(damage_taken)", "effects": [{"kind": "shake"}, {"kind": "supply_drop"}]}
+  ],
+  "summary": [
+    "1 zombie tué → 2 zombies chez l'adversaire (max 60/min)",
+    "3 constructions puis 1 kill en 30 s → horde de 25 dans un rayon de 20",
+    "10 kills en 60 s sans être touché → brouillard de 90 s",
+    "1 blessure reçue → secousse d'écran + caisse de soin"
+  ]
+}

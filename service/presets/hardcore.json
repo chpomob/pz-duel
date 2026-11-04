@@ -1,0 +1,19 @@
+{
+  "id": "hardcore",
+  "label": "Hardcore",
+  "tagline": "20 min, tout fait mal",
+  "duration_s": 1200,
+  "day_length": 2,
+  "rules": [
+    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 3, "cap_per_min": 90}]},
+    {"when": "atom(zombie_kill).count(5).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 2}]},
+    {"when": "atom(explosion)", "effects": [{"kind": "horde_area", "n": 30}]},
+    {"when": "atom(vehicle_repair)", "effects": [{"kind": "noise", "radius": 40}]}
+  ],
+  "summary": [
+    "1 zombie tué → 3 zombies chez l'adversaire (max 90/min)",
+    "5 kills en 10 s → 2 rôdeurs rapides",
+    "1 explosion → horde de 30",
+    "1 réparation de véhicule → bruit sur 40 cases"
+  ]
+}

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PZ Duel</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">PZ</span>
+    <div>
+      <h1>DUEL</h1>
+      <p id="tagline">deux mondes, une seule pression</p>
+    </div>
+  </div>
+  <div class="topright">
+    <span id="mode-badge" class="badge badge-mock">mode simulé</span>
+    <span id="svc" class="badge badge-ok">service : ok</span>
+  </div>
+</header>
+
+<main id="app" aria-live="polite"></main>
+
+<section id="logsbox" class="logs collapsed">
+  <button id="logstoggle" class="logs-head">Logs <span id="logcount">0</span></button>
+  <div id="logs" class="logs-body"></div>
+</section>
+
+<footer class="credits">
+  Inspiré par SIF (YebNFlo) · SIF Example Events (YebNFlo, ShavedTube) · Chaos Mod (zoidxf) ·
+  log-extender (outdead) · zomboid-mod-analytics (spoutnickgp) · Zombie Spawn Manager (El1oN).
+  QR : qrcode-generator, © 2009 Kazuhiko Arase, licence MIT. Détail complet : CREDITS.md.
+</footer>
+
+<script src="/vendor/qrcode.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.duel-service.json
+docs/campaigns/**/logs/
+docs/campaigns/**/loop-out/

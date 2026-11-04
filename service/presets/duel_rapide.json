@@ -1,0 +1,17 @@
+{
+  "id": "duel_rapide",
+  "label": "Duel rapide",
+  "tagline": "25 min, lisible, peu de règles",
+  "duration_s": 1500,
+  "day_length": 1,
+  "rules": [
+    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "cap_per_min": 60}]},
+    {"when": "atom(zombie_kill).count(3).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 1}]},
+    {"when": "atom(damage_taken)", "effects": [{"kind": "supply_drop"}]}
+  ],
+  "summary": [
+    "1 zombie tué → 2 zombies chez l'adversaire (max 60/min)",
+    "3 kills en 10 s → 1 rôdeur rapide en plus",
+    "1 blessure reçue → caisse de soin à proximité"
+  ]
+}

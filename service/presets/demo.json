@@ -1,0 +1,11 @@
+{
+  "id": "demo",
+  "label": "Démo 90 s",
+  "tagline": "pour tester le flow, pas pour jouer",
+  "duration_s": 90,
+  "day_length": 1,
+  "rules": [
+    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "cap_per_min": 60}]}
+  ],
+  "summary": ["1 zombie tué → 2 zombies chez l'adversaire (max 60/min)"]
+}
