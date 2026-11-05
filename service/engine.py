@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .journal import Journal, read_journal
-from .preflight import run_preflight
+from .preflight import detect_pz, run_preflight
 from .protocol import PROTOCOL_VERSION, SIDES
 from .rules import (
     MS_PER_S,
@@ -47,6 +47,7 @@ from .servers import (
     ServerPair,
     ServerProcess,
     apply_status,
+    gen_player_password,
     gen_secret,
     mods_setting,
     server_name,
@@ -86,10 +87,16 @@ MODE_MOCK = "mock"
 MODE_REAL = "real"
 MODES = (MODE_MOCK, MODE_REAL)
 STEAM_BINARY = "steam"
+# Lanceur du client, posé à côté du dossier que `detect_pz` rend.
+CLIENT_SCRIPT = "projectzomboid.sh"
+# `start-server.sh` fixe `-Dzomboid.steam=0` : le client doit quitter le mode Steam lui aussi.
+NO_STEAM_FLAG = "-nosteam"
 # L'hôte joue sur la machine du serveur A.
+HOST_SIDE = "A"
 CLIENT_HOST = "127.0.0.1"
 # L'invité joue sur le serveur B.
 GUEST_SIDE = "B"
+PLAYER_REFUSED = "player_refused"
 LUA_DIR = "Lua"
 SERVER_DIR = "Server"
 FIRST_BOOT = 1
@@ -140,14 +147,11 @@ def load_presets(
     return out
 
 
-def launch_steam(args: Sequence[str]) -> bool:
-    """Lance Steam avec `args`, détaché du service. Rend faux si Steam est introuvable."""
-    steam = shutil.which(STEAM_BINARY)
-    if steam is None:
-        return False
+def _spawn(command: Sequence[str]) -> bool:
+    """Lance `command`, détachée du service. Rend faux si elle ne peut pas partir."""
     try:
         subprocess.Popen(
-            [steam, *args],
+            command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -156,6 +160,17 @@ def launch_steam(args: Sequence[str]) -> bool:
     except OSError:
         return False
     return True
+
+
+def launch_client(script: Path, args: Sequence[str]) -> bool:
+    """Lance le client par son script, sans passer par Steam."""
+    return _spawn([str(script), *args])
+
+
+def launch_steam(args: Sequence[str]) -> bool:
+    """Lance Steam avec `args`, détaché du service. Rend faux si Steam est introuvable."""
+    steam = shutil.which(STEAM_BINARY)
+    return steam is not None and _spawn([steam, *args])
 
 
 def local_ip() -> str:
@@ -394,6 +409,9 @@ class RealMatch:
         self._on_state = on_state
         self.window = ContractWindow(table, effects, runtime["hook_window_s"])
         self.players: dict[str, str | None] = dict.fromkeys(SIDES)
+        # Nom de connexion lié à chaque camp, pour tout le match, relances comprises.
+        self._identities: dict[str, str] = {}
+        self._refused_players: set[tuple[str, str]] = set()
         self._probes: dict[str, _Probe] = {}
         self._last_cmd_seq = FIRST_CMD_FLOOR
         self._countdown_end_ms: int | None = None
@@ -473,6 +491,10 @@ class RealMatch:
         S'il manque encore au lancement du match, la relecture du contrat refuse.
         """
         server_dir = self.zomboid_dir / SERVER_DIR
+        passwords = {
+            HOST_SIDE: self.config["host_password"],
+            GUEST_SIDE: self.config["password"],
+        }
         self._lua_dir.mkdir(parents=True, exist_ok=True)
         for side, channel in self._channels.items():
             name = server_name(side)
@@ -482,7 +504,7 @@ class RealMatch:
                 "UDPPort": ports["udp"],
                 "RCONPort": ports["rcon"],
                 "RCONPassword": self._rcon_password,
-                "Password": self.config["password"],
+                "Password": passwords[side],
                 "Mods": mods_setting(self.table),
                 **self.runtime["managed_ini"],
             }
@@ -898,12 +920,34 @@ class RealMatch:
             self._take_probe_result(side, data, now_ms)
 
     def _take_beat(self, side: str, data: Mapping[str, Any], now_ms: int) -> None:
-        self.players[side] = next(iter(data["players"]), None)
+        self.players[side] = self._identify(side, data["players"])
         self._beat_ms[side] = now_ms
         if self.players[side] is not None:
             self._seen_ms[side] = now_ms
         if self._core is not None:
             self._track_age(side, data["age"])
+
+    def _identify(self, side: str, names: Sequence[str]) -> str | None:
+        """Rend le joueur du camp : le premier nom admis s'y lie, et n'en sert aucun autre."""
+        bound = self._identities.get(side)
+        if bound in names:
+            return bound
+        taken = {name for other, name in self._identities.items() if other != side}
+        for name in names:
+            if bound is None and name not in taken:
+                self._identities[side] = name
+                return name
+            self._refuse_player(side, name)
+        return None
+
+    def _refuse_player(self, side: str, name: str) -> None:
+        """Un nom refusé ne compte pas comme présent ; il se signale une fois par camp."""
+        if (side, name) in self._refused_players:
+            return
+        self._refused_players.add((side, name))
+        self._record_anomalies([Anomaly(PLAYER_REFUSED, side, {"player": name})])
+        message = f"joueur {name} ignoré sur le serveur {side} : ce n'est pas l'identité du camp"
+        self._on_state(lambda state: state.log(self.redactor.redact(message), "warn"))
 
     def _take_probe_result(self, side: str, result: Mapping[str, Any], now_ms: int) -> None:
         probe = self._probes.get(side)
@@ -1169,6 +1213,7 @@ class Engine:
         effects: Mapping[str, Any] | None = None,
         clock: Callable[[], float] | None = None,
         matches_dir: str | os.PathLike[str] | None = None,
+        client_launcher: Callable[[Path, Sequence[str]], bool] | None = None,
         steam_launcher: Callable[[Sequence[str]], bool] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
     ) -> None:
@@ -1181,6 +1226,7 @@ class Engine:
         self.effects = load_effects() if effects is None else effects
         self.matches_dir = MATCHES_DIR if matches_dir is None else Path(matches_dir)
         self._clock = time.time if clock is None else clock
+        self._client_launcher = launch_client if client_launcher is None else client_launcher
         self._steam_launcher = launch_steam if steam_launcher is None else steam_launcher
         self._server_factory = ServerProcess if server_factory is None else server_factory
         self.lock = threading.RLock()
@@ -1246,7 +1292,8 @@ class Engine:
                 cfg = dict(self.state.config)
                 try:
                     # En réel, l'invitation déjà donnée reste valable.
-                    self._begin(cfg, cfg.get("code") if self.real else None)
+                    code = cfg.get("code") if self.real else None
+                    self._begin(cfg, code, cfg.get("host_password"))
                 except ActionRefused as exc:
                     return False, str(exc)
                 return True, "revanche"
@@ -1303,29 +1350,45 @@ class Engine:
         return stopped and not self._stop_incomplete
 
     def _open_game_real(self) -> tuple[bool, str]:
-        """Connecte le client de l'hôte au serveur A. La commande n'est jamais journalisée."""
-        password = self.state.config.get("password")
+        """Connecte le client de l'hôte au serveur A. La commande n'est jamais journalisée.
+
+        Les serveurs tournent sans Steam, le client aussi : son script d'abord, et Steam
+        seulement s'il manque, avec le même `-nosteam`.
+        """
+        password = self.state.config.get("host_password")
         if not password:
             return False, "aucun duel préparé : démarrez un duel avant d'ouvrir le jeu"
-        port = self.runtime["ports"]["A"]["game"]
         args = [
-            "-applaunch",
-            str(self.runtime["steam_app_id"]),
+            NO_STEAM_FLAG,
             "+connect",
-            f"{CLIENT_HOST}:{port}",
+            self.state.config["host_address"],
             "+password",
             password,
         ]
-        if not self._steam_launcher(args):
-            message = "Steam introuvable : lancez Project Zomboid à la main"
+        script = self._client_script()
+        if script is not None and self._client_launcher(script, args):
+            message = "client PZ lancé sans Steam"
+        elif self._steam_launcher(["-applaunch", str(self.runtime["steam_app_id"]), *args]):
+            message = f"client PZ lancé par Steam avec {NO_STEAM_FLAG}"
+        else:
+            message = f"client PZ introuvable : lancez PZ à la main avec {NO_STEAM_FLAG}"
             self.state.log(message, "warn")
             return False, message
-        self.state.log("client PZ lancé par Steam")
-        return True, "client PZ lancé par Steam"
+        self.state.log(message)
+        return True, message
+
+    def _client_script(self) -> Path | None:
+        folder = detect_pz(self.pz_dir, os.environ, Path.home()).path
+        if folder is None:
+            return None
+        script = folder.parent / CLIENT_SCRIPT
+        return script if os.access(script, os.X_OK) else None
 
     # -- moteur ----------------------------------------------------------
-    def _begin(self, payload: dict, code: str | None = None) -> None:
-        """`code` vient de la revanche seule : le `payload` d'un `start` n'en fixe aucun.
+    def _begin(
+        self, payload: dict, code: str | None = None, host_password: str | None = None
+    ) -> None:
+        """`code` et `host_password` viennent de la revanche seule, jamais d'un `start`.
 
         Tout le `payload` se valide ici, avant le premier effet : un refus laisse l'état, les
         mondes et les sauvegardes tels quels.
@@ -1350,7 +1413,10 @@ class Engine:
             "code": code or make_code(),
             "summary": preset["summary"],
         }
-        cfg["password"] = password or cfg["code"]
+        # `password` ouvre B et part dans l'invitation ; `host_password` n'ouvre que A.
+        cfg["password"] = password or gen_player_password()
+        cfg["host_password"] = host_password or gen_player_password()
+        cfg["host_address"] = f"{CLIENT_HOST}:{self.runtime['ports'][HOST_SIDE]['game']}"
         self.state = MatchState(mode=self.mode, config=cfg)
         self.state.reset_steps()
         # Dès ici et non dans le fil : un second `start` ne doit pas passer entre les deux.

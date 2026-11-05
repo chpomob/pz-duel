@@ -35,6 +35,7 @@ ENCODING = "utf-8"
 ENCODING_ERRORS = "surrogateescape"
 INI_MODE = 0o600
 REDACTED = "***"
+PLAYER_PASSWORD_BYTES = 8
 DAY_LENGTH_KEY = "DayLength"
 # Un commentaire commence par `#` ; le `\r` d'une fin CRLF reste dans la valeur capturée.
 INI_LINE = re.compile(r"[ \t]*([^\s#=]+)[ \t]*=(.*)")
@@ -177,6 +178,11 @@ def gen_secret() -> str:
     return secrets.token_hex()
 
 
+def gen_player_password() -> str:
+    """Tire un mot de passe joueur : un humain le recopie, il reste donc court."""
+    return secrets.token_hex(PLAYER_PASSWORD_BYTES)
+
+
 class Redactor:
     """Retire les secrets de toute sortie de serveur et de tout message d'exception."""
 
@@ -230,6 +236,12 @@ class ServerProcess:
     @property
     def ready(self) -> bool:
         return self._ready.is_set()
+
+    @property
+    def running(self) -> bool:
+        """Le groupe de processus décide, pas le script : `java` peut lui survivre."""
+        with self._stop_lock:
+            return self._process is not None and self._group_alive()
 
     @property
     def exit_code(self) -> int | None:

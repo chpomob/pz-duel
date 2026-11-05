@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from functools import partial
 from pathlib import Path
 
-from .preflight import _check_ports
+from .preflight import check_ports
 from .rules import load_runtime
 from .servers import ServerPair, ServerProcess, server_name
 
@@ -56,15 +56,6 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
-
-
-def _is_running(server: ServerProcess) -> bool:
-    """Le groupe de processus décide, pas le script : `java` peut lui survivre.
-
-    `ServerProcess` n'expose rien de public pour cela : `exit_code` vaut `None` aussi bien
-    pour un serveur jamais lancé que pour un serveur qui tourne, et `stop` l'arrêterait.
-    """
-    return server._process is not None and server._group_alive()
 
 
 def _switch(moves: Iterable[tuple[Path, Path, Path]]) -> None:
@@ -185,11 +176,11 @@ class SnapshotStore:
         )
 
     def _require_stopped(self, pair: ServerPair, action: str) -> None:
-        running = [side for side, server in pair.servers.items() if _is_running(server)]
+        running = [side for side, server in pair.servers.items() if server.running]
         if running:
             raise SnapshotError(f"{action} refusée : serveur {', '.join(running)} en marche")
         game_ports = {side: {"game": self._ports[side]["game"]} for side in pair.servers}
-        _, failures = _check_ports(game_ports)
+        _, failures = check_ports(game_ports)
         if failures:
             raise SnapshotError(f"{action} refusée : {' '.join(failures)}")
 

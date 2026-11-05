@@ -12,7 +12,7 @@ import pytest
 from test_contract import (
     L_S,
     MS,
-    PLAYER,
+    PLAYERS,
     SIDES,
     Lobby,
     crash,
@@ -179,13 +179,47 @@ def test_players_come_from_beats_and_silence_is_no_failure(engine_rig):
     assert state["servers"] == {"A": "up", "B": "up"}
 
     seq = lobby.join("A")
-    engine_rig.until(lambda s: s["players"] == {"A": PLAYER, "B": None})
+    engine_rig.until(lambda s: s["players"] == {"A": PLAYERS["A"], "B": None})
     assert lobby.state()["capabilities"]["spawn"]["A"] == "unknown"
 
     lobby.mods["A"].cmd_result(seq, "applied", spawned=1)
     lobby.mods["A"].beat(players=())
     engine_rig.until(lambda s: s["players"]["A"] is None)
     assert lobby.state()["phase"] == "lobby"
+
+
+def test_each_side_has_its_own_password(engine_rig):
+    state = Lobby(engine_rig, PRESET).state()
+    server_dir = engine_rig.zomboid / "Server"
+
+    assert read_ini(server_dir / "duelB.ini")["Password"] == PLAYER_PASSWORD
+    assert read_ini(server_dir / "duelA.ini")["Password"] == state["config"]["host_password"]
+    assert state["config"]["host_password"] != PLAYER_PASSWORD
+    assert state["config"]["host_password"] not in state["invite"].values()
+
+
+def test_side_follows_the_connection_identity(engine_rig):
+    lobby = Lobby(engine_rig, PRESET)
+    host, guest = PLAYERS["A"], PLAYERS["B"]
+    lobby.mods["A"].beat(players=(host,))
+    engine_rig.until(lambda s: s["players"] == {"A": host, "B": None})
+
+    # L'hôte sur B : un nom lié à A ne compte pas pour l'autre camp.
+    lobby.mods["B"].beat(players=(host,))
+    engine_rig.until(lambda _: lobby.records("player_refused"))
+    assert lobby.state()["players"] == {"A": host, "B": None}
+
+    lobby.mods["B"].beat(players=(guest,))
+    engine_rig.until(lambda s: s["players"] == PLAYERS)
+
+    # Un inconnu à la place de l'hôte : le camp est vide, jusqu'au retour de son joueur.
+    lobby.mods["A"].beat(players=("intrus",))
+    engine_rig.until(lambda s: s["players"] == {"A": None, "B": guest})
+    assert lobby.records("player_refused")[-1]["data"] == {"player": "intrus"}
+    lobby.mods["A"].beat(players=("intrus",))
+    lobby.mods["A"].beat(players=(host,))
+    engine_rig.until(lambda s: s["players"] == PLAYERS)
+    assert len(lobby.records("player_refused")) == 2
 
 
 def test_no_countdown_without_both_players(engine_rig):
@@ -202,7 +236,7 @@ def test_no_countdown_without_both_players(engine_rig):
     assert lobby.state()["phase"] == "lobby"
 
     lobby.at(10)
-    lobby.mods["A"].beat(players=(PLAYER,))
+    lobby.mods["A"].beat(players=(PLAYERS["A"],))
 
     state = engine_rig.wait("countdown", "error")
     assert state["phase"] == "countdown", state["error"]
@@ -289,7 +323,7 @@ class Duel(Lobby):
         self.rig.until(lambda _: reader.offset == size)
 
     def beat(self, side: str, age: float = 0.0, kills: int | None = None) -> bytes:
-        line = self.mods[side].beat(age=age, players=(PLAYER,), kills=kills)
+        line = self.mods[side].beat(age=age, players=(PLAYERS[side],), kills=kills)
         self.read(side)
         return line
 
@@ -536,8 +570,8 @@ def test_drift_real_seconds(
 
     duel.at_match(11)
     # Sans attendre la lecture : la fin de match arrête celle de `out` (D11).
-    duel.mods["A"].beat(age=first_age_a + advance_a, players=(PLAYER,))
-    line = duel.mods["B"].beat(age=advance_b, players=(PLAYER,))
+    duel.mods["A"].beat(age=first_age_a + advance_a, players=(PLAYERS["A"],))
+    line = duel.mods["B"].beat(age=advance_b, players=(PLAYERS["B"],))
 
     state = engine_rig.until(lambda s: s["clock"]["drift_s"] == drift_s)
     if outcome is None:
@@ -575,8 +609,8 @@ def test_drift_judged_after_both_queues(engine_rig, presets):
     duel.at_match(11)
     # La passe attend : les deux heartbeats sont en file quand elle lit `out`.
     with gate:
-        duel.mods["A"].beat(age=1.7, players=(PLAYER,))
-        line = duel.mods["B"].beat(age=1.7, players=(PLAYER,))
+        duel.mods["A"].beat(age=1.7, players=(PLAYERS["A"],))
+        line = duel.mods["B"].beat(age=1.7, players=(PLAYERS["B"],))
 
     duel.played(line)
     state = duel.reach(duel.te_s + duel.step_s)
@@ -605,7 +639,7 @@ def test_beat_silence_by_phase(engine_rig):
     state = duel.reach(1 + timeout_s - 1)
     assert state["phase"] == "running"
     assert state["servers"] == {"A": "up", "B": "up"}
-    assert state["players"] == {"A": PLAYER, "B": PLAYER}
+    assert state["players"] == PLAYERS
 
     duel.at_match(1 + timeout_s)
     # `players` se publie en fin de passe, après les statuts.
@@ -618,7 +652,7 @@ def test_beat_silence_by_phase(engine_rig):
     duel.at_match(duel.te_s + 1)
     line = duel.beat("A")
     state = engine_rig.until(
-        lambda s: s["servers"]["A"] == "up" and s["players"] == {"A": PLAYER, "B": None}
+        lambda s: s["servers"]["A"] == "up" and s["players"] == {"A": PLAYERS["A"], "B": None}
     )
     assert state["servers"]["B"] == "suspect"
     duel.played(line)
@@ -972,7 +1006,7 @@ def test_drift_decides_after_the_return(engine_rig, presets):
     assert state["clock"]["drift_s"] == 0
 
     duel.at_match(6)
-    duel.mods["B"].beat(age=3.4, players=(PLAYER,))
+    duel.mods["B"].beat(age=3.4, players=(PLAYERS["B"],))
     duel.at_match(duel.te_s + duel.step_s)
     state = duel.finish()
     assert state["result"]["outcome"] == "invalidated"
@@ -1023,7 +1057,7 @@ def test_restart_keeps_the_match_and_the_acquired_drift(engine_rig, presets):
     assert state["phase"] == "running"
 
     duel.at_match(74)
-    duel.mods["A"].beat(age=2.25, players=(PLAYER,))
+    duel.mods["A"].beat(age=2.25, players=(PLAYERS["A"],))
     duel.at_match(duel.te_s + duel.step_s)
     state = duel.finish()
     assert state["result"]["outcome"] == "invalidated"
@@ -1311,6 +1345,7 @@ def test_rematch(engine_rig, presets):
     assert state["phase"] == "lobby", state["error"]
     assert state["config"]["code"] == first["config"]["code"]
     assert state["config"]["password"] == first["config"]["password"] == PLAYER_PASSWORD
+    assert state["config"]["host_password"] == first["config"]["host_password"]
     assert state["invite"]["code"] == first["invite"]["code"]
     assert state["invite"]["password"] == PLAYER_PASSWORD
     assert state["match_id"] != first["match_id"]
@@ -1322,7 +1357,8 @@ def test_rematch(engine_rig, presets):
         assert (session["boot"], session["cmd_floor"]) == (1, 0)
         assert session["match"] == state["match_id"]
         ini = read_ini(rig.zomboid / "Server" / f"duel{side}.ini")
-        assert ini["Password"] == PLAYER_PASSWORD
+        passwords = {"A": first["config"]["host_password"], "B": PLAYER_PASSWORD}
+        assert ini["Password"] == passwords[side]
     assert len(rig.seen("A")) == launches + 1
 
     # Nouveau match : la fenêtre de contrat se rouvre et se referme sur ses propres preuves.

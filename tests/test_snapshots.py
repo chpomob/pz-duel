@@ -653,7 +653,8 @@ def test_first_run_creation_pass(engine_rig):
             assert ini["UDPPort"] == str(ports["udp"])
             assert ini["RCONPort"] == str(ports["rcon"])
             assert ini["RCONPassword"] == config["rcon_password"]
-            assert ini["Password"] == PLAYER_PASSWORD
+            passwords = {"A": state["config"]["host_password"], "B": PLAYER_PASSWORD}
+            assert ini["Password"] == passwords[side]
             session = json.loads((seen / "Lua" / f"duel_{side}_session.txt").read_bytes())
             assert session["match"] == state["match_id"]
             assert (session["side"], session["boot"], session["cmd_floor"]) == (side, 1, 0)
@@ -737,7 +738,7 @@ def test_failed_creation_pass_captures_nothing(rig):
 
     assert not store.has("A") and not store.has("B")
     assert not any(event[0] == "capture" for event in rig.events if isinstance(event, tuple))
-    assert not any(snapshots._is_running(server) for server in rig.servers.values())
+    assert not any(server.running for server in rig.servers.values())
     assert_creation_undone(store)
 
 
@@ -752,7 +753,7 @@ def test_cancelled_creation_pass_captures_nothing(rig):
 
     cancel.join()
     assert not store.has("A") and not store.has("B")
-    assert not any(snapshots._is_running(server) for server in rig.servers.values())
+    assert not any(server.running for server in rig.servers.values())
     assert_creation_undone(store)
 
     # Le monde de la passe annulée ne devient pas l'origine : une passe entière le remplace.

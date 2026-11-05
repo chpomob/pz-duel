@@ -30,7 +30,7 @@ ATOM = "damage_taken"
 HOOK = "OnWeaponHitCharacter"
 WITH_ATOM = "duel_rapide"
 WITHOUT_ATOM = "demo"
-PLAYER = "durand"
+PLAYERS = {"A": "durand", "B": "dupont"}
 # `L` : le test fige l'horloge du moteur, tout se passe à cet instant sauf s'il l'avance.
 L_S = 1000.0
 MS = 1000
@@ -229,7 +229,7 @@ class Lobby:
     def join(self, side: str) -> int:
         """Connecte le joueur du camp et rend le `seq` de sa sonde."""
         mod = self.mods[side]
-        mod.beat(players=(PLAYER,))
+        mod.beat(players=(PLAYERS[side],))
         self.rig.until(lambda _: mod.in_path.read_bytes())
         return json.loads(mod.in_path.read_bytes().splitlines()[-1])["seq"]
 

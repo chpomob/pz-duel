@@ -78,11 +78,6 @@ const mmss = (s) => {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 };
 
-function code5() {
-  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  return Array.from({ length: 5 }, () => a[Math.floor(Math.random() * a.length)]).join('');
-}
-
 function newDraft() {
   const p = presets[0] || { id: 'duel_rapide', duration_s: 1500, day_length: 1 };
   return {
@@ -90,7 +85,7 @@ function newDraft() {
     duration_s: p.duration_s,
     day_length: p.day_length,
     pseudo: localStorage.getItem('pzduel.pseudo') || 'hôte',
-    password: code5(),
+    password: '',
   };
 }
 
@@ -189,8 +184,8 @@ function renderConfig() {
         <label class="field"><span>Ton pseudo</span>
           <input id="f-pseudo" value="${esc(draft.pseudo)}" maxlength="20">
         </label>
-        <label class="field"><span>Mot de passe du serveur</span>
-          <input id="f-password" value="${esc(draft.password)}" maxlength="24">
+        <label class="field"><span>Mot de passe de l'invité</span>
+          <input id="f-password" value="${esc(draft.password)}" maxlength="24" placeholder="tiré au hasard">
         </label>
       </div>
 
@@ -280,6 +275,7 @@ function renderLive() {
               <button class="ghost" data-action="open-game">Ouvrir PZ</button>
               ${S.mode === 'mock' ? '<button class="ghost" data-action="simulate">Simuler l\'adversaire</button>' : ''}
             </div>
+            ${S.mode === 'real' ? `<p class="hint" style="margin-top:10px">Ton accès, à garder pour toi : ${esc(S.config.host_address)}, mot de passe <b>${esc(S.config.host_password)}</b></p>` : ''}
             <p class="hint" style="margin-top:10px">Adversaire : ${S.players.B ? esc(S.players.B) : 'en attente…'}</p>
           </div>
         </div>

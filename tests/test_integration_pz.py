@@ -28,7 +28,7 @@ from service.preflight import (
     ENV_VAR,
     MOD_SRC,
     SCRIPT,
-    _check_ports,
+    check_ports,
     detect_pz,
     install_mod,
     run_preflight,
@@ -51,6 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_BUILD = "42.21.0"
 PRESET_ID = "duel_rapide"
 PLAYER_PASSWORD = "integration"
+HOST_PASSWORD = "integration-hote"
 GAME_SERVER_CLASS = b"zombie/network/GameServer"
 POLL_S = 0.1
 
@@ -119,6 +120,7 @@ def real_match(pz_dir, tmp_path, match_secrets) -> Iterator[RealMatch]:
     match = RealMatch(
         {
             "password": PLAYER_PASSWORD,
+            "host_password": HOST_PASSWORD,
             "day_length": table["day_length"],
             "duration_s": table["duration_s"],
         },
@@ -216,7 +218,7 @@ def test_real_servers_boot_contract_stop(real_match, match_secrets):
 
     assert real_match.shutdown()
     assert game_server_pids() == []
-    assert _check_ports(real_match.runtime["ports"])[1] == []
+    assert check_ports(real_match.runtime["ports"])[1] == []
 
     for side, server in real_match.pair.servers.items():
         # Le `RCONPassword` du `.ini` a bien servi : l'arrêt n'a pas eu à se replier.

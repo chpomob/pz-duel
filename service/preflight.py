@@ -120,7 +120,7 @@ def _bind(port: int, kind: int) -> None:
         sock.bind((BIND_HOST, port))
 
 
-def _check_ports(ports: Mapping[str, Mapping[str, int]]) -> tuple[list[str], list[str]]:
+def check_ports(ports: Mapping[str, Mapping[str, int]]) -> tuple[list[str], list[str]]:
     free: list[str] = []
     failures: list[str] = []
     for side, side_ports in ports.items():
@@ -258,7 +258,7 @@ def run_preflight(
 
     detection = detect_pz(pz_dir, env, home)
     failures = [] if detection.path else [detection.message]
-    free_ports, port_failures = _check_ports(runtime["ports"])
+    free_ports, port_failures = check_ports(runtime["ports"])
     available_mb, ram_failures = _check_ram(meminfo, runtime["min_free_ram_mb"])
     fingerprint, mod_failures = _check_mod(zomboid_dir, Path(mod_src), runtime["mod_version_dir"])
     ini_readable, ini_failures = _check_ini(zomboid_dir / "Server", runtime["ports"])

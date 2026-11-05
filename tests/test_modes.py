@@ -363,7 +363,9 @@ def test_open_game_real(zomboid_home, tmp_path, monkeypatch, runtime):
     assert engine.action("start", {"preset": "demo", "password": "marqueur-joueur"})[0]
     settle(engine)
     ok, _ = engine.action("open_game")
+    host_password = engine.snapshot()["config"]["host_password"]
 
+    # Sans script de client, Steam ne sert que de relais : le client reste en `-nosteam`.
     assert ok is True
     [args] = launcher.calls
     port = runtime["ports"]["A"]["game"]
@@ -371,24 +373,101 @@ def test_open_game_real(zomboid_home, tmp_path, monkeypatch, runtime):
     assert args == [
         "-applaunch",
         str(runtime["steam_app_id"]),
+        "-nosteam",
         "+connect",
         f"127.0.0.1:{port}",
         "+password",
-        "marqueur-joueur",
+        host_password,
     ]
-    assert not any("marqueur-joueur" in e["msg"] for e in engine.snapshot()["logs"])
+    assert not any(host_password in e["msg"] for e in engine.snapshot()["logs"])
 
     # Sans Steam : le lanceur double, puis le vrai lanceur sur un PATH sans `steam`.
     launcher.found = False
     ok, message = engine.action("open_game")
     assert ok is False
-    assert "Steam introuvable" in message
+    assert "client PZ introuvable" in message
 
     monkeypatch.setenv("PATH", str(tmp_path))
     no_steam = real_engine(zomboid_home, runtime)
     assert no_steam.action("start", {"preset": "demo"})[0]
     settle(no_steam)
     assert no_steam.action("open_game")[0] is False
+
+
+def client_install(root: Path) -> tuple[Path, Path]:
+    """Rend le dossier à passer en `pz_dir` et le script du client, à l'endroit du jeu."""
+    game = root / "ProjectZomboid" / "projectzomboid"
+    game.mkdir(parents=True)
+    server_script = game / "start-server.sh"
+    client_script = game.parent / "projectzomboid.sh"
+    for script in (server_script, client_script):
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        script.chmod(0o755)
+    return game.parent, client_script
+
+
+def test_open_game_is_direct_and_leaves_steam_mode(zomboid_home, tmp_path, runtime):
+    """Les serveurs tournent en `zomboid.steam=0` : un client en mode Steam n'y entrerait pas."""
+    pz_dir, script = client_install(tmp_path)
+    direct: list[tuple[Path, list[str]]] = []
+    steam = Launcher()
+
+    def client_launcher(path, args):
+        direct.append((path, list(args)))
+        return True
+
+    engine = real_engine(
+        zomboid_home,
+        runtime,
+        pz_dir=pz_dir,
+        client_launcher=client_launcher,
+        steam_launcher=steam,
+    )
+    engine.state.config = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
+
+    assert engine.action("open_game")[0] is True
+    assert direct == [
+        (script.resolve(), ["-nosteam", "+connect", "127.0.0.1:17261", "+password", "marqueur-hote"])
+    ]
+    assert steam.calls == []
+
+
+def test_open_game_uses_steam_only_when_direct_launch_fails(zomboid_home, tmp_path, runtime):
+    pz_dir, _ = client_install(tmp_path)
+    steam = Launcher()
+    engine = real_engine(
+        zomboid_home,
+        runtime,
+        pz_dir=pz_dir,
+        client_launcher=lambda path, args: False,
+        steam_launcher=steam,
+    )
+    engine.state.config = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
+
+    assert engine.action("open_game")[0] is True
+    [args] = steam.calls
+    assert "-nosteam" in args
+
+
+def test_default_client_launcher_runs_the_script(tmp_path, monkeypatch):
+    started = []
+    monkeypatch.setattr(
+        engine_module.subprocess, "Popen", lambda command, **kwargs: started.append(command)
+    )
+
+    assert engine_module.launch_client(tmp_path / "pz.sh", ["-nosteam"]) is True
+    assert started == [[str(tmp_path / "pz.sh"), "-nosteam"]]
+
+
+def test_default_passwords_are_distinct_and_unrelated_to_the_code(zomboid_home, runtime):
+    engine = real_engine(zomboid_home, runtime)
+
+    assert engine.action("start", {"preset": "demo"})[0]
+    config = settle(engine)["config"]
+
+    assert config["password"] != config["host_password"]
+    assert config["code"] not in (config["password"], config["host_password"])
+    assert min(len(config["password"]), len(config["host_password"])) >= 16
 
 
 def test_default_launcher_goes_through_steam(tmp_path, monkeypatch):
