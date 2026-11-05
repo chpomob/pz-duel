@@ -18,14 +18,32 @@ import string
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .journal import Journal
 from .preflight import run_preflight
-from .rules import load_effects, load_runtime, load_table
-from .servers import LINE_BREAK, ServerProcess
+from .protocol import PROTOCOL_VERSION, SIDES
+from .rules import MS_PER_S, load_effects, load_runtime, load_table, rules_hash
+from .servers import (
+    LINE_BREAK,
+    STATUS_ERROR,
+    Redactor,
+    ServerPair,
+    ServerProcess,
+    apply_status,
+    gen_secret,
+    mods_setting,
+    server_name,
+    verify_contract,
+    write_ini,
+    write_sandbox,
+)
+from .snapshots import SnapshotError, SnapshotStore, prepare_worlds
 from .state import MatchState
+from .transport import CommandChannel, OutReader
 
 PRESETS_DIR = os.path.join(os.path.dirname(__file__), "presets")
 MATCHES_DIR = Path(__file__).resolve().parent.parent / "matches"
@@ -37,11 +55,13 @@ MODES = (MODE_MOCK, MODE_REAL)
 STEAM_BINARY = "steam"
 # L'hôte joue sur la machine du serveur A.
 CLIENT_HOST = "127.0.0.1"
-# Transitoire : P18 retire cet arrêt, P24 vérifie qu'il n'en reste rien.
-REAL_LAUNCH_PENDING = (
-    "préflight réussi, mais le lancement réel des serveurs n'est pas encore disponible : "
-    "aucun serveur n'a été démarré"
-)
+# L'invité joue sur le serveur B.
+GUEST_SIDE = "B"
+LUA_DIR = "Lua"
+SERVER_DIR = "Server"
+FIRST_BOOT = 1
+FIRST_CMD_FLOOR = 0
+STOP_INCOMPLETE = "arrêt incomplet : des processus de serveur subsistent"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -114,6 +134,210 @@ def _check_ini_value(label: str, value: Any) -> None:
         )
 
 
+class RealMatch:
+    """Un lancement réel, de la préparation à l'arrêt, dans l'ordre de D23.
+
+    Le constructeur tire `match_id` et les secrets et arme le `Redactor` : la passe de
+    création écrit déjà `server_X.log`. `on_status` suit `ServerPair` ; `stop` est l'événement
+    d'annulation du moteur. `shutdown` est le seul chemin d'arrêt : `cancel`, erreur et fin.
+    """
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        table: Mapping[str, Any],
+        *,
+        runtime: Mapping[str, Any],
+        effects: Mapping[str, Any],
+        zomboid_dir: Path,
+        pz_dir: str | os.PathLike[str],
+        matches_dir: Path,
+        clock: Callable[[], float],
+        stop: threading.Event,
+        server_factory: Callable[..., ServerProcess],
+        on_status: Callable[[str, str, str], None],
+    ) -> None:
+        self.config = config
+        self.table = table
+        self.runtime = runtime
+        self.effects = effects
+        self.zomboid_dir = zomboid_dir
+        self.match_id = uuid.uuid4().hex
+        self.match_dir = matches_dir / self.match_id
+        self.match_dir.mkdir(parents=True)
+        admin_password, self._rcon_password = gen_secret(), gen_secret()
+        self.redactor = Redactor([admin_password, self._rcon_password])
+        self.poll_s = runtime["tick_ms"] / MS_PER_S
+        self._clock = clock
+        self._stop = stop
+        self._on_status = on_status
+        cfg = {
+            **runtime,
+            "pz_dir": pz_dir,
+            "zomboid_dir": zomboid_dir,
+            "admin_password": admin_password,
+            "rcon_password": self._rcon_password,
+        }
+        servers = {
+            side: server_factory(side, cfg, self.match_dir, self.redactor) for side in SIDES
+        }
+        self.pair = ServerPair(servers, runtime, self._publish_status)
+        self._store = SnapshotStore(zomboid_dir, ports=runtime["ports"])
+        lua_dir = zomboid_dir / LUA_DIR
+        self._lua_dir = lua_dir
+        self._channels = {side: CommandChannel(side, lua_dir) for side in SIDES}
+        self._readers = {
+            side: OutReader(channel.out_path, side, effects)
+            for side, channel in self._channels.items()
+        }
+        self._journal: Journal | None = None
+        self._shutdown_lock = threading.Lock()
+        self._stopped: bool | None = None
+
+    def prepare(self) -> None:
+        """Amène les mondes à leur origine, rejoue la préparation, ouvre le journal.
+
+        Le second `_prepare_launch` efface aussi ce que la passe de création a laissé :
+        `caps`, `out` et toute réécriture du `.ini` par PZ. Les serveurs sont alors arrêtés.
+        """
+        prepare_worlds(self.pair, self._store, prepare_launch=self._prepare_launch)
+        self._prepare_launch()
+        self._journal = Journal(self.match_dir, lambda: self._clock() * MS_PER_S)
+        self._journal.write(
+            "match_start",
+            {
+                "match_id": self.match_id,
+                "preset": self.table,
+                "rules_hash": rules_hash(self.table),
+                "ports": self.runtime["ports"],
+                "protocol": PROTOCOL_VERSION,
+                "runtime": self.runtime,
+                "effects": self.effects,
+                "duration_s": self.config["duration_s"],
+                "day_length": self.config["day_length"],
+            },
+        )
+
+    def _prepare_launch(self) -> None:
+        """Idempotent, mêmes secrets à chaque appel, et jamais avec un serveur en marche.
+
+        Un `SandboxVars` absent n'existe pas encore : PZ le crée à la passe de création.
+        S'il manque encore au lancement du match, la relecture du contrat refuse.
+        """
+        server_dir = self.zomboid_dir / SERVER_DIR
+        self._lua_dir.mkdir(parents=True, exist_ok=True)
+        for side, channel in self._channels.items():
+            name = server_name(side)
+            ports = self.runtime["ports"][side]
+            managed = {
+                "DefaultPort": ports["game"],
+                "UDPPort": ports["udp"],
+                "RCONPort": ports["rcon"],
+                "RCONPassword": self._rcon_password,
+                "Password": self.config["password"],
+                "Mods": mods_setting(self.table),
+                **self.runtime["managed_ini"],
+            }
+            write_ini(server_dir / f"{name}.ini", managed)
+            try:
+                write_sandbox(
+                    server_dir / f"{name}_SandboxVars.lua",
+                    self.config["day_length"],
+                    self.runtime["sandbox_start"],
+                )
+            except FileNotFoundError:
+                pass
+            channel.write_session(self.match_id, FIRST_BOOT, FIRST_CMD_FLOOR)
+            channel.reset()
+
+    def launch(self) -> bool:
+        """Démarre les serveurs du match ; rend faux sur échec (`pair.failure`) ou annulation."""
+        return self.pair.start() and self.pair.wait_ready()
+
+    def wait_caps(self) -> dict[str, Mapping[str, Any] | None]:
+        """Lit `out` jusqu'aux `caps` des deux camps, `contract_timeout_s`, annulation ou panne."""
+        caps: dict[str, Mapping[str, Any] | None] = dict.fromkeys(SIDES)
+        deadline = time.monotonic() + self.runtime["contract_timeout_s"]
+        while True:
+            self._poll_out(caps)
+            if all(caps.values()) or time.monotonic() >= deadline or self._any_exited():
+                return caps
+            if self._stop.wait(self.poll_s):
+                return caps
+
+    def _poll_out(self, caps: dict[str, Mapping[str, Any] | None]) -> None:
+        for side, reader in self._readers.items():
+            events, anomalies = reader.poll()
+            for anomaly in anomalies:
+                self._journal.write(anomaly.type, anomaly.data, anomaly.side)
+            for event in events:
+                self._journal.write("event", event, event["side"])
+                if event["kind"] == "caps":
+                    caps[side] = event["data"]
+
+    def verify(self, caps: Mapping[str, Mapping[str, Any] | None]) -> list[str]:
+        builds = {side: server.build for side, server in self.pair.servers.items()}
+        failures = verify_contract(
+            self.zomboid_dir,
+            self.table,
+            self.config["day_length"],
+            self.runtime,
+            caps,
+            builds,
+        )
+        return [self.redactor.redact(failure) for failure in failures]
+
+    def _any_exited(self) -> bool:
+        return any(server.exited_unexpectedly() for server in self.pair.servers.values())
+
+    def lost_server(self) -> str | None:
+        """Hors `running`, une sortie non demandée est une erreur : rend son message expurgé."""
+        for side, server in self.pair.servers.items():
+            if server.exited_unexpectedly():
+                reason = f"serveur {side} : sortie inattendue, code {server.exit_code}"
+                detail = "\n".join([reason, *server.log_tail()])
+                self._on_status(side, STATUS_ERROR, detail)
+                return detail
+        return None
+
+    def record_phase(self, phase: str) -> None:
+        self._record_state({"phase": phase}, None)
+
+    def _publish_status(self, side: str, status: str, detail: str) -> None:
+        self._on_status(side, status, detail)
+        self._record_state({"server": status}, side)
+
+    def _record_state(self, data: Mapping[str, Any], side: str | None) -> None:
+        """Journalise un `state`, rien avant `match_start`.
+
+        Ces lignes accompagnent aussi l'arrêt : une panne du journal, disque plein compris,
+        est consignée sans jamais empêcher d'arrêter les serveurs.
+        """
+        journal = self._journal
+        if journal is None:
+            return
+        try:
+            journal.write("state", data, side)
+        except (OSError, ValueError) as exc:
+            LOGGER.error("journal : %s", self.redactor.redact_exception(exc))
+
+    def shutdown(self) -> bool:
+        """Arrête les serveurs une seule fois, depuis n'importe quel fil, verrou du moteur libre.
+
+        Un appel concurrent attend la fin de l'arrêt et en rend le résultat.
+        """
+        with self._shutdown_lock:
+            if self._stopped is None:
+                self._stopped = self.pair.close()
+            return self._stopped
+
+    def close(self) -> None:
+        """Ferme le journal : à n'appeler qu'après `shutdown`, plus rien n'y écrit."""
+        if self._journal is not None:
+            self._journal.close()
+            self._journal = None
+
+
 class Engine:
     """Un duel à la fois. `clock` rend l'heure murale en secondes."""
 
@@ -146,6 +370,7 @@ class Engine:
         self.state.reset_steps()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._match: RealMatch | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -203,6 +428,11 @@ class Engine:
                     return False, "rien à annuler"
                 self._stop.set()
                 self.state.log("annulation demandée", "warn")
+                if self._match is not None:
+                    # Hors du verrou : `on_status` le prend, et un arrêt dure.
+                    threading.Thread(
+                        target=self._match.shutdown, name="duel-cancel", daemon=True
+                    ).start()
                 return True, "annulation"
             if name == "simulate_join":
                 if self.real:
@@ -303,10 +533,113 @@ class Engine:
             return
         with self.lock:
             self.state.set_step("preflight", "ok" if result.ok else "error", result.detail)
-        if result.ok:
-            self._fail(REAL_LAUNCH_PENDING)
-        else:
+        if not result.ok:
             self._fail("préflight en échec : " + " ; ".join(result.failures))
+            return
+        match = self._open_match(table, result.values["pz_dir"])
+        if match is None:
+            self._cancel_state()
+            return
+        try:
+            failure = self._drive_match(match)
+        except SnapshotError as exc:
+            failure = match.redactor.redact(str(exc))
+        except Exception as exc:
+            # Toute panne, même imprévue, doit passer par `_finish_match` et son arrêt.
+            failure = f"lancement impossible : {match.redactor.redact_exception(exc)}"
+        self._finish_match(match, failure)
+
+    def _open_match(self, table: Mapping[str, Any], pz_dir: str) -> RealMatch | None:
+        """Crée le match sous le verrou : `cancel` voit soit `_match`, soit `_stop` ici relu."""
+        with self.lock:
+            if self._stop.is_set():
+                return None
+            self._match = RealMatch(
+                self.state.config,
+                table,
+                runtime=self.runtime,
+                effects=self.effects,
+                zomboid_dir=self.zomboid_dir,
+                pz_dir=pz_dir,
+                matches_dir=self.matches_dir,
+                clock=self._clock,
+                stop=self._stop,
+                server_factory=self._server_factory,
+                on_status=self._on_server_status,
+            )
+            self.state.match_id = self._match.match_id
+            self.state.config["rules_hash"] = rules_hash(table)
+            self.state.phase = "starting"
+            self.state.log("préparation des mondes et des réglages")
+            return self._match
+
+    def _on_server_status(self, side: str, status: str, detail: str) -> None:
+        with self.lock:
+            apply_status(self.state, side, status, detail)
+
+    def _enter_phase(self, match: RealMatch, phase: str) -> None:
+        """Le journal s'écrit hors du verrou : un `fsync` ne doit pas figer `/api/state`."""
+        with self.lock:
+            self.state.phase = phase
+        match.record_phase(phase)
+
+    def _drive_match(self, match: RealMatch) -> str | None:
+        """Mène le match jusqu'au lobby et l'y tient. Rend le motif d'échec, `None` si annulé."""
+        match.prepare()
+        match.record_phase("starting")
+        if self._stop.is_set():
+            return None
+        if not match.launch():
+            return match.pair.failure
+        self._enter_phase(match, "contract")
+        with self.lock:
+            self.state.set_step("contract", "running")
+        caps = match.wait_caps()
+        if self._stop.is_set():
+            return None
+        if lost := match.lost_server():
+            return lost
+        if failures := match.verify(caps):
+            message = "contrat refusé : " + " ; ".join(failures)
+            with self.lock:
+                self.state.set_step("contract", "error", message)
+            return message
+        self._open_lobby(match)
+        while not self._stop.wait(match.poll_s):
+            if lost := match.lost_server():
+                return lost
+        return None
+
+    def _open_lobby(self, match: RealMatch) -> None:
+        with self.lock:
+            self.state.set_step("contract", "ok", "contrat vérifié sur A et B")
+            self.state.set_step("lobby", "running", "en attente des joueurs")
+            self.state.invite = {
+                "ip": local_ip(),
+                "port": self.runtime["ports"][GUEST_SIDE]["game"],
+                "password": self.state.config["password"],
+                "code": self.state.config["code"],
+            }
+            self.state.log("lobby ouvert, invitation prête")
+        self._enter_phase(match, "lobby")
+
+    def _finish_match(self, match: RealMatch, failure: str | None) -> None:
+        """Toute sortie passe ici : arrêt d'abord, puis état final, puis fermeture du journal."""
+        self._enter_phase(match, "stopping")
+        stopped = match.shutdown()
+        with self.lock:
+            self._match = None
+        if not stopped:
+            failure = STOP_INCOMPLETE
+        elif self._stop.is_set():
+            failure = None
+        if failure is None:
+            self._cancel_state()
+            match.record_phase("idle")
+        else:
+            self._fail(failure)
+            match.record_phase("error")
+        match.close()
 
     def _run(self) -> None:
         self._phase_preflight()

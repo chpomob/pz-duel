@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from doubles.fake_server import FakeRcon, install_fake_server
+from test_snapshots import engine_rig, make_world  # noqa: F401
 from service.rcon import MAX_PACKET_SIZE, RconClient, RconError
 from service.servers import (
     REDACTED,
@@ -724,6 +725,16 @@ def test_stop_during_start_keeps_next_server_down(harness):
     assert not group_alive(first._process.pid)
 
 
+def test_close_forbids_any_later_start(harness):
+    """L'annulation peut précéder `start` : contrairement à `stop`, `close` y survit."""
+    pair = harness.pair({"lines": READY_LINES}, {"lines": READY_LINES})
+
+    assert pair.close() is True
+
+    assert pair.start() is False
+    assert all(server._process is None for server in pair.servers.values())
+
+
 def test_pair_restarts_after_stop(harness):
     pair = harness.pair({"lines": READY_LINES}, {"lines": READY_LINES})
     for _ in range(2):
@@ -911,3 +922,141 @@ def test_exited_unexpectedly_distinguishes_requested_stop(harness):
     assert not stopped.exited_unexpectedly()
     assert stopped.stop()
     assert not stopped.exited_unexpectedly()
+
+
+def stopped_for_good(rig) -> bool:
+    return not any(group_alive(server._process.pid) for server in rig.servers if server._process)
+
+
+def both_running(state: dict) -> bool:
+    return state["servers"] == {"A": "starting", "B": "starting"}
+
+
+def cancel_during_creation_pass(rig) -> None:
+    rig.build(lines=[])
+    rig.start()
+    rig.until(both_running)
+    cancel(rig)
+
+
+def cancel_during_starting(rig) -> None:
+    for side in ("A", "B"):
+        make_world(rig.zomboid, side)
+    rig.build(lines=[])
+    rig.start()
+    rig.until(both_running)
+    cancel(rig)
+
+
+def cancel(rig) -> None:
+    assert rig.engine.action("cancel")[0]
+    state = rig.wait("idle", "error")
+    assert state["phase"] == "idle", state["error"]
+    assert state["servers"] == {"A": "down", "B": "down"}
+
+
+def contract_error(rig) -> None:
+    rig.build(on_match_launch=f"""sed -i 's/^Mods=.*/Mods=autre/' "{rig.zomboid}/Server/$2.ini" """)
+    rig.start()
+    state = rig.wait("error", "lobby")
+    assert state["phase"] == "error"
+    assert "contrat refusé" in state["error"]
+    assert "Mods" in state["error"]
+    assert next(s for s in state["steps"] if s["id"] == "contract")["state"] == "error"
+    assert state["servers"] == {"A": "down", "B": "down"}
+
+
+@pytest.mark.parametrize(
+    "scenario", [cancel_during_creation_pass, cancel_during_starting, contract_error]
+)
+def test_every_exit_stops_servers(engine_rig, scenario):
+    engine_rig.runtime["server_start_timeout_s"] = 600
+    started = time.monotonic()
+
+    scenario(engine_rig)
+
+    assert engine_rig.servers
+    assert any(server._process is not None for server in engine_rig.servers)
+    assert stopped_for_good(engine_rig)
+    # L'attente de disponibilité a été interrompue, pas subie.
+    assert time.monotonic() - started < PROCESS_TIMEOUT_S
+    assert engine_rig.engine._match is None
+
+
+def test_cancelled_creation_pass_leaves_no_snapshot(engine_rig):
+    cancel_during_creation_pass(engine_rig)
+
+    assert not (engine_rig.zomboid / "duel-snapshots" / "duelA").exists()
+    assert not (engine_rig.zomboid / "duel-snapshots" / "duelB").exists()
+
+
+def test_cancel_in_lobby_stops_servers(engine_rig):
+    engine_rig.build()
+    engine_rig.start()
+    state = engine_rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+
+    cancel(engine_rig)
+
+    assert stopped_for_good(engine_rig)
+    phases = [r["data"]["phase"] for r in engine_rig.journal(state["match_id"]) if "phase" in r["data"]]
+    assert phases == ["starting", "contract", "lobby", "stopping", "idle"]
+
+
+def test_missing_caps_refused_after_timeout(engine_rig):
+    engine_rig.runtime["contract_timeout_s"] = 0.2
+    engine_rig.build()
+    for side in ("A", "B"):
+        (engine_rig.caps_dir / side).unlink()
+
+    engine_rig.start()
+    state = engine_rig.wait("error", "lobby")
+
+    assert state["phase"] == "error"
+    assert "caps de A non reçu" in state["error"]
+    assert "caps de B non reçu" in state["error"]
+    assert stopped_for_good(engine_rig)
+
+
+def test_server_crash_on_match_launch_is_an_error(engine_rig):
+    crash = 'if [ "$2" = duelB ]; then echo "boom"; exit 3; fi'
+    engine_rig.build(on_match_launch=crash)
+
+    engine_rig.start()
+    state = engine_rig.wait("error", "lobby")
+
+    assert state["phase"] == "error"
+    assert "serveur B : sortie anticipée, code 3" in state["error"]
+    assert next(s for s in state["steps"] if s["id"] == "serverB")["state"] == "error"
+    assert stopped_for_good(engine_rig)
+
+
+def test_server_lost_in_lobby_is_an_error(engine_rig):
+    engine_rig.build()
+    engine_rig.start()
+    state = engine_rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+
+    server = engine_rig.engine._match.pair.servers["A"]
+    os.killpg(server._process.pid, signal.SIGKILL)
+    state = engine_rig.wait("error")
+
+    assert "serveur A : sortie inattendue" in state["error"]
+    assert stopped_for_good(engine_rig)
+
+
+def test_unexpected_failure_still_stops_servers(engine_rig, monkeypatch):
+    """Une panne imprévue dans le contrat ne laisse aucun serveur derrière elle."""
+    engine_rig.build()
+
+    def explode(self, caps):
+        raise RuntimeError(f"panne {self.redactor._secrets[0]}")
+
+    monkeypatch.setattr("service.engine.RealMatch.verify", explode)
+    engine_rig.start()
+    state = engine_rig.wait("error", "lobby")
+
+    assert state["phase"] == "error"
+    assert "lancement impossible" in state["error"]
+    assert REDACTED in state["error"]
+    assert stopped_for_good(engine_rig)

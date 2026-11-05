@@ -13,12 +13,19 @@ import shutil
 import signal
 import socket
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from doubles.fake_mod import FakeMod
 from doubles.fake_server import install_fake_server
+from test_preflight import free_ports
 from service import snapshots
+from service.engine import Engine
+from service.journal import JOURNAL_NAME, read_journal
+from service.preflight import MOD_SRC, install_mod
+from service.replay import START_FIELDS
 from service.rules import load_runtime
 from service.servers import Redactor, ServerPair, ServerProcess, read_ini, write_ini
 from service.snapshots import SnapshotError, SnapshotStore, copy_path, prepare_worlds
@@ -48,6 +55,152 @@ CREATE_WORLD = 'mkdir -p "{zomboid}/Saves/Multiplayer/$2/map"\n' + (
     'echo created > "{zomboid}/Saves/Multiplayer/$2/map/chunk.bin"\n'
     'echo created > "{zomboid}/db/$2.db"'
 )
+
+
+# Double d'un vrai lancement : relève le disque, puis agit comme PZ et comme le mod. Sans
+# monde, c'est la passe de création : elle crée monde et sandbox, et son `caps` est périmé.
+ENGINE_SCRIPT = """#!/bin/sh
+side="${{2#duel}}"
+mkdir -p "{launches}/$2"
+seen="{launches}/$2/$(ls "{launches}/$2" | wc -l)"
+mkdir "$seen"
+cp "{zomboid}/Server/$2.ini" "$seen/"
+cp "{zomboid}/Server/$2_SandboxVars.lua" "$seen/" 2>/dev/null
+cp -r "{zomboid}/Lua" "$seen/Lua"
+ls "{zomboid}/duel-snapshots" > "$seen/snapshots" 2>/dev/null
+out="{zomboid}/Lua/duel_${{side}}_out.txt"
+if [ -d "{zomboid}/Saves/Multiplayer/$2" ]; then
+  {on_match_launch}
+  cat "{caps}/$side" >> "$out" 2>/dev/null
+else
+  mkdir -p "{zomboid}/Saves/Multiplayer/$2/map"
+  echo created > "{zomboid}/Saves/Multiplayer/$2/map/chunk.bin"
+  echo created > "{zomboid}/db/$2.db"
+  printf '{sandbox}' > "{zomboid}/Server/$2_SandboxVars.lua"
+  echo 'Mods=rewritten by PZ' >> "{zomboid}/Server/$2.ini"
+  cat "{caps}/stale_$side" >> "$out"
+fi
+exec {inner} "$@"
+"""
+ENGINE_SANDBOX = (
+    r"DayLength = 4,\nStartYear = 3,\nStartMonth = 1,\nStartDay = 2,\nStartTime = 5,\n"
+)
+BUILD = "42.21.0"
+ENGINE_READY = [f"version={BUILD}", *READY_LINES]
+WAIT_S = 10
+WAIT_POLL_S = 0.01
+PLAYER_PASSWORD = "player-marker"
+
+
+class EngineRig:
+    """Vrai `Engine` réel sur le double : seuls PZ et le mod sont remplacés."""
+
+    def __init__(self, tmp_path: Path, zomboid: Path, runtime: dict) -> None:
+        self.zomboid = zomboid
+        self.launches = tmp_path / "launches"
+        self.matches = tmp_path / "matches"
+        self.pz_dir = tmp_path / "pz"
+        self.caps_dir = tmp_path / "caps"
+        self.pz_dir.mkdir()
+        self.caps_dir.mkdir()
+        self.runtime = {**runtime, **FAST_TIMEOUTS, "min_free_ram_mb": 0}
+        self.runtime["contract_timeout_s"] = WAIT_S
+        self.runtime["ports"] = free_ports(runtime)
+        self.servers: list[ServerProcess] = []
+        self.configs: list[dict] = []
+        self.engine: Engine | None = None
+        install_mod(MOD_SRC, zomboid)
+
+    def build(
+        self, lines: list[str] | None = None, on_match_launch: str = ":", **scenario
+    ) -> Engine:
+        """Pose le double et rend le moteur ; `on_match_launch` agit hors passe de création."""
+        script = install_fake_server(
+            self.pz_dir, {"lines": ENGINE_READY if lines is None else lines, **scenario}
+        )
+        inner = script.rename(self.pz_dir / "inner-server.sh")
+        script.write_text(
+            ENGINE_SCRIPT.format(
+                launches=self.launches,
+                zomboid=self.zomboid,
+                caps=self.caps_dir,
+                inner=shlex.quote(str(inner)),
+                sandbox=ENGINE_SANDBOX,
+                on_match_launch=on_match_launch,
+            ),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        self.engine = Engine(
+            "real",
+            zomboid_dir=self.zomboid,
+            pz_dir=self.pz_dir,
+            runtime=self.runtime,
+            matches_dir=self.matches,
+            server_factory=self.factory,
+        )
+        table = self.engine.preset("demo")
+        for side in SIDES:
+            mod = FakeMod(self.zomboid / "Lua", side)
+            data = {
+                "build": BUILD,
+                "mod": "0.1.0",
+                "protocol": 1,
+                "hooks": {},
+                "functions": {},
+                "atoms": list(table["atoms"]),
+                "effects": [e["kind"] for rule in table["rules"] for e in rule["effects"]],
+            }
+            (self.caps_dir / side).write_bytes(mod.line("caps", data))
+            stale = mod.line("caps", {**data, "mod": f"creation pass {side}"})
+            (self.caps_dir / f"stale_{side}").write_bytes(stale)
+        return self.engine
+
+    def factory(self, side, cfg, match_dir, redactor) -> ServerProcess:
+        self.configs.append(cfg)
+        self.servers.append(ServerProcess(side, cfg, match_dir, redactor))
+        return self.servers[-1]
+
+    def start(self) -> None:
+        ok, message = self.engine.action("start", {"preset": "demo", "password": PLAYER_PASSWORD})
+        assert ok, message
+
+    def wait(self, *phases: str) -> dict:
+        return self.until(lambda state: state["phase"] in phases)
+
+    def until(self, condition) -> dict:
+        deadline = time.monotonic() + WAIT_S
+        while time.monotonic() < deadline:
+            state = self.engine.snapshot()
+            if condition(state):
+                return state
+            time.sleep(WAIT_POLL_S)
+        raise AssertionError(f"condition jamais atteinte : {self.engine.snapshot()['logs']}")
+
+    def seen(self, side: str) -> list[Path]:
+        folder = self.launches / f"duel{side}"
+        return [folder / name for name in sorted(os.listdir(folder), key=int)]
+
+    def journal(self, match_id: str) -> list[dict]:
+        return read_journal(self.matches / match_id / JOURNAL_NAME).records
+
+    def cleanup(self) -> None:
+        if self.engine is not None:
+            self.engine._stop.set()
+            if self.engine._match is not None:
+                self.engine._match.shutdown()
+            if self.engine._thread is not None:
+                self.engine._thread.join(WAIT_S)
+        for server in self.servers:
+            if server._process is not None and server._group_alive():
+                os.killpg(server._process.pid, signal.SIGKILL)
+
+
+@pytest.fixture
+def engine_rig(tmp_path, zomboid_home, runtime):
+    built = EngineRig(tmp_path, zomboid_home, runtime)
+    yield built
+    built.cleanup()
 
 
 def free_port(kind: int) -> int:
@@ -432,7 +585,7 @@ def worlds_state_of(zomboid: Path, side: str) -> tuple:
     return tree(world_dir(zomboid, side)), world_db(zomboid, side).read_bytes()
 
 
-def test_first_run_creation_pass(rig):
+def test_creation_pass_order_on_prepare_worlds(rig):
     for channel in rig.channels.values():
         for path in (channel.in_path, channel.out_path, channel.ack_path):
             path.write_bytes(b"left by an earlier run\n")
@@ -471,6 +624,102 @@ def test_first_run_creation_pass(rig):
     rig.events.clear()
     prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
     assert "prepare_launch" not in rig.events
+
+
+def test_first_run_creation_pass(engine_rig):
+    rig = engine_rig
+    engine = rig.build()
+    lua = rig.zomboid / "Lua"
+    for side in SIDES:
+        for name in ("in", "out", "ack"):
+            (lua / f"duel_{side}_{name}.txt").write_bytes(b"left by an earlier run\n")
+
+    rig.start()
+    state = rig.wait("lobby", "error")
+
+    assert state["phase"] == "lobby", state["error"]
+    [config] = {id(cfg): cfg for cfg in rig.configs}.values()
+    for side in SIDES:
+        assert (rig.zomboid / "duel-snapshots" / f"duel{side}").is_dir()
+        launches = rig.seen(side)
+        assert len(launches) == 2
+        snapshots_seen = [(seen / "snapshots").read_text().split() for seen in launches]
+        assert snapshots_seen == [[], ["duelA", "duelB"]]
+        ports = rig.runtime["ports"][side]
+        for seen in launches:
+            ini = read_ini(seen / f"duel{side}.ini")
+            assert ini["Mods"] == "duelcore"
+            assert ini["DefaultPort"] == str(ports["game"])
+            assert ini["UDPPort"] == str(ports["udp"])
+            assert ini["RCONPort"] == str(ports["rcon"])
+            assert ini["RCONPassword"] == config["rcon_password"]
+            assert ini["Password"] == PLAYER_PASSWORD
+            session = json.loads((seen / "Lua" / f"duel_{side}_session.txt").read_bytes())
+            assert session["match"] == state["match_id"]
+            assert (session["side"], session["boot"], session["cmd_floor"]) == (side, 1, 0)
+            for name in ("in", "out", "ack"):
+                assert (seen / "Lua" / f"duel_{side}_{name}.txt").read_bytes() == b""
+        # La passe a créé le sandbox et réécrit le `.ini` : le second lancement les corrige.
+        assert "rewritten" not in (launches[1] / f"duel{side}.ini").read_text()
+        day_length = engine.state.config["day_length"]
+        sandbox = (launches[1] / f"duel{side}_SandboxVars.lua").read_text()
+        assert f"DayLength = {day_length}," in sandbox
+    # Lu par le contrat, le `caps` de la passe refuserait le match : son `mod` diffère par camp.
+    assert {step["id"]: step["state"] for step in state["steps"]} == {
+        "preflight": "ok",
+        "serverA": "ok",
+        "serverB": "ok",
+        "contract": "ok",
+        "lobby": "running",
+    }
+    assert state["invite"]["port"] == rig.runtime["ports"]["B"]["game"]
+    assert state["invite"]["password"] == PLAYER_PASSWORD
+
+
+def test_match_start_comes_first_without_secret(engine_rig):
+    rig = engine_rig
+    rig.build()
+    rig.start()
+    state = rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+
+    first, *others = rig.journal(state["match_id"])
+
+    assert first["type"] == "match_start"
+    assert set(START_FIELDS) <= set(first["data"])
+    assert first["data"]["match_id"] == state["match_id"]
+    assert first["data"]["rules_hash"] == state["config"]["rules_hash"]
+    assert first["data"]["day_length"] == state["config"]["day_length"]
+    assert first["data"]["runtime"] == rig.runtime
+    assert {"phase": "contract"} in [record["data"] for record in others]
+    assert sum(record["data"].get("kind") == "caps" for record in others) == 2
+    [config] = {id(cfg): cfg for cfg in rig.configs}.values()
+    text = (rig.matches / state["match_id"] / JOURNAL_NAME).read_text(encoding="utf-8")
+    for secret in (config["rcon_password"], config["admin_password"], PLAYER_PASSWORD):
+        assert secret not in text
+
+
+def test_next_match_restores_without_creation_pass(engine_rig):
+    rig = engine_rig
+    engine = rig.build()
+    rig.start()
+    first = rig.wait("lobby", "error")
+    assert first["phase"] == "lobby", first["error"]
+    assert engine.action("cancel")[0]
+    rig.wait("idle")
+    chunk = world_dir(rig.zomboid, "A") / "map" / "chunk.bin"
+    chunk.write_bytes(b"after the match")
+
+    rig.start()
+    second = rig.wait("lobby", "error")
+
+    assert second["phase"] == "lobby", second["error"]
+    assert second["match_id"] != first["match_id"]
+    assert chunk.read_bytes() == b"created\n"
+    for side in SIDES:
+        assert len(rig.seen(side)) == 3
+    secrets_by_match = {cfg["rcon_password"] for cfg in rig.configs}
+    assert len(secrets_by_match) == 2
 
 
 def test_failed_creation_pass_captures_nothing(rig):

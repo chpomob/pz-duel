@@ -18,8 +18,9 @@ from test_preflight import free_ports, make_install
 from service import engine as engine_module
 from service import main as main_module
 from service.api import make_server
-from service.engine import ACTIONS, REAL_LAUNCH_PENDING, Engine, load_presets
+from service.engine import ACTIONS, Engine, load_presets
 from service.preflight import MOD_SRC, install_mod
+from service.servers import ServerProcess
 
 SIMULATED = "simulé"
 CHECK_STEPS = ("preflight", "serverA", "serverB", "contract")
@@ -104,13 +105,8 @@ def state_text(state: dict) -> str:
 
 def real_engine(zomboid_home: Path, runtime: dict, **kwargs) -> Engine:
     kwargs.setdefault("pz_dir", zomboid_home / "absent")
-    return Engine(
-        "real",
-        zomboid_dir=zomboid_home,
-        runtime=runtime,
-        server_factory=forbidden_factory,
-        **kwargs,
-    )
+    kwargs.setdefault("server_factory", forbidden_factory)
+    return Engine("real", zomboid_dir=zomboid_home, runtime=runtime, **kwargs)
 
 
 def test_mock_never_claims_real(runtime):
@@ -163,21 +159,28 @@ def test_real_never_falls_back(zomboid_home, runtime):
     assert engine.action("simulate_join")[0] is False
 
 
-def test_real_stops_after_successful_preflight(zomboid_home, tmp_path, runtime):
+def test_real_launches_after_successful_preflight(zomboid_home, tmp_path, runtime):
+    """Le script vide sort aussitôt : l'échec vient du lancement, plus d'un arrêt transitoire."""
     runtime["ports"] = free_ports(runtime)
     runtime["min_free_ram_mb"] = 0
     install_mod(MOD_SRC, zomboid_home)
-    engine = real_engine(zomboid_home, runtime, pz_dir=make_install(tmp_path / "pz"))
+    engine = real_engine(
+        zomboid_home,
+        runtime,
+        pz_dir=make_install(tmp_path / "pz"),
+        matches_dir=tmp_path / "matches",
+        server_factory=ServerProcess,
+    )
 
     assert engine.action("start", {"preset": "demo"})[0]
     state = settle(engine)
 
     assert state["phase"] == "error"
-    assert state["error"] == REAL_LAUNCH_PENDING
+    assert "passe de création en échec" in state["error"]
     preflight = step(state, "preflight")
     assert preflight["state"] == "ok"
     assert "RAM disponible" in preflight["detail"]
-    assert step(state, "serverA")["state"] == "pending"
+    assert step(state, "serverA")["state"] == "error"
     assert SIMULATED not in state_text(state)
 
 

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .preflight import SCRIPT
+from .protocol import SIDES
 from .rcon import RconClient, RconError
 from .rules import MS_PER_S
 from .state import MatchState
@@ -48,6 +49,10 @@ STATUS_UP = "up"
 STATUS_ERROR = "error"
 STATUS_DOWN = "down"
 STEP_STATES = {STATUS_STARTING: "running", STATUS_UP: "ok", STATUS_ERROR: "error"}
+
+MODS_SEPARATOR = ";"
+CONTRACT_PORT_KEYS = ("DefaultPort", "UDPPort", "RCONPort")
+CAPS_SHARED_KEYS = ("protocol", "mod")
 
 STOP_RCON = "rcon"
 STOP_STDIN = "stdin"
@@ -141,6 +146,11 @@ def write_sandbox(path: str | Path, day_length: int, start: Mapping[str, Any]) -
 def server_name(side: str) -> str:
     """Nom du serveur : le mod en déduit son camp par `getServerName()`."""
     return f"duel{side}"
+
+
+def mods_setting(table: Mapping[str, Any]) -> str:
+    """Valeur de `Mods` pour `table`, écrite au lancement et attendue par le contrat."""
+    return MODS_SEPARATOR.join(table["mods"])
 
 
 def launch_command(side: str, cfg: Mapping[str, Any]) -> list[str]:
@@ -452,13 +462,15 @@ class ServerPair:
         self._deadline = 0.0
         self._up: set[str] = set()
         self._stopping = threading.Event()
+        self._closed = threading.Event()
         self._decision = threading.Lock()
 
     def start(self) -> bool:
         """Lance les deux serveurs. Un lancement impossible arrête celui déjà parti.
 
         Rend aussi faux, sans rien signaler, si `stop` vient d'un autre fil : le serveur
-        suivant ne part alors pas, et `stop` s'occupe de ceux qui sont déjà partis.
+        suivant ne part alors pas, et `stop` s'occupe de ceux qui sont déjà partis. Après
+        `close`, rien ne part : `start` efface `_stopping`, pas `_closed`.
         """
         self.failure = None
         self._up.clear()
@@ -466,7 +478,7 @@ class ServerPair:
         self._deadline = time.monotonic() + self._start_timeout_s
         for side, server in self.servers.items():
             with self._decision:
-                if self._stopping.is_set():
+                if self._stopping.is_set() or self._closed.is_set():
                     return False
                 self._on_status(side, STATUS_STARTING, "")
                 try:
@@ -509,6 +521,11 @@ class ServerPair:
                 self._on_status(side, STATUS_DOWN, "")
         return all(results.values())
 
+    def close(self) -> bool:
+        """Arrêt définitif : un `start` qui suivrait, même de peu, ne relance plus rien."""
+        self._closed.set()
+        return self.stop()
+
     def _announce_up(self) -> bool:
         for side, server in self.servers.items():
             if server.ready and side not in self._up:
@@ -539,3 +556,116 @@ class ServerPair:
         for side in self.servers:
             if side not in failures:
                 self._on_status(side, STATUS_ERROR, f"arrêté après l'échec du serveur {culprits}")
+
+
+def read_sandbox(path: str | Path, keys: Iterable[str]) -> dict[str, str]:
+    """Relit `keys` en début de ligne, comme `write_sandbox` ; une clé absente est omise."""
+    text = _read_text(Path(path))
+    values = {}
+    for key in keys:
+        pattern = rf"^[ \t]*{re.escape(key)}[ \t]*=[ \t]*([^,\r\n]*)"
+        if found := re.findall(pattern, text, flags=re.MULTILINE):
+            values[key] = found[-1].strip()
+    return values
+
+
+def _table_effects(table: Mapping[str, Any]) -> set[str]:
+    kinds = {effect["kind"] for rule in table["rules"] for effect in rule["effects"]}
+    score_gap = table["modifiers"].get("score_gap")
+    if score_gap:
+        kinds.add(score_gap["defender_bonus"]["kind"])
+    return kinds
+
+
+def _check_ini_contract(
+    inis: Mapping[str, Mapping[str, str]],
+    table: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> list[str]:
+    expected = {
+        "Mods": mods_setting(table),
+        "WorkshopItems": runtime["managed_ini"]["WorkshopItems"],
+        "PauseEmpty": runtime["managed_ini"]["PauseEmpty"],
+    }
+    failures = []
+    for side, ini in inis.items():
+        for key, value in expected.items():
+            if ini.get(key) != value:
+                failures.append(f"{key} sur {side} : {ini.get(key)!r}, attendu {value!r}")
+    for key in CONTRACT_PORT_KEYS:
+        values = {side: ini.get(key) for side, ini in inis.items()}
+        if None in values.values() or len(set(values.values())) < len(values):
+            failures.append(f"{key} non distincts entre les camps : {values}")
+    return failures
+
+
+def _check_sandbox_contract(
+    side: str, found: Mapping[str, str], expected: Mapping[str, Any]
+) -> list[str]:
+    return [
+        f"{key} sur {side} : {found.get(key)!r}, attendu {str(value)!r}"
+        for key, value in expected.items()
+        if found.get(key) != str(value)
+    ]
+
+
+def _check_caps_contract(
+    caps: Mapping[str, Mapping[str, Any] | None],
+    builds: Mapping[str, str | None],
+    table: Mapping[str, Any],
+    timeout_s: float,
+) -> list[str]:
+    received = {side: caps[side] for side in SIDES if caps.get(side) is not None}
+    missing = [side for side in SIDES if side not in received]
+    failures = [f"caps de {side} non reçu après {timeout_s} s" for side in missing]
+    if len(received) > 1:
+        for key in CAPS_SHARED_KEYS:
+            values = {side: data[key] for side, data in received.items()}
+            if len(set(values.values())) > 1:
+                failures.append(f"{key} différent entre les camps : {values}")
+    atoms, effects = set(table["atoms"]), _table_effects(table)
+    for side, data in received.items():
+        if data["build"] != builds.get(side):
+            failures.append(
+                f"build sur {side} : caps {data['build']!r}, log {builds.get(side)!r}"
+            )
+        for label, wanted, present in (
+            ("atome", atoms, data["atoms"]),
+            ("effet", effects, data["effects"]),
+        ):
+            for name in sorted(wanted - set(present)):
+                failures.append(f"{label} {name} absent de caps sur {side}")
+    return failures
+
+
+def verify_contract(
+    zomboid_dir: str | Path,
+    table: Mapping[str, Any],
+    day_length: int,
+    runtime: Mapping[str, Any],
+    caps: Mapping[str, Mapping[str, Any] | None],
+    builds: Mapping[str, str | None],
+) -> list[str]:
+    """Rend un message par écart, sur les fichiers relus ; une liste vide vaut conformité.
+
+    `caps` donne par camp le `data` reçu ; un camp à `None` ou absent de `caps` compte comme
+    non reçu, et ses fichiers sont relus quand même : le contrat porte toujours sur `SIDES`.
+    `builds` donne le build lu dans le log. Aucun `hook_seen` n'est jugé ici. `RCONPassword` n'est jamais lu : seuls les réglages
+    du contrat figurent dans les messages.
+    """
+    server_dir = Path(zomboid_dir) / "Server"
+    expected_sandbox = {DAY_LENGTH_KEY: day_length, **runtime["sandbox_start"]}
+    failures: list[str] = []
+    inis: dict[str, dict[str, str]] = {}
+    for side in SIDES:
+        name = server_name(side)
+        try:
+            inis[side] = read_ini(server_dir / f"{name}.ini")
+            found = read_sandbox(server_dir / f"{name}_SandboxVars.lua", expected_sandbox)
+        except OSError as exc:
+            failures.append(f"réglages de {side} illisibles : {exc}")
+            continue
+        failures += _check_sandbox_contract(side, found, expected_sandbox)
+    if len(inis) == len(SIDES):
+        failures += _check_ini_contract(inis, table, runtime)
+    return failures + _check_caps_contract(caps, builds, table, runtime["contract_timeout_s"])
