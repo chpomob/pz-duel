@@ -1,0 +1,54 @@
+{
+  "atoms": {
+    "zombie_kill": {"source": "server"},
+    "damage_taken": {"source": "server", "hook_proof": "OnWeaponHitCharacter"},
+    "build": {"source": "server"},
+    "vehicle_repair": {"source": "server"},
+    "explosion": {"source": "server"}
+  },
+  "effects": {
+    "spawn_pop": {
+      "required": ["n", "distance", "warn_s"],
+      "optional": ["cap_per_min", "target"],
+      "table": true
+    },
+    "spawn_sprinter": {
+      "required": ["n", "distance", "warn_s"],
+      "optional": ["cap_per_min", "target"],
+      "table": true
+    },
+    "horde_area": {
+      "required": ["n", "radius", "distance", "warn_s"],
+      "optional": ["cap_per_min", "target"],
+      "table": true
+    },
+    "noise": {
+      "required": ["radius", "distance", "warn_s"],
+      "optional": ["target"],
+      "table": true
+    },
+    "weather_rain": {
+      "required": ["duration_s", "warn_s"],
+      "optional": ["target"],
+      "table": true
+    },
+    "supply_drop": {
+      "required": ["distance", "warn_s", "items"],
+      "optional": ["target"],
+      "table": true
+    },
+    "probe_spawn": {
+      "required": ["n", "distance", "warn_s"],
+      "optional": [],
+      "table": false
+    }
+  },
+  "supply_items": [
+    "Base.Bandage",
+    "Base.Bandaid",
+    "Base.Disinfectant",
+    "Base.AlcoholWipes",
+    "Base.Antibiotics",
+    "Base.Pills"
+  ]
+}

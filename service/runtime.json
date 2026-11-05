@@ -1,0 +1,70 @@
+{
+  "ports": {
+    "A": {"game": 17261, "udp": 17262, "rcon": 27015},
+    "B": {"game": 17271, "udp": 17272, "rcon": 27016}
+  },
+  "server_start_timeout_s": 300,
+  "stop_timeout_s": 30,
+  "kill_grace_s": 10,
+  "rcon_timeout_s": 5,
+  "contract_timeout_s": 60,
+  "ack_timeout_s": 15,
+  "cmd_result_timeout_s": 60,
+  "probe_timeout_s": 30,
+  "beat_timeout_s": 30,
+  "hook_window_s": 120,
+  "countdown_s": 3,
+  "tick_ms": 250,
+  "rate_window_s": 60,
+  "max_units_per_command": 30,
+  "min_free_ram_mb": 6144,
+  "max_drift_s": 60,
+  "drift_factor": 2.5,
+  "max_server_restarts": 1,
+  "attribution_min_kills": 100,
+  "log_tail_lines": 40,
+  "day_length_minutes": {
+    "1": 15,
+    "2": 30,
+    "3": 60,
+    "4": 90,
+    "5": 120,
+    "6": 180,
+    "7": 240
+  },
+  "limits": {
+    "max_n": 30,
+    "min_distance": 25,
+    "max_distance": 100,
+    "max_warn_s": 30,
+    "max_radius": 50,
+    "max_effect_duration_s": 300,
+    "max_cap_per_min": 120,
+    "max_supply_entries": 5,
+    "max_item_count": 10,
+    "max_threats_per_minute": 12,
+    "max_concurrent_effects": 8
+  },
+  "probe_spawn": {
+    "n": 1,
+    "distance": [30, 60],
+    "warn_s": 0,
+    "origin": {"rule": "probe_spawn"}
+  },
+  "managed_ini": {
+    "PauseEmpty": "false",
+    "WorkshopItems": "",
+    "UPnP": "false",
+    "Public": "false",
+    "MaxPlayers": "1",
+    "SaveWorldEveryMinutes": "5"
+  },
+  "sandbox_start": {
+    "StartYear": 1,
+    "StartMonth": 7,
+    "StartDay": 9,
+    "StartTime": 2
+  },
+  "mod_version_dir": "42.21",
+  "steam_app_id": 108600
+}
