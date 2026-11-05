@@ -4,11 +4,17 @@
   "tagline": "25 min, lisible, peu de règles",
   "duration_s": 1500,
   "day_length": 1,
+  "mods": ["duelcore"],
+  "atoms": ["zombie_kill", "damage_taken"],
   "rules": [
-    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "cap_per_min": 60}]},
-    {"when": "atom(zombie_kill).count(3).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 1}]},
-    {"when": "atom(damage_taken)", "effects": [{"kind": "supply_drop"}]}
+    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "distance": [30, 60], "warn_s": 6, "cap_per_min": 60}]},
+    {"id": "kill_streak", "when": "atom(zombie_kill).count(3).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 1, "distance": [40, 70], "warn_s": 10}]},
+    {"id": "hurt_supply", "when": "atom(damage_taken)", "effects": [{"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}], "target": "self"}]}
   ],
+  "modifiers": {},
+  "budget": {"threats_per_minute": 6, "concurrent_effects": 4, "per_effect_cooldown_s": 20},
+  "score": {"points": {"zombie_kill": 1}},
+  "disconnect_grace_s": 120,
   "summary": [
     "1 zombie tué → 2 zombies chez l'adversaire (max 60/min)",
     "3 kills en 10 s → 1 rôdeur rapide en plus",

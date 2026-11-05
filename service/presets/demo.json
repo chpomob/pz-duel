@@ -4,8 +4,14 @@
   "tagline": "pour tester le flow, pas pour jouer",
   "duration_s": 90,
   "day_length": 1,
+  "mods": ["duelcore"],
+  "atoms": ["zombie_kill"],
   "rules": [
-    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "cap_per_min": 60}]}
+    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "distance": [30, 60], "warn_s": 6, "cap_per_min": 60}]}
   ],
+  "modifiers": {},
+  "budget": {"threats_per_minute": 6, "concurrent_effects": 4, "per_effect_cooldown_s": 20},
+  "score": {"points": {"zombie_kill": 1}},
+  "disconnect_grace_s": 120,
   "summary": ["1 zombie tué → 2 zombies chez l'adversaire (max 60/min)"]
 }

@@ -4,17 +4,29 @@
   "tagline": "25 min, combos et ambiance",
   "duration_s": 1500,
   "day_length": 1,
+  "mods": ["duelcore"],
+  "atoms": ["zombie_kill", "damage_taken", "build"],
   "rules": [
-    {"when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "cap_per_min": 60}]},
-    {"when": "atom(zombie_kill).count(3).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 1}]},
-    {"when": "atom(zombie_kill).count(10).within(60s).and(not atom(damage_taken).within(60s))", "effects": [{"kind": "fog", "duration_s": 90}]},
-    {"when": "atom(build).count(3).within(120s).then(atom(zombie_kill), within=30s)", "effects": [{"kind": "horde_area", "n": 25}]},
-    {"when": "atom(damage_taken)", "effects": [{"kind": "shake"}, {"kind": "supply_drop"}]}
+    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "distance": [30, 60], "warn_s": 6, "cap_per_min": 60}]},
+    {"id": "kill_streak", "when": "atom(zombie_kill).count(3).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 1, "distance": [40, 70], "warn_s": 10}]},
+    {"id": "untouched_minute", "when": "atom(zombie_kill).count(10).within(60s).and(not atom(damage_taken).within(60s))", "effects": [{"kind": "weather_rain", "duration_s": 90, "warn_s": 0}]},
+    {"id": "builder_payoff", "when": "atom(build).count(3).within(120s).then(atom(zombie_kill), within=30s)", "effects": [{"kind": "horde_area", "n": 25, "radius": 20, "distance": [50, 80], "warn_s": 12}]},
+    {"id": "hurt_supply", "when": "atom(damage_taken)", "effects": [{"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}], "target": "self"}]}
   ],
+  "modifiers": {
+    "combo": {"per": 0.15, "max": 3.0, "on": "zombie_kill", "reset_on": "damage_taken"},
+    "score_gap": {"when_gt": 30, "attacker": 0.6, "defender_bonus": {"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}]}}
+  },
+  "budget": {"threats_per_minute": 6, "concurrent_effects": 4, "per_effect_cooldown_s": 20},
+  "score": {"points": {"zombie_kill": 1}},
+  "disconnect_grace_s": 120,
   "summary": [
     "1 zombie tué → 2 zombies chez l'adversaire (max 60/min)",
+    "3 kills en 10 s → 1 rôdeur rapide en plus",
     "3 constructions puis 1 kill en 30 s → horde de 25 dans un rayon de 20",
-    "10 kills en 60 s sans être touché → brouillard de 90 s",
-    "1 blessure reçue → secousse d'écran + caisse de soin"
+    "10 kills en 60 s sans être touché → pluie de 90 s",
+    "1 blessure reçue → caisse de soin à proximité",
+    "Combo : +15 % de zombies par kill, jusqu'à ×3, remis à zéro par une blessure",
+    "Plus de 30 kills d'avance → effets ×0,6 et caisse de soin pour le camp mené"
   ]
 }
