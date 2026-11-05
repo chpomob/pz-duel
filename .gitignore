@@ -5,3 +5,5 @@ __pycache__/
 docs/campaigns/**/logs/
 docs/campaigns/**/loop-out/
 /docs/campaigns/phase1/run/
+.adversarial-plan/
+docs/campaigns/phase1/plan-run/
