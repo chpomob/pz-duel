@@ -1,0 +1,5 @@
+# artefacts d'exécution — jamais commités
+logs/
+loop-out/
+steps/
+campaign.log
