@@ -44,6 +44,7 @@ STATE_KEYS = {
 NEW_STATE_KEYS = {"match_id", "capabilities", "result"}
 PRESET_KEYS = {"id", "label", "tagline", "summary", "duration_s", "day_length"}
 WAIT_S = 10
+JSON_HEADERS = {"Content-Type": "application/json"}
 
 
 class FastClock:
@@ -348,7 +349,7 @@ def test_default_launcher_goes_through_steam(tmp_path, monkeypatch):
 def call(url: str, data: dict | None = None) -> tuple[int, dict]:
     body = None if data is None else json.dumps(data).encode("utf-8")
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=body)) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, body, JSON_HEADERS)) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as exc:
         with exc:

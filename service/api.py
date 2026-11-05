@@ -20,6 +20,11 @@ TYPES = {
     ".json": "application/json; charset=utf-8",
 }
 
+# La liaison sur la boucle locale n'arrête pas le navigateur de l'utilisateur : une page web
+# peut viser l'API, ou la lire par rebinding DNS. Seuls ces noms désignent ce service.
+LOCAL_NAMES = ("127.0.0.1", "localhost")
+JSON_TYPE = "application/json"
+
 
 class Handler(BaseHTTPRequestHandler):
     engine = None  # injecté par make_server
@@ -55,9 +60,25 @@ class Handler(BaseHTTPRequestHandler):
         with open(path, "rb") as fh:
             self._send(200, fh.read(), ctype)
 
+    def _refused(self) -> bool:
+        """Répond 403 et rend vrai si la requête ne vient pas de l'interface locale."""
+        bound, port = self.server.server_address[:2]
+        hosts = {f"{name}:{port}" for name in (bound, *LOCAL_NAMES)}
+        sent_hosts = [value.lower() for value in self.headers.get_all("Host", [])]
+        sent_origins = [value.lower() for value in self.headers.get_all("Origin", [])]
+        if len(sent_hosts) != 1 or sent_hosts[0] not in hosts:
+            self._json(403, {"ok": False, "error": "en-tête Host refusé"})
+            return True
+        if any(origin not in {f"http://{host}" for host in hosts} for origin in sent_origins):
+            self._json(403, {"ok": False, "error": "en-tête Origin refusé"})
+            return True
+        return False
+
     # -- routes ----------------------------------------------------------
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/api/") and self._refused():
+            return
         if path == "/api/state":
             self._json(200, self.engine.snapshot())
             return
@@ -75,7 +96,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length") or 0)
+        # Le corps se lit même pour un refus : fermer sur des octets non lus couperait la réponse.
         raw = self.rfile.read(length) if length else b"{}"
+        if self._refused():
+            return
+        if self.headers.get_content_type() != JSON_TYPE:
+            self._json(415, {"ok": False, "error": f"Content-Type attendu : {JSON_TYPE}"})
+            return
         try:
             payload = json.loads(raw or b"{}")
         except json.JSONDecodeError:

@@ -1020,7 +1020,8 @@ class Service:
 
     def start_duel(self) -> None:
         payload = {"action": "start", "preset": "demo", "password": PLAYER_PASSWORD}
-        request = Request(f"{self.url}api/action", json.dumps(payload).encode())
+        headers = {"Content-Type": "application/json"}
+        request = Request(f"{self.url}api/action", json.dumps(payload).encode(), headers)
         urlopen(request, timeout=PROCESS_TIMEOUT_S).close()
 
     def groups(self) -> list[int]:

@@ -71,8 +71,8 @@ def log(msg: str, console: bool = True) -> None:
         print(line, flush=True)
 
 
-def run(cmd: list[str], cwd: Path = REPO, timeout: int | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+def run(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=REPO, text=True, capture_output=True, timeout=timeout)
 
 
 def parse_plan() -> list[dict]:
@@ -154,14 +154,24 @@ def git(*args: str) -> str:
     return r.stdout.strip()
 
 
-def require_clean() -> None:
+def read_gitignore() -> bytes | None:
+    path = REPO / ".gitignore"
+    return path.read_bytes() if path.exists() else None
+
+
+def require_clean(gitignore_before: bytes | None = None) -> None:
+    """Arrête la campagne sur un arbre sale ; `gitignore_before` est le fichier d'avant l'étape."""
     dirty = git("status", "--porcelain")
     if dirty:
-        # une boucle peut laisser .gitignore modifié en restaurant son workdir ; ce n'est
-        # pas une modification de l'étape, on la rétablit plutôt que d'arrêter la campagne.
+        # La boucle remet .gitignore dans son état d'avant l'exécution : si l'étape l'a commité,
+        # l'arbre diffère de HEAD sans que personne ne l'ait édité. Seul ce cas se rétablit ;
+        # sans référence (lancement) ou avec un autre contenu, c'est peut-être un travail voulu.
         paths = [line.split(maxsplit=1)[-1].strip() for line in dirty.splitlines() if line.strip()]
         if paths and all(p == ".gitignore" for p in paths):
-            git("checkout", "--", ".gitignore")
+            if gitignore_before is None or read_gitignore() != gitignore_before:
+                raise SystemExit(".gitignore modifié hors de l'étape, rien n'est restauré : "
+                                 "à commiter ou à annuler à la main")
+            git("checkout", "HEAD", "--", ".gitignore")
             dirty = git("status", "--porcelain")
     if dirty:
         raise SystemExit(f"arbre sale, rien n'est lancé :\n{dirty}")
@@ -196,14 +206,23 @@ def tail(path: Path, n: int = 12) -> str:
     return "\n".join(path.read_text(encoding="utf-8", errors="ignore").splitlines()[-n:])
 
 
-def gate(step: dict) -> tuple[bool, str]:
-    """Vérifie ce qu'un APPROVE de revue ne prouve pas : le commit, la suite, les invariants."""
+def gate(step: dict, before: str) -> tuple[bool, str]:
+    """Vérifie ce qu'un APPROVE de revue ne prouve pas : le commit, la suite, les invariants.
+
+    `before` est le SHA d'avant la boucle : tant que HEAD n'a pas avancé au-delà, le commit
+    courant n'est pas celui de l'étape et rien ne doit le réécrire.
+    """
+    if git("rev-list", "--count", f"{before}..HEAD") == "0":
+        return False, f"aucun commit produit pour l'étape (HEAD toujours à {before[:12]})"
     subject = git("log", "-1", "--format=%s")
     expected = f"feat(phase1): {step['id']} — {step['title']}"
     notes = [f"HEAD: {subject}"]
     if subject != expected:
-        # la boucle squash-merge avec son propre sujet ; on rétablit la convention du plan
-        amend = run(["git", "commit", "--amend", "-q", "-m", expected])
+        # la boucle squash-merge avec son propre sujet ; on rétablit la convention du plan,
+        # sans perdre le corps ni les trailers du message
+        body = git("log", "-1", "--format=%b")
+        message = ["-m", expected, *(["-m", body] if body else [])]
+        amend = run(["git", "commit", "--amend", "-q", *message])
         if amend.returncode != 0:
             return False, "amend impossible: " + (amend.stderr.strip() or amend.stdout.strip())
         notes.append(f"sujet rétabli: {expected}")
@@ -264,7 +283,9 @@ def main() -> int:
 
     for step in selected:
         log(f"{step['id']}: démarrage — {step['title']}")
-        before = git("rev-parse", "HEAD")
+        # master et non HEAD : c'est lui que le gate lit, quelle que soit la branche de départ
+        before = git("rev-parse", "master")
+        gitignore_before = read_gitignore()
         code = run_loop(step, paths[step["id"]])
         if code != 0:
             log(f"{step['id']}: ÉCHEC boucle (code {code}) — arbre laissé en l'état, arrêt")
@@ -274,15 +295,12 @@ def main() -> int:
         branch = git("rev-parse", "--abbrev-ref", "HEAD")
         if branch != "master":
             git("checkout", "master")
-        ok, notes = gate(step)
+        ok, notes = gate(step, before)
         log(f"{step['id']}: {'OK' if ok else 'GATE ROUGE'} — {notes}")
         if not ok:
             log(tail(LOGS / f"{step['id']}.log"))
             return 1
-        after = git("rev-parse", "HEAD")
-        if after == before:
-            log(f"{step['id']}: aucun commit produit — arrêt")
-            return 1
+        require_clean(gitignore_before)
 
     log("campagne phase1 : toutes les étapes demandées sont passées")
     return 0
