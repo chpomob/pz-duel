@@ -1,0 +1,210 @@
+# Phase 1 review: synthesis report
+
+## Verdict
+
+**REQUEST_CHANGES**
+
+Excluding the two inference-only findings would not change this verdict. It rests on three code-backed majors (M1, M2, M3).
+
+## Summary
+
+The phase 1 work has no blocker, but three major defects need fixing before it is relied on. The campaign gate can report a step as done when no commit was produced, and it rewrites the previous step's commit while doing so (M1). A relative `--pz-dir` or `PZ_INSTALL_DIR` passes preflight, then fails every launch (M2). The local HTTP API now drives real processes but has no Origin, Host or Content-Type check (M3).
+
+The cross-reviews changed the picture substantially. Of the five Inspector majors, only the path bug stayed major. The other four needed a forged or corrupted transport file, or a hand-made API request, so they were downgraded. Two Architect majors were also downgraded: the `damage_taken` hook proof is a boundary the spec accepts explicitly, and the Steam client concern is still an untested hypothesis. Most of the 16 remaining findings are hardening work, not failures on the normal path.
+
+The largest remaining risk is not a code defect: real-mode play has never been proven end to end. The README lists AC19, the hook signatures and the Steam client connection as unproven. Finding m12 could become a blocker if that connection fails, so test it before building further on this path.
+
+Scope of this synthesis: the brief mentions five passes, but four were supplied (Architect, Inspector, Cross-Review 1, Cross-Review 2). I re-read the cited code for the retained findings and confirmed the JSON overflow behaviour. I did not re-run the cross-reviewers' other probes or the test suite, and no real PZ server or client was exercised.
+
+## Epistemic Distribution
+
+Counts cover the 19 retained, deduplicated findings.
+
+| Confidence | Count |
+|---|---:|
+| high | 13 |
+| medium | 5 |
+| low | 1 |
+
+| Basis | Count |
+|---|---:|
+| spec | 1 |
+| code | 16 |
+| inference | 2 |
+| external | 0 |
+
+**Inference-only findings: 2** (m11, m12). Both need corroboration, and neither affects the verdict.
+
+Severity distribution: 0 blockers, 3 majors, 12 minors, 4 nits.
+
+The supplied distribution (10 high, 6 medium, 2 low; 14 code, 4 inference) covers the 18 raw Architect and Inspector findings, before deduplication and cross-review. The figures above differ for three reasons: duplicates were merged, cross-review added X22 and X23, and three labels changed. No labels were missing or invalid, so no normalization was needed.
+
+Label changes:
+
+- **m3 (A5), medium/inference to high/code:** X13 narrowed the claim to the missing provenance check, which the code shows directly. Actual world corruption remains unproven.
+- **m10 (A4), medium/inference to high/spec:** the retained claim is now the acceptance boundary stated at spec line 235, not the hypothesis that the atom never fires.
+- **n4 (B3), high/code to medium/code:** no Lua interpreter was run, and the behaviour of PZ's embedded `tonumber` was not checked.
+
+## Critical Findings
+
+No blockers.
+
+### M1. Major: the campaign gate no longer detects a step without a commit [high/code]
+
+`docs/campaigns/phase1/scaffolding/run_campaign.py:206` (sources: A2, X10; risk: confirmed by code reading)
+
+- On any subject mismatch, `gate()` runs `git commit --amend -m expected` on whatever HEAD is. If a loop exits 0 without committing, the previous step's commit is renamed to the current step, and the unchanged tree passes pytest.
+- The later safeguard cannot catch this. `before` is recorded at line 267, but `after == before` is only compared at lines 282-283, after the amend has already produced a new SHA.
+- The amend replaces the whole message, dropping body and trailers. It also takes in anything left staged by the loop, which would land in the previous step's commit.
+- **Fix:** pass `before` into `gate()`, fail if HEAD has not moved, and check that the index is clean. Only then amend.
+
+### M2. Major: a relative installation path passes preflight, then fails every launch [high/code]
+
+`service/preflight.py:78` (sources: B1, X1; risk: confirmed by code reading, with X1's subprocess probe)
+
+- `detect_pz` builds `Path(explicit).expanduser()` without resolving it, and `_accept` returns `script.parent` as is.
+- `launch_command` then joins the relative path while `Popen` uses that same path as `cwd`, so the executable is looked up from the wrong directory. X1's probe raised `FileNotFoundError`. A folder of `.` gives a bare script name, which is looked up on `PATH`.
+- `--pz-dir` and `PZ_INSTALL_DIR` are both affected. Mitigating factors: the failure is loud, and the README example is absolute.
+- **Fix:** make the path absolute in `detect_pz`, which covers both routes.
+
+### M3. Major: the local API drives real processes with no Origin, Host or Content-Type check [medium/code]
+
+`service/api.py:72` and `service/engine.py:1235` (sources: A1, X7, X9; risk: missing checks confirmed, browser reachability untested)
+
+- `do_POST` parses any body as JSON and passes it to `engine.action`. A web page open in the host's browser could send a `text/plain` POST to `127.0.0.1:8765` and trigger `start`, `cancel` or `open_game`. In real mode, `start` restores worlds and launches two servers.
+- With DNS rebinding, a page could also read `/api/state`, which holds `config.password` and the invite.
+- X9 widens the scope, and the code confirms it: `_cancel_state` keeps `config`, and `_open_game_real` checks only for a password, so `open_game` can still launch Steam after a cancel.
+- **Dispute:** X7 rated this minor and A1/X9 major. Major stands, because the actions have real process effects. Confidence stays medium because no browser test was run, and local-network protections may block some requests.
+- `service/api.py` is not modified in this change. Real mode is what makes the gap matter.
+- **Fix:** reject foreign Host and Origin values, require `application/json`, and check the phase in `open_game`.
+
+## Minor Findings
+
+### Minor
+
+**m1. Lines accepted by `parse_event` can still abort a match [high/code]**
+`service/protocol.py:53`, `service/transport.py:90` (sources: B2, X2, X6; risk: confirmed for the mechanism, not reachable from the shipped mod)
+- `1e999` decodes to infinity without reaching `parse_constant`, then `dump_line` raises in `Journal.write`. X6's probes found the same outcome for a lone surrogate, a forbidden key such as `password`, and a 400-digit integer age. A huge `boot` would make later lines report as `DUP`, but that case was read, not run.
+- **Dispute:** X2's downgrade from major is valid. `encodeNumber` turns infinities into `null`, so only a corrupted or foreign out file triggers this, and `_run_real` still stops the servers.
+- **Fix:** a `1e999`-only fix is too narrow. Test journalability in `OutReader._take`, report failures as `bad_line`, and bound integers.
+
+**m2. An unsupported `day_length` kills a running match [high/code]**
+`service/engine.py:1271`, failing at `service/engine.py:713` (sources: A6, B4, X4, X14; risk: confirmed by code reading)
+- `_begin` does not check the value against `runtime.day_length_minutes`. With 8, the contract passes, then `_drift_end` raises `KeyError` once both sides are running.
+- **Dispute:** X4's downgrade from major is valid. The UI offers only 1 to 4 and presets are validated, so this takes a direct POST, which M3 makes easier. X14 is also valid: malformed types fail before any state changes and only drop that request, so that branch is less serious.
+- Non-numeric values and non-object JSON bodies (`service/api.py:84`) still escape the JSON refusal path.
+- **Fix:** validate in `_begin`, and return refusals for bad types.
+
+**m3. A world from a failed creation pass can become the permanent origin [high/code]**
+`service/snapshots.py:204` (sources: A5, X13; risk: missing provenance confirmed, corruption theoretical)
+- `_creation_pass` raises without leaving a marker or cleaning up. On the next launch, `prepare_worlds` finds both worlds and calls `capture`, which only checks that the files exist.
+- A graceful stop may leave usable files, so X13's narrowing stands.
+- **Fix:** write a completion marker after a successful pass, or clean up on failure.
+
+**m4. A decided match result is lost if the end-of-match verdict fails [high/code]**
+`service/engine.py:740` (sources: A7, X15; risk: dependency confirmed, trigger needs a journal write failure)
+- `_write_records` calls `verdict()` before `self.result` is set, so an exception sends `_finish_match` down its failure path even though `MatchCore` has decided the winner.
+- The torn-line trigger is plausible: the journal is opened unbuffered (`service/journal.py:71`), and a short write raises after leaving a fragment.
+- **Dispute:** X15's correction is valid. Spec line 497 protects against an attribution of `ko`, not an unreadable journal, so this is a resilience gap and not a spec violation.
+- **Fix:** catch the failure, write `match_end` with unknown attribution, and terminate torn lines.
+
+**m5. `cmd_result` ownership is not checked [high/code]**
+`service/rules.py:834` (sources: B5, X5; risk: reproduced by X5, not reachable from a conforming mod)
+- `_settle` receives only `seq`, so a result from A can release a command sent to B.
+- **Dispute:** X5's downgrade from major is valid. Seqs are unique across sides, and a conforming mod echoes only its own, so this takes a forged or corrupted out file.
+- X5 also found a consequence B5 missed: the seq stays in `_unresolved[B]`, so a later restart of B skips the `lost_on_restart` record required by spec line 194.
+- **Fix:** pass `src` into `_settle` and reject a mismatch.
+
+**m6. `require_clean` silently discards `.gitignore` edits [high/code]**
+`docs/campaigns/phase1/scaffolding/run_campaign.py:164` (sources: A10, X18; risk: confirmed by code reading)
+- When `.gitignore` is the only dirty path, it is restored without checking what changed. This happens before any loop runs, and this change's own uncommitted `.gitignore` entries are exposed to it.
+- X18's scope correction stands: only unstaged content is lost.
+- **Fix:** commit those entries, and compare against the expected artefact before restoring.
+
+**m7. Request bodies have no size or time limit [high/code]**
+`service/api.py:78` (source: X22; risk: confirmed by code reading, loopback only)
+- `rfile.read(length)` trusts `Content-Length` with no maximum or socket timeout, and a negative length reads to EOF.
+- **Fix:** validate the length, and set body-size and socket-time limits.
+
+**m8. An unterminated transport tail is reread without limit [high/code]**
+`service/transport.py:77` (source: X23; risk: confirmed by code reading, trigger needs malformed or excessive output)
+- `handle.read()` loads the whole remainder, and the offset only moves past complete lines, so a growing tail is reallocated on every poll.
+- **Fix:** bound the record size and the read per poll.
+
+**m9. One shared password opens both servers [medium/code]**
+`service/engine.py:459` (sources: A8, X16; risk: confirmed by code reading, impact limited to a friendly duel)
+- A guest could join A, take its single slot and lock out the host, and `_take_beat` accepts any username. The default password is a 5-character code from `random.choice` (`service/engine.py:171`).
+- **Dispute:** X16 is valid on scope. The spec defines no per-side credentials, so this is a limit of the agreed participant model, and distinct passwords would be an enhancement. Using `secrets` for the default code is still a cheap improvement.
+
+**m10. The `damage_taken` hook proof does not prove the atom can fire [high/spec]**
+`service/effects.json:4` (sources: A4, X12; risk: accepted boundary, outcome unverified until AC19 runs)
+- The README procedure satisfies the proof by hitting a zombie, which exercises only the discarded non-player branch.
+- **Dispute:** X12's challenge is valid. Spec line 235 says `hook_seen` does not prove a zombie wound triggers the hook, and assigns that to AC19. The code follows the spec, so this is downgraded from major.
+- The gap still matters: if zombie bites never fire the hook, scoring pressure changes silently during a valid match. README step 4 covers this manually.
+
+**m11. In-match restart will probably end in drift invalidation [medium/inference]**
+`service/engine.py:710` (sources: A9, X8, X17; risk: inference only, needs corroboration)
+- Assumption: world age stops during downtime and may roll back to the last save (`SaveWorldEveryMinutes` 5). Against `max_drift_s` 60, most recoveries would then be invalidated.
+- **Dispute:** X17 is valid as a correction. `_drift_end` returns nothing while a side is unavailable and `advance` can still finish on the timer, so invalidation is not certain. Spec line 403 says the timer continues, so this timer behaviour conforms to the spec.
+- **To confirm:** kill a real server mid-match, then measure relaunch time and the age delta. Rebasing age would change a fairness policy the spec chose, so it is not an automatic fix.
+
+**m12. A Steam client may be unable to join the non-Steam server [low/inference]**
+`service/engine.py:1241` (sources: A3, X11; risk: unverified, needs corroboration)
+- `_open_game_real` uses Steam `+connect`, as spec line 457 requires, and no fallback exists.
+- **Dispute:** X11's downgrade from major is valid, because no connection was tried and no authoritative source is cited. Its claim that the launch mode is not established is wrong, though: `start-server.sh` line 15 sets `-Dzomboid.steam=0`, and `README.md:104` says so.
+- Only the consequence is hypothetical. If a real connection fails, no match can run in real mode, and this becomes a blocker.
+- **To confirm:** make one real client connection.
+
+### Nits
+
+**n1. `snapshots.py` depends on private members of other modules [high/code]**
+`service/snapshots.py:53`, and line 20 for `_check_ports` (sources: A11, X19)
+- X19 is valid: the cited call paths show no harmful race, so this is an encapsulation issue only. A public `running` property and a public port check would remove the coupling.
+
+**n2. The README still describes `.duel-service.json` [high/code]**
+`README.md:15` (sources: A12, X20)
+- Nothing in `service/` writes this file any more. It matters because `free_port` can select another port, so the README should point to the printed URL.
+
+**n3. `lastAttacker` keeps zombies that never die [medium/code]**
+`mods/duelcore/42.21/media/lua/server/DuelCore.lua:352` (sources: A13, X21)
+- Only `onZombieDead` clears an entry, which X21 confirms. Whether this causes real growth or stale attribution needs runtime evidence.
+
+**n4. An infinite command seq would block later commands [medium/code]**
+`mods/duelcore/42.21/media/lua/server/DuelCore.lua:708` (sources: B3, X3; risk: theoretical)
+- **Dispute:** X3's challenge is valid, so this drops from major to nit. Only the service writes the `in` file, from an integer counter with `allow_nan=False`. A large finite seq such as `9e15` would block commands the same way, so a finiteness check alone does not remove the failure. It is cheap hardening only.
+
+## Operational Risk Assessment
+
+- **Real mode is unproven end to end.** AC19, the hook signatures, kill attribution and the Steam client connection are all open (`README.md:104`). The doubles do not cover them. Run the two-person procedure before treating a real-mode match as valid, and test m12 first because it gates everything else.
+- **Campaign integrity (M1, m6).** Until M1 is fixed, a green campaign log does not prove each step produced a commit. History from any run since the amend was added should be checked for empty or misattributed steps.
+- **Local exposure (M3, m7).** The service assumes that binding to loopback is enough. That does not hold while the host browses the web during a real-mode session, and browser protections vary by version.
+- **Network exposure (m9).** Game ports are reachable by the guest, and a single low-entropy password is their only access control. This suits a friendly duel between trusted players, not a public server.
+- **Match loss paths (m1, m2, m4, m8).** These all turn a bad input or a write failure into a lost match. `_run_real` still routes failures through `_finish_match`, so the servers stop and no process should leak, but the result is lost. Disk-full conditions on the journal path are the most realistic trigger.
+- **Restart recovery (m11).** `max_server_restarts=1` may preserve the record rather than the match. Do not promise players recovery until this is measured.
+- **World state (m3).** A cancelled first boot can silently fix the origin world for all later matches. Until this is fixed, operators should delete worlds left by a failed creation pass before relaunching.
+- **Environment assumptions.** The service assumes a Linux Steam install, an executable `start-server.sh` that keeps `-Dzomboid.steam=0`, a `~/Zomboid` layout, free ports, and a game build matching mod version 42.21. A game update could invalidate the hook and script assumptions.
+
+READ:bda6235bcaae0a82
+READ: /tmp/review-phase1-full-1/READ:bda6235bcaae0a82
+
+## Epistemic label distribution
+
+{
+  "basis": {
+    "code": 14,
+    "external": 0,
+    "inference": 4,
+    "spec": 0
+  },
+  "combined": {
+    "high/code": 10,
+    "low/inference": 2,
+    "medium/code": 4,
+    "medium/inference": 2
+  },
+  "confidence": {
+    "high": 10,
+    "low": 2,
+    "medium": 6
+  }
+}

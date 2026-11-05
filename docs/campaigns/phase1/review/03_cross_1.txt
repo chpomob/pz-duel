@@ -1,0 +1,102 @@
+{
+  "findings": [
+    {
+      "id": "X1",
+      "severity": "major",
+      "original_id": "B1",
+      "action": "VALIDATE",
+      "file": "service/preflight.py",
+      "line": 78,
+      "summary": "Confirmed: a relative --pz-dir passes preflight, then cannot launch",
+      "evidence": "_accept returns script.parent unresolved (preflight.py:78). run_preflight stores it as values['pz_dir'] (preflight.py:264), and engine.py:1321 passes it on. launch_command builds Path(pz_dir)/SCRIPT (servers.py:163) while Popen sets cwd to the same relative pz_dir (servers.py:257). A probe with a real executable script, subprocess.run(['game/start-server.sh'], cwd='game'), raised FileNotFoundError, because the child changes directory before it resolves the executable. PZ_INSTALL_DIR takes the same path through detect_pz. A folder of '.' gives a bare 'start-server.sh', which is looked up on PATH instead. Mitigating factors: the README example is absolute (README.md:24) and the failure is loud rather than silent. It stays major because a documented option passes preflight and then fails every launch. Making the path absolute in detect_pz fixes both the CLI and env routes.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X2",
+      "severity": "minor",
+      "original_id": "B2",
+      "action": "VALIDATE",
+      "file": "service/protocol.py",
+      "line": 53,
+      "summary": "Mechanism confirmed, but the shipped mod cannot emit this line",
+      "evidence": "A probe confirmed it: parse_event accepted data.x=1e999, then Journal.write raised ValueError from dump_line (protocol.py:283). This breaks the invariant in the transport.py header, 'Une ligne n'arrête jamais la lecture'. The severity is overstated, though. The mod serializes every number through encodeNumber, which turns infinities into null (DuelCore.lua:107-110) and never produces exponent notation, so only a corrupted or foreign out file can trigger it. The failure is also contained: pump's exception reaches the except Exception in _run_real (engine.py:1329), then _finish_match stops the servers. The match is lost, but no process leaks. Downgraded to minor. The proposed fix is also too narrow; see X6.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X3",
+      "severity": "nit",
+      "original_id": "B3",
+      "action": "CHALLENGE",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 708,
+      "summary": "Infinite seq is unreachable, and the fix misses the real hazard",
+      "evidence": "Only the service writes the in file (CommandChannel docstring, transport.py). seq comes from an integer counter (rules.py:987), and dump_line sets allow_nan=False (protocol.py:283), so the service cannot write 1e999. Anyone else able to write in could send a finite seq such as 9e15. That passes isInteger and sets lastCmdSeq (DuelCore.lua:708-709), so all later commands are discarded in the same way. Requiring finiteness therefore does not remove the failure mode; only the null ack serialization is specific to infinity. The original 'high' confidence also rests on runtime behaviour nobody ran: no Lua interpreter is installed here, and PZ's embedded Lua tonumber was not checked. A finite guard is cheap hardening, not a major defect.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X4",
+      "severity": "minor",
+      "original_id": "B4",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 1271,
+      "summary": "Confirmed, but only a hand-made API request can reach it",
+      "evidence": "_begin takes int(payload day_length) without checking the table (engine.py:1271), and engine.py:713 then indexes day_length_minutes, which has keys 1 to 7 only (spec line 399). prepare writes the same value to the sandbox (engine.py:466-467), and verify_contract expects that value (servers.py:657), so the contract passes rather than catching it. The KeyError fires once both ages are known, meaning after players have joined and the match is running, which is the costliest moment. Reachability is narrow: the UI offers only 1 to 4 (ui/app.js:183) and presets are validated (rules.py:303), so it takes a direct POST. Downgraded to minor; the fix should still be validation in _begin. The anchor is better placed at line 1271 than 713. Related: a non-numeric day_length or duration_s raises ValueError in _begin, while action() catches only ActionRefused (engine.py:1170), so the client gets no JSON refusal.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X5",
+      "severity": "minor",
+      "original_id": "B5",
+      "action": "CHALLENGE",
+      "file": "service/rules.py",
+      "line": 834,
+      "summary": "Reproduced, but a conforming mod cannot send a foreign result",
+      "evidence": "The behaviour is real. In a MatchCore probe, seq 1 targeted B and a cmd_result from A emptied both _unanswered and _running. A conforming mod cannot do this, though: seq comes from one core-wide counter (rules.py:987), so seqs are unique across sides, and the mod only echoes entry.cmd.seq taken from its own in file. OutReader already enforces src against the file's side (transport.py:90 onward). The trigger therefore needs a forged or corrupted out file, which does not justify major. One consequence the original missed: engine.py:832 discards from _unresolved[src], so the seq stays in _unresolved[B]. If B later restarts, submit_lost finds nothing in _unanswered (rules.py:919) and the lost_on_restart record required by spec line 194 is silently skipped. Passing src into _settle is a cheap fix and stays deterministic in replay, because events flow through the same core.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X6",
+      "severity": "minor",
+      "original_id": "B2",
+      "action": "ADD",
+      "file": "service/transport.py",
+      "line": 90,
+      "summary": "Rejecting non-finite numbers leaves other accepted lines fatal",
+      "evidence": "Probes found further lines that parse_event accepts but later stages reject. data.x='\\ud800' makes dump_line raise UnicodeEncodeError in Journal.write. A data key of 'password' raises JournalError (journal.py, _forbidden_key). A beat with a 400-digit integer age passes _check_number, which only tests floats for finiteness, and the drift arithmetic at engine.py:715 raises OverflowError. Each one aborts the match the same way as B2, so a 1e999-only fix leaves the invariant broken. A line with a huge boot also needs no exception: it moves self.last, after which every legitimate line is reported as DUP (transport.py:103), silently deafening that side. That last case comes from reading the code and was not run. As with X2, the shipped mod does not produce these lines: encodeString emits raw bytes and only \\u00xx control escapes. A sturdier fix is to test journalability in OutReader._take and report failures as bad_line, and to bound integers in the envelope and _check_number.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X7",
+      "severity": "minor",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/api.py",
+      "line": 80,
+      "summary": "POST /api/action accepts cross-site requests with no origin check",
+      "evidence": "do_POST parses any body as JSON without checking Content-Type, Origin or Host (api.py:72-85). A web page open in the host's browser could therefore send a no-cors text/plain POST to 127.0.0.1 and trigger start or cancel. In real mode that launches two servers or aborts a running duel. With DNS rebinding, GET /api/state could also expose config.password and the invite (state.py to_dict, engine.py _open_lobby). api.py predates this work, but --mode real is what gives these actions real effects, and the spec does not address it. Assumptions: the port must be known (default 8765), and browser local-network protections may block some of these requests. Not tested from a browser. Rejecting foreign Origin and Host values would close it.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X8",
+      "severity": "minor",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/engine.py",
+      "line": 715,
+      "summary": "Restart recovery may usually end in a drift invalidation",
+      "evidence": "The behaviour is deliberate: spec line 403 says 'La dérive tranche ensuite', and test_drift_decides_after_the_return asserts it. The operational effect may undercut the feature. Assuming world age stops while a server is down, the other side keeps advancing, so downtime becomes drift directly. A crash may also roll age back to the last save (SaveWorldEveryMinutes 5). The limit is max_drift_s 60, yet a relaunch may take up to server_start_timeout_s 300. Any recovery longer than about 60 s would then invalidate the match, making max_server_restarts=1 mostly a delayed invalidation. To confirm or refute: measure real PZ relaunch time and the age delta after a crash. If confirmed, either rebase the restarted side's age or state in the spec that restarts rarely save a match.",
+      "confidence": "medium",
+      "basis": "inference"
+    }
+  ],
+  "read_nonce": "READ:bda6235bcaae0a82"
+}
+READ: READ:bda6235bcaae0a82 service/preflight.py service/protocol.py service/transport.py service/journal.py service/engine.py service/rules.py service/servers.py service/main.py service/api.py service/state.py service/runtime.json mods/duelcore/42.21/media/lua/server/DuelCore.lua docs/campaigns/phase1/spec.md tests/test_budget.py tests/test_match.py

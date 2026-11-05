@@ -1,0 +1,137 @@
+{
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "major",
+      "file": "service/api.py",
+      "line": 72,
+      "summary": "The local API now drives real processes but has no Origin, Host or Content-Type check",
+      "evidence": "do_POST (api.py:72-86) parses any body as JSON whatever its Content-Type and passes it to engine.action; grep finds no Origin or Host handling in api.py. Binding to 127.0.0.1 does not stop the user's browser from reaching it. A web page can send a text/plain 'simple' POST to http://127.0.0.1:8765/api/action, which in --mode real can trigger start (restores ~/Zomboid worlds and launches two servers), cancel or open_game (launches Steam, engine.py:1235). With DNS rebinding the page can also read /api/state, which holds config.password and invite (spec line 461 keeps the player password there). The handler code is unambiguous; the reach depends on the browser, since Private Network Access may block some of these requests. Fix: reject any Host other than 127.0.0.1:<port> or localhost:<port>, reject a foreign Origin, and require application/json.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "major",
+      "file": "docs/campaigns/phase1/scaffolding/run_campaign.py",
+      "line": 206,
+      "summary": "The campaign gate no longer detects a step without a commit: it amends whatever HEAD is",
+      "evidence": "Before this change, a wrong subject failed the gate ('SUJET INATTENDU'), and that was the only check that the step had produced a commit. Now run_campaign.py:204-210 runs 'git commit --amend -m expected' on any mismatch. If a loop exits 0 without committing, HEAD is the previous step's commit: it gets renamed to the current step's subject, pytest passes on the unchanged tree, and gate() returns True. The step is reported done with no work, and history now misattributes the previous step. The amend also replaces the whole message, dropping the body and any trailers. Fix: record the HEAD SHA before the loop, fail if it has not moved, and only then amend.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A3",
+      "severity": "major",
+      "file": "service/engine.py",
+      "line": 1241,
+      "summary": "The only host join path is a Steam client, but the servers run with zomboid.steam=0",
+      "evidence": "launch_command uses start-server.sh, and the installed script hardcodes -Dzomboid.steam=0 (~/.local/share/Steam/steamapps/common/ProjectZomboid/projectzomboid/start-server.sh). _open_game_real uses 'steam -applaunch 108600 +connect ... +password' (engine.py:1241-1248), as spec line 457 requires. Assumption: a Steam-mode client may be unable to join a non-Steam server. If so, neither player reaches the lobby, so no probe, hook window or match can run in real mode, and no fallback exists. The README lists this connection as unproven. Confirm with one real client connection before building further on this path; I did not test it, and no authoritative source is cited.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "A4",
+      "severity": "major",
+      "file": "service/effects.json",
+      "line": 4,
+      "summary": "The damage_taken hook proof does not prove the atom can fire",
+      "evidence": "ContractWindow treats hook_seen(OnWeaponHitCharacter) as proof for damage_taken (effects.json:4, engine.py:257-260). DuelCore.lua:468 emits hook_seen before the handler runs, and lines 372-373 discard every hit whose target is not a player. The README procedure satisfies the proof by a player hitting a zombie, which exercises only the discarded branch. Assumption: if zombie attacks on players do not fire this hook on the server, the contract still passes and the atom never fires. hurt_supply then never triggers, the pression combo never resets, and 'not atom(damage_taken)' in untouched_minute is always true, so scoring pressure changes silently during a 'valid' match. The README concedes the gap, and only a manual checklist after the match catches it. Confirm by observing a zombie bite in play; better, make the proof the first damage_taken event or a dedicated probe.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A5",
+      "severity": "minor",
+      "file": "service/snapshots.py",
+      "line": 204,
+      "summary": "A world left by an interrupted creation pass can become the permanent origin",
+      "evidence": "_creation_pass (snapshots.py:219-225) raises on failure or cancel without removing what the servers created. On the next launch, prepare_worlds sees no snapshot and worlds on both sides, so it calls store.capture (line 204-205). capture only requires that the world folder and the db exist (line 109). A pass cancelled or crashed after both exist is therefore frozen as the origin, and every later match restores it with no warning. The message at line 208 covers only the one-sided case. How incomplete such a world is depends on when PZ writes its files; confirm by cancelling during the first boot. Fix: write a completion marker after a successful pass, or clean up created worlds on failure.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A6",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 1271,
+      "summary": "Unvalidated start payload: an unknown day_length kills a running match, and bad types escape the refusal path",
+      "evidence": "_begin takes int(payload.get('day_length')) without checking it against runtime.day_length_minutes, while load_table does check the preset value (rules.py:303). With day_length=8, the sandbox write and contract both pass. The first time both sides have a running beat, _drift_end raises KeyError at engine.py:713, and _run_real reports it as 'lancement impossible' mid-match with no match_end. Separately, int('abc') at lines 1264/1271 raises ValueError, which action() does not catch (it catches only ActionRefused), and a non-object JSON body raises AttributeError at api.py:84. Both drop the HTTP connection with no JSON response. The UI only offers 1-4, so this needs a direct API call, which A1 makes easier.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A7",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 740,
+      "summary": "A decided match result is lost if the end-of-match verdict cannot be computed",
+      "evidence": "_conclude re-reads the journal and calls verdict() before writing match_end or setting self.result (engine.py:740-760). JournalError or VerdictError propagates to _run_real, so the match ends as 'lancement impossible', with no match_end and no result, even though MatchCore has already decided the winner. Spec line 497 says attribution must not alter the result, yet a failure of that measurement discards it. One trigger is in journal.py:97-99: a short write raises OSError after leaving a fragment with no newline. The next state line, which _record_state still attempts, then joins it, creating a mid-file unreadable line that read_journal rejects and that also breaks service.replay. Fix: catch the verdict failure, write match_end with an unknown attribution, and terminate or truncate torn journal lines.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A8",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 459,
+      "summary": "One shared password opens both servers, and sides are not bound to a player",
+      "evidence": "_prepare_launch writes the same config password to duelA and duelB (engine.py:454-462), and the invite gives that password to the guest. _take_beat accepts any username as that side's player (engine.py:836). A guest who tries port 17261 can join A, take its single slot (MaxPlayers=1) and lock the host out, or play in the opponent's world; the engine would count that as the host being present. The default password is also the 5-character code from random.choice (engine.py:171, 1275), not the secrets module. Impact is limited to a friendly duel, but this is the only access control on a game port exposed to the network. Fix: use a distinct password per side, and generate it with secrets.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A9",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 710,
+      "summary": "In-match restart will probably end in invalidation, so the recovery path may rarely save a match",
+      "evidence": "After a restart, _first_age is kept and _drift_end resumes once the side is available (engine.py:585, 710-720). The restarted side has lost its downtime (about 20 s to boot per the README) plus, assuming world age reloads from the last save, up to SaveWorldEveryMinutes=5 of progress (runtime.json:60). That is measured against max_drift_s=60 (runtime.json:21), so a crash more than about 40 s after a save would exceed the limit and return 'invalidated'. Spec line 403 accepts 'La dérive tranche ensuite', so this is not a spec violation, but AC38 only tests the double path, where this does not show. Confirm by killing a real server mid-match and comparing age across boots. If it holds, either rebase _first_age on restart or state plainly that restart only preserves the record.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "A10",
+      "severity": "minor",
+      "file": "docs/campaigns/phase1/scaffolding/run_campaign.py",
+      "line": 164,
+      "summary": "require_clean silently discards .gitignore edits, including the ones in this change",
+      "evidence": "When .gitignore is the only dirty path, run_campaign.py:160-165 runs 'git checkout -- .gitignore'. It cannot tell a loop artefact from intended work. This diff's own uncommitted .gitignore additions (.adversarial-loop/, matches/, docs/runs/) would be reverted the same way if they were the only remaining change, leaving matches/ unignored. Fix: commit these entries, and compare against the expected loop artefact before restoring.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A11",
+      "severity": "nit",
+      "file": "service/snapshots.py",
+      "line": 53,
+      "summary": "snapshots.py depends on private members of other modules",
+      "evidence": "_is_running reads server._process and calls server._group_alive() without _stop_lock (snapshots.py:53), and the module imports the private preflight._check_ports (line 20). The docstring admits ServerProcess lacks a public API for this. A public ServerProcess.running property and a public port check would remove the coupling.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A12",
+      "severity": "nit",
+      "file": "README.md",
+      "line": 15,
+      "summary": "The README still says the service writes .duel-service.json",
+      "evidence": "README.md:15 says the service writes .duel-service.json for tools to find the interface. This diff removes that code from service/main.py, as plan step R2/R7 intended ('.duel-service.json retiré'). Any tool following the README will find no file.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A13",
+      "severity": "nit",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 352,
+      "summary": "lastAttacker keeps strong references to zombies that are hit but never die",
+      "evidence": "onHitZombie stores lastAttacker[zombie] (line 352), and only onZombieDead clears it (line 362). The table is not weak, so zombies that are hit and then despawn stay referenced for the server's lifetime. The line 364 comment says the game recycles zombies, so a stale entry could also be read for a recycled zombie. Growth is small over a 25-minute match with one player, and the side result is unchanged because a server hosts one side.",
+      "confidence": "medium",
+      "basis": "code"
+    }
+  ],
+  "verdict": "REQUEST_CHANGES"
+}
+READ:3c54a91210a8f373
+READ: /tmp/review-phase1-full-1
