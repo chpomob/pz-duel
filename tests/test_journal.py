@@ -1,21 +1,21 @@
-"""R6 : séquence, `fsync` de phase, dernière ligne coupée et champs interdits.
-
-AC44 `test_sequenced_records` est complété en P10, avec un match synthétique : ici,
-les types sont écrits directement.
-"""
+"""R6 : séquence, `fsync` de phase, dernière ligne coupée et champs interdits."""
 
 from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
 import service.journal as journal_module
 from service.journal import Journal, JournalError, read_journal
+from service.protocol import parse_event
+from service.rules import MatchCore, load_effects, load_runtime, load_table
 
 T0_MS = 1793830000456
 SECRET = "marqueur-secret"
+PRESET_PATH = Path(journal_module.__file__).resolve().parent / "presets" / "duel_rapide.json"
 
 
 class FakeClock:
@@ -47,16 +47,41 @@ def raw_lines(journal):
 
 
 def test_sequenced_records(journal):
-    types = ["match_start", "event", "rule_fired", "command", "match_end"]
-    for name in types:
-        journal.write(name, {})
+    """Match synthétique : un kill et un tick de fin, écrits comme `RealMatch` les écrira."""
+    runtime = load_runtime()
+    catalog = load_effects()
+    raw = json.loads(PRESET_PATH.read_text(encoding="utf-8"))
+    table = load_table(raw, catalog, runtime["limits"], PRESET_PATH.stem)
+    duration_s = 5
+    core = MatchCore(table, runtime, catalog, T0_MS, duration_s)
+    kill = {
+        "v": 1,
+        "boot": 1,
+        "seq": 1,
+        "t_ms": T0_MS + 1000,
+        "src": "A",
+        "side": "A",
+        "kind": "zombie_kill",
+        "data": {"origin": "world"},
+    }
+
+    journal.write("match_start", {"preset": table, "duration_s": duration_s})
+    journal.write("state", {"phase": "running", "t0_ms": T0_MS}, mt=0)
+    core.submit_event(parse_event(kill, catalog))
+    written = core.advance(T0_MS + duration_s * 1000)
+    for record in written:
+        journal.write(**record)
 
     records = read_journal(journal.path).records
 
-    assert [record["n"] for record in records] == [1, 2, 3, 4, 5]
-    assert [record["type"] for record in records] == types
-    assert all(record["v"] == 1 for record in records)
-    assert [record["ts_ms"] for record in records] == [T0_MS + i for i in range(1, 6)]
+    assert [record["n"] for record in records] == list(range(1, len(records) + 1))
+    assert all(record["v"] == 1 and "type" in record for record in records)
+    assert [record["ts_ms"] for record in records] == [
+        T0_MS + i for i in range(1, len(records) + 1)
+    ]
+    assert {"match_start", "event", "rule_fired", "command", "match_end"} <= {
+        record["type"] for record in records
+    }
 
 
 def test_line_format(journal):
