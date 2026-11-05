@@ -1,14 +1,15 @@
-"""AC2 à AC6 : lecture de `out`, à travers le double du mod."""
+"""AC2 à AC8 : `out`, `in`, `ack` et `session`, à travers le double du mod."""
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from service.protocol import parse_ack, parse_event
-from service.transport import OutReader
+from service.protocol import parse_ack, parse_command, parse_event
+from service.transport import CommandChannel, OutReader
 from doubles.fake_mod import FakeMod
 
 EFFECTS_PATH = Path(__file__).resolve().parent.parent / "service" / "effects.json"
@@ -256,3 +257,207 @@ def test_fake_mod_adopts_session_boot(mod):
     mod.caps()
     assert mod.read_session()["cmd_floor"] == 17
     assert (mod.boot, mod.seq) == (2, 0)
+
+
+@pytest.fixture
+def channel(tmp_path):
+    channel = CommandChannel("A", tmp_path)
+    channel.write_session("8f3a2c", 1, 0)
+    return channel
+
+
+def command(seq):
+    return {
+        "v": 1,
+        "seq": seq,
+        "kind": "spawn_pop",
+        "n": 2,
+        "distance": [30, 60],
+        "warn_s": 6,
+        "origin": {"rule": "kill_baseline", "boot": 1, "event_seq": 42},
+    }
+
+
+def written(channel, *seqs):
+    for seq in seqs:
+        channel.write(command(seq))
+
+
+def in_seqs(mod):
+    return [parse_command(line, CATALOG)["seq"] for line in mod.in_path.read_bytes().splitlines()]
+
+
+def test_write_is_one_write_then_fsync(channel, mod, monkeypatch):
+    calls = []
+    real_write, real_fsync = os.write, os.fsync
+    monkeypatch.setattr(os, "write", lambda fd, data: calls.append(data) or real_write(fd, data))
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append("fsync") or real_fsync(fd))
+    channel.write(command(1))
+    assert len(calls) == 2
+    assert calls[0].endswith(b"\n") and calls[0].count(b"\n") == 1
+    assert calls[1] == "fsync"
+    assert mod.in_path.read_bytes() == calls[0]
+
+
+def test_seq_must_grow_above_floor(channel, mod):
+    written(channel, 3)
+    for seq in (3, 2):
+        with pytest.raises(ValueError):
+            channel.write(command(seq))
+    assert in_seqs(mod) == [3]
+
+
+def test_truncate_only_on_full_ack(channel, mod):
+    written(channel, 1, 2, 3, 4, 5, 6, 7)
+    before = mod.in_path.read_bytes()
+    inode = mod.in_path.stat().st_ino
+
+    mod.ack(6)
+    assert channel.poll_ack() == []
+    assert mod.in_path.read_bytes() == before
+
+    mod.ack(9)
+    (ahead,) = channel.poll_ack()
+    assert (ahead.type, ahead.side) == ("ack_ahead", "A")
+    assert ahead.data == {"boot": 1, "seq": 9, "last_seq": 7}
+    assert mod.in_path.read_bytes() == before
+
+    mod.ack(7, boot=2)
+    (foreign,) = channel.poll_ack()
+    assert foreign.type == "ack_foreign_boot"
+    assert foreign.data == {"boot": 2, "seq": 7, "current_boot": 1}
+    assert mod.in_path.read_bytes() == before
+
+    mod.ack(7)
+    assert channel.poll_ack() == []
+    assert mod.in_path.read_bytes() == b""
+    assert mod.in_path.stat().st_ino == inode
+
+
+def test_write_after_read_ack_keeps_new_line(channel, mod):
+    written(channel, 1)
+    mod.ack(1)
+    written(channel, 2)
+    assert channel.poll_ack() == []
+    assert in_seqs(mod) == [1, 2]
+
+
+def test_abnormal_ack_reported_once_while_it_stays(channel, mod):
+    written(channel, 1)
+    mod.ack(9)
+    assert [a.type for a in channel.poll_ack()] == ["ack_ahead"]
+    assert channel.poll_ack() == []
+    mod.ack(0)
+    assert channel.poll_ack() == []
+    mod.ack(9)
+    assert [a.type for a in channel.poll_ack()] == ["ack_ahead"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, b"", b'{"v":1,"boot":1,"se', b"\xff\xfe\n", b'{"v":2,"boot":1,"seq":1}\n', b'{"v":1,"boot":1}\n'],
+)
+def test_empty_or_unreadable_ack_is_no_ack(channel, mod, content):
+    written(channel, 1)
+    if content is not None:
+        mod.ack_path.write_bytes(content)
+    assert channel.poll_ack() == []
+    assert in_seqs(mod) == [1]
+
+
+def test_ack_timeout_is_reported_once_and_never_reissues(tmp_path, mod, runtime):
+    now = [0.0]
+    limit = runtime["ack_timeout_s"]
+    channel = CommandChannel("A", tmp_path, clock=lambda: now[0])
+    channel.write_session("8f3a2c", 1, 0)
+    written(channel, 1)
+    now[0] = limit / 2
+    written(channel, 2)
+    before = mod.in_path.read_bytes()
+
+    assert channel.check_ack_timeout(limit) == []
+    now[0] = limit
+    (late,) = channel.check_ack_timeout(limit)
+    assert (late.type, late.data) == ("ack_timeout", {"seq": 1})
+    assert channel.check_ack_timeout(limit) == []
+    assert mod.in_path.read_bytes() == before
+
+    # L'ack arrivé après l'échéance vide encore `in`, et couvre la commande suivante.
+    mod.ack(2)
+    assert channel.poll_ack() == []
+    assert mod.in_path.read_bytes() == b""
+    now[0] = limit * 2
+    assert channel.check_ack_timeout(limit) == []
+
+
+def test_write_session_replaces_in_one_block(channel, mod):
+    channel.write_session("8f3a2c", 2, 17)
+    assert mod.read_session() == {"v": 1, "match": "8f3a2c", "side": "A", "boot": 2, "cmd_floor": 17}
+    assert [path.name for path in mod.session_path.parent.iterdir()] == [mod.session_path.name]
+    with pytest.raises(ValueError):
+        channel.write_session("8f3a2c", 0, 17)
+    assert mod.read_session()["boot"] == 2
+
+
+def test_restart_is_at_most_once(channel, mod):
+    reader = OutReader(mod.out_path, "A", CATALOG)
+    written(channel, 1, 2, 3)
+    mod.cmd_result(1)
+    resolved = {event["data"]["seq"] for event in reader.poll().events}
+    unresolved = [seq for seq in (1, 2, 3) if seq not in resolved]
+    inode = mod.in_path.stat().st_ino
+
+    lost = channel.prepare_restart(unresolved)
+
+    assert [(a.type, a.side, a.data) for a in lost] == [
+        ("lost_on_restart", "A", {"seq": 2}),
+        ("lost_on_restart", "A", {"seq": 3}),
+    ]
+    assert mod.in_path.read_bytes() == b""
+    assert mod.in_path.stat().st_ino == inode
+    session = mod.read_session()
+    assert (session["boot"], session["cmd_floor"]) == (2, 3)
+
+    # Aucune réémission : le nouveau `boot` ne voit dans `in` que les commandes neuves.
+    mod.ack(3)
+    assert channel.poll_ack() == []
+    assert mod.in_path.read_bytes() == b""
+    written(channel, 4)
+    assert in_seqs(mod) == [4]
+    with pytest.raises(ValueError):
+        channel.write(command(3))
+
+
+def test_restart_forgets_pending_acks_and_rejects_old_boot(tmp_path, mod, runtime):
+    now = [0.0]
+    channel = CommandChannel("A", tmp_path, clock=lambda: now[0])
+    channel.write_session("8f3a2c", 1, 0)
+    written(channel, 1)
+    mod.ack(1)
+    channel.prepare_restart([1])
+    now[0] = runtime["ack_timeout_s"]
+    assert channel.check_ack_timeout(runtime["ack_timeout_s"]) == []
+    assert [a.type for a in channel.poll_ack()] == ["ack_foreign_boot"]
+    assert channel.boot == 2 and channel.last_seq == 1
+
+
+def test_restart_without_session_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        CommandChannel("A", tmp_path).prepare_restart([])
+
+
+def test_reset_empties_files_and_keeps_session(channel, mod):
+    written(channel, 1, 2)
+    mod.ack(2)
+    mod.write_raw(b"reste\n")
+    channel.reset()
+    assert [path.read_bytes() for path in (mod.out_path, mod.in_path, mod.ack_path)] == [b"", b"", b""]
+    assert mod.session_path.exists()
+    assert channel.boot == 1 and channel.last_seq == 0
+    written(channel, 1)
+    assert in_seqs(mod) == [1]
+
+
+def test_reset_creates_missing_files(tmp_path, mod):
+    CommandChannel("A", tmp_path).reset()
+    assert [path.stat().st_size for path in (mod.out_path, mod.in_path, mod.ack_path)] == [0, 0, 0]
