@@ -157,6 +157,13 @@ def git(*args: str) -> str:
 def require_clean() -> None:
     dirty = git("status", "--porcelain")
     if dirty:
+        # une boucle peut laisser .gitignore modifié en restaurant son workdir ; ce n'est
+        # pas une modification de l'étape, on la rétablit plutôt que d'arrêter la campagne.
+        paths = [line.split(maxsplit=1)[-1].strip() for line in dirty.splitlines() if line.strip()]
+        if paths and all(p == ".gitignore" for p in paths):
+            git("checkout", "--", ".gitignore")
+            dirty = git("status", "--porcelain")
+    if dirty:
         raise SystemExit(f"arbre sale, rien n'est lancé :\n{dirty}")
 
 
