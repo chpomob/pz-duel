@@ -9,12 +9,30 @@ import shutil
 
 import pytest
 
-from test_contract import PLAYER, SIDES, Lobby, MS, L_S, state_entered_at
+from test_contract import (
+    L_S,
+    MS,
+    PLAYER,
+    SIDES,
+    Lobby,
+    crash,
+    crash_and_hold,
+    state_entered_at,
+)
 from test_servers import stopped_for_good
-from test_snapshots import engine_rig  # noqa: F401
+from test_snapshots import (  # noqa: F401
+    PLAYER_PASSWORD,
+    WAIT_S,
+    engine_rig,
+    world_db,
+    world_dir,
+    worlds_state,
+)
 from service import engine as engine_module
 from service.journal import JOURNAL_NAME
+from service.protocol import parse_session
 from service.replay import main as replay_main
+from service.servers import read_ini
 from service.state import MatchState
 from service.verdict import spawn_status, verdict
 
@@ -22,6 +40,7 @@ PRESET = "demo"
 PROBE_TIMEOUT_S = 30
 KILL = {"w": "Base.Axe", "x": 10500, "y": 9900, "origin": "world"}
 LONG_MATCH_S = 300
+RESTART_MATCH_S = 900
 
 
 @pytest.fixture
@@ -588,15 +607,19 @@ def test_beat_silence_by_phase(engine_rig):
     assert state["players"] == {"A": PLAYER, "B": PLAYER}
 
     duel.at_match(1 + timeout_s)
-    state = engine_rig.until(lambda s: s["servers"] == {"A": "suspect", "B": "suspect"})
+    # `players` se publie en fin de passe, après les statuts.
+    absent = {"A": None, "B": None}
+    state = engine_rig.until(
+        lambda s: s["servers"] == {"A": "suspect", "B": "suspect"} and s["players"] == absent
+    )
     assert state["phase"] == "running"
-    assert state["players"] == {"A": None, "B": None}
 
     duel.at_match(duel.te_s + 1)
     line = duel.beat("A")
-    state = engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    state = engine_rig.until(
+        lambda s: s["servers"]["A"] == "up" and s["players"] == {"A": PLAYER, "B": None}
+    )
     assert state["servers"]["B"] == "suspect"
-    assert state["players"] == {"A": PLAYER, "B": None}
     duel.played(line)
 
     states = [r for r in duel.records("state") if "server" in r["data"]]
@@ -677,4 +700,456 @@ def test_cancel_during_match_stops_servers(engine_rig):
     assert stopped_for_good(engine_rig)
     assert duel.records("match_end") == []
     assert all(r["mt"] is not None for r in duel.records("state")[-2:])
+    assert duel.replays()
+
+
+def launch_session(rig, side: str) -> dict:
+    """Session que le dernier lancement du serveur `side` a trouvée sur le disque."""
+    return dict(parse_session((rig.seen(side)[-1] / "Lua" / f"duel_{side}_session.txt").read_bytes()))
+
+
+def sent(duel: Duel, side: str) -> list[dict]:
+    """Commandes du match vers `side`, sondes exclues."""
+    return [
+        record
+        for record in duel.records("command")
+        if record["side"] == side and record["mt"] is not None
+    ]
+
+
+def wait_sent(duel: Duel, side: str, count: int) -> list[dict]:
+    duel.rig.until(lambda _: len(sent(duel, side)) >= count)
+    return sent(duel, side)
+
+
+def server_states(duel: Duel, side: str) -> list[str]:
+    return [
+        record["data"]["server"]
+        for record in duel.records("state")
+        if record["side"] == side and record["mt"] is not None and "server" in record["data"]
+    ]
+
+
+def forfeit_after_a_fresh_grace(duel: Duel, back_s: float) -> None:
+    grace_s = duel.engine.preset(PRESET)["disconnect_grace_s"]
+    duel.at_match(back_s + 60)
+    duel.beat("B")
+    state = duel.reach(back_s + grace_s - 1)
+    assert state["phase"] == "running"
+
+    duel.at_match(back_s + grace_s)
+    state = duel.finish()
+    assert state["result"]["outcome"] == "forfeit"
+    assert state["result"]["winner"] == "B"
+
+
+def invalidated_by_second_exit(duel: Duel, back_s: float) -> None:
+    launches = len(duel.rig.seen("A"))
+    crash(duel, "A")
+    duel.rig.until(lambda s: s["servers"]["A"] == "error")
+    duel.at_match(back_s + 1)
+    state = duel.finish()
+    assert state["result"]["outcome"] == "invalidated"
+    assert state["result"]["winner"] is None
+    assert "serveur A perdu" in state["result"]["reason"]
+    assert len(duel.rig.seen("A")) == launches
+
+
+@pytest.mark.parametrize("ending", [forfeit_after_a_fresh_grace, invalidated_by_second_exit])
+def test_restart_in_match(engine_rig, presets, ending):
+    rig = engine_rig
+    edit_preset(presets, duration_s=RESTART_MATCH_S)
+    duel = Duel(rig)
+    duel.start_match()
+    assert duel.engine.preset(PRESET)["disconnect_grace_s"] == 120
+
+    duel.at_match(10)
+    duel.kills("A", 1)
+    for te_s in (100, 200, 290):
+        duel.at_match(te_s)
+        duel.beat("A")
+        duel.beat("B")
+    state = duel.reach(300)
+    assert state["score"] == {"A": 1, "B": 0}
+    match = duel.engine._match
+    core = match._core
+    launches = len(rig.seen("A"))
+    played = b"played before the exit"
+    world = world_dir(rig.zomboid, "A") / "map" / "chunk.bin"
+    world.write_bytes(played)
+
+    release = crash_and_hold(duel, "A")
+    state = duel.state()
+    assert state["phase"] == "running"
+    assert state["servers"] == {"A": "restarting", "B": "up"}
+    assert duel.reach(301)["players"]["A"] is None
+
+    # A est muet depuis 140 s, au-delà de la grâce : elle est suspendue, le minuteur non.
+    duel.at_match(400)
+    duel.beat("B")
+    state = duel.reach(430)
+    assert state["phase"] == "running"
+    assert state["servers"]["A"] == "restarting"
+    assert state["clock"]["remaining_s"] == RESTART_MATCH_S - 430
+    assert server_states(duel, "A") == ["restarting"]
+    assert len(rig.seen("A")) == launches
+
+    duel.at_match(440)
+    release.set()
+    state = rig.until(lambda s: s["servers"]["A"] == "up")
+    assert len(rig.seen("A")) == launches + 1
+    assert launch_session(rig, "A")["boot"] == 2
+    assert launch_session(rig, "B")["boot"] == 1
+    assert (rig.seen("A")[-1] / "Lua" / "duel_A_in.txt").read_bytes() == b""
+    assert world.read_bytes() == played
+    assert state["score"] == {"A": 1, "B": 0}
+    assert match._core is core
+
+    # Le `boot` 2 repart de `seq` 1 et atteint les mêmes règles, sur le même score.
+    assert duel.mods["A"].read_session()["boot"] == 2
+    duel.kills("A", 1)
+    state = rig.until(lambda s: s["score"]["A"] == 2)
+    assert state["score"] == {"A": 2, "B": 0}
+    assert server_states(duel, "A") == ["restarting", "up"]
+
+    ending(duel, duel.te_s)
+    assert stopped_for_good(rig)
+    assert duel.replays()
+
+
+def test_drift_decides_after_the_return(engine_rig, presets):
+    """Un âge figé par la relance ne mesure rien : la dérive attend le heartbeat de retour."""
+    edit_preset(presets, day_length=1)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.beat("A")
+    duel.beat("B")
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 0)
+
+    release = crash_and_hold(duel, "A")
+    duel.at_match(2)
+    duel.beat("B", age=1.7)
+    state = duel.reach(3)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
+
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    state = duel.reach(4)
+    assert state["phase"] == "running"
+
+    duel.mods["A"].read_session()
+    duel.mods["A"].beat(age=0.0, players=(PLAYER,))
+    duel.at_match(5)
+    state = duel.finish()
+    assert state["result"]["outcome"] == "invalidated"
+    assert "dérive" in state["result"]["reason"]
+    assert duel.replays()
+
+
+def test_drift_ignores_a_beat_of_the_old_boot(engine_rig, presets):
+    """Le `java` survivant du `boot` révolu tique encore : ni âge, ni joueur, ni dérive."""
+    edit_preset(presets, day_length=1)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.beat("A")
+    duel.beat("B")
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 0)
+
+    release = crash_and_hold(duel, "A")
+    duel.at_match(2)
+    duel.beat("A")
+    duel.beat("B", age=1.7)
+    state = duel.reach(3)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
+    assert state["players"]["A"] is None
+
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    state = duel.reach(4)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
+    assert duel.replays()
+
+
+def test_drift_waits_for_the_availability(engine_rig, presets):
+    """Un heartbeat du nouveau `boot` reçu en relance n'est jugé qu'une fois le camp `up`."""
+    edit_preset(presets, day_length=1)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.beat("A")
+    duel.beat("B")
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 0)
+
+    release = crash_and_hold(duel, "A")
+    duel.mods["A"].read_session()
+    duel.at_match(2)
+    duel.beat("A")
+    duel.beat("B", age=1.7)
+    state = duel.reach(3)
+    assert state["phase"] == "running"
+    assert state["servers"]["A"] == "restarting"
+    assert state["clock"]["drift_s"] == 0
+
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    duel.at_match(4)
+    state = duel.finish()
+    assert state["result"]["outcome"] == "invalidated"
+    assert "dérive" in state["result"]["reason"]
+    assert duel.replays()
+
+
+def test_no_command_while_restarting(engine_rig, presets):
+    budget = {"threats_per_minute": 6, "concurrent_effects": 1, "per_effect_cooldown_s": 20}
+    edit_preset(presets, budget=budget)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    assert engine_rig.runtime["cmd_result_timeout_s"] == 60
+
+    # Sans `cmd_result`, cette commande tient l'unique place vers A jusqu'à `mt` = 61.
+    duel.at_match(1)
+    duel.kills("B", 1)
+    (first,) = wait_sent(duel, "A", 1)
+    first_seq = first["data"]["command"]["seq"]
+
+    duel.reach(30)
+    release = crash_and_hold(duel, "A")
+    duel.at_match(duel.te_s + duel.step_s)
+    engine_rig.until(lambda _: duel.records("lost_on_restart"))
+    (lost,) = duel.records("lost_on_restart")
+    assert (lost["data"], lost["side"]) == ({"seq": first_seq}, "A")
+
+    duel.reach(31)
+    duel.kills("B", 3)
+    # Ce lot vers B est plus récent que celui qui attend A : il part quand même.
+    duel.reach(33)
+    duel.kills("A", 1)
+    assert wait_sent(duel, "B", 1)[0]["mt"] >= 33
+    duel.reach(35)
+    assert len(sent(duel, "A")) == 1
+
+    duel.at_match(40)
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    assert launch_session(engine_rig, "A")["cmd_floor"] == first_seq
+    duel.at_match(40 + duel.step_s)
+
+    second = wait_sent(duel, "A", 2)[1]
+    assert second["data"]["command"]["n"] == 6
+    assert second["data"]["command"]["seq"] > first_seq
+    up = next(
+        record
+        for record in duel.records("state")
+        if record["side"] == "A"
+        and record["data"].get("server") == "up"
+        and record["mt"] is not None
+    )
+    assert second["mt"] == up["mt"]
+    assert duel.records("cmd_timeout") == []
+    # La commande perdue compte encore : 2 vers A et 1 vers B sur la fenêtre d'une minute.
+    state = engine_rig.until(lambda s: s["threats_per_min"] == 3.0)
+    assert state["phase"] == "running"
+
+    duel.at_match(engine_rig.engine.preset(PRESET)["duration_s"])
+    duel.finish()
+    assert duel.replays()
+
+
+def test_result_written_before_exit_is_not_lost(engine_rig, presets):
+    """`cmd_result` écrit juste avant la sortie : seule la commande muette est perdue."""
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.kills("B", 1)
+    unanswered = wait_sent(duel, "A", 1)[0]["data"]["command"]["seq"]
+    duel.at_match(30)
+    duel.kills("B", 1)
+    answered = wait_sent(duel, "A", 2)[1]["data"]["command"]["seq"]
+
+    match = duel.engine._match
+    server = match.pair.servers["A"]
+    poll_out = match._poll_out
+    te_s = duel.te_s + duel.step_s
+    due_ms = int((L_S + (duel.t0_s + te_s)) * MS)
+
+    def exit_right_after_the_read(now_ms: int) -> None:
+        """Pire instant : `out` vient d'être lu, puis le résultat s'écrit et le serveur sort.
+
+        Dans une passe qui exécute un tick : sinon le `cmd_result` lu ensuite passerait
+        avant le `lost_on_restart` dans le tick, et masquerait une perte déclarée à tort.
+        """
+        poll_out(now_ms)
+        if now_ms >= due_ms:
+            match._poll_out = poll_out
+            duel.mods["A"].cmd_result(answered, "applied", spawned=2)
+            crash(duel, "A")
+            engine_rig.until(lambda _: server.exit_code is not None)
+
+    match._poll_out = exit_right_after_the_read
+    duel.at_match(te_s)
+    engine_rig.until(lambda s: s["servers"]["A"] == "restarting")
+    duel.at_match(te_s + duel.step_s)
+    engine_rig.until(lambda _: duel.records("lost_on_restart"))
+    assert [r["data"]["seq"] for r in duel.records("lost_on_restart")] == [unanswered]
+    assert [r["data"]["data"]["seq"] for r in duel.records("cmd_result")][-1] == answered
+
+
+def refuse_launch(duel: Duel, server) -> None:
+    def start() -> None:
+        raise OSError("plus de mémoire")
+
+    server.start = start
+
+
+def exit_during_launch(duel: Duel, server) -> None:
+    launch = server.start
+
+    def start() -> None:
+        launch()
+        crash(duel, "A")
+
+    server.start = start
+
+
+@pytest.mark.parametrize(
+    "failure, cause",
+    [
+        (refuse_launch, "relance impossible"),
+        (exit_during_launch, "sortie inattendue pendant la relance"),
+    ],
+)
+def test_failed_relaunch_invalidates(engine_rig, failure, cause):
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    failure(duel, duel.engine._match.pair.servers["A"])
+
+    crash(duel, "A")
+    engine_rig.until(lambda s: s["servers"]["A"] == "error")
+    duel.at_match(2)
+
+    state = duel.finish()
+    assert state["result"]["outcome"] == "invalidated"
+    assert cause in state["result"]["reason"]
+    assert duel.replays()
+
+
+def cancelled(duel: Duel) -> dict:
+    assert duel.engine.action("cancel")[0]
+    state = duel.rig.wait("idle", "error")
+    assert state["phase"] == "idle", state["error"]
+    return state
+
+
+def timer_over(duel: Duel) -> dict:
+    duel.at_match(duel.state()["config"]["duration_s"])
+    return duel.finish()
+
+
+@pytest.mark.parametrize("ending", [cancelled, timer_over])
+def test_no_relaunch_after_the_end(engine_rig, ending):
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    launches = len(engine_rig.seen("A"))
+    release = crash_and_hold(duel, "A")
+
+    ending(duel)
+    release.set()
+    for thread in threading.enumerate():
+        if thread.name == "duel-relaunch-A":
+            thread.join(WAIT_S)
+
+    assert len(engine_rig.seen("A")) == launches
+    assert stopped_for_good(engine_rig)
+
+
+def in_lobby(lobby: Lobby) -> None:
+    pass
+
+
+def in_countdown(lobby: Lobby) -> None:
+    lobby.join_and_resolve()
+    state = lobby.rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+
+
+@pytest.mark.parametrize("reach", [in_lobby, in_countdown])
+def test_exit_outside_running_stays_an_error(engine_rig, reach):
+    lobby = Lobby(engine_rig, PRESET)
+    reach(lobby)
+    launches = len(engine_rig.seen("A"))
+
+    crash(lobby, "A")
+
+    state = engine_rig.wait("error")
+    assert "serveur A : sortie inattendue" in state["error"]
+    assert len(engine_rig.seen("A")) == launches
+    assert stopped_for_good(engine_rig)
+
+
+def test_rematch(engine_rig, presets):
+    rig = engine_rig
+    duel = Duel(rig)
+    origin = worlds_state(rig.zomboid)
+    duel.start_match()
+    first = duel.state()
+    first_window = duel.engine._match.window
+    assert first["capabilities"]["active_atoms"] is not None
+
+    # Le premier match finit à `boot` 2, sur des mondes joués.
+    duel.at_match(1)
+    crash_and_hold(duel, "A").set()
+    rig.until(lambda s: s["servers"]["A"] == "up")
+    assert launch_session(rig, "A")["boot"] == 2
+    for side in SIDES:
+        (world_dir(rig.zomboid, side) / "map" / "chunk.bin").write_bytes(b"played")
+        world_db(rig.zomboid, side).write_bytes(b"played")
+    assert worlds_state(rig.zomboid) != origin
+    duel.at_match(first["config"]["duration_s"])
+    duel.finish()
+    launches = len(rig.seen("A"))
+
+    for mod in duel.mods.values():
+        mod.restart(1)
+        # Le `caps` posé par le double de lancement a pris le `seq` 1.
+        mod.seq = 1
+    ok, message = duel.engine.action("rematch")
+    assert ok, message
+    state = rig.wait("lobby", "error")
+
+    assert state["phase"] == "lobby", state["error"]
+    assert state["config"]["code"] == first["config"]["code"]
+    assert state["config"]["password"] == first["config"]["password"] == PLAYER_PASSWORD
+    assert state["invite"]["code"] == first["invite"]["code"]
+    assert state["invite"]["password"] == PLAYER_PASSWORD
+    assert state["match_id"] != first["match_id"]
+    assert state["score"] == {"A": 0, "B": 0}
+    assert state["result"] is None
+    assert worlds_state(rig.zomboid) == origin
+    for side in SIDES:
+        session = launch_session(rig, side)
+        assert (session["boot"], session["cmd_floor"]) == (1, 0)
+        assert session["match"] == state["match_id"]
+        ini = read_ini(rig.zomboid / "Server" / f"duel{side}.ini")
+        assert ini["Password"] == PLAYER_PASSWORD
+    assert len(rig.seen("A")) == launches + 1
+
+    # Nouveau match : la fenêtre de contrat se rouvre et se referme sur ses propres preuves.
+    assert duel.engine._match.window is not first_window
+    assert state["capabilities"].get("active_atoms") is None
+    duel.match_id = state["match_id"]
+    duel.start_match(lobby_s=duel.t0_s + first["config"]["duration_s"])
+    assert duel.state()["capabilities"]["active_atoms"] is not None
+    duel.at_match(1)
+    duel.kills("A", 1)
+    assert duel.state()["score"] == {"A": 1, "B": 0}
+    duel.at_match(first["config"]["duration_s"])
+    state = duel.finish()
+    assert state["config"]["code"] == first["config"]["code"]
     assert duel.replays()

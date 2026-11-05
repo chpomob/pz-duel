@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -11,7 +14,7 @@ import pytest
 
 from doubles.fake_mod import FakeMod
 from test_servers import stopped_for_good
-from test_snapshots import PLAYER_PASSWORD, engine_rig  # noqa: F401
+from test_snapshots import PLAYER_PASSWORD, WAIT_S, engine_rig  # noqa: F401
 from service.engine import ContractWindow
 from service.rules import load_effects, load_table
 from service.servers import verify_contract, write_ini, write_sandbox
@@ -236,6 +239,29 @@ class Lobby:
             self.mods[side].cmd_result(self.join(side), "applied", spawned=1)
 
 
+def crash(lobby: Lobby, side: str) -> None:
+    """Tue le groupe du serveur : pour le moteur, une sortie que personne n'a demandée."""
+    os.killpg(lobby.engine._match.pair.servers[side]._process.pid, signal.SIGKILL)
+
+
+def crash_and_hold(lobby: Lobby, side: str) -> threading.Event:
+    """Provoque la sortie et retient le fil de relance jusqu'à l'événement rendu.
+
+    Seul ce fil passe par l'instance : `ServerPair` arrête par `ServerProcess.stop`.
+    """
+    server = lobby.engine._match.pair.servers[side]
+    stop, release = server.stop, threading.Event()
+
+    def held() -> bool:
+        release.wait(WAIT_S)
+        return stop()
+
+    server.stop = held
+    crash(lobby, side)
+    lobby.rig.until(lambda s: s["servers"][side] == "restarting")
+    return release
+
+
 def state_entered_at(lobby: Lobby, phase: str) -> int:
     return next(r["ts_ms"] for r in lobby.records("state") if r["data"].get("phase") == phase)
 
@@ -367,11 +393,21 @@ def test_hook_window_outlives_contract_step(engine_rig):
     active = state["capabilities"]["active_atoms"]
     assert ATOM in active
 
-    # Un nouveau `boot` publie ses `caps`, sans `hook_seen` : la décision reste.
+    lobby.at(engine_rig.runtime["countdown_s"])
+    state = engine_rig.wait("running", "error")
+    assert state["phase"] == "running", state["error"]
+
+    # Le `boot` suivant publie ses `caps`, sans `hook_seen` : la décision reste.
+    crash_and_hold(lobby, "A").set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
     mod = lobby.mods["A"]
-    mod.restart()
+    assert mod.read_session()["boot"] == 2
     mod.caps(atoms=["zombie_kill"], hooks={HOOK: False})
     engine_rig.until(lambda s: not s["capabilities"]["A"]["hooks"][HOOK]["registered"])
+    assert lobby.state()["capabilities"]["active_atoms"] == active
+    assert lobby.records("atom_withdrawn") == []
+    lobby.at(engine_rig.runtime["hook_window_s"] * 2)
+    lobby.settle()
     assert lobby.state()["capabilities"]["active_atoms"] == active
     assert lobby.records("atom_withdrawn") == []
 

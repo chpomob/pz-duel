@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import shutil
 import socket
@@ -30,6 +31,7 @@ from .preflight import run_preflight
 from .protocol import PROTOCOL_VERSION, SIDES
 from .rules import (
     MS_PER_S,
+    RESTARTING,
     MatchCore,
     TableError,
     load_effects,
@@ -306,6 +308,11 @@ class RealMatch:
 
     `_core` naît à l'entrée en `running` : c'est lui qui journalise alors tout ce qui compte
     pour le rejeu. `result` reste nul jusqu'à l'écriture de `match_end`.
+
+    Une relance en match tourne sur son propre fil, qui ne touche que le serveur : son issue
+    revient par `_relaunched`, que `pump` lit, seul à parler au cœur et aux canaux.
+    `_relaunch_lock` ordonne le `start` de ce fil et `shutdown` : aucun serveur ne part
+    une fois l'arrêt engagé.
     """
 
     def __init__(
@@ -356,6 +363,14 @@ class RealMatch:
         self._last_age: dict[str, float] = {}
         self._drift_s: float | None = None
         self._threats: deque[float] = deque()
+        # Commandes écrites sans `cmd_result` lu : ce qu'un redémarrage rendrait perdu.
+        self._unresolved: dict[str, set[int]] = {side: set() for side in SIDES}
+        self._restarts = dict.fromkeys(SIDES, 0)
+        # Camps en relance ou perdus : ni sortie, ni silence, ni absence n'y sont jugés.
+        self._unavailable: set[str] = set()
+        self._relaunched: queue.SimpleQueue[tuple[str, str | None]] = queue.SimpleQueue()
+        self._relaunch_lock = threading.Lock()
+        self._closing = threading.Event()
         cfg = {
             **runtime,
             "pz_dir": pz_dir,
@@ -457,14 +472,19 @@ class RealMatch:
         Seul ce fil écrit sur les canaux. L'absence de heartbeat n'est une panne qu'en
         `running` : un serveur vide ne tique pas (H3). L'entrée en `running` précède la
         lecture de `out` : ce que le mod a écrit depuis `t0_ms` doit atteindre le cœur.
+
+        Les sorties se relèvent avant cette lecture, qui devient la dernière de ce serveur :
+        relevées après, un `cmd_result` écrit juste avant la sortie resterait non lu, et sa
+        commande deviendrait un faux `lost_on_restart`.
         """
-        if lost := self.lost_server():
-            return lost
+        exited = self._exited_sides()
+        if exited and self._core is None:
+            return self.lost_server()
         if self._countdown_over(now_ms):
             self._enter_running(now_ms)
         self._poll_out(now_ms)
         if self._core is not None:
-            self._pump_match(now_ms)
+            self._pump_match(now_ms, exited)
             return None
         self._poll_acks()
         refusal = self._advance(now_ms)
@@ -497,11 +517,14 @@ class RealMatch:
 
         self._on_state(change)
 
-    def _pump_match(self, now_ms: int) -> None:
+    def _pump_match(self, now_ms: int, exited: Sequence[str]) -> None:
         """Juge l'instant, avance le cœur, puis écrit ce qu'il rend : le tick reste son ordre.
 
         `out` est déjà lu : une fin soumise ici passe après les événements de son tick.
         """
+        self._take_relaunches(now_ms)
+        for side in exited:
+            self._on_server_exit(side)
         self._watch_beats(now_ms)
         end = self._drift_end() or self._absence_end(now_ms)
         if end is not None:
@@ -512,10 +535,112 @@ class RealMatch:
         self._publish(now_ms)
         self._publish_match(records)
 
+    def _exited_sides(self) -> list[str]:
+        return [
+            side
+            for side, server in self.pair.servers.items()
+            if side not in self._unavailable and server.exited_unexpectedly()
+        ]
+
+    def _on_server_exit(self, side: str) -> None:
+        """Applique la procédure de redémarrage, ou perd le serveur au-delà du plafond.
+
+        `out` a été lu après la sortie : `_unresolved` ne garde que de vraies pertes. L'âge
+        retiré suspend la dérive jusqu'au premier heartbeat du nouveau `boot` : un âge figé
+        pendant la relance ne mesure rien, et c'est après le retour que la dérive tranche.
+        """
+        server = self.pair.servers[side]
+        cause = f"sortie inattendue, code {server.exit_code}"
+        self._unavailable.add(side)
+        if self._restarts[side] >= self.runtime["max_server_restarts"]:
+            self._lose_server(side, cause)
+            return
+        self._restarts[side] += 1
+        lost = self._channels[side].prepare_restart(sorted(self._unresolved[side]))
+        self._unresolved[side].clear()
+        self._suspects.discard(side)
+        self.players[side] = None
+        self._last_age.pop(side, None)
+        self._on_status(side, RESTARTING, self._server_detail(side, cause))
+        self._core.submit_state(side, RESTARTING)
+        for anomaly in lost:
+            self._core.submit_lost(anomaly.data["seq"])
+        message = f"serveur {side} : {cause}, relance du même monde"
+
+        def change(state: MatchState) -> None:
+            state.log(message, "warn")
+            state.event(message, side)
+
+        self._on_state(change)
+        threading.Thread(
+            target=self._relaunch, args=(side,), name=f"duel-relaunch-{side}", daemon=True
+        ).start()
+
+    def _lose_server(self, side: str, cause: str) -> None:
+        self._on_status(side, STATUS_ERROR, self._server_detail(side, cause))
+        reason = f"serveur {side} perdu : {cause}"
+        self._core.submit_end({"outcome": OUTCOME_INVALIDATED, "winner": None, "reason": reason})
+
+    def _server_detail(self, side: str, cause: str) -> str:
+        return "\n".join([f"serveur {side} : {cause}", *self.pair.servers[side].log_tail()])
+
+    def _relaunch(self, side: str) -> None:
+        """Corps du fil de relance : rien de ce qui dure ne doit retenir `pump`."""
+        try:
+            failure = self._restart_server(side)
+        except Exception as exc:
+            # Un fil mort en silence laisserait le camp en relance jusqu'à la fin du match.
+            failure = f"relance impossible ({self.redactor.redact_exception(exc)})"
+        if not self._closing.is_set():
+            self._relaunched.put((side, failure))
+
+    def _restart_server(self, side: str) -> str | None:
+        """Relance le même monde et attend sa disponibilité ; rend le motif d'un échec.
+
+        Le script parti, son `java` peut lui survivre : `stop` vide le groupe, que `start`
+        refuserait. Une sortie pendant la relance est la deuxième sortie du serveur.
+        """
+        server = self.pair.servers[side]
+        if not server.stop():
+            return "relance impossible : des processus de l'ancien serveur subsistent"
+        with self._relaunch_lock:
+            if self._closing.is_set():
+                return None
+            server.start()
+        timeout_s = self.runtime["server_start_timeout_s"]
+        deadline = time.monotonic() + timeout_s
+        while not self._closing.wait(self.poll_s):
+            if server.exit_code is not None:
+                return f"sortie inattendue pendant la relance, code {server.exit_code}"
+            if server.ini_failure:
+                return server.ini_failure
+            if server.ready:
+                return None
+            if time.monotonic() >= deadline:
+                return f"pas de disponibilité après {timeout_s} s"
+        return None
+
+    def _take_relaunches(self, now_ms: int) -> None:
+        """Reçoit l'issue des relances : la grâce et le silence repartent de zéro à `up`."""
+        while True:
+            try:
+                side, failure = self._relaunched.get_nowait()
+            except queue.Empty:
+                return
+            if failure is not None:
+                self._lose_server(side, failure)
+                continue
+            self._unavailable.discard(side)
+            self._beat_ms[side] = self._seen_ms[side] = now_ms
+            self._on_status(side, STATUS_UP, "serveur relancé")
+            self._core.submit_state(side, STATUS_UP)
+
     def _watch_beats(self, now_ms: int) -> None:
         """Passe `suspect` un camp muet depuis `beat_timeout_s`, et `up` un camp revenu."""
         timeout_ms = self.runtime["beat_timeout_s"] * MS_PER_S
         for side in SIDES:
+            if side in self._unavailable:
+                continue
             silent = now_ms - self._beat_ms[side] >= timeout_ms
             if silent == (side in self._suspects):
                 continue
@@ -530,10 +655,16 @@ class RealMatch:
             self._core.submit_state(side, status)
 
     def _absence_end(self, now_ms: int) -> dict[str, Any] | None:
-        """Rend la fin due à une absence, comptée depuis le dernier heartbeat du joueur."""
+        """Rend la fin due à une absence, comptée depuis le dernier heartbeat du joueur.
+
+        Un camp en relance n'est pas jugé : sa grâce reste suspendue jusqu'à son retour.
+        """
         grace_s = self.table["disconnect_grace_s"]
         absent = [
-            side for side in SIDES if now_ms - self._seen_ms[side] >= grace_s * MS_PER_S
+            side
+            for side in SIDES
+            if side not in self._unavailable
+            and now_ms - self._seen_ms[side] >= grace_s * MS_PER_S
         ]
         if not absent:
             return None
@@ -551,9 +682,10 @@ class RealMatch:
         Elle compare les avances depuis le début du match, une fois `out` lu des deux côtés :
         A est lu avant B, et juger entre les deux prendrait un retard de lecture pour une
         dérive. L'arrondi précède la comparaison : `(3 + 1,6) − 3` vaut 1,5999… et le seuil
-        est strict.
+        est strict. Un camp en relance n'est pas jugé, même s'il tique déjà : il n'est pas
+        encore disponible.
         """
-        if len(self._last_age) < len(SIDES):
+        if self._unavailable or len(self._last_age) < len(SIDES):
             return None
         first, second = (self._last_age[s] - self._first_age[s] for s in SIDES)
         minutes = self.runtime["day_length_minutes"][str(self.config["day_length"])]
@@ -575,6 +707,7 @@ class RealMatch:
             self._journal.write(record["type"], data, record["side"], record["mt"])
             if record["type"] == COMMAND:
                 self._channels[record["side"]].write(data[COMMAND])
+                self._unresolved[record["side"]].add(data[COMMAND]["seq"])
                 self._threats.append(record["mt"])
 
     def _conclude(self, record: Mapping[str, Any]) -> None:
@@ -669,9 +802,11 @@ class RealMatch:
             self.window.on_caps(side, data)
         elif kind == HOOK_SEEN:
             self.window.on_hook_seen(side, data["hook"], now_ms)
-        elif kind == BEAT:
+        elif kind == BEAT and event["boot"] == self._channels[side].boot:
+            # Le `java` d'un `boot` révolu peut survivre à son script : il n'atteste plus rien.
             self._take_beat(side, data, now_ms)
         elif kind == CMD_RESULT:
+            self._unresolved[side].discard(data["seq"])
             self._take_probe_result(side, data, now_ms)
 
     def _take_beat(self, side: str, data: Mapping[str, Any], now_ms: int) -> None:
@@ -873,8 +1008,7 @@ class RealMatch:
         """Hors `running`, une sortie non demandée est une erreur : rend son message expurgé."""
         for side, server in self.pair.servers.items():
             if server.exited_unexpectedly():
-                reason = f"serveur {side} : sortie inattendue, code {server.exit_code}"
-                detail = "\n".join([reason, *server.log_tail()])
+                detail = self._server_detail(side, f"sortie inattendue, code {server.exit_code}")
                 self._on_status(side, STATUS_ERROR, detail)
                 return detail
         return None
@@ -916,6 +1050,8 @@ class RealMatch:
         """
         with self._shutdown_lock:
             if self._stopped is None:
+                with self._relaunch_lock:
+                    self._closing.set()
                 self._stopped = self.pair.close()
             return self._stopped
 
@@ -1007,7 +1143,8 @@ class Engine:
                     return False, "revanche possible seulement après un match"
                 cfg = dict(self.state.config)
                 try:
-                    self._begin(cfg)
+                    # En réel, l'invitation déjà donnée reste valable.
+                    self._begin(cfg, cfg.get("code") if self.real else None)
                 except ActionRefused as exc:
                     return False, str(exc)
                 return True, "revanche"
@@ -1062,7 +1199,8 @@ class Engine:
         return True, "client PZ lancé par Steam"
 
     # -- moteur ----------------------------------------------------------
-    def _begin(self, payload: dict) -> None:
+    def _begin(self, payload: dict, code: str | None = None) -> None:
+        """`code` vient de la revanche seule : le `payload` d'un `start` n'en fixe aucun."""
         preset = self.preset(payload.get("preset", "duel_rapide"))
         if self.real:
             for label, key in (("pseudo", "pseudo"), ("mot de passe", "password")):
@@ -1076,7 +1214,7 @@ class Engine:
             "preset_label": preset["label"],
             "duration_s": duration,
             "day_length": int(payload.get("day_length") or preset["day_length"]),
-            "code": make_code(),
+            "code": code or make_code(),
             "summary": preset["summary"],
         }
         cfg["password"] = payload.get("password") or cfg["code"]
