@@ -1,4 +1,4 @@
-"""État partagé du service duel (MVP, backend simulé)."""
+"""État partagé du service duel, en mode simulé comme en mode réel."""
 
 from __future__ import annotations
 
@@ -55,6 +55,9 @@ class MatchState:
     logs: list = field(default_factory=list)
     started_at: float | None = None
     version: int = 1
+    match_id: str | None = None
+    capabilities: dict = field(default_factory=dict)
+    result: dict | None = None
 
     # --- helpers ---------------------------------------------------------
     def log(self, msg: str, level: str = "info") -> None:
@@ -95,4 +98,7 @@ class MatchState:
             "events": self.events[-12:],
             "error": self.error,
             "logs": self.logs[-80:],
+            "match_id": self.match_id,
+            "capabilities": self.capabilities,
+            "result": self.result,
         }

@@ -62,7 +62,7 @@ def main() -> None:
             sys.exit(detection.message)
         print(detection.message, flush=True)
 
-    engine = Engine(mode=args.mode)
+    engine = Engine(mode=args.mode, pz_dir=args.pz_dir)
     port = free_port(args.port)
     httpd = make_server(engine, port=port)
     port = httpd.server_address[1]
