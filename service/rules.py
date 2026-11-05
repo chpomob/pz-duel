@@ -1,8 +1,10 @@
-"""Moteur de règles : chargement strict des tables (presets).
+"""Moteur de règles : chargement strict des tables (presets) et évaluation.
 
 `load_table` refuse tout ce qui sort du schéma de la spec, avec un message français
 nommant la règle, ou la section hors règle, et le champ. Les bornes viennent de
 `limits`, le catalogue a la forme de `service/effects.json`.
+
+`RuleEvaluator` évalue une table validée pour un camp, sans horloge, fichier ni réseau.
 """
 
 from __future__ import annotations
@@ -12,8 +14,10 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Collection, Mapping
-from dataclasses import dataclass
+from bisect import bisect_left, bisect_right, insort
+from collections.abc import Collection, Mapping, MutableMapping
+from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -24,6 +28,11 @@ ALLOWED_MODS = ["duelcore"]
 ALLOWED_SOURCE = "server"
 SIDES = ("A", "B")
 TARGETS = ("self", "opponent")
+MS_PER_S = 1000
+KILL_ATOM = "zombie_kill"
+DUEL_ORIGIN = "duel"
+# Absents de la commande : `target` devient le camp visé, `cap_per_min` reste au budget.
+NON_COMMAND_PARAMS = ("target", "cap_per_min")
 
 TABLE_KEYS = (
     "id",
@@ -83,6 +92,46 @@ class When:
     def atoms(self) -> tuple[str, ...]:
         cited = (self.atom, self.absent_atom, self.then_atom)
         return tuple(atom for atom in cited if atom is not None)
+
+
+@dataclass(frozen=True)
+class FiredEffect:
+    """Effet à soumettre aux budgets : `params` porte `kind` et le `n` modifié."""
+
+    target: str
+    params: Mapping[str, Any]
+    cap_per_min: int | None = None
+    defender_bonus: bool = False
+
+
+@dataclass(frozen=True)
+class FiredRule:
+    """Déclenchement d'une règle, `event` étant l'événement qui l'a provoqué."""
+
+    rule: str
+    side: str
+    event: Mapping[str, Any]
+    multipliers: Mapping[str, float]
+    effects: tuple[FiredEffect, ...]
+
+
+@dataclass
+class _RuleState:
+    """État d'une règle pour un camp, les dates étant des `te` en ms, triés.
+
+    Toute base se ramène à `need` occurrences tenant dans `span_ms` : un atome est un
+    compte sans fenêtre (`None`), de `every` ou de 1. Une occurrence dont l'absence
+    échoue reste donc en attente. `spent` garde les `b` qui ont déclenché.
+    """
+
+    rule: Mapping[str, Any]
+    when: When
+    need: int
+    span_ms: int | None
+    occurrences: list[int] = field(default_factory=list)
+    arms: list[int] = field(default_factory=list)
+    followers: list[int] = field(default_factory=list)
+    spent: list[int] = field(default_factory=list)
 
 
 def load_runtime() -> dict:
@@ -433,3 +482,177 @@ def _check_items(
             _fail(where, f"{path}.item", f"objet « {item} » cité deux fois")
         seen.add(item)
         _check_int(entry["count"], where, f"{path}.count", 1, limits["max_item_count"])
+
+
+def _exact(value: int | float) -> Fraction:
+    """Valeur décimale écrite dans la table, sans l'erreur du flottant binaire (D7)."""
+    return Fraction(str(value))
+
+
+def _opponent(side: str) -> str:
+    return SIDES[1 - SIDES.index(side)]
+
+
+def _rule_state(rule: Mapping[str, Any]) -> _RuleState:
+    when = parse_when(rule["when"])
+    if when.count is not None:
+        return _RuleState(rule, when, when.count, when.within_s * MS_PER_S)
+    return _RuleState(rule, when, rule.get("every", 1), None)
+
+
+class RuleEvaluator:
+    """Règles et modificateurs d'un camp, sur une table validée par `load_table`.
+
+    `scores`, partagé par les évaluateurs des deux camps, associe chaque camp à son
+    score ; chacun n'y crédite que le sien. Les fenêtres restent triées par `te` : un
+    événement en retard s'y insère à sa place, quel que soit l'ordre de traitement.
+    """
+
+    def __init__(self, table: Mapping[str, Any], side: str, scores: MutableMapping[str, int]):
+        self.side = side
+        self.combo_series = 0
+        self._scores = scores
+        self._points = table["score"]["points"]
+        self._atoms = frozenset(table["atoms"])
+        self._combo = table["modifiers"].get("combo")
+        self._gap = table["modifiers"].get("score_gap")
+        self._rules = [
+            _rule_state(rule) for rule in table["rules"] if side in rule.get("sides", SIDES)
+        ]
+        self._history: dict[str, list[int]] = {
+            state.when.absent_atom: [] for state in self._rules if state.when.absent_atom
+        }
+
+    def feed(self, event: Mapping[str, Any], te_ms: int) -> list[FiredRule]:
+        """Traite un événement et rend les règles déclenchées, dans l'ordre de la table.
+
+        Le score et le combo sont mis à jour avant l'évaluation. Tout atome accepté
+        réévalue les règles, une règle ne se déclenchant qu'une fois par événement : ce
+        qui reste réalisable attend l'événement suivant. Un `beat` ou un `caps` n'est
+        pas un atome et ne réévalue rien.
+        """
+        kind = event["kind"]
+        if event["side"] != self.side or te_ms < 0:
+            return []
+        self._scores[self.side] += self._points.get(kind, 0)
+        duel_spawn = kind == KILL_ATOM and event["data"].get("origin") == DUEL_ORIGIN
+        if duel_spawn or kind not in self._atoms:
+            return []
+        self._update_combo(kind)
+        self._record(kind, te_ms)
+        return [self._fire(state, event) for state in self._rules if self._fires(state, te_ms)]
+
+    def _update_combo(self, kind: str) -> None:
+        if self._combo is None:
+            return
+        if kind == self._combo["reset_on"]:
+            self.combo_series = 0
+        elif kind == self._combo["on"]:
+            self.combo_series += 1
+
+    def _record(self, kind: str, te_ms: int) -> None:
+        if kind in self._history:
+            insort(self._history[kind], te_ms)
+        for state in self._rules:
+            if kind == state.when.atom:
+                insort(state.occurrences, te_ms)
+            if kind == state.when.then_atom:
+                insort(state.followers, te_ms)
+
+    def _fires(self, state: _RuleState, te_ms: int) -> bool:
+        instant = self._realise(state, te_ms)
+        if state.when.then_atom is None:
+            return instant is not None
+        if instant is not None and not self._already_disarmed(state, instant):
+            insort(state.arms, instant)
+        return self._series_fires(state)
+
+    def _realise(self, state: _RuleState, te_ms: int) -> int | None:
+        """Consomme les `need` occurrences les plus anciennes qui réalisent la base.
+
+        Rend l'instant de réalisation : `te_ms`, ou la dernière occurrence si l'événement
+        traité est en retard sur elle. Une absence en échec ne consomme rien. Une série
+        passe aussi par ici : sa base est consommée à l'armement.
+        """
+        dates, need, span = state.occurrences, state.need, state.span_ms
+        first = 0 if span is None else bisect_left(dates, te_ms - span)
+        for start in range(first, len(dates) - need + 1):
+            instant = max(te_ms, dates[start + need - 1])
+            if span is not None and instant - dates[start] > span:
+                continue
+            if self._absence_holds(state.when, instant):
+                del dates[start : start + need]
+                return instant
+        return None
+
+    def _absence_holds(self, when: When, instant: int) -> bool:
+        if when.absent_atom is None:
+            return True
+        dates = self._history[when.absent_atom]
+        oldest = instant - when.absent_within_s * MS_PER_S
+        return bisect_left(dates, oldest) == bisect_right(dates, instant)
+
+    def _already_disarmed(self, state: _RuleState, instant: int) -> bool:
+        """Dit si un `b` déjà retenu tombe dans `[t, t+D]` d'une réalisation traitée après lui.
+
+        Traitée avant ce `b`, elle aurait été désarmée par lui : l'ordre de traitement ne
+        doit pas lui rendre un armement.
+        """
+        index = bisect_left(state.spent, instant)
+        window = state.when.then_within_s * MS_PER_S
+        return index < len(state.spent) and state.spent[index] <= instant + window
+
+    def _series_fires(self, state: _RuleState) -> bool:
+        """Cherche un `b` dans `]t, t+D]` d'un armement, et désarme s'il y en a un.
+
+        Chaque réalisation garde son intervalle : leur union est l'échéance repoussée. Un
+        intervalle dépassé ne peut plus retenir qu'un `b` en retard, daté à l'intérieur.
+        Une réalisation postérieure au `b` retenu reste armée.
+        """
+        window = state.when.then_within_s * MS_PER_S
+        for armed_at in state.arms:
+            index = bisect_right(state.followers, armed_at)
+            if index < len(state.followers) and state.followers[index] <= armed_at + window:
+                follower = state.followers.pop(index)
+                insort(state.spent, follower)
+                state.arms = [date for date in state.arms if date > follower]
+                return True
+        return False
+
+    def _multipliers(self) -> dict[str, Fraction]:
+        multipliers: dict[str, Fraction] = {}
+        if self._combo is not None:
+            grown = 1 + _exact(self._combo["per"]) * self.combo_series
+            multipliers["combo"] = min(_exact(self._combo["max"]), grown)
+        if self._gap is not None:
+            gap = self._scores[self.side] - self._scores[_opponent(self.side)]
+            if gap > self._gap["when_gt"]:
+                multipliers["score_gap"] = _exact(self._gap["attacker"])
+        return multipliers
+
+    def _fire(self, state: _RuleState, event: Mapping[str, Any]) -> FiredRule:
+        multipliers = self._multipliers()
+        product = math.prod(multipliers.values(), start=Fraction(1))
+        declared = state.rule["effects"]
+        effects = [self._resolve(effect, product) for effect in declared]
+        if "score_gap" in multipliers and any("n" in effect for effect in declared):
+            bonus = self._resolve(self._gap["defender_bonus"], Fraction(1))
+            effects.append(replace(bonus, defender_bonus=True))
+        return FiredRule(
+            rule=state.rule["id"],
+            side=self.side,
+            event=event,
+            multipliers={name: float(value) for name, value in multipliers.items()},
+            effects=tuple(effects),
+        )
+
+    def _resolve(self, effect: Mapping[str, Any], product: Fraction) -> FiredEffect:
+        params = {
+            key: copy.deepcopy(value)
+            for key, value in effect.items()
+            if key not in NON_COMMAND_PARAMS
+        }
+        if "n" in params:
+            params["n"] = max(1, math.floor(params["n"] * product))
+        target = self.side if effect.get("target") == "self" else _opponent(self.side)
+        return FiredEffect(target, params, effect.get("cap_per_min"))
