@@ -5,6 +5,8 @@ nommant la règle, ou la section hors règle, et le champ. Les bornes viennent d
 `limits`, le catalogue a la forme de `service/effects.json`.
 
 `RuleEvaluator` évalue une table validée pour un camp, sans horloge, fichier ni réseau.
+`MatchCore` y ajoute la grille de ticks et les files de lots : il ne lit ni horloge, ni
+fichier, ni réseau, et rend ses enregistrements dans l'ordre d'écriture du journal.
 """
 
 from __future__ import annotations
@@ -15,11 +17,14 @@ import json
 import math
 import re
 from bisect import bisect_left, bisect_right, insort
+from collections import deque
 from collections.abc import Collection, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, NoReturn
+
+from .protocol import PROTOCOL_VERSION
 
 RUNTIME_PATH = Path(__file__).resolve().parent / "runtime.json"
 EFFECTS_PATH = Path(__file__).resolve().parent / "effects.json"
@@ -31,6 +36,8 @@ TARGETS = ("self", "opponent")
 MS_PER_S = 1000
 KILL_ATOM = "zombie_kill"
 DUEL_ORIGIN = "duel"
+CMD_RESULT = "cmd_result"
+RESTARTING = "restarting"
 # Absents de la commande : `target` devient le camp visé, `cap_per_min` reste au budget.
 NON_COMMAND_PARAMS = ("target", "cap_per_min")
 
@@ -132,6 +139,29 @@ class _RuleState:
     arms: list[int] = field(default_factory=list)
     followers: list[int] = field(default_factory=list)
     spent: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _Lot:
+    """Effets en attente sous une même clé : `params` porte `kind` et le `n` cumulé.
+
+    `rule` et `event` viennent de l'effet qui a créé le lot, `oldest_t_ms` de son
+    événement le plus ancien, qui peut être arrivé après en retard (D8).
+    """
+
+    params: dict[str, Any]
+    rule: str
+    event: Mapping[str, Any]
+    oldest_t_ms: int
+
+
+@dataclass
+class _RunningEffect:
+    """Effet en cours sur `target` ; `release_ms` reste nul jusqu'à son `cmd_result`."""
+
+    target: str
+    duration_ms: int
+    release_ms: int | None = None
 
 
 def load_runtime() -> dict:
@@ -656,3 +686,198 @@ class RuleEvaluator:
             params["n"] = max(1, math.floor(params["n"] * product))
         target = self.side if effect.get("target") == "self" else _opponent(self.side)
         return FiredEffect(target, params, effect.get("cap_per_min"))
+
+
+class MatchCore:
+    """Cœur déterministe d'un match : horloge à ticks, évaluation et files par cible.
+
+    Tout se compte en millisecondes entières depuis `t0_ms` et en index de tick, `mt`
+    n'étant calculé qu'à la sortie. `t_ms` date les événements et ne cadence jamais les
+    ticks. Un enregistrement a les arguments de `Journal.write` : `type`, `data`, `side`
+    et `mt`. `reserve_seq` agit tout de suite, car une sonde part hors de tout tick.
+    """
+
+    def __init__(
+        self,
+        table: Mapping[str, Any],
+        runtime: Mapping[str, Any],
+        catalog: Mapping[str, Any],
+        t0_ms: int,
+        duration_s: int,
+    ):
+        self.scores = {side: 0 for side in SIDES}
+        self.catalog = catalog
+        self.duration_s = duration_s
+        self._t0_ms = t0_ms
+        self._tick_ms = runtime["tick_ms"]
+        self._rate_window_ms = runtime["rate_window_s"] * MS_PER_S
+        budget = table["budget"]
+        self._threats_per_window = budget["threats_per_minute"]
+        self._concurrent_effects = budget["concurrent_effects"]
+        self._cooldown_ms = budget["per_effect_cooldown_s"] * MS_PER_S
+        self._evaluators = {side: RuleEvaluator(table, side, self.scores) for side in SIDES}
+        self._tick = -1
+        self._events: list[Mapping[str, Any]] = []
+        self._state_inputs: list[tuple[str, str]] = []
+        self._records: list[dict[str, Any]] = []
+        # Un dict garde l'ordre d'insertion : c'est la file FIFO, indexée par clé de lot.
+        self._lots: dict[str, dict[str, _Lot]] = {side: {} for side in SIDES}
+        self._running: dict[int, _RunningEffect] = {}
+        self._restarting: set[str] = set()
+        self._last_sent: dict[tuple[str, str], int] = {}
+        self._sent: dict[str, deque[int]] = {side: deque() for side in SIDES}
+        self._last_seq = 0
+
+    @property
+    def mt(self) -> float | None:
+        """`mt` du dernier tick exécuté, nul avant le tick 0."""
+        return None if self._tick < 0 else self._mt()
+
+    def submit_event(self, event: Mapping[str, Any]) -> None:
+        """Rattache un événement accepté, `cmd_result` compris, au prochain tick."""
+        self._events.append(event)
+
+    def submit_state(self, side: str, state: str) -> None:
+        """Rattache un changement d'état du serveur `side` au prochain tick."""
+        self._state_inputs.append((side, state))
+
+    def reserve_seq(self, seq: int) -> None:
+        """Consomme le `seq` d'une commande écrite hors du cœur, comme une sonde."""
+        self._last_seq = max(self._last_seq, seq)
+
+    def advance(self, now_ms: int) -> list[dict[str, Any]]:
+        """Exécute dans l'ordre tous les ticks non clos jusqu'à l'instant courant."""
+        last_tick = (now_ms - self._t0_ms) // self._tick_ms
+        records: list[dict[str, Any]] = []
+        while self._tick < last_tick:
+            records += self.run_tick()
+        return records
+
+    def run_tick(self) -> list[dict[str, Any]]:
+        """Exécute le tick suivant : événements, intrants, échéances, puis émission."""
+        self._tick += 1
+        self._records = []
+        events, self._events = self._events, []
+        for event in sorted(events, key=lambda e: (e["t_ms"], e["src"], e["boot"], e["seq"])):
+            self._process_event(event)
+        inputs, self._state_inputs = self._state_inputs, []
+        for side, state in inputs:
+            self._apply_state(side, state)
+        self._release_due()
+        self._serve_queues()
+        return self._records
+
+    @property
+    def _now_ms(self) -> int:
+        return self._tick * self._tick_ms
+
+    def _mt(self) -> float:
+        return self._now_ms / MS_PER_S
+
+    def _record(self, type: str, data: Mapping[str, Any], side: str | None) -> None:
+        self._records.append({"type": type, "data": data, "side": side, "mt": self._mt()})
+
+    def _is_late(self, te_ms: int) -> bool:
+        """Compare `te` au dernier tick clos : au tick 0, aucun ne l'est encore."""
+        return self._tick > 0 and te_ms <= self._now_ms - self._tick_ms
+
+    def _process_event(self, event: Mapping[str, Any]) -> None:
+        kind, side = event["kind"], event["side"]
+        te_ms = event["t_ms"] - self._t0_ms
+        self._record(CMD_RESULT if kind == CMD_RESULT else "event", event, side)
+        if self._is_late(te_ms):
+            data = {
+                "boot": event["boot"],
+                "seq": event["seq"],
+                "te": te_ms / MS_PER_S,
+                "mt": self._mt(),
+            }
+            self._record("late_event", data, side)
+        if kind == CMD_RESULT:
+            self._settle(event["data"]["seq"])
+        elif side is not None:
+            for fired in self._evaluators[side].feed(event, te_ms):
+                self._apply_rule(fired)
+
+    def _settle(self, seq: int) -> None:
+        """Date la fin d'un effet : ni un doublon, ni une sonde n'y changent rien."""
+        effect = self._running.get(seq)
+        if effect is not None and effect.release_ms is None:
+            effect.release_ms = self._now_ms + effect.duration_ms
+
+    def _apply_rule(self, fired: FiredRule) -> None:
+        source = fired.event
+        data = {
+            "rule": fired.rule,
+            "event": {"src": source["src"], "boot": source["boot"], "seq": source["seq"]},
+            "multipliers": dict(fired.multipliers),
+        }
+        self._record("rule_fired", data, fired.side)
+        for effect in fired.effects:
+            self._enqueue(fired, effect)
+
+    def _enqueue(self, fired: FiredRule, effect: FiredEffect) -> None:
+        """Crée le lot de l'effet ou l'y cumule : `n` seul reste hors de la clé."""
+        params = dict(effect.params)
+        units = params.pop("n", None)
+        key = json.dumps(params, sort_keys=True)
+        lots = self._lots[effect.target]
+        t_ms = fired.event["t_ms"]
+        lot = lots.get(key)
+        if lot is None:
+            lots[key] = _Lot(dict(effect.params), fired.rule, fired.event, t_ms)
+            return
+        lot.oldest_t_ms = min(lot.oldest_t_ms, t_ms)
+        if units is not None:
+            lot.params["n"] += units
+        else:
+            data = {"rule": fired.rule, "kind": params["kind"]}
+            self._record("effect_coalesced", data, effect.target)
+
+    def _apply_state(self, side: str, state: str) -> None:
+        self._record("state", {"server": state}, side)
+        if state == RESTARTING:
+            self._restarting.add(side)
+        else:
+            self._restarting.discard(side)
+
+    def _release_due(self) -> None:
+        for seq, effect in list(self._running.items()):
+            if effect.release_ms is not None and effect.release_ms <= self._now_ms:
+                del self._running[seq]
+
+    def _serve_queues(self) -> None:
+        """Sert A puis B ; la première tête bloquée n'arrête que sa propre file."""
+        for target in SIDES:
+            lots = self._lots[target]
+            while lots:
+                key, lot = next(iter(lots.items()))
+                if not self._may_send(target, lot.params["kind"]):
+                    break
+                del lots[key]
+                self._send(target, lot)
+
+    def _may_send(self, target: str, kind: str) -> bool:
+        if target in self._restarting:
+            return False
+        last_sent = self._last_sent.get((target, kind))
+        if last_sent is not None and self._now_ms - last_sent < self._cooldown_ms:
+            return False
+        sent = self._sent[target]
+        while sent and sent[0] <= self._now_ms - self._rate_window_ms:
+            sent.popleft()
+        if len(sent) >= self._threats_per_window:
+            return False
+        running = sum(effect.target == target for effect in self._running.values())
+        return running < self._concurrent_effects
+
+    def _send(self, target: str, lot: _Lot) -> None:
+        self._last_seq += 1
+        origin = {"rule": lot.rule, "boot": lot.event["boot"], "event_seq": lot.event["seq"]}
+        command = {"v": PROTOCOL_VERSION, "seq": self._last_seq, **lot.params, "origin": origin}
+        latency_ms = self._t0_ms + self._now_ms - lot.oldest_t_ms
+        self._record("command", {"command": command, "latency_ms": latency_ms}, target)
+        self._last_sent[target, lot.params["kind"]] = self._now_ms
+        self._sent[target].append(self._now_ms)
+        duration_ms = lot.params.get("duration_s", 0) * MS_PER_S
+        self._running[self._last_seq] = _RunningEffect(target, duration_ms)
