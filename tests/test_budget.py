@@ -196,6 +196,84 @@ def test_cmd_result_of_another_target_keeps_place():
     assert len(script.commands) == 2
 
 
+def ignored(script: Script) -> list[tuple]:
+    return [
+        (r["side"], r["data"]["seq"], r["data"]["reason"])
+        for r in script.of_type("cmd_result_ignored")
+    ]
+
+
+def test_cmd_result_from_another_source_releases_nothing():
+    script = Script(make_core(KILL_SPAWN, cooldown_s=0, concurrent=1))
+    script.send(0)
+    script.send(1)
+    script.result(2, cmd_seq=1, side="A")
+    script.to(3)
+    assert ignored(script) == [("A", 1, "wrong_source")]
+    assert len(script.commands) == 1
+    # La commande reste due à B : sa cible peut encore y répondre.
+    script.result(4, cmd_seq=1, side="B")
+    script.to(4.25)
+    assert len(script.commands) == 2
+    assert len(ignored(script)) == 1
+
+
+def test_cmd_result_from_another_source_keeps_command_loseable():
+    script = Script(make_core(KILL_SPAWN, cooldown_s=0, concurrent=1))
+    script.send(0)
+    script.result(1, cmd_seq=1, side="A")
+    script.core.submit_lost(1)
+    script.to(1.25)
+    assert [r["side"] for r in script.of_type("lost_on_restart")] == ["B"]
+
+
+def test_orphan_cmd_result_releases_nothing():
+    script = Script(make_core(KILL_SPAWN, cooldown_s=0, concurrent=1))
+    script.send(0)
+    script.send(1)
+    script.result(2, cmd_seq=99)
+    script.to(3)
+    assert ignored(script) == [("B", 99, "unknown_command")]
+    assert len(script.commands) == 1
+    assert len(script.of_type("cmd_result")) == 1
+
+
+def test_double_cmd_result_is_journaled_and_releases_once():
+    script = Script(make_core(rule("rain", "build", RAIN), KILL_SPAWN, cooldown_s=0, concurrent=1))
+    script.send(0, "build")
+    script.send(1)
+    script.result(2, cmd_seq=1)
+    assert ignored(script) == []
+    script.result(4, cmd_seq=1)
+    assert ignored(script) == [("B", 1, "already_settled")]
+    script.to(6.75)
+    assert len(script.commands) == 1
+    script.to(7)
+    assert len(script.commands) == 2
+
+
+def test_cmd_result_after_timeout_closes_command_without_release():
+    script = Script(make_core(KILL_SPAWN, cooldown_s=0, concurrent=1, cmd_result_timeout_s=1))
+    script.send(0)
+    script.to(1)
+    script.result(1.5, cmd_seq=1)
+    assert ignored(script) == [("B", 1, "already_settled")]
+    script.core.submit_lost(1)
+    script.to(1.75)
+    assert script.of_type("lost_on_restart") == []
+
+
+def test_probe_result_is_not_an_orphan():
+    core = make_core(KILL_SPAWN, cooldown_s=0, concurrent=1)
+    core.reserve_seq(2)
+    script = Script(core)
+    script.send(0)
+    script.result(1, cmd_seq=2, side="A")
+    script.result(1.25, cmd_seq=1, side="B")
+    assert ignored(script) == []
+    assert len(script.of_type("cmd_result")) == 2
+
+
 def test_reserve_seq_keeps_commands_increasing():
     core = make_core(KILL_SPAWN, cooldown_s=0, concurrent=2)
     core.reserve_seq(3)

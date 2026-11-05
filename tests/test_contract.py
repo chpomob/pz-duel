@@ -430,6 +430,22 @@ def test_window_never_closes_before_l():
     assert opened.due(10)
 
 
+def test_registered_hook_without_proof_withdraws_atom():
+    """`caps` publie l'enregistrement : seul un `hook_seen` du hook requis le prouve."""
+    opened = ContractWindow({"atoms": [ATOM]}, load_effects(), 120)
+    for side in SIDES:
+        opened.on_caps(side, {"atoms": [ATOM], "hooks": {HOOK: True}})
+        opened.on_hook_seen(side, "OnHitZombie", 0)
+    opened.on_hook_seen("A", HOOK, 0)
+    opened.reach_lobby_ready(0)
+
+    assert not opened.due(119_999)
+    assert opened.due(120_000)
+    opened.close()
+    assert opened.withdrawn == [{"atom": ATOM, "hook": HOOK, "sides": ["B"]}]
+    assert opened.active_atoms == []
+
+
 def test_window_opens_at_first_caps():
     opened = ContractWindow({"atoms": [ATOM]}, load_effects(), 120)
 

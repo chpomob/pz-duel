@@ -290,6 +290,9 @@ def test_hook_seen_distinct_from_registered():
     assert published["hooks"][HOOK] == {"registered": True, "seen": True}
     assert published["hooks"]["OnZombieDead"] == {"registered": True, "seen": False}
     assert published["hooks"]["OnEnterVehicle"] == {"registered": False, "seen": False}
+
+    published = publish_capabilities(CAPS, ["OnZombieDead"])
+    assert published["hooks"][HOOK] == {"registered": True, "seen": False}
     assert published["functions"] == {"addZombiesInOutfit": True}
 
     assert publish_capabilities(None, []) == {"hooks": {}, "functions": {}}

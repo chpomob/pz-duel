@@ -39,6 +39,7 @@ MS_PER_S = 1000
 KILL_ATOM = "zombie_kill"
 DUEL_ORIGIN = "duel"
 CMD_RESULT = "cmd_result"
+CMD_RESULT_IGNORED = "cmd_result_ignored"
 PLAYER_DEATH = "player_death"
 RESTARTING = "restarting"
 # Absents de la commande : `target` devient le camp visé, `cap_per_min` reste au budget.
@@ -743,6 +744,8 @@ class MatchCore:
         self._last_sent: dict[tuple[str, str], int] = {}
         self._sent: dict[str, deque[int]] = {side: deque() for side in SIDES}
         self._last_seq = 0
+        # Dernier `seq` écrit hors du cœur : le résultat d'une sonde n'y concerne aucun effet.
+        self._reserved_seq = 0
 
     @property
     def mt(self) -> float | None:
@@ -769,6 +772,7 @@ class MatchCore:
     def reserve_seq(self, seq: int) -> None:
         """Consomme le `seq` d'une commande écrite hors du cœur, comme une sonde."""
         self._last_seq = max(self._last_seq, seq)
+        self._reserved_seq = max(self._reserved_seq, seq)
 
     def advance(self, now_ms: int) -> list[dict[str, Any]]:
         """Exécute dans l'ordre tous les ticks non clos jusqu'à l'instant courant."""
@@ -831,23 +835,39 @@ class MatchCore:
             }
             self._record("late_event", data, side)
         if kind == CMD_RESULT:
-            self._settle(event["data"]["seq"])
+            self._settle(event["src"], event["data"]["seq"])
         elif side is not None:
             if kind == PLAYER_DEATH and te_ms >= 0 and self._ending is None:
                 self._ending = self._death_result(side)
             for fired in self._evaluators[side].feed(event, te_ms):
                 self._apply_rule(fired)
 
-    def _settle(self, seq: int) -> None:
-        """Date la fin d'un effet : ni un doublon, ni une sonde n'y changent rien.
+    def _settle(self, src: str, seq: int) -> None:
+        """Date la fin de l'effet `seq`, sur le seul résultat attendu de sa cible.
 
-        Après un `cmd_timeout` ou un `lost_on_restart`, l'effet n'est plus suivi : un
-        `cmd_result` tardif ne libère donc pas une seconde fois sa place.
+        Tout autre résultat est journalisé et ne libère rien : `seq` inconnu, source qui
+        n'est pas la cible, doublon, ou effet déjà rendu par `cmd_timeout` ou par
+        `lost_on_restart`. Un `cmd_result` tardif clôt quand même sa commande, qu'un
+        redémarrage ne rendra donc pas perdue. Une sonde n'est pas un effet : son résultat
+        ne regarde que le moteur.
         """
-        self._unanswered.pop(seq, None)
-        effect = self._running.get(seq)
-        if effect is not None and effect.release_ms is None:
-            effect.release_ms = self._now_ms + effect.duration_ms
+        if seq <= self._reserved_seq:
+            return
+        target = self._unanswered.get(seq)
+        if target == src:
+            del self._unanswered[seq]
+            effect = self._running.get(seq)
+            if effect is not None:
+                effect.release_ms = self._now_ms + effect.duration_ms
+                return
+            reason = "already_settled"
+        elif target is not None:
+            reason = "wrong_source"
+        elif seq <= self._last_seq:
+            reason = "already_settled"
+        else:
+            reason = "unknown_command"
+        self._record(CMD_RESULT_IGNORED, {"seq": seq, "reason": reason}, src)
 
     def _apply_rule(self, fired: FiredRule) -> None:
         source = fired.event

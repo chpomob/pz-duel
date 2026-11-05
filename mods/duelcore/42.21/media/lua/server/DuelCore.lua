@@ -46,6 +46,12 @@ local RAIN_INTENSITY = 1.0
 local SPRINT_WALK_TYPE = "sprint1"
 local DUEL_MARK = "duelOrigin"
 
+-- Au-delà, un `seq` ne vient pas du compteur du service : l'accepter bloquerait les suivants.
+local MAX_CMD_SEQ = 2147483647
+-- Un coup sans mort oublié passé ce délai : le zombie a disparu, ou le jeu l'a recyclé.
+local ATTACKER_TTL_MS = 120000
+local ATTACKER_PURGE_MS = 30000
+
 -- État de session. `session` reste nil tant que le plancher est inconnu : sans lui,
 -- aucune commande n'est traitée et rien n'est émis, faute de `boot`.
 local session = nil
@@ -59,6 +65,7 @@ local nextFlush = 0
 local nextRead = 0
 local nextAck = 0
 local nextBeat = 0
+local nextAttackerPurge = 0
 local rainStopAt = nil
 
 local hooks = {}
@@ -257,8 +264,14 @@ local function decodeJson(text)
     return value
 end
 
+-- `1e999` décode en infini, et l'infini passe `math.floor(value) == value`.
 local function isInteger(value)
-    return type(value) == "number" and math.floor(value) == value
+    return type(value) == "number" and value > -math.huge and value < math.huge
+        and math.floor(value) == value
+end
+
+local function isCmdSeq(value, lowest)
+    return isInteger(value) and value >= lowest and value <= MAX_CMD_SEQ
 end
 
 -- Émission ------------------------------------------------------------------------
@@ -348,8 +361,26 @@ local function positionData(character, data)
     return data
 end
 
+-- Sans preuve de réception, un hook reste `false` côté service, même enregistré.
+local function noteHook(name)
+    if not seenHooks[name] and emit("hook_seen", { hook = name }, side) then
+        seenHooks[name] = true
+    end
+end
+
 local function onHitZombie(zombie, wielder)
-    if isPlayer(wielder) then lastAttacker[zombie] = wielder end
+    if isPlayer(wielder) then
+        lastAttacker[zombie] = { wielder = wielder, at = getTimestampMs() }
+    end
+end
+
+-- La table est rebâtie : une entrée n'y survit que par un coup récent.
+local function purgeAttackers(now)
+    local kept = {}
+    for zombie, hit in pairs(lastAttacker) do
+        if now - hit.at < ATTACKER_TTL_MS then kept[zombie] = hit end
+    end
+    lastAttacker = kept
 end
 
 local function onZombieDead(zombie)
@@ -358,8 +389,9 @@ local function onZombieDead(zombie)
     recentDead[zombie] = true
 
     local author = zombie:getAttackedBy()
-    if not isPlayer(author) then author = lastAttacker[zombie] end
+    local hit = lastAttacker[zombie]
     lastAttacker[zombie] = nil
+    if not isPlayer(author) then author = hit and hit.wielder end
 
     -- Le jeu recycle ses zombies sans vider leur modData : la marque ne survit pas au mort.
     local modData = zombie:getModData()
@@ -369,12 +401,15 @@ local function onZombieDead(zombie)
     emit("zombie_kill", positionData(zombie, { w = weaponOf(author), origin = origin }), sideOf(author))
 end
 
+-- Le coup d'un joueur sur un zombie tire aussi ce hook, sans rien dire de `damage_taken` :
+-- la preuve est le premier atome émis, pas la première réception.
 local function onWeaponHitCharacter(wielder, target, weapon, damage)
     if not isPlayer(target) then return end
     emit("damage_taken", positionData(target, {
         w = weapon and weapon:getFullType() or NULL,
         damage = damage or NULL,
     }), side)
+    noteHook("OnWeaponHitCharacter")
 end
 
 local function onProcessAction(action, character)
@@ -452,19 +487,14 @@ end
 
 -- Sondes --------------------------------------------------------------------------
 
-local function noteHook(name)
-    if not seenHooks[name] and emit("hook_seen", { hook = name }, side) then
-        seenHooks[name] = true
-    end
-end
-
-local function register(name, handler)
+-- `selfProved` : le traitement appelle lui-même `noteHook`, sur ce qui prouve le hook.
+local function register(name, handler, selfProved)
     local event = Events[name]
     hooks[name] = false
     if not event or not event.Add then return end
     local ok = pcall(event.Add, function(...)
         local done, err = pcall(function(...)
-            noteHook(name)
+            if not selfProved then noteHook(name) end
             if handler then handler(...) end
         end, ...)
         if not done then logError(err) end
@@ -474,7 +504,7 @@ end
 
 register("OnZombieDead", onZombieDead)
 register("OnHitZombie", onHitZombie)
-register("OnWeaponHitCharacter", onWeaponHitCharacter)
+register("OnWeaponHitCharacter", onWeaponHitCharacter, true)
 register("OnProcessAction", onProcessAction)
 register("OnThrowableExplode", onThrowableExplode)
 register("OnCharacterDeath", onCharacterDeath)
@@ -704,7 +734,11 @@ end
 local function acceptCommandLine(line)
     local cmd = decodeJson(line)
     if type(cmd) ~= "table" or cmd.v ~= PROTOCOL then return end
-    if not isInteger(cmd.seq) or type(cmd.kind) ~= "string" then return end
+    if not isCmdSeq(cmd.seq, 1) then
+        logError("commande refusée, seq invalide : " .. tostring(cmd.seq))
+        return
+    end
+    if type(cmd.kind) ~= "string" then return end
     if cmd.seq <= lastCmdSeq or cmd.seq <= session.cmd_floor then return end
     lastCmdSeq = cmd.seq
     local warn = type(cmd.warn_s) == "number" and cmd.warn_s or 0
@@ -793,7 +827,11 @@ local function openSession(now)
     local text = readSessionText()
     local loaded = text and decodeJson(text)
     if type(loaded) ~= "table" or loaded.v ~= PROTOCOL or loaded.side ~= side then return end
-    if not isInteger(loaded.boot) or not isInteger(loaded.cmd_floor) then return end
+    if not isInteger(loaded.boot) then return end
+    if not isCmdSeq(loaded.cmd_floor, 0) then
+        logError("session refusée, cmd_floor invalide : " .. tostring(loaded.cmd_floor))
+        return
+    end
     session = loaded
     lastCmdSeq = session.cmd_floor
     nextBeat = now + BEAT_MS
@@ -803,6 +841,11 @@ end
 local function step()
     -- getTimestampMs et non EveryOneMinute : le cadencement suit le temps réel.
     local now = getTimestampMs()
+    if now >= nextAttackerPurge then
+        nextAttackerPurge = now + ATTACKER_PURGE_MS
+        purgeAttackers(now)
+    end
+
     if not session then
         if now < nextRead then return end
         nextRead = now + READ_MS

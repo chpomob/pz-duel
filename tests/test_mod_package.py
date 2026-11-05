@@ -115,6 +115,75 @@ def test_command_reader_guards() -> None:
     assert guard < advance < enqueue
 
 
+def test_hook_proof_is_a_hit_on_the_player() -> None:
+    """`hook_seen` d'`OnWeaponHitCharacter` suit le premier `damage_taken`, jamais un coup sur zombie."""
+    code = lua_code()
+    assert re.search(r'register\("OnWeaponHitCharacter", onWeaponHitCharacter, true\)', code)
+    assert len(re.findall(r'^register\(.*, true\)$', code, re.MULTILINE)) == 1
+
+    wrapper = function_body("register")
+    assert re.search(r"if not selfProved then noteHook\(name\) end", wrapper)
+    assert wrapper.index("noteHook(name)") < wrapper.index("handler(...)")
+
+    handler = function_body("onWeaponHitCharacter")
+    guard = handler.index("if not isPlayer(target) then return end")
+    atom = handler.index('emit("damage_taken"')
+    proof = handler.index('noteHook("OnWeaponHitCharacter")')
+    assert guard < atom < proof
+
+
+def test_caps_publish_registration_not_proof() -> None:
+    caps = function_body("emitCaps")
+    assert "hooks = hooks" in caps
+    assert 'addAtom("damage_taken", hooks.OnWeaponHitCharacter)' in caps
+    assert "seenHooks" not in caps
+    assert "seenHooks" not in function_body("register")
+
+
+def test_last_attacker_is_purged() -> None:
+    """Un zombie touché qui ne meurt jamais ne reste pas dans la table."""
+    dead = function_body("onZombieDead")
+    assert "lastAttacker[zombie] = nil" in dead
+    assert "hit.wielder" in dead
+
+    hit = function_body("onHitZombie")
+    assert re.search(r"at = getTimestampMs\(\)", hit)
+
+    purge = function_body("purgeAttackers")
+    assert re.search(r"now - hit\.at < ATTACKER_TTL_MS", purge)
+    assert re.search(r"lastAttacker = kept", purge)
+
+    step = function_body("step")
+    assert "purgeAttackers(now)" in step
+    assert step.index("purgeAttackers(now)") < step.index("if not session then")
+    # Kahlua n'honore pas `__mode` : la purge ne repose pas sur une table faible.
+    assert "__mode" not in lua_code()
+
+
+def test_command_seq_is_bounded_before_any_advance() -> None:
+    """`1e999` décode en infini : ni `lastCmdSeq` ni `cmd_floor` ne doivent le prendre."""
+    integer = function_body("isInteger")
+    assert re.search(r"value > -math\.huge and value < math\.huge", integer)
+    assert integer.index("math.huge") < integer.index("math.floor")
+
+    bounded = function_body("isCmdSeq")
+    assert "isInteger(value)" in bounded
+    assert "value >= lowest" in bounded
+    assert "value <= MAX_CMD_SEQ" in bounded
+    limit = re.search(r"^local MAX_CMD_SEQ = (\d+)$", lua_code(), re.MULTILINE)
+    assert limit and int(limit.group(1)) < 9e15, "un `seq` fini immense bloquerait les suivants"
+
+    accept = function_body("acceptCommandLine")
+    check = accept.index("isCmdSeq(cmd.seq, 1)")
+    refusal = accept.index("logError(")
+    assert check < refusal < accept.index("lastCmdSeq = cmd.seq")
+    assert "error(" not in accept.replace("logError(", "")
+
+    session = function_body("openSession")
+    check = session.index("isCmdSeq(loaded.cmd_floor, 0)")
+    assert check < session.index("logError(") < session.index("session = loaded")
+
+
 def test_number_decoder_follows_json_grammar() -> None:
     """Un `seq` hors grammaire ne doit pas atteindre `tonumber`, qui l'accepterait."""
     body = function_body("decodeNumber")
