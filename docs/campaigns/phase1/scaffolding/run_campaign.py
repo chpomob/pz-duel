@@ -38,7 +38,7 @@ PY = str(REPO / ".venv/bin/python")
 LOOP = "/home/chpo/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py"
 DEV_CMD = (
     "python3 /home/chpo/claude-tmux-wrapper/claude-tmux.py "
-    "--timeout 1800 --hard-timeout 2700 --max-turns 24 --cwd /home/chpo/pz-duel"
+    "--timeout 2700 --hard-timeout 3300 --max-turns 30 --cwd /home/chpo/pz-duel"
 )
 REVIEW_CMD = "bash /home/chpo/.config/adversarial/codex-loop-review.sh"
 
@@ -180,7 +180,7 @@ def run_loop(step: dict, spec_path: Path) -> int:
         "--test-cmd", TEST_CMD,
         "--max-loops", "3",
         "--no-arbiter",
-        "--timeout", "2700",
+        "--timeout", "3600",
         "--out", str(LOOP_OUT),
     ]
     with logfile.open("w", encoding="utf-8") as fh:
