@@ -1,12 +1,18 @@
-"""Contrat statique : chaque écart, relu sur le disque ou dans `caps`, est refusé et nommé."""
+"""Contrat : écarts statiques refusés et nommés, puis fenêtre de preuve des hooks."""
 
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from doubles.fake_mod import FakeMod
+from test_servers import stopped_for_good
+from test_snapshots import PLAYER_PASSWORD, engine_rig  # noqa: F401
+from service.engine import ContractWindow
 from service.rules import load_effects, load_table
 from service.servers import verify_contract, write_ini, write_sandbox
 
@@ -16,6 +22,15 @@ RCON_SECRET = "rcon-marker"
 SANDBOX = "SandboxVars = {\n    DayLength = 4,\n    StartYear = 3,\n    StartMonth = 1,\n" + (
     "    StartDay = 2,\n    StartTime = 5,\n}\n"
 )
+SIDES = ("A", "B")
+ATOM = "damage_taken"
+HOOK = "OnWeaponHitCharacter"
+WITH_ATOM = "duel_rapide"
+WITHOUT_ATOM = "demo"
+PLAYER = "durand"
+# `L` : le test fige l'horloge du moteur, tout se passe à cet instant sauf s'il l'avance.
+L_S = 1000.0
+MS = 1000
 
 
 def caps_data(table: dict) -> dict:
@@ -135,3 +150,291 @@ def test_absent_camp_files_refused(zomboid_home, table, runtime, conforming):
 
     assert len(failures) == 1
     assert "réglages de B illisibles" in failures[0]
+
+
+class FrozenClock:
+    """Instant courant fourni par le test : seule l'attente des doubles reste réelle."""
+
+    def __init__(self) -> None:
+        self.now = L_S
+        self.on_next_read: Callable[[], None] | None = None
+
+    def __call__(self) -> float:
+        if self.on_next_read is not None:
+            action, self.on_next_read = self.on_next_read, None
+            action()
+        return self.now
+
+
+class Lobby:
+    """Vrai `Engine` réel mené au lobby sur les doubles, à un instant fourni par le test."""
+
+    def __init__(self, rig, preset: str) -> None:
+        self.rig = rig
+        self.clock = FrozenClock()
+        self.engine = rig.build()
+        self.engine._clock = self.clock
+        catalog = self.engine.effects
+        data = {
+            "build": BUILD,
+            "mod": "0.1.0",
+            "protocol": 1,
+            "hooks": {HOOK: True},
+            "functions": {},
+            "atoms": list(catalog["atoms"]),
+            "effects": list(catalog["effects"]),
+        }
+        self.mods = {side: FakeMod(rig.zomboid / "Lua", side) for side in SIDES}
+        for side, mod in self.mods.items():
+            (rig.caps_dir / side).write_bytes(mod.line("caps", data))
+        ok, message = self.engine.action(
+            "start", {"preset": preset, "password": PLAYER_PASSWORD}
+        )
+        assert ok, message
+        state = rig.wait("lobby", "error")
+        assert state["phase"] == "lobby", state["error"]
+        self.match_id = state["match_id"]
+
+    def records(self, type_: str) -> list[dict]:
+        return [r for r in self.rig.journal(self.match_id) if r["type"] == type_]
+
+    def phases(self) -> list[str]:
+        return [r["data"]["phase"] for r in self.records("state") if "phase" in r["data"]]
+
+    def state(self) -> dict:
+        return self.engine.snapshot()
+
+    def step(self, step_id: str) -> dict:
+        return next(item for item in self.state()["steps"] if item["id"] == step_id)
+
+    def at(self, seconds_after_l: float) -> None:
+        self.clock.now = L_S + seconds_after_l
+
+    def settle(self) -> None:
+        """Attend qu'une passe ait lu une ligne écrite à l'instant courant."""
+        line = json.loads(self.mods["A"].beat(players=self.present("A")))
+        self.rig.until(lambda _: any(r["data"] == line for r in self.records("event")))
+        time.sleep(self.engine.runtime["tick_ms"] / MS * 3)
+
+    def present(self, side: str) -> tuple[str, ...]:
+        player = self.state()["players"][side]
+        return (player,) if player else ()
+
+    def wait_detail(self, text: str) -> None:
+        self.rig.until(lambda _: text in self.step("contract")["detail"])
+
+    def join(self, side: str) -> int:
+        """Connecte le joueur du camp et rend le `seq` de sa sonde."""
+        mod = self.mods[side]
+        mod.beat(players=(PLAYER,))
+        self.rig.until(lambda _: mod.in_path.read_bytes())
+        return json.loads(mod.in_path.read_bytes().splitlines()[-1])["seq"]
+
+    def join_and_resolve(self) -> None:
+        """Mène à `L` : les deux joueurs sont là et les deux sondes résolues."""
+        for side in SIDES:
+            self.mods[side].cmd_result(self.join(side), "applied", spawned=1)
+
+
+def state_entered_at(lobby: Lobby, phase: str) -> int:
+    return next(r["ts_ms"] for r in lobby.records("state") if r["data"].get("phase") == phase)
+
+
+def refused_at_window_end(lobby: Lobby) -> None:
+    lobby.mods["A"].hook_seen()
+    lobby.join_and_resolve()
+    lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 120 s")
+
+    lobby.at(119)
+    lobby.wait_detail("temps restant : 1 s")
+    assert lobby.state()["phase"] == "lobby"
+
+    lobby.at(120)
+    state = lobby.rig.wait("error")
+    for name in (ATOM, HOOK, "sur B"):
+        assert name in state["error"]
+    assert stopped_for_good(lobby.rig)
+    assert state["servers"] == {"A": "down", "B": "down"}
+    assert ATOM in state["capabilities"]["withdrawn"]
+    assert ATOM not in state["capabilities"]["active_atoms"]
+    # Ce refus ne conclut rien sur l'architecture.
+    assert state["capabilities"]["fallback"] is None
+    assert lobby.step("contract")["state"] == "error"
+    assert "countdown" not in lobby.phases()
+    (withdrawn,) = lobby.records("atom_withdrawn")
+    assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
+    assert withdrawn["ts_ms"] == (L_S + 120) * MS
+    assert withdrawn["mt"] is None
+
+
+def late_hook_read_with_the_deadline_pass(lobby: Lobby) -> None:
+    lobby.mods["A"].hook_seen()
+    lobby.join_and_resolve()
+    lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 120 s")
+
+    def miss_the_deadline() -> None:
+        # Sur le fil du moteur, juste avant `pump` : la passe qui constate l'échéance lit le hook.
+        lobby.at(120.001)
+        lobby.mods["B"].hook_seen()
+
+    lobby.clock.on_next_read = miss_the_deadline
+    state = lobby.rig.wait("countdown", "error")
+
+    assert state["phase"] == "error"
+    for name in (ATOM, HOOK, "sur B"):
+        assert name in state["error"]
+    assert "countdown" not in lobby.phases()
+    assert ATOM in state["capabilities"]["withdrawn"]
+    (withdrawn,) = lobby.records("atom_withdrawn")
+    assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
+    # Le hook tardif reste publié comme vu, sans compter dans la décision.
+    assert state["capabilities"]["B"]["hooks"][HOOK]["seen"]
+
+
+def published_without_the_atom(lobby: Lobby) -> None:
+    lobby.mods["A"].hook_seen()
+    lobby.join_and_resolve()
+
+    state = lobby.rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state_entered_at(lobby, "countdown") == L_S * MS
+    assert state["capabilities"]["withdrawn"] == [ATOM]
+    assert ATOM not in state["capabilities"]["active_atoms"]
+    assert "zombie_kill" in state["capabilities"]["active_atoms"]
+    (withdrawn,) = lobby.records("atom_withdrawn")
+    assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
+
+    # Un `hook_seen` tardif ne réactive rien, même publié comme vu.
+    lobby.mods["B"].hook_seen()
+    lobby.rig.until(lambda s: s["capabilities"]["B"]["hooks"][HOOK]["seen"])
+    assert lobby.state()["capabilities"]["withdrawn"] == [ATOM]
+    assert ATOM not in lobby.state()["capabilities"]["active_atoms"]
+
+
+def seen_on_both_sides(lobby: Lobby) -> None:
+    lobby.join_and_resolve()
+    lobby.wait_detail(f"hook {HOOK} attendu sur A, B ; temps restant : 120 s")
+
+    lobby.at(5)
+    lobby.wait_detail("temps restant : 115 s")
+    lobby.mods["A"].hook_seen()
+    lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 115 s")
+    assert lobby.state()["phase"] == "lobby"
+    lobby.mods["B"].hook_seen()
+
+    state = lobby.rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state_entered_at(lobby, "countdown") == (L_S + 5) * MS
+    assert ATOM in state["capabilities"]["active_atoms"]
+    assert state["capabilities"]["withdrawn"] == []
+    assert lobby.records("atom_withdrawn") == []
+
+
+@pytest.mark.parametrize(
+    "preset, scenario",
+    [
+        (WITH_ATOM, refused_at_window_end),
+        (WITH_ATOM, late_hook_read_with_the_deadline_pass),
+        (WITHOUT_ATOM, published_without_the_atom),
+        (WITH_ATOM, seen_on_both_sides),
+    ],
+)
+def test_unseen_hook_withdraws_atom(engine_rig, preset, scenario):
+    assert engine_rig.runtime["hook_window_s"] == 120
+
+    scenario(Lobby(engine_rig, preset))
+
+
+def test_hook_window_outlives_contract_step(engine_rig):
+    lobby = Lobby(engine_rig, WITH_ATOM)
+
+    assert lobby.step("contract")["state"] == "ok"
+    lobby.wait_detail(f"hook {HOOK} attendu sur A, B")
+    lobby.at(300)
+    lobby.settle()
+    assert lobby.state()["phase"] == "lobby"
+    assert lobby.records("atom_withdrawn") == []
+    assert lobby.state()["capabilities"]["active_atoms"] is None
+
+    lobby.at(0)
+    for mod in lobby.mods.values():
+        mod.hook_seen()
+    lobby.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    active = state["capabilities"]["active_atoms"]
+    assert ATOM in active
+
+    # Un nouveau `boot` publie ses `caps`, sans `hook_seen` : la décision reste.
+    mod = lobby.mods["A"]
+    mod.restart()
+    mod.caps(atoms=["zombie_kill"], hooks={HOOK: False})
+    engine_rig.until(lambda s: not s["capabilities"]["A"]["hooks"][HOOK]["registered"])
+    assert lobby.state()["capabilities"]["active_atoms"] == active
+    assert lobby.records("atom_withdrawn") == []
+
+
+def window(table_atoms: list[str]) -> ContractWindow:
+    opened = ContractWindow({"atoms": table_atoms}, load_effects(), 120)
+    for side in SIDES:
+        opened.on_caps(side, {"atoms": ["zombie_kill", ATOM]})
+    return opened
+
+
+def test_window_never_closes_before_l():
+    opened = window(["zombie_kill", ATOM])
+    for side in SIDES:
+        opened.on_hook_seen(side, HOOK, 0)
+
+    assert not opened.due(0)
+
+    opened.reach_lobby_ready(10)
+    assert opened.due(10)
+
+
+def test_window_opens_at_first_caps():
+    opened = ContractWindow({"atoms": [ATOM]}, load_effects(), 120)
+
+    opened.on_hook_seen("A", HOOK, 0)
+    assert opened.seen["A"] == set()
+
+    opened.on_caps("B", {"atoms": [ATOM]})
+    opened.on_hook_seen("A", HOOK, 0)
+    assert opened.seen["A"] == {HOOK}
+
+
+def test_window_keeps_first_l():
+    opened = window([ATOM])
+    opened.reach_lobby_ready(1000)
+    opened.reach_lobby_ready(5000)
+
+    assert not opened.due(120_999)
+    assert opened.due(121_000)
+
+
+def test_atom_missing_from_one_caps_is_not_active():
+    opened = window(["zombie_kill"])
+    opened.on_caps("B", {"atoms": ["zombie_kill"]})
+    opened.on_hook_seen("A", HOOK, 0)
+    opened.on_hook_seen("B", HOOK, 0)
+
+    opened.close()
+
+    assert opened.active_atoms == ["zombie_kill"]
+    assert opened.withdrawn == []
+
+
+def test_hook_after_deadline_is_published_but_proves_nothing():
+    opened = window([ATOM])
+    opened.reach_lobby_ready(1000)
+    opened.on_hook_seen("A", HOOK, 121_000)
+    opened.on_hook_seen("B", HOOK, 121_001)
+
+    assert opened.seen["B"] == {HOOK}
+    assert opened.due(121_001)
+    opened.close()
+
+    assert opened.withdrawn == [{"atom": ATOM, "hook": HOOK, "sides": ["B"]}]
+    assert ATOM not in opened.active_atoms
