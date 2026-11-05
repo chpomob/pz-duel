@@ -1,0 +1,112 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A1",
+      "status": "RESOLVED",
+      "evidence": "service/api.py:63,80,101,103 : Host est contrôlé sur les routes API, les Origin étrangers sont refusés et POST exige application/json ; les scénarios text/plain et rebinding décrits sont bloqués."
+    },
+    {
+      "id": "A2",
+      "status": "RESOLVED",
+      "evidence": "docs/campaigns/phase1/scaffolding/run_campaign.py:215,223 : le gate refuse l'absence de nouveau commit avant tout amend et conserve le corps du message, trailers compris."
+    },
+    {
+      "id": "A3",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:1361,1369,1371 : les deux chemins de lancement passent désormais -nosteam. README.md:106 indique cependant explicitement que la connexion réelle reste non prouvée ; la confirmation demandée manque."
+    },
+    {
+      "id": "A4",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:406,412,507 : hook_seen est émis après damage_taken, uniquement pour une cible joueur ; le wrapper ne produit plus cette preuve sur la branche rejetée."
+    },
+    {
+      "id": "A5",
+      "status": "RESOLVED",
+      "evidence": "service/snapshots.py:239,260,273 : un marqueur précède le démarrage de création ; une passe interrompue est invalidée avant toute capture ultérieure, y compris lorsque les deux mondes existent."
+    },
+    {
+      "id": "A6",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:1400,1406,1412,1437 : textes, durée et DayLength sont validés avant mutation de l'état. service/api.py:111 refuse les corps JSON non objets."
+    },
+    {
+      "id": "A7",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:819,845 protège désormais le verdict et l'écriture finale. Mais service/engine.py:602,797,804 écrit sans protection les enregistrements précédant match_end : une panne sur un événement ou effect_dropped empêche encore _conclude, alors que service/rules.py:972 a déjà fixé le résultat."
+    },
+    {
+      "id": "A8",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:491,1417,1418 sépare les mots de passe. Cependant la liaison d'identité ne filtre que les heartbeats (service/engine.py:923,930) : les événements d'un joueur refusé passent toujours au cœur via service/engine.py:910 ; sa mort peut décider le match via service/rules.py:840."
+    },
+    {
+      "id": "A9",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:632,775,780 : la dérive acquise est conservée, puis les repères d'âge sont recalés au premier heartbeat après relance ; arrêt et retour à une sauvegarde ne sont plus comptés comme dérive."
+    },
+    {
+      "id": "A10",
+      "status": "RESOLVED",
+      "evidence": "docs/campaigns/phase1/scaffolding/run_campaign.py:171 : sans référence préalable ou si le contenu diffère de cette référence, require_clean s'arrête sans restaurer .gitignore ; la restauration aveugle est supprimée."
+    },
+    {
+      "id": "A11",
+      "status": "RESOLVED",
+      "evidence": "service/snapshots.py:24,179,183 : snapshots utilise désormais check_ports et server.running, sans accéder à _process, _group_alive ou _check_ports."
+    },
+    {
+      "id": "A12",
+      "status": "RESOLVED",
+      "evidence": "README.md:15 : le README annonce désormais l'absence de fichier de découverte et l'affichage de l'URL au démarrage."
+    },
+    {
+      "id": "A13",
+      "status": "PARTIAL",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:378,844 borne la rétention par purge périodique. Mais les références restent fortes et onZombieDead réutilise hit.wielder sans vérifier sa fraîcheur ni un recyclage de l'objet (lignes 392-394) ; une attribution périmée reste possible avant purge."
+    },
+    {
+      "id": "B1",
+      "status": "RESOLVED",
+      "evidence": "service/preflight.py:83 : _accept applique script.parent.resolve(), donc tous les chemins de détection acceptés rendent un dossier absolu."
+    },
+    {
+      "id": "B2",
+      "status": "PARTIAL",
+      "evidence": "service/protocol.py:56,91 rejette récursivement les nombres non finis. La famille des champs préservés impossibles à journaliser reste ouverte : data.extra=\"\\ud800\" passe _check_bounds, puis dump_line lève UnicodeEncodeError lors de l'encodage UTF-8 (service/protocol.py:315), interrompant l'écriture du match."
+    },
+    {
+      "id": "B3",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:268,273,737,831 : séquences et plancher exigent un entier fini borné avant toute modification de lastCmdSeq."
+    },
+    {
+      "id": "B4",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:1412,1432 : le DayLength effectif doit être un entier présent dans runtime.day_length_minutes, avant préparation des mondes ou lancement du fil."
+    },
+    {
+      "id": "B5",
+      "status": "RESOLVED",
+      "evidence": "service/rules.py:838,856 : _settle reçoit event.src et ne retire le suivi ni ne programme la libération que lorsque la source correspond à la cible ; une autre source produit wrong_source."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "service/api.py",
+    "service/snapshots.py",
+    "service/preflight.py",
+    "service/protocol.py",
+    "docs/campaigns/phase1/scaffolding/run_campaign.py",
+    "service/effects.json",
+    "service/runtime.json",
+    "service/journal.py",
+    "service/main.py",
+    ".gitignore",
+    "service/engine.py",
+    "README.md",
+    "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+    "service/rules.py"
+  ]
+}
