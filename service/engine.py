@@ -179,6 +179,17 @@ def _check_ini_value(label: str, value: Any) -> None:
         )
 
 
+def _redacted(redactor: Redactor, value: Any) -> Any:
+    """Copie une valeur JSON sans aucun secret, à toute profondeur."""
+    if isinstance(value, str):
+        return redactor.redact(value)
+    if isinstance(value, Mapping):
+        return {_redacted(redactor, k): _redacted(redactor, v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redacted(redactor, item) for item in value]
+    return value
+
+
 class ContractWindow:
     """Fenêtre de contrat : ce que les camps ont prouvé, jusqu'à une décision figée.
 
@@ -298,10 +309,17 @@ class _Refusal(NamedTuple):
     message: str
 
 
+class MatchSecrets(NamedTuple):
+    """Secrets d'un match, tirés par le moteur avant `RealMatch` : voir `Engine._guarded`."""
+
+    admin_password: str
+    rcon_password: str
+
+
 class RealMatch:
     """Un lancement réel, de la préparation à l'arrêt, dans l'ordre de D23.
 
-    Le constructeur tire `match_id` et les secrets et arme le `Redactor` : la passe de
+    Le constructeur tire `match_id` et arme le `Redactor` sur `secrets` : la passe de
     création écrit déjà `server_X.log`. `on_status` suit `ServerPair` ; `stop` est l'événement
     d'annulation du moteur. `shutdown` est le seul chemin d'arrêt : `cancel`, erreur et fin.
     `on_state` applique une modification à l'état du moteur, sous son verrou.
@@ -313,6 +331,9 @@ class RealMatch:
     revient par `_relaunched`, que `pump` lit, seul à parler au cœur et aux canaux.
     `_relaunch_lock` ordonne le `start` de ce fil et `shutdown` : aucun serveur ne part
     une fois l'arrêt engagé.
+
+    Ce que le mod écrit est une sortie de serveur comme une autre : `_poll_out` l'expurge
+    à la lecture, avant le journal, le cœur et l'état.
     """
 
     def __init__(
@@ -320,6 +341,7 @@ class RealMatch:
         config: Mapping[str, Any],
         table: Mapping[str, Any],
         *,
+        secrets: MatchSecrets,
         runtime: Mapping[str, Any],
         effects: Mapping[str, Any],
         zomboid_dir: Path,
@@ -340,8 +362,8 @@ class RealMatch:
         self.match_id = uuid.uuid4().hex
         self.match_dir = matches_dir / self.match_id
         self.match_dir.mkdir(parents=True)
-        admin_password, self._rcon_password = gen_secret(), gen_secret()
-        self.redactor = Redactor([admin_password, self._rcon_password])
+        self._rcon_password = secrets.rcon_password
+        self.redactor = Redactor(secrets)
         self.poll_s = runtime["tick_ms"] / MS_PER_S
         self._clock = clock
         self._stop = stop
@@ -375,7 +397,7 @@ class RealMatch:
             **runtime,
             "pz_dir": pz_dir,
             "zomboid_dir": zomboid_dir,
-            "admin_password": admin_password,
+            "admin_password": secrets.admin_password,
             "rcon_password": self._rcon_password,
         }
         servers = {
@@ -785,11 +807,12 @@ class RealMatch:
             events, anomalies = reader.poll()
             self._record_anomalies(anomalies)
             for event in events:
-                self._take_event(side, event, now_ms)
+                self._take_event(side, _redacted(self.redactor, event), now_ms)
 
     def _record_anomalies(self, anomalies: Sequence[Anomaly]) -> None:
         for anomaly in anomalies:
-            self._journal.write(anomaly.type, anomaly.data, anomaly.side, self._line_mt())
+            data = _redacted(self.redactor, anomaly.data)
+            self._journal.write(anomaly.type, data, anomaly.side, self._line_mt())
 
     def _take_event(self, side: str, event: Mapping[str, Any], now_ms: int) -> None:
         """Avant le match, l'événement se journalise ici ; ensuite, le cœur l'écrit à son tick."""
@@ -913,7 +936,8 @@ class RealMatch:
                 for item in self.window.withdrawn
                 if item["atom"] in self.table["atoms"]
             ]
-            return _Refusal(STEP_CONTRACT, "contrat refusé : " + " ; ".join(causes or [str(exc)]))
+            cause = " ; ".join(causes or [self.redactor.redact(str(exc))])
+            return _Refusal(STEP_CONTRACT, f"contrat refusé : {cause}")
         return None
 
     def _rules_refusal(self) -> _Refusal | None:
@@ -1095,6 +1119,12 @@ class Engine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._match: RealMatch | None = None
+        self._redactor = Redactor(())
+        # Une fois vrai, plus rien ne démarre : le service s'arrête.
+        self._closing = False
+        self._stop_incomplete = False
+        self._shutdown_lock = threading.Lock()
+        self._stopped: bool | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -1130,6 +1160,8 @@ class Engine:
             return False, f"action inconnue: {name}"
         with self.lock:
             phase = self.state.phase
+            if self._closing and name in ("start", "rematch"):
+                return False, "service en cours d'arrêt"
             if name == "start":
                 if phase not in ("idle", "over", "error"):
                     return False, f"impossible de démarrer en phase {phase}"
@@ -1176,6 +1208,29 @@ class Engine:
                 self.state.log("lancement du client PZ demandé (simulé)")
                 return True, "client PZ lancé (simulé)"
         return False, "action non traitée"
+
+    def shutdown(self) -> bool:
+        """Arrête le service : plus aucun départ, duel en cours clos comme par `cancel`.
+
+        Idempotent et sûr depuis tout fil, sauf celui du duel : un appel concurrent attend
+        la fin de l'arrêt. Rend faux si des processus de serveur subsistent.
+        """
+        with self._shutdown_lock:
+            if self._stopped is None:
+                self._stopped = self._stop_service()
+            return self._stopped
+
+    def _stop_service(self) -> bool:
+        """Le verrou reste libre pendant l'arrêt : `on_status` le prend, et un arrêt dure."""
+        with self.lock:
+            self._closing = True
+            self._stop.set()
+            match, thread = self._match, self._thread
+        stopped = match is None or match.shutdown()
+        if thread is not None:
+            # L'état final et la fermeture du journal sont écrits par ce fil.
+            thread.join()
+        return stopped and not self._stop_incomplete
 
     def _open_game_real(self) -> tuple[bool, str]:
         """Connecte le client de l'hôte au serveur A. La commande n'est jamais journalisée."""
@@ -1231,10 +1286,11 @@ class Engine:
         self._thread.start()
 
     def _guarded(self, run: Callable[[], None]) -> None:
+        """Dernier filet : `_redactor` connaît les secrets même si `RealMatch` n'a pas pu naître."""
         try:
             run()
-        except Exception as exc:  # pragma: no cover - garde-fou
-            self._fail(f"erreur interne: {exc}")
+        except Exception as exc:
+            self._fail(f"erreur interne: {self._redactor.redact_exception(exc)}")
 
     def _fail(self, message: str) -> None:
         with self.lock:
@@ -1280,9 +1336,12 @@ class Engine:
         with self.lock:
             if self._stop.is_set():
                 return None
+            secrets = MatchSecrets(gen_secret(), gen_secret())
+            self._redactor = Redactor(secrets)
             self._match = RealMatch(
                 self.state.config,
                 table,
+                secrets=secrets,
                 runtime=self.runtime,
                 effects=self.effects,
                 zomboid_dir=self.zomboid_dir,
@@ -1359,6 +1418,7 @@ class Engine:
         stopped = match.shutdown()
         with self.lock:
             self._match = None
+            self._stop_incomplete = self._stop_incomplete or not stopped
         if stopped and match.result is not None:
             # Une annulation venue pendant l'arrêt n'efface pas un match déjà jugé.
             match.enter_phase("over")

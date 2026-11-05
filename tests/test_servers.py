@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import pytest
 
 from doubles.fake_server import FakeRcon, install_fake_server
-from test_snapshots import engine_rig, make_world  # noqa: F401
+from test_snapshots import PLAYER_PASSWORD, engine_rig, make_world  # noqa: F401
+from service.engine import STOP_INCOMPLETE, Engine
 from service.rcon import MAX_PACKET_SIZE, RconClient, RconError
 from service.servers import (
     REDACTED,
@@ -37,6 +43,9 @@ from service.servers import (
 from service.state import MatchState
 
 PROCESS_TIMEOUT_S = 10
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUN_SERVICE = REPO_ROOT / "tests" / "doubles" / "run_service.py"
+SERVICE_URL_PREFIX = "interface : "
 RCON_TIMEOUT_S = 2
 MUTE_TIMEOUT_S = 0.05
 INI_LINES = 200
@@ -924,8 +933,12 @@ def test_exited_unexpectedly_distinguishes_requested_stop(harness):
     assert not stopped.exited_unexpectedly()
 
 
+def launched_groups(rig) -> list[int]:
+    return [server._process.pid for server in rig.servers if server._process]
+
+
 def stopped_for_good(rig) -> bool:
-    return not any(group_alive(server._process.pid) for server in rig.servers if server._process)
+    return not any(group_alive(group) for group in launched_groups(rig))
 
 
 def both_running(state: dict) -> bool:
@@ -966,21 +979,205 @@ def contract_error(rig) -> None:
     assert state["servers"] == {"A": "down", "B": "down"}
 
 
+class Service:
+    """`service.main` dans son propre processus, sur le double du banc `engine_rig`."""
+
+    def __init__(self, rig, groups_dir: Path) -> None:
+        self.rig = rig
+        self.groups_dir = groups_dir
+        config = rig.pz_dir.parent / "service.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "zomboid_dir": str(rig.zomboid),
+                    "matches_dir": str(rig.matches),
+                    "runtime": rig.runtime,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.process = subprocess.Popen(
+            [
+                sys.executable, str(RUN_SERVICE), str(config),
+                "--mode", "real", "--no-browser", "--port", "0", "--pz-dir", str(rig.pz_dir),
+            ],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )  # fmt: skip
+        self.url = self._read_url()
+
+    def _read_url(self) -> str:
+        for line in self.process.stdout:
+            if SERVICE_URL_PREFIX in line:
+                return line.split(SERVICE_URL_PREFIX)[1].strip()
+        raise AssertionError("le service est sorti sans publier son URL")
+
+    def state(self) -> dict:
+        with urlopen(f"{self.url}api/state", timeout=PROCESS_TIMEOUT_S) as response:
+            return json.load(response)
+
+    def start_duel(self) -> None:
+        payload = {"action": "start", "preset": "demo", "password": PLAYER_PASSWORD}
+        request = Request(f"{self.url}api/action", json.dumps(payload).encode())
+        urlopen(request, timeout=PROCESS_TIMEOUT_S).close()
+
+    def groups(self) -> list[int]:
+        return [int(path.read_text()) for path in self.groups_dir.iterdir()]
+
+    def stop(self, *signums: signal.Signals) -> int:
+        for signum in signums:
+            self.process.send_signal(signum)
+        self.process.communicate(timeout=PROCESS_TIMEOUT_S)
+        return self.process.returncode
+
+    def kill(self) -> None:
+        """Filet d'un test en échec : ni le service, ni un serveur ne lui survivent."""
+        self.process.kill()
+        self.process.communicate()
+        for group in self.groups():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@contextmanager
+def service_in_lobby(rig) -> Iterator[tuple[Service, dict]]:
+    """Mène le service au lobby ; chaque lancement de match consigne le groupe du serveur."""
+    groups_dir = rig.pz_dir.parent / "groups"
+    groups_dir.mkdir()
+    rig.build(on_match_launch=f'echo $$ > "{groups_dir}/$2"', child=True)
+    service = Service(rig, groups_dir)
+    try:
+        service.start_duel()
+        until(lambda: service.state()["phase"] in ("lobby", "error"))
+        state = service.state()
+        assert state["phase"] == "lobby", state["error"]
+        yield service, state
+    finally:
+        service.kill()
+
+
+def signals_to_service(rig, *signums: signal.Signals) -> list[int]:
+    with service_in_lobby(rig) as (service, state):
+        groups = service.groups()
+        assert len(groups) == 2
+        assert all(group_alive(group) for group in groups)
+
+        assert service.stop(*signums) == 0
+        # Constaté ici : en sortant du bloc, le filet tuerait les survivants.
+        assert not any(group_alive(group) for group in groups)
+
+    records = rig.journal(state["match_id"])
+    phases = [r["data"]["phase"] for r in records if "phase" in r["data"]]
+    # L'arrêt est celui d'un duel, une seule fois, et non la mort du processus.
+    assert phases[-2:] == ["stopping", "idle"]
+    assert phases.count("stopping") == 1
+    return groups
+
+
+def sigterm_to_service(rig) -> list[int]:
+    return signals_to_service(rig, signal.SIGTERM)
+
+
+def sigint_then_sigterm_to_service(rig) -> list[int]:
+    return signals_to_service(rig, signal.SIGINT, signal.SIGTERM)
+
+
+def cancelled_launch(scenario):
+    """Rend les groupes lancés par `scenario`, joué dans le processus du test."""
+
+    def run(rig) -> list[int]:
+        scenario(rig)
+        return launched_groups(rig)
+
+    run.__name__ = scenario.__name__
+    return run
+
+
 @pytest.mark.parametrize(
-    "scenario", [cancel_during_creation_pass, cancel_during_starting, contract_error]
+    "scenario",
+    [
+        cancelled_launch(cancel_during_creation_pass),
+        cancelled_launch(cancel_during_starting),
+        cancelled_launch(contract_error),
+        sigterm_to_service,
+        sigint_then_sigterm_to_service,
+    ],
+    ids=lambda scenario: scenario.__name__,
 )
 def test_every_exit_stops_servers(engine_rig, scenario):
     engine_rig.runtime["server_start_timeout_s"] = 600
     started = time.monotonic()
 
-    scenario(engine_rig)
+    groups = scenario(engine_rig)
 
-    assert engine_rig.servers
-    assert any(server._process is not None for server in engine_rig.servers)
-    assert stopped_for_good(engine_rig)
+    assert groups
+    assert not any(group_alive(group) for group in groups)
     # L'attente de disponibilité a été interrompue, pas subie.
     assert time.monotonic() - started < PROCESS_TIMEOUT_S
     assert engine_rig.engine._match is None
+
+
+def test_concurrent_shutdowns_stop_once(engine_rig):
+    engine_rig.build()
+    engine_rig.start()
+    state = engine_rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+    pair = engine_rig.engine._match.pair
+    closes = []
+    close = pair.close
+    pair.close = lambda: closes.append(1) or close()
+    results = []
+    callers = [
+        threading.Thread(target=lambda: results.append(engine_rig.engine.shutdown()))
+        for _ in range(2)
+    ]
+
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(PROCESS_TIMEOUT_S)
+
+    assert results == [True, True]
+    assert len(closes) == 1
+    assert stopped_for_good(engine_rig)
+    assert engine_rig.engine.snapshot()["phase"] == "idle"
+    assert engine_rig.engine.shutdown()
+
+
+def test_nothing_starts_after_shutdown(engine_rig):
+    engine = engine_rig.build()
+
+    assert engine.shutdown()
+
+    assert engine.action("start", {"preset": "demo"}) == (False, "service en cours d'arrêt")
+    assert engine.snapshot()["phase"] == "idle"
+    assert not engine_rig.servers
+
+
+def test_shutdown_reports_leftover_processes(engine_rig):
+    engine_rig.build()
+    engine_rig.start()
+    state = engine_rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+    engine_rig.engine._match.pair.close = lambda: False
+
+    assert not engine_rig.engine.shutdown()
+
+    assert engine_rig.engine.snapshot()["error"] == STOP_INCOMPLETE
+
+
+def test_shutdown_ends_a_mock_duel():
+    engine = Engine("mock")
+    assert engine.action("start")[0]
+
+    assert engine.shutdown()
+
+    assert not engine._thread.is_alive()
+    assert engine.snapshot()["phase"] == "idle"
 
 
 def test_cancelled_creation_pass_leaves_no_snapshot(engine_rig):

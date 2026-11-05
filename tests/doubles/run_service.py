@@ -1,0 +1,34 @@
+"""Lance `service.main` avec un `Engine` de test, sans toucher au vrai `~/Zomboid`.
+
+À lancer avec la racine du dépôt dans `PYTHONPATH` : `python run_service.py <config>
+<arguments de main>`. `<config>` est un fichier JSON portant `zomboid_dir`, `matches_dir` et
+`runtime`.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+from service.engine import Engine
+from service.main import main
+
+
+def run(config_path: str, argv: list[str]) -> None:
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+    def make_engine(mode: str, pz_dir: str | None) -> Engine:
+        return Engine(
+            mode,
+            zomboid_dir=config["zomboid_dir"],
+            pz_dir=pz_dir,
+            runtime=config["runtime"],
+            matches_dir=config["matches_dir"],
+        )
+
+    main(argv, make_engine)
+
+
+if __name__ == "__main__":
+    run(sys.argv[1], sys.argv[2:])

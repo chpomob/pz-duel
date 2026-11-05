@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import argparse
-import atexit
-import json
 import os
+import signal
 import socket
 import sys
 import threading
 import webbrowser
+from collections.abc import Callable, Sequence
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import FrameType
 
 from .api import make_server
-from .engine import Engine
+from .engine import STOP_INCOMPLETE, Engine
 from .preflight import MOD_SRC, detect_pz, install_mod, mod_fingerprint
+
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 def free_port(preferred: int = 8765) -> int:
@@ -38,7 +42,36 @@ def run_install_mod() -> None:
     print(f"Mod installé : {destination} (empreinte {mod_fingerprint(destination)})", flush=True)
 
 
-def main() -> None:
+def stop_on_signal(engine: Engine, httpd: ThreadingHTTPServer) -> None:
+    """Sur SIGINT ou SIGTERM, arrête le moteur puis le serveur HTTP, une seule fois.
+
+    Tout se passe sur un fil dédié : le gestionnaire s'exécute sur le fil de `serve_forever`,
+    et `httpd.shutdown()`, qui attend la fin de cette boucle, s'y bloquerait. Il ne prend
+    aucun verrou : un signal peut en interrompre un autre sur ce même fil.
+    """
+    requested = False
+
+    def stop() -> None:
+        print("Arrêt demandé : fermeture des serveurs", flush=True)
+        try:
+            engine.shutdown()
+        finally:
+            httpd.shutdown()
+
+    def on_signal(signum: int, frame: FrameType | None) -> None:
+        nonlocal requested
+        if not requested:
+            requested = True
+            threading.Thread(target=stop, name="duel-stop", daemon=True).start()
+
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, on_signal)
+
+
+def main(
+    argv: Sequence[str] | None = None, make_engine: Callable[..., Engine] | None = None
+) -> None:
+    """`argv` et `make_engine` servent aux tests, qui posent un `Engine` hors du vrai `~`."""
     parser = argparse.ArgumentParser(description="PZ Duel — service local")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
@@ -49,7 +82,7 @@ def main() -> None:
         action="store_true",
         help="installe mods/duelcore dans ~/Zomboid/mods/ puis quitte",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.install_mod:
         run_install_mod()
@@ -62,29 +95,26 @@ def main() -> None:
             sys.exit(detection.message)
         print(detection.message, flush=True)
 
-    engine = Engine(mode=args.mode, pz_dir=args.pz_dir)
+    engine = (Engine if make_engine is None else make_engine)(mode=args.mode, pz_dir=args.pz_dir)
     port = free_port(args.port)
     httpd = make_server(engine, port=port)
+    # Avant toute requête : aucun serveur ne peut partir sans que le signal l'arrête.
+    stop_on_signal(engine, httpd)
     port = httpd.server_address[1]
     url = f"http://127.0.0.1:{port}/"
     print(f"PZ Duel — interface : {url}", flush=True)
-
-    # fichier de découverte : le mod in-game et les outils lisent l'URL ici
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    info_path = os.path.join(root, ".duel-service.json")
-    with open(info_path, "w", encoding="utf-8") as fh:
-        json.dump({"url": url, "port": port, "pid": os.getpid()}, fh)
-    atexit.register(lambda: os.path.exists(info_path) and os.unlink(info_path))
 
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
     finally:
+        # Sur signal, attend le fil d'arrêt ; sur panne de la boucle, c'est l'arrêt lui-même.
+        stopped = engine.shutdown()
         httpd.server_close()
+    if not stopped:
+        sys.exit(STOP_INCOMPLETE)
 
 
 if __name__ == "__main__":
