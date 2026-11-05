@@ -20,17 +20,27 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .journal import Journal
+from .journal import Journal, read_journal
 from .preflight import run_preflight
 from .protocol import PROTOCOL_VERSION, SIDES
-from .rules import MS_PER_S, TableError, load_effects, load_runtime, load_table, rules_hash
+from .rules import (
+    MS_PER_S,
+    MatchCore,
+    TableError,
+    load_effects,
+    load_runtime,
+    load_table,
+    rules_hash,
+)
 from .servers import (
     LINE_BREAK,
     STATUS_ERROR,
+    STATUS_UP,
     Redactor,
     ServerPair,
     ServerProcess,
@@ -55,6 +65,7 @@ from .verdict import (
     HOOK_SEEN,
     INSUFFICIENT,
     KO,
+    MATCH_END,
     MIN_SPAWNED,
     OK,
     PROBE_KIND,
@@ -62,6 +73,7 @@ from .verdict import (
     combined_spawn,
     fallback,
     publish_capabilities,
+    verdict,
 )
 
 PRESETS_DIR = os.path.join(os.path.dirname(__file__), "presets")
@@ -86,6 +98,13 @@ PROBE_FUNCTION = "addZombiesInOutfit"
 ATOM_WITHDRAWN = "atom_withdrawn"
 STEP_CONTRACT = "contract"
 STEP_LOBBY = "lobby"
+STATUS_SUSPECT = "suspect"
+OUTCOME_FORFEIT = "forfeit"
+OUTCOME_INVALIDATED = "invalidated"
+# Le `state` d'entrée en `running` ouvre le tick 0.
+FIRST_MT = 0
+DRIFT_DIGITS = 6
+SECONDS_PER_MINUTE = 60
 
 LOGGER = logging.getLogger(__name__)
 
@@ -249,6 +268,18 @@ class ContractWindow:
         return f"{' ; '.join(waited)} ; {limit}"
 
 
+def _feed_line(record: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Rend le texte et le camp d'une ligne du fil de match, `None` si elle n'y figure pas."""
+    data, side = record["data"], record["side"]
+    if record["type"] == COMMAND:
+        command = data[COMMAND]
+        units = f" × {command['n']}" if "n" in command else ""
+        return f"{command['kind']}{units} vers {side}", side
+    if record["type"] == EVENT and side is not None and data["kind"] not in (BEAT, CAPS, HOOK_SEEN):
+        return f"{side} : {data['kind']}", side
+    return None
+
+
 class _Probe(NamedTuple):
     """`probe_spawn` d'un camp : `cause` dit pourquoi elle a échoué."""
 
@@ -272,6 +303,9 @@ class RealMatch:
     création écrit déjà `server_X.log`. `on_status` suit `ServerPair` ; `stop` est l'événement
     d'annulation du moteur. `shutdown` est le seul chemin d'arrêt : `cancel`, erreur et fin.
     `on_state` applique une modification à l'état du moteur, sous son verrou.
+
+    `_core` naît à l'entrée en `running` : c'est lui qui journalise alors tout ce qui compte
+    pour le rejeu. `result` reste nul jusqu'à l'écriture de `match_end`.
     """
 
     def __init__(
@@ -311,6 +345,17 @@ class RealMatch:
         self._probes: dict[str, _Probe] = {}
         self._last_cmd_seq = FIRST_CMD_FLOOR
         self._countdown_end_ms: int | None = None
+        self._core: MatchCore | None = None
+        self.result: Mapping[str, Any] | None = None
+        self._attribution: str | None = None
+        # Instants de réception : `t_ms` date les événements, jamais l'absence (D13).
+        self._beat_ms: dict[str, int] = {}
+        self._seen_ms: dict[str, int] = {}
+        self._suspects: set[str] = set()
+        self._first_age: dict[str, float] = {}
+        self._last_age: dict[str, float] = {}
+        self._drift_s: float | None = None
+        self._threats: deque[float] = deque()
         cfg = {
             **runtime,
             "pz_dir": pz_dir,
@@ -407,15 +452,21 @@ class RealMatch:
         return {side: self.window.caps.get(side) for side in SIDES}
 
     def pump(self, now_ms: int) -> str | None:
-        """Une passe du lobby ou du décompte à l'instant `now_ms` ; rend le motif d'un arrêt.
+        """Une passe à l'instant `now_ms` ; rend le motif d'un arrêt, `result` dit la fin.
 
-        Seul ce fil écrit sur les canaux. L'absence de heartbeat n'est pas une panne ici :
-        un serveur vide ne tique pas (H3).
+        Seul ce fil écrit sur les canaux. L'absence de heartbeat n'est une panne qu'en
+        `running` : un serveur vide ne tique pas (H3). L'entrée en `running` précède la
+        lecture de `out` : ce que le mod a écrit depuis `t0_ms` doit atteindre le cœur.
         """
-        self._poll_out(now_ms)
-        self._poll_acks()
         if lost := self.lost_server():
             return lost
+        if self._countdown_over(now_ms):
+            self._enter_running(now_ms)
+        self._poll_out(now_ms)
+        if self._core is not None:
+            self._pump_match(now_ms)
+            return None
+        self._poll_acks()
         refusal = self._advance(now_ms)
         self._publish(now_ms)
         if refusal is None:
@@ -423,8 +474,178 @@ class RealMatch:
         self._on_state(lambda state: state.set_step(refusal.step, STATUS_ERROR, refusal.message))
         return refusal.message
 
+    def _countdown_over(self, now_ms: int) -> bool:
+        end_ms = self._countdown_end_ms
+        return self._core is None and end_ms is not None and now_ms >= end_ms
+
+    def _enter_running(self, now_ms: int) -> None:
+        """Ouvre le tick 0 : `t0_ms` est le seul relevé de l'horloge du service dans le match.
+
+        Le `state` s'écrit sans le filet de `_record_state` : sans `t0_ms`, rien ne se rejoue.
+        """
+        self._journal.write("state", {"phase": "running", "t0_ms": now_ms}, None, FIRST_MT)
+        duration_s = self.config["duration_s"]
+        self._core = MatchCore(self.table, self.runtime, self.effects, now_ms, duration_s)
+        self._core.reserve_seq(self._last_cmd_seq)
+
+        def change(state: MatchState) -> None:
+            state.phase = "running"
+            state.started_at = now_ms / MS_PER_S
+            state.clock = {"remaining_s": duration_s, "drift_s": None}
+            state.log("match lancé")
+            state.event("le duel commence")
+
+        self._on_state(change)
+
+    def _pump_match(self, now_ms: int) -> None:
+        """Juge l'instant, avance le cœur, puis écrit ce qu'il rend : le tick reste son ordre.
+
+        `out` est déjà lu : une fin soumise ici passe après les événements de son tick.
+        """
+        self._watch_beats(now_ms)
+        end = self._drift_end() or self._absence_end(now_ms)
+        if end is not None:
+            self._core.submit_end(end)
+        records = self._core.advance(now_ms)
+        self._write_records(records)
+        self._poll_acks()
+        self._publish(now_ms)
+        self._publish_match(records)
+
+    def _watch_beats(self, now_ms: int) -> None:
+        """Passe `suspect` un camp muet depuis `beat_timeout_s`, et `up` un camp revenu."""
+        timeout_ms = self.runtime["beat_timeout_s"] * MS_PER_S
+        for side in SIDES:
+            silent = now_ms - self._beat_ms[side] >= timeout_ms
+            if silent == (side in self._suspects):
+                continue
+            if silent:
+                self._suspects.add(side)
+                self.players[side] = None
+                status, detail = STATUS_SUSPECT, f"aucun heartbeat depuis {timeout_ms // MS_PER_S} s"
+            else:
+                self._suspects.discard(side)
+                status, detail = STATUS_UP, "heartbeat revenu"
+            self._on_status(side, status, detail)
+            self._core.submit_state(side, status)
+
+    def _absence_end(self, now_ms: int) -> dict[str, Any] | None:
+        """Rend la fin due à une absence, comptée depuis le dernier heartbeat du joueur."""
+        grace_s = self.table["disconnect_grace_s"]
+        absent = [
+            side for side in SIDES if now_ms - self._seen_ms[side] >= grace_s * MS_PER_S
+        ]
+        if not absent:
+            return None
+        if len(absent) == len(SIDES):
+            reason = f"les deux joueurs absents depuis {grace_s} s"
+            return {"outcome": OUTCOME_INVALIDATED, "winner": None, "reason": reason}
+        [side] = absent
+        winner = next(other for other in SIDES if other != side)
+        reason = f"forfait du camp {side}, absent depuis {grace_s} s"
+        return {"outcome": OUTCOME_FORFEIT, "winner": winner, "reason": reason}
+
+    def _drift_end(self) -> dict[str, Any] | None:
+        """Recalcule la dérive en secondes réelles et rend la fin due à son dépassement.
+
+        Elle compare les avances depuis le début du match, une fois `out` lu des deux côtés :
+        A est lu avant B, et juger entre les deux prendrait un retard de lecture pour une
+        dérive. L'arrondi précède la comparaison : `(3 + 1,6) − 3` vaut 1,5999… et le seuil
+        est strict.
+        """
+        if len(self._last_age) < len(SIDES):
+            return None
+        first, second = (self._last_age[s] - self._first_age[s] for s in SIDES)
+        minutes = self.runtime["day_length_minutes"][str(self.config["day_length"])]
+        scale = minutes * self.runtime["drift_factor"]
+        self._drift_s = round((first - second) * scale, DRIFT_DIGITS)
+        limit_s = self.runtime["max_drift_s"]
+        if abs(self._drift_s) <= limit_s:
+            return None
+        reason = f"dérive de {self._drift_s} s, au-delà de {limit_s} s"
+        return {"outcome": OUTCOME_INVALIDATED, "winner": None, "reason": reason}
+
+    def _write_records(self, records: Sequence[Mapping[str, Any]]) -> None:
+        """Journalise dans l'ordre du cœur ; une commande part une fois journalisée."""
+        for record in records:
+            if record["type"] == MATCH_END:
+                self._conclude(record)
+                continue
+            data = record["data"]
+            self._journal.write(record["type"], data, record["side"], record["mt"])
+            if record["type"] == COMMAND:
+                self._channels[record["side"]].write(data[COMMAND])
+                self._threats.append(record["mt"])
+
+    def _conclude(self, record: Mapping[str, Any]) -> None:
+        """Écrit `match_end` avec le verdict relu sur le journal, qui contient tout le match.
+
+        Une attribution `ko` ne touche ni `outcome` ni `winner` : elle s'ajoute à `reason`.
+        """
+        report = verdict(read_journal(self._journal.path).records)
+        kills = report["attribution"]
+        status, branch = kills["status"], report["fallback"]
+        result = dict(record["data"]["result"])
+        note = None
+        if status == KO:
+            note = (
+                f"attribution {status} : {kills['attributed']} kills attribués "
+                f"sur {kills['reference']}, branche de repli {branch}"
+            )
+            result["reason"] = f"{result['reason']} ; {note}"
+        data = {
+            **record["data"],
+            "result": result,
+            "attribution": status,
+            "spawn": report["spawn"],
+            "fallback": branch,
+        }
+        self._journal.write(MATCH_END, data, record["side"], record["mt"])
+        self._attribution = status
+        self.result = result
+        score = record["data"]["score"]
+
+        def change(state: MatchState) -> None:
+            state.result = result
+            state.log(f"match terminé — A {score['A']} / B {score['B']} : {result['reason']}")
+            state.event(f"fin du match — {result['reason']}")
+            if note is not None:
+                state.log(note, "warn")
+
+        self._on_state(change)
+
+    def _publish_match(self, records: Sequence[Mapping[str, Any]]) -> None:
+        core = self._core
+        mt = core.mt or FIRST_MT
+        window_s = self.runtime["rate_window_s"]
+        while self._threats and self._threats[0] <= mt - window_s:
+            self._threats.popleft()
+        threats = round(len(self._threats) * SECONDS_PER_MINUTE / window_s, 1)
+        clock = {
+            "remaining_s": math.ceil(core.duration_s - mt),
+            "drift_s": self._drift_s,
+        }
+        score = dict(core.scores)
+        feed = [line for line in map(_feed_line, records) if line is not None]
+
+        def change(state: MatchState) -> None:
+            state.score = score
+            state.clock = clock
+            state.threats_per_min = threats
+            for text, side in feed:
+                state.event(text, side)
+
+        self._on_state(change)
+
     def _now_ms(self) -> int:
         return int(self._clock() * MS_PER_S)
+
+    def _line_mt(self) -> float | None:
+        """`mt` d'une ligne écrite hors d'un tick : le dernier tick clos, nul avant le match."""
+        if self._core is None:
+            return None
+        mt = self._core.mt
+        return FIRST_MT if mt is None else mt
 
     def _poll_out(self, now_ms: int) -> None:
         for side, reader in self._readers.items():
@@ -435,19 +656,32 @@ class RealMatch:
 
     def _record_anomalies(self, anomalies: Sequence[Anomaly]) -> None:
         for anomaly in anomalies:
-            self._journal.write(anomaly.type, anomaly.data, anomaly.side)
+            self._journal.write(anomaly.type, anomaly.data, anomaly.side, self._line_mt())
 
     def _take_event(self, side: str, event: Mapping[str, Any], now_ms: int) -> None:
+        """Avant le match, l'événement se journalise ici ; ensuite, le cœur l'écrit à son tick."""
         kind, data = event["kind"], event["data"]
-        self._journal.write(CMD_RESULT if kind == CMD_RESULT else EVENT, event, event["side"])
+        if self._core is None:
+            self._journal.write(CMD_RESULT if kind == CMD_RESULT else EVENT, event, event["side"])
+        else:
+            self._core.submit_event(event)
         if kind == CAPS:
             self.window.on_caps(side, data)
         elif kind == HOOK_SEEN:
             self.window.on_hook_seen(side, data["hook"], now_ms)
         elif kind == BEAT:
-            self.players[side] = next(iter(data["players"]), None)
+            self._take_beat(side, data, now_ms)
         elif kind == CMD_RESULT:
             self._take_probe_result(side, data, now_ms)
+
+    def _take_beat(self, side: str, data: Mapping[str, Any], now_ms: int) -> None:
+        self.players[side] = next(iter(data["players"]), None)
+        self._beat_ms[side] = now_ms
+        if self.players[side] is not None:
+            self._seen_ms[side] = now_ms
+        if self._core is not None:
+            self._first_age.setdefault(side, data["age"])
+            self._last_age[side] = data["age"]
 
     def _take_probe_result(self, side: str, result: Mapping[str, Any], now_ms: int) -> None:
         probe = self._probes.get(side)
@@ -473,7 +707,7 @@ class RealMatch:
 
     def _advance(self, now_ms: int) -> _Refusal | None:
         if self._countdown_end_ms is not None:
-            self._tick_countdown(now_ms)
+            self._tick_countdown(self._countdown_end_ms - now_ms)
             return None
         self._send_probes(now_ms)
         if refusal := self._failed_probes(now_ms):
@@ -583,14 +817,9 @@ class RealMatch:
         self.enter_phase("countdown")
         return None
 
-    def _tick_countdown(self, now_ms: int) -> None:
-        left_ms = self._countdown_end_ms - now_ms
-
+    def _tick_countdown(self, left_ms: int) -> None:
         def change(state: MatchState) -> None:
-            if left_ms > 0:
-                state.clock["countdown"] = math.ceil(left_ms / MS_PER_S)
-            else:
-                state.clock.pop("countdown", None)
+            state.clock["countdown"] = math.ceil(left_ms / MS_PER_S)
 
         self._on_state(change)
 
@@ -607,10 +836,10 @@ class RealMatch:
             **published,
             "active_atoms": window.active_atoms,
             "withdrawn": [item["atom"] for item in window.withdrawn],
-            "attribution": None,
+            "attribution": self._attribution,
             "spawn": spawn,
-            # L'attribution ne se mesure qu'en fin de match : rien à en conclure ici.
-            "fallback": fallback(combined_spawn(spawn), INSUFFICIENT),
+            # L'attribution ne se mesure qu'en fin de match : rien à en conclure avant.
+            "fallback": fallback(combined_spawn(spawn), self._attribution or INSUFFICIENT),
         }
 
     def _publish(self, now_ms: int) -> None:
@@ -676,7 +905,7 @@ class RealMatch:
         if journal is None:
             return
         try:
-            journal.write("state", data, side)
+            journal.write("state", data, side, self._line_mt())
         except (OSError, ValueError) as exc:
             LOGGER.error("journal : %s", self.redactor.redact_exception(exc))
 
@@ -942,9 +1171,9 @@ class Engine:
             change(self.state)
 
     def _drive_match(self, match: RealMatch) -> str | None:
-        """Mène le match au bout du décompte et l'y tient : `cancel` ou une panne en sort.
+        """Mène le match jusqu'à sa fin : `cancel` ou une panne en sort plus tôt.
 
-        Rend le motif d'échec, `None` si annulé.
+        Rend le motif d'échec, `None` si annulé ou fini, ce que dit `match.result`.
         """
         match.prepare()
         match.record_phase("starting")
@@ -969,6 +1198,8 @@ class Engine:
         while not self._stop.wait(match.poll_s):
             if failure := match.pump(int(self._clock() * MS_PER_S)):
                 return failure
+            if match.result is not None:
+                break
         return None
 
     def _open_lobby(self, match: RealMatch) -> None:
@@ -990,6 +1221,11 @@ class Engine:
         stopped = match.shutdown()
         with self.lock:
             self._match = None
+        if stopped and match.result is not None:
+            # Une annulation venue pendant l'arrêt n'efface pas un match déjà jugé.
+            match.enter_phase("over")
+            match.close()
+            return
         if not stopped:
             failure = STOP_INCOMPLETE
         elif self._stop.is_set():
