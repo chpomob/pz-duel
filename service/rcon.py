@@ -8,6 +8,7 @@ from __future__ import annotations
 import itertools
 import socket
 import struct
+import time
 from types import TracebackType
 
 LOOPBACK = "127.0.0.1"
@@ -29,13 +30,23 @@ class RconError(Exception):
 
 
 class RconClient:
+    """`timeout_s` borne chaque opération réseau ; `deadline`, sur l'horloge de
+    `time.monotonic`, borne l'ensemble : un serveur lent à chaque étape ne l'allonge pas.
+    """
+
     def __init__(
-        self, port: int, password: str, timeout_s: float, host: str = LOOPBACK
+        self,
+        port: int,
+        password: str,
+        timeout_s: float,
+        host: str = LOOPBACK,
+        deadline: float | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._password = password
         self._timeout_s = timeout_s
+        self._deadline = deadline
         self._sock: socket.socket | None = None
         self._ids = itertools.count(1)
 
@@ -52,10 +63,9 @@ class RconClient:
         self.close()
 
     def connect(self) -> None:
+        timeout_s = self._step_timeout()
         try:
-            self._sock = socket.create_connection(
-                (self._host, self._port), timeout=self._timeout_s
-            )
+            self._sock = socket.create_connection((self._host, self._port), timeout=timeout_s)
         except OSError as exc:
             raise RconError(f"RCON injoignable sur le port {self._port}") from exc
         try:
@@ -107,7 +117,9 @@ class RconClient:
             raise RconError("RCON non connecté")
         request_id = next(self._ids)
         payload = HEADER.pack(request_id, kind) + body.encode("utf-8") + TERMINATOR
+        timeout_s = self._step_timeout()
         try:
+            self._sock.settimeout(timeout_s)
             self._sock.sendall(SIZE_FIELD.pack(len(payload)) + payload)
         except OSError as exc:
             raise RconError(f"envoi RCON impossible sur le port {self._port}") from exc
@@ -127,7 +139,9 @@ class RconClient:
             raise RconError("RCON non connecté")
         chunks = bytearray()
         while len(chunks) < count:
+            timeout_s = self._step_timeout()
             try:
+                self._sock.settimeout(timeout_s)
                 chunk = self._sock.recv(count - len(chunks))
             except OSError as exc:
                 raise RconError(f"réponse RCON absente sur le port {self._port}") from exc
@@ -135,3 +149,11 @@ class RconClient:
                 raise RconError(f"connexion RCON fermée sur le port {self._port}")
             chunks += chunk
         return bytes(chunks)
+
+    def _step_timeout(self) -> float:
+        if self._deadline is None:
+            return self._timeout_s
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise RconError(f"délai RCON dépassé sur le port {self._port}")
+        return min(self._timeout_s, remaining)

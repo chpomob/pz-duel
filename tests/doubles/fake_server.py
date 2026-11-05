@@ -4,15 +4,18 @@
 Il reçoit les arguments d'un vrai serveur. `install_fake_server` le pose à la place du
 script dans un dossier d'installation factice. Le scénario est un objet JSON :
 
-- `lines` : sortie standard ; `{servername}`, `{port}`, `{udpport}` et `{adminpassword}`
-  y sont remplacés ; `line_delay_s` les espace ;
+- `lines` : sortie standard ; `{servername}`, `{port}`, `{udpport}`, `{adminpassword}` et
+  `{cwd}` y sont remplacés ; `line_delay_s` les espace ;
+- `stderr_lines` : erreur standard, écrite avant `lines` ;
 - `child` : lance un enfant dans le groupe, dont le pid est imprimé, et qui vit au plus
   `child_life_s` : un test interrompu ne laisse rien derrière lui ;
 - `orphan_child` : sort sans tuer l'enfant, comme le script qui précède son `java` ;
 - `refuse_quit` : ignore `quit` sur l'entrée standard et par RCON ;
 - `ignore_sigterm` : ignore SIGTERM, enfant compris, car l'ignorance se transmet ;
 - `exit_code` : crash, sortie immédiate avec ce code après les lignes ;
-- `rcon_password` : ouvre le RCON factice et imprime `fake rcon port=<port>`.
+- `rcon_password` : ouvre le RCON factice et imprime `fake rcon port=<port>` ; il écoute
+  sur `rcon_port` s'il est donné, sinon sur un port libre. En sortant, le double imprime
+  `fake rcon commands=<commandes reçues>`.
 
 Le protocole est réécrit ici, sans `service.rcon` : le client est ainsi vérifié contre une
 implémentation indépendante, et le script tourne sans le dépôt dans son chemin.
@@ -76,12 +79,13 @@ class FakeRcon:
         password: str,
         on_quit: Callable[[], None] = lambda: None,
         mute: bool = False,
+        port: int = 0,
     ) -> None:
         self.password = password
         self.on_quit = on_quit
         self.mute = mute
         self.commands: list[str] = []
-        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener = socket.create_server(("127.0.0.1", port))
         self.port = self._listener.getsockname()[1]
         threading.Thread(target=self._serve, daemon=True).start()
 
@@ -160,12 +164,19 @@ def main() -> int:
         if not scenario.get("refuse_quit"):
             stop.set()
 
+    rcon = None
     if "rcon_password" in scenario:
-        rcon = FakeRcon(scenario["rcon_password"], on_quit=request_stop)
+        rcon = FakeRcon(
+            scenario["rcon_password"],
+            on_quit=request_stop,
+            port=scenario.get("rcon_port", 0),
+        )
         print_line(f"fake rcon port={rcon.port}")
 
+    for line in scenario.get("stderr_lines", ()):
+        print(line, file=sys.stderr, flush=True)
     for line in scenario.get("lines", ()):
-        print_line(line.format(**vars(args)))
+        print_line(line.format(cwd=os.getcwd(), **vars(args)))
         time.sleep(scenario.get("line_delay_s", 0))
 
     def read_stdin() -> None:
@@ -179,6 +190,8 @@ def main() -> int:
     if child and not scenario.get("orphan_child"):
         child.kill()
         child.wait()
+    if rcon:
+        print_line(f"fake rcon commands={','.join(rcon.commands)}")
     # Sans attendre les fils encore bloqués sur l'entrée standard ou sur RCON.
     sys.stdout.flush()
     os._exit(scenario.get("exit_code", 0))
