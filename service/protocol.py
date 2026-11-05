@@ -7,13 +7,17 @@ champs inconnus compris, et lève `ProtocolError` s'il sort du contrat.
 Dans `data`, seuls les champs lus par le service sont contrôlés : un contrôle plus
 large rejetterait des lignes réelles. Les bornes ci-dessous sont celles du contrat
 (`seq` part de 1, un plancher vaut 0 avant toute commande), pas des réglages.
+
+Les champs inconnus sont préservés jusqu'au journal : ils y doivent au moins rester
+sérialisables et relisibles. `_check_bounds` borne donc toute la ligne, sans regarder
+ce que ses champs signifient.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 PROTOCOL_VERSION = 1
@@ -30,6 +34,11 @@ BAD_FIELD = "bad_field"
 UNKNOWN_KIND = "unknown_kind"
 SIDE_MISMATCH = "side_mismatch"
 
+# Plus grand entier exact d'un nombre Lua : au-delà, le mod n'a pas pu écrire une mesure.
+MAX_NUMBER = 2**53
+# Une ligne réelle tient sur quatre niveaux. La copie et le journal descendent récursivement.
+MAX_DEPTH = 16
+
 
 class ProtocolError(ValueError):
     """Ligne hors contrat : `code` est stable, `detail` est lisible en français."""
@@ -42,6 +51,27 @@ class ProtocolError(ValueError):
 
 def _reject_constant(name: str) -> None:
     raise ValueError(f"constante non JSON : {name}")
+
+
+def _check_bounds(value: Any, depth: int = 0) -> None:
+    """Refuse, à toute profondeur, ce que le journal ne saurait écrire puis relire.
+
+    `1e999` se décode en infini sans passer par `parse_constant`, et `dump_line` le
+    refuserait une fois la ligne acceptée. Une comparaison ne déborde pas, même sur un
+    entier géant, et elle est fausse pour NaN.
+    """
+    if depth > MAX_DEPTH:
+        raise _bad("la ligne", f"imbriquée sur au plus {MAX_DEPTH} niveaux")
+    if isinstance(value, Mapping):
+        children: Iterable[Any] = value.values()
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        if type(value) in (int, float) and not abs(value) <= MAX_NUMBER:
+            raise _bad("tout nombre", f"fini et borné par {MAX_NUMBER} en valeur absolue")
+        return
+    for child in children:
+        _check_bounds(child, depth + 1)
 
 
 def _load(raw: bytes | str | Mapping[str, Any]) -> Mapping[str, Any]:
@@ -58,6 +88,7 @@ def _load(raw: bytes | str | Mapping[str, Any]) -> Mapping[str, Any]:
     version = obj.get("v")
     if type(version) is not int or version != PROTOCOL_VERSION:
         raise ProtocolError(BAD_VERSION, f"`v` doit valoir {PROTOCOL_VERSION}")
+    _check_bounds(obj)
     return obj
 
 

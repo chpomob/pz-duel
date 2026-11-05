@@ -107,6 +107,9 @@ OUTCOME_INVALIDATED = "invalidated"
 FIRST_MT = 0
 DRIFT_DIGITS = 6
 SECONDS_PER_MINUTE = 60
+MIN_DURATION_S = 30
+MAX_DURATION_S = 3600
+VERDICT_FAILED = "verdict_failed"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -177,6 +180,26 @@ def _check_ini_value(label: str, value: Any) -> None:
         raise ActionRefused(
             f"{label} refusé : texte sans retour à la ligne et sans « = » en tête attendu"
         )
+
+
+def _text_option(payload: Mapping[str, Any], key: str, label: str) -> str:
+    """Rend un texte facultatif du `payload`, vide s'il manque."""
+    value = payload.get(key)
+    if value is not None and not isinstance(value, str):
+        raise ActionRefused(f"{label} refusé : texte attendu")
+    return value or ""
+
+
+def _duration_of(payload: Mapping[str, Any], preset: Mapping[str, Any]) -> int:
+    """Une durée demandée sort du refus ; seule celle du preset, déjà chargé, se ramène."""
+    value = payload.get("duration_s")
+    if value is None:
+        return max(MIN_DURATION_S, min(MAX_DURATION_S, preset["duration_s"]))
+    if type(value) is not int or not MIN_DURATION_S <= value <= MAX_DURATION_S:
+        raise ActionRefused(
+            f"durée refusée : entier de {MIN_DURATION_S} à {MAX_DURATION_S} s attendu"
+        )
+    return value
 
 
 def _redacted(redactor: Redactor, value: Any) -> Any:
@@ -383,6 +406,9 @@ class RealMatch:
         self._suspects: set[str] = set()
         self._first_age: dict[str, float] = {}
         self._last_age: dict[str, float] = {}
+        # Écart d'âge A − B acquis avant les relances, et camps sans repère depuis la leur.
+        self._banked_gap = 0.0
+        self._rebasing: set[str] = set()
         self._drift_s: float | None = None
         self._threats: deque[float] = deque()
         # Commandes écrites sans `cmd_result` lu : ce qu'un redémarrage rendrait perdu.
@@ -568,8 +594,7 @@ class RealMatch:
         """Applique la procédure de redémarrage, ou perd le serveur au-delà du plafond.
 
         `out` a été lu après la sortie : `_unresolved` ne garde que de vraies pertes. L'âge
-        retiré suspend la dérive jusqu'au premier heartbeat du nouveau `boot` : un âge figé
-        pendant la relance ne mesure rien, et c'est après le retour que la dérive tranche.
+        retiré suspend la dérive : voir `_track_age` pour sa reprise.
         """
         server = self.pair.servers[side]
         cause = f"sortie inattendue, code {server.exit_code}"
@@ -582,7 +607,9 @@ class RealMatch:
         self._unresolved[side].clear()
         self._suspects.discard(side)
         self.players[side] = None
+        self._bank_drift()
         self._last_age.pop(side, None)
+        self._rebasing.add(side)
         self._on_status(side, RESTARTING, self._server_detail(side, cause))
         self._core.submit_state(side, RESTARTING)
         for anomaly in lost:
@@ -701,23 +728,49 @@ class RealMatch:
     def _drift_end(self) -> dict[str, Any] | None:
         """Recalcule la dérive en secondes réelles et rend la fin due à son dépassement.
 
-        Elle compare les avances depuis le début du match, une fois `out` lu des deux côtés :
-        A est lu avant B, et juger entre les deux prendrait un retard de lecture pour une
-        dérive. L'arrondi précède la comparaison : `(3 + 1,6) − 3` vaut 1,5999… et le seuil
-        est strict. Un camp en relance n'est pas jugé, même s'il tique déjà : il n'est pas
-        encore disponible.
+        Elle compare les avances depuis le repère courant, plus l'écart acquis avant les
+        relances, une fois `out` lu des deux côtés : A est lu avant B, et juger entre les
+        deux prendrait un retard de lecture pour une dérive. L'arrondi précède la
+        comparaison : `(3 + 1,6) − 3` vaut 1,5999… et le seuil est strict. Un camp en
+        relance n'est pas jugé, même s'il tique déjà : il n'est pas encore disponible.
         """
         if self._unavailable or len(self._last_age) < len(SIDES):
             return None
-        first, second = (self._last_age[s] - self._first_age[s] for s in SIDES)
+        gap = self._age_gap() + self._banked_gap
         minutes = self.runtime["day_length_minutes"][str(self.config["day_length"])]
         scale = minutes * self.runtime["drift_factor"]
-        self._drift_s = round((first - second) * scale, DRIFT_DIGITS)
+        self._drift_s = round(gap * scale, DRIFT_DIGITS)
         limit_s = self.runtime["max_drift_s"]
         if abs(self._drift_s) <= limit_s:
             return None
         reason = f"dérive de {self._drift_s} s, au-delà de {limit_s} s"
         return {"outcome": OUTCOME_INVALIDATED, "winner": None, "reason": reason}
+
+    def _age_gap(self) -> float:
+        first, second = (self._last_age[s] - self._first_age[s] for s in SIDES)
+        return first - second
+
+    def _bank_drift(self) -> None:
+        """Met de côté l'écart mesuré avant une relance : le repère va changer, pas lui."""
+        if len(self._last_age) == len(SIDES):
+            self._banked_gap += self._age_gap()
+
+    def _track_age(self, side: str, age: float) -> None:
+        """Suit l'âge du monde d'un camp, et repose le repère au retour d'une relance.
+
+        Le monde relancé a perdu son temps d'arrêt et repart de sa dernière sauvegarde : son
+        âge ne se compare plus à l'ancien repère. Son premier heartbeat une fois disponible
+        ouvre donc un repère neuf, pris au dernier âge connu pour l'autre camp. Un serveur
+        vide ne tique pas : attendre ce heartbeat écarte aussi le temps de reconnexion du
+        joueur. La relance ne compte ainsi pas comme dérive, et ce qui suit se mesure.
+        """
+        if side in self._unavailable:
+            return
+        if side in self._rebasing:
+            self._rebasing.discard(side)
+            self._first_age = {**self._last_age, side: age}
+        self._first_age.setdefault(side, age)
+        self._last_age[side] = age
 
     def _write_records(self, records: Sequence[Mapping[str, Any]]) -> None:
         """Journalise dans l'ordre du cœur ; une commande part une fois journalisée."""
@@ -736,27 +789,39 @@ class RealMatch:
         """Écrit `match_end` avec le verdict relu sur le journal, qui contient tout le match.
 
         Une attribution `ko` ne touche ni `outcome` ni `winner` : elle s'ajoute à `reason`.
+        Le cœur a déjà décidé : ni un verdict incalculable, journalisé à part avec une
+        attribution `unknown`, ni une panne du journal ne font perdre le résultat.
         """
-        report = verdict(read_journal(self._journal.path).records)
-        kills = report["attribution"]
-        status, branch = kills["status"], report["fallback"]
         result = dict(record["data"]["result"])
-        note = None
-        if status == KO:
-            note = (
-                f"attribution {status} : {kills['attributed']} kills attribués "
-                f"sur {kills['reference']}, branche de repli {branch}"
-            )
-            result["reason"] = f"{result['reason']} ; {note}"
+        notes = []
+        try:
+            report = verdict(read_journal(self._journal.path).records)
+        except Exception as exc:
+            cause = self.redactor.redact_exception(exc)
+            self._write_safely(VERDICT_FAILED, {"cause": cause}, None, record["mt"])
+            notes.append(f"verdict non calculé, attribution inconnue : {cause}")
+            published = self._capabilities()
+            status, spawn, branch = UNKNOWN, published["spawn"], published["fallback"]
+        else:
+            kills = report["attribution"]
+            status, spawn, branch = kills["status"], report["spawn"], report["fallback"]
+            self._attribution = status
+            if status == KO:
+                note = (
+                    f"attribution {status} : {kills['attributed']} kills attribués "
+                    f"sur {kills['reference']}, branche de repli {branch}"
+                )
+                result["reason"] = f"{result['reason']} ; {note}"
+                notes.append(note)
         data = {
             **record["data"],
             "result": result,
             "attribution": status,
-            "spawn": report["spawn"],
+            "spawn": spawn,
             "fallback": branch,
         }
-        self._journal.write(MATCH_END, data, record["side"], record["mt"])
-        self._attribution = status
+        if not self._write_safely(MATCH_END, data, record["side"], record["mt"]):
+            notes.append("fin de match absente du journal : écriture impossible")
         self.result = result
         score = record["data"]["score"]
 
@@ -764,7 +829,7 @@ class RealMatch:
             state.result = result
             state.log(f"match terminé — A {score['A']} / B {score['B']} : {result['reason']}")
             state.event(f"fin du match — {result['reason']}")
-            if note is not None:
+            for note in notes:
                 state.log(note, "warn")
 
         self._on_state(change)
@@ -838,8 +903,7 @@ class RealMatch:
         if self.players[side] is not None:
             self._seen_ms[side] = now_ms
         if self._core is not None:
-            self._first_age.setdefault(side, data["age"])
-            self._last_age[side] = data["age"]
+            self._track_age(side, data["age"])
 
     def _take_probe_result(self, side: str, result: Mapping[str, Any], now_ms: int) -> None:
         probe = self._probes.get(side)
@@ -1059,13 +1123,19 @@ class RealMatch:
         Ces lignes accompagnent aussi l'arrêt : une panne du journal, disque plein compris,
         est consignée sans jamais empêcher d'arrêter les serveurs.
         """
-        journal = self._journal
-        if journal is None:
-            return
+        if self._journal is not None:
+            self._write_safely("state", data, side, self._line_mt())
+
+    def _write_safely(
+        self, type_: str, data: Mapping[str, Any], side: str | None, mt: float | None
+    ) -> bool:
+        """Journalise une ligne qu'une panne du journal ne doit pas interrompre."""
         try:
-            journal.write("state", data, side, self._line_mt())
+            self._journal.write(type_, data, side, mt)
         except (OSError, ValueError) as exc:
             LOGGER.error("journal : %s", self.redactor.redact_exception(exc))
+            return False
+        return True
 
     def shutdown(self) -> bool:
         """Arrête les serveurs une seule fois, depuis n'importe quel fil, verrou du moteur libre.
@@ -1156,7 +1226,7 @@ class Engine:
     # -- actions ---------------------------------------------------------
     def action(self, name: str, payload: dict | None = None) -> tuple[bool, str]:
         payload = payload or {}
-        if name not in ACTIONS:
+        if not isinstance(name, str) or name not in ACTIONS:
             return False, f"action inconnue: {name}"
         with self.lock:
             phase = self.state.phase
@@ -1255,24 +1325,32 @@ class Engine:
 
     # -- moteur ----------------------------------------------------------
     def _begin(self, payload: dict, code: str | None = None) -> None:
-        """`code` vient de la revanche seule : le `payload` d'un `start` n'en fixe aucun."""
-        preset = self.preset(payload.get("preset", "duel_rapide"))
+        """`code` vient de la revanche seule : le `payload` d'un `start` n'en fixe aucun.
+
+        Tout le `payload` se valide ici, avant le premier effet : un refus laisse l'état, les
+        mondes et les sauvegardes tels quels.
+        """
+        preset_id = payload.get("preset", "duel_rapide")
+        if not isinstance(preset_id, str):
+            raise ActionRefused("preset refusé : identifiant texte attendu")
+        preset = self.preset(preset_id)
+        pseudo = _text_option(payload, "pseudo", "pseudo")
+        password = _text_option(payload, "password", "mot de passe")
         if self.real:
-            for label, key in (("pseudo", "pseudo"), ("mot de passe", "password")):
-                if payload.get(key):
-                    _check_ini_value(label, payload[key])
-        duration = int(payload.get("duration_s") or preset["duration_s"])
-        duration = max(30, min(3600, duration))
+            for label, value in (("pseudo", pseudo), ("mot de passe", password)):
+                if value:
+                    _check_ini_value(label, value)
+        duration = _duration_of(payload, preset)
         cfg = {
-            "pseudo": (payload.get("pseudo") or "hôte")[:20],
+            "pseudo": (pseudo or "hôte")[:20],
             "preset": preset["id"],
             "preset_label": preset["label"],
             "duration_s": duration,
-            "day_length": int(payload.get("day_length") or preset["day_length"]),
+            "day_length": self._day_length_of(payload, preset),
             "code": code or make_code(),
             "summary": preset["summary"],
         }
-        cfg["password"] = payload.get("password") or cfg["code"]
+        cfg["password"] = password or cfg["code"]
         self.state = MatchState(mode=self.mode, config=cfg)
         self.state.reset_steps()
         # Dès ici et non dans le fil : un second `start` ne doit pas passer entre les deux.
@@ -1284,6 +1362,15 @@ class Engine:
             target=self._guarded, args=(run,), name="duel-engine", daemon=True
         )
         self._thread.start()
+
+    def _day_length_of(self, payload: Mapping[str, Any], preset: Mapping[str, Any]) -> int:
+        """Contrôle la valeur effective : c'est elle que la dérive cherchera dans la table."""
+        value = payload.get("day_length")
+        value = preset["day_length"] if value is None else value
+        known = self.runtime["day_length_minutes"]
+        if type(value) is not int or str(value) not in known:
+            raise ActionRefused(f"DayLength refusé : valeur attendue parmi {', '.join(known)}")
+        return value
 
     def _guarded(self, run: Callable[[], None]) -> None:
         """Dernier filet : `_redactor` connaît les secrets même si `RealMatch` n'a pas pu naître."""

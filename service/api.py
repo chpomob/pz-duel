@@ -105,8 +105,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             payload = json.loads(raw or b"{}")
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             self._json(400, {"ok": False, "error": "JSON invalide"})
+            return
+        if not isinstance(payload, dict):
+            self._json(400, {"ok": False, "error": "objet JSON attendu"})
             return
         action = payload.get("action", "")
         ok, msg = self.engine.action(action, payload)

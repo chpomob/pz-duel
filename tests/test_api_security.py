@@ -9,6 +9,7 @@ import threading
 import pytest
 
 from service.api import make_server
+from service.engine import Engine
 
 SECRET = "mot-de-passe-joueur"
 JSON_TYPE = "application/json"
@@ -157,3 +158,47 @@ def test_local_interface_still_works(api, name, with_origin):
     assert status == 200
     assert json.loads(body)["ok"] is True
     assert engine.actions == ["start"]
+
+
+def action(port: int, body: bytes) -> tuple[int, dict]:
+    headers = {"Host": f"127.0.0.1:{port}", "Content-Type": JSON_TYPE}
+    status, answer = send(port, "/api/action", headers, body)
+    return status, json.loads(answer)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"[1, 2]", b'"start"', b"5", b"null", b"\xff", b"[" * 200_000],
+    ids=["array", "text", "number", "null", "bad-utf8", "deep"],
+)
+def test_body_that_is_no_object_gets_a_json_refusal(api, body):
+    engine, port = api
+    status, answer = action(port, body)
+    assert status == 400
+    assert answer["ok"] is False and answer["error"]
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": []},
+        {"action": "start", "day_length": "abc"},
+        {"action": "start", "day_length": 8},
+        {"action": "start", "duration_s": "abc"},
+        {"action": "start", "pseudo": 5},
+    ],
+    ids=["action", "day-length-text", "day-length-unknown", "duration-text", "pseudo"],
+)
+def test_bad_payload_keeps_the_connection_and_answers_json(payload):
+    engine = Engine("mock")
+    server = make_server(engine)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        status, answer = action(server.server_address[1], json.dumps(payload).encode())
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert status == 409
+    assert answer["ok"] is False and answer["message"]
+    assert answer["state"]["phase"] == "idle"

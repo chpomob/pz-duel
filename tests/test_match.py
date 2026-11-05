@@ -24,17 +24,18 @@ from test_snapshots import (  # noqa: F401
     PLAYER_PASSWORD,
     WAIT_S,
     engine_rig,
+    make_world,
     world_db,
     world_dir,
     worlds_state,
 )
 from service import engine as engine_module
-from service.journal import JOURNAL_NAME
+from service.journal import JOURNAL_NAME, JournalError
 from service.protocol import parse_session
 from service.replay import main as replay_main
 from service.servers import read_ini
 from service.state import MatchState
-from service.verdict import spawn_status, verdict
+from service.verdict import VerdictError, spawn_status, verdict
 
 PRESET = "demo"
 PROBE_TIMEOUT_S = 30
@@ -686,6 +687,130 @@ def test_attribution_ko_reported_at_end(engine_rig):
     assert faulty.replays()
 
 
+def verdict_refused(records) -> dict:
+    raise VerdictError("champ `runtime` manquant dans `match_start`")
+
+
+def journal_unreadable(path) -> None:
+    raise JournalError("ligne 3 du journal illisible")
+
+
+@pytest.mark.parametrize(
+    "name, failing, cause",
+    [
+        ("verdict", verdict_refused, "runtime"),
+        ("read_journal", journal_unreadable, "ligne 3"),
+    ],
+)
+def test_decided_result_survives_a_failed_verdict(
+    engine_rig, monkeypatch, name, failing, cause
+):
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.kills("A", 1)
+    monkeypatch.setattr(engine_module, name, failing)
+    duel.at_match(duel.state()["config"]["duration_s"])
+    state = duel.finish()
+
+    assert state["error"] is None
+    assert state["result"]["outcome"] == "win"
+    assert state["result"]["winner"] == "A"
+    assert state["score"] == {"A": 1, "B": 0}
+    assert state["capabilities"]["attribution"] is None
+    (failure,) = duel.records("verdict_failed")
+    assert cause in failure["data"]["cause"]
+    end = duel.match_end()
+    assert end["n"] > failure["n"]
+    assert end["data"]["result"] == state["result"]
+    assert end["data"]["score"] == {"A": 1, "B": 0}
+    assert end["data"]["attribution"] == "unknown"
+    assert end["data"]["spawn"] == {"A": "ok", "B": "ok"}
+    assert end["data"]["fallback"] is None
+    warned = [log["msg"] for log in state["logs"] if log["level"] == "warn"]
+    assert any("verdict non calculé" in msg and cause in msg for msg in warned)
+    monkeypatch.undo()
+    assert duel.replays()
+
+
+def test_decided_result_survives_a_journal_failure(engine_rig):
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.kills("A", 1)
+    journal = duel.engine._match._journal
+    write = journal.write
+
+    def disk_full(type_, *args):
+        if type_ == "match_end":
+            raise OSError("disque plein")
+        return write(type_, *args)
+
+    journal.write = disk_full
+    duel.at_match(duel.state()["config"]["duration_s"])
+    state = duel.finish()
+
+    assert state["result"]["winner"] == "A"
+    assert duel.records("match_end") == []
+    warned = [log["msg"] for log in state["logs"] if log["level"] == "warn"]
+    assert any("fin de match absente du journal" in msg for msg in warned)
+
+
+def test_refused_start_touches_no_world(engine_rig):
+    """Une valeur inconnue s'arrête avant les serveurs, les mondes et le dossier du match."""
+    engine = engine_rig.build()
+    for side in SIDES:
+        make_world(engine_rig.zomboid, side)
+    before = worlds_state(engine_rig.zomboid)
+
+    ok, message = engine.action("start", {"preset": PRESET, "day_length": 8})
+
+    assert not ok and "DayLength" in message
+    assert engine.snapshot()["phase"] == "idle"
+    assert engine._thread is None
+    assert worlds_state(engine_rig.zomboid) == before
+    assert not (engine_rig.zomboid / "duel-snapshots").exists()
+    assert not engine_rig.launches.exists()
+    assert not engine_rig.matches.exists()
+
+
+def test_effective_day_length_is_checked_against_the_runtime(engine_rig):
+    """Le preset n'a été contrôlé que sur `runtime.json` : c'est la table du moteur qui sert."""
+    engine = engine_rig.build()
+    engine.runtime = {**engine.runtime, "day_length_minutes": {"7": 240}}
+
+    ok, message = engine.action("start", {"preset": PRESET})
+
+    assert not ok and "DayLength" in message
+    assert engine._thread is None
+
+
+def test_refused_start_leaves_a_running_match_alone(engine_rig):
+    duel = Duel(engine_rig)
+    duel.start_match()
+
+    ok, _ = duel.engine.action("start", {"preset": PRESET, "day_length": 8})
+
+    assert not ok
+    state = duel.reach(1)
+    assert state["phase"] == "running"
+    assert state["error"] is None
+
+
+def test_refused_start_keeps_the_previous_result(engine_rig):
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(duel.state()["config"]["duration_s"])
+    finished = duel.finish()
+
+    ok, _ = duel.engine.action("start", {"preset": PRESET, "duration_s": "abc"})
+
+    assert not ok
+    state = duel.state()
+    assert state["phase"] == "over"
+    assert state["result"] == finished["result"]
+
+
 def test_cancel_during_match_stops_servers(engine_rig):
     duel = Duel(engine_rig)
     duel.start_match()
@@ -818,7 +943,7 @@ def test_restart_in_match(engine_rig, presets, ending):
 
 
 def test_drift_decides_after_the_return(engine_rig, presets):
-    """Un âge figé par la relance ne mesure rien : la dérive attend le heartbeat de retour."""
+    """La relance ne compte pas, mais la dérive tranche sur ce qui suit le retour."""
     edit_preset(presets, day_length=1)
     duel = Duel(engine_rig)
     duel.start_match()
@@ -839,12 +964,70 @@ def test_drift_decides_after_the_return(engine_rig, presets):
     state = duel.reach(4)
     assert state["phase"] == "running"
 
+    # B a pris 1,7 d'avance pendant la relance : c'est son nouveau repère, pas une dérive.
     duel.mods["A"].read_session()
-    duel.mods["A"].beat(age=0.0, players=(PLAYER,))
-    duel.at_match(5)
+    duel.beat("A", age=0.0)
+    state = duel.reach(5)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
+
+    duel.at_match(6)
+    duel.mods["B"].beat(age=3.4, players=(PLAYER,))
+    duel.at_match(duel.te_s + duel.step_s)
     state = duel.finish()
     assert state["result"]["outcome"] == "invalidated"
+    assert state["clock"]["drift_s"] == -63.75
     assert "dérive" in state["result"]["reason"]
+    assert duel.replays()
+
+
+def test_restart_keeps_the_match_and_the_acquired_drift(engine_rig, presets):
+    """Comportement d'une relance réelle : le monde repart de sa dernière sauvegarde.
+
+    A revient avec un âge inférieur à celui de sa sortie, après un arrêt pendant lequel B a
+    continué. Ni cet arrêt, ni ce recul ne sont de la dérive : le match continue. L'écart
+    mesuré avant la sortie reste acquis, et s'ajoute à ce qui se mesure après le retour.
+    """
+    edit_preset(presets, day_length=1, duration_s=RESTART_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.beat("A", age=3.0)
+    duel.beat("B", age=0.0)
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 0)
+    duel.at_match(11)
+    duel.beat("A", age=3.5)
+    duel.beat("B", age=0.0)
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 18.75)
+
+    release = crash_and_hold(duel, "A")
+    duel.at_match(40)
+    duel.beat("B", age=4.0)
+    assert duel.reach(41)["clock"]["drift_s"] == 18.75
+
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    # Un serveur vide ne tique pas : le joueur met 30 s à revenir, et B avance encore.
+    duel.at_match(60)
+    duel.beat("B", age=5.0)
+    duel.at_match(71)
+    duel.mods["A"].read_session()
+    duel.beat("A", age=1.0)
+    state = duel.reach(72)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 18.75
+
+    duel.at_match(73)
+    duel.beat("A", age=1.25)
+    state = engine_rig.until(lambda s: s["clock"]["drift_s"] == 28.125)
+    assert state["phase"] == "running"
+
+    duel.at_match(74)
+    duel.mods["A"].beat(age=2.25, players=(PLAYER,))
+    duel.at_match(duel.te_s + duel.step_s)
+    state = duel.finish()
+    assert state["result"]["outcome"] == "invalidated"
+    assert state["clock"]["drift_s"] == 65.625
     assert duel.replays()
 
 
@@ -876,7 +1059,7 @@ def test_drift_ignores_a_beat_of_the_old_boot(engine_rig, presets):
 
 
 def test_drift_waits_for_the_availability(engine_rig, presets):
-    """Un heartbeat du nouveau `boot` reçu en relance n'est jugé qu'une fois le camp `up`."""
+    """Un heartbeat du nouveau `boot` reçu en relance ne pose aucun repère : le camp n'est pas `up`."""
     edit_preset(presets, day_length=1)
     duel = Duel(engine_rig)
     duel.start_match()
@@ -897,10 +1080,12 @@ def test_drift_waits_for_the_availability(engine_rig, presets):
 
     release.set()
     engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    # Pris dès la relance, le repère de A verrait ici 1,7 d'avance, au-delà du seuil.
     duel.at_match(4)
-    state = duel.finish()
-    assert state["result"]["outcome"] == "invalidated"
-    assert "dérive" in state["result"]["reason"]
+    duel.beat("A", age=1.7)
+    state = duel.reach(5)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
     assert duel.replays()
 
 

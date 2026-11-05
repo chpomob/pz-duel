@@ -240,8 +240,44 @@ def test_infinite_number_is_rejected():
 
 
 def test_huge_integer_does_not_escape_as_overflow():
+    """Il atteindrait la dérive, où sa soustraction à un flottant lèverait `OverflowError`."""
     line = BEAT.replace("2.4657", "1" + "0" * 400)
-    assert parse_beat(line)["data"]["age"] == 10**400
+    assert_rejected("bad_field", parse_beat, line)
+
+
+@pytest.mark.parametrize(
+    "number",
+    ["1e999", "-1e999", "1" + "0" * 400, "1e300", str(2**53 + 1)],
+    ids=["infinity", "minus-infinity", "huge-int", "huge-float", "above-exact-integers"],
+)
+@pytest.mark.parametrize(
+    "template",
+    ['"extra":{}', '"nested":{{"list":[1,{}]}}'],
+    ids=["field", "nested"],
+)
+def test_preserved_field_out_of_bounds_is_rejected(template, number):
+    field = template.format(number)
+    line = EVENT.replace('"origin":"world"', f'"origin":"world",{field}')
+    assert_rejected("bad_field", parse_catalog_event, line)
+
+
+def test_decoded_event_is_bounded_too():
+    """Le rejeu repasse par `parse_event` avec un objet déjà décodé."""
+    event = json.loads(EVENT)
+    event["data"]["extra"] = float("inf")
+    assert_rejected("bad_field", parse_catalog_event, event)
+
+
+def test_preserved_field_too_deep_is_rejected():
+    line = EVENT.replace('"origin":"world"', '"origin":"world","deep":' + "[" * 900 + "]" * 900)
+    assert_rejected("bad_field", parse_catalog_event, line)
+
+
+def test_preserved_numbers_within_bounds_stay_untouched():
+    line = EVENT.replace('"origin":"world"', f'"origin":"world","big":{2**53},"low":-1.5e15')
+    event = parse_catalog_event(line)
+    assert (event["data"]["big"], event["data"]["low"]) == (2**53, -1.5e15)
+    assert json.loads(dump_line(event)) == event
 
 
 def test_parse_beat_refuses_other_kinds():

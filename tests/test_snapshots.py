@@ -722,17 +722,23 @@ def test_next_match_restores_without_creation_pass(engine_rig):
     assert len(secrets_by_match) == 2
 
 
+def assert_creation_undone(store: SnapshotStore) -> None:
+    assert not store.has_world("A") and not store.has_world("B")
+    assert not store.creation_pending()
+
+
 def test_failed_creation_pass_captures_nothing(rig):
     crash = {"lines": ["boom"], "exit_code": 3}
     pair = rig.pair({"B": crash}, create_world=CREATE_WORLD)
     store = rig.store()
 
-    with pytest.raises(SnapshotError, match="passe de création en échec : serveur B"):
+    with pytest.raises(SnapshotError, match="(?s)passe de création en échec : serveur B.*invalidé"):
         prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
 
     assert not store.has("A") and not store.has("B")
     assert not any(event[0] == "capture" for event in rig.events if isinstance(event, tuple))
     assert not any(snapshots._is_running(server) for server in rig.servers.values())
+    assert_creation_undone(store)
 
 
 def test_cancelled_creation_pass_captures_nothing(rig):
@@ -747,6 +753,15 @@ def test_cancelled_creation_pass_captures_nothing(rig):
     cancel.join()
     assert not store.has("A") and not store.has("B")
     assert not any(snapshots._is_running(server) for server in rig.servers.values())
+    assert_creation_undone(store)
+
+    # Le monde de la passe annulée ne devient pas l'origine : une passe entière le remplace.
+    rig.events.clear()
+    pair = rig.pair(create_world=CREATE_WORLD)
+    prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
+    assert "prepare_launch" in rig.events
+    assert store.has("A") and store.has("B")
+    assert not store.creation_pending()
 
 
 def test_creation_pass_missing_world_captures_nothing(rig):
@@ -758,6 +773,61 @@ def test_creation_pass_missing_world_captures_nothing(rig):
         prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
 
     assert not store.has("A") and not store.has("B")
+
+
+def test_killed_creation_pass_is_invalidated_not_captured(rig):
+    """Service tué en pleine passe : personne n'a nettoyé, et les deux mondes existent."""
+    pair = rig.pair()
+    store = rig.store()
+
+    def killed() -> bool:
+        for side in SIDES:
+            make_world(rig.zomboid, side, b"partial")
+        raise RuntimeError("service tué")
+
+    pair.start = killed
+    with pytest.raises(RuntimeError, match="service tué"):
+        prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
+    assert store.has_world("A") and store.has_world("B")
+
+    pair = rig.pair(create_world=CREATE_WORLD)
+    with pytest.raises(SnapshotError, match="passe de création interrompue, invalidé"):
+        prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
+    assert not store.has("A") and not store.has("B")
+    assert_creation_undone(store)
+    assert not rig.launches.exists()
+
+    prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
+    assert store.has("A") and store.has("B")
+    assert (store._snapshot("A") / "world" / "map" / "chunk.bin").read_text() == "created\n"
+
+
+def test_creation_pass_erases_nothing_under_a_running_server(rig):
+    pair = rig.pair()
+    store = rig.store()
+
+    def started() -> bool:
+        for side in SIDES:
+            make_world(rig.zomboid, side)
+        return True
+
+    pair.start, pair.wait_ready, pair.stop = started, lambda: True, lambda: False
+    with pytest.raises(SnapshotError, match="arrêt des serveurs incomplet"):
+        prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
+
+    assert store.has_world("A") and store.has_world("B")
+    assert store.creation_pending()
+
+
+def test_marker_left_after_a_complete_capture_erases_nothing(rig, captured):
+    """Coupure entre la capture et le retrait du marqueur : les snapshots sont entiers."""
+    pair, store, origin = captured
+    store.begin_creation()
+
+    prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
+
+    assert worlds_state(rig.zomboid) == origin
+    assert not store.creation_pending()
 
 
 def test_failed_prepare_launch_starts_nothing(rig):

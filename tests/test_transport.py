@@ -181,6 +181,7 @@ def test_late_line_after_gap_is_not_reprocessed(mod, reader):
         pytest.param(b"1" * 10000, id="huge-int"),
         pytest.param(b'{"v":1,"boot":"1","seq":1,"t_ms":0,"src":"A","side":"A","kind":"beat","data":{}}', id="bad-boot"),
         pytest.param(b'{"v":1,"boot":1,"seq":1,"t_ms":0,"src":"A","side":"A","kind":"nope","data":{}}', id="unknown-kind"),
+        pytest.param(b'{"v":1,"boot":1,"seq":2,"t_ms":0,"src":"A","side":"A","kind":"zombie_kill","data":{"extra":1e999}}', id="infinite-preserved-field"),
     ],
 )
 def test_poll_never_raises_on_a_line(mod, reader, line):

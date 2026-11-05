@@ -228,6 +228,65 @@ def test_real_refuses_ini_injection(zomboid_home, runtime, field, value):
     assert engine.snapshot()["phase"] == "idle"
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("day_length", 8),
+        ("day_length", 0),
+        ("day_length", -1),
+        ("day_length", "abc"),
+        ("day_length", "1"),
+        ("day_length", 1.5),
+        ("day_length", True),
+        ("day_length", [1]),
+        ("day_length", float("inf")),
+        ("duration_s", "abc"),
+        ("duration_s", 0),
+        ("duration_s", 29),
+        ("duration_s", 3601),
+        ("duration_s", 10**400),
+        ("duration_s", 120.5),
+        ("duration_s", True),
+        ("duration_s", float("nan")),
+        ("duration_s", {"s": 1}),
+        ("pseudo", 5),
+        ("pseudo", ["hôte"]),
+        ("password", 5),
+        ("preset", ["demo"]),
+        ("preset", 5),
+    ],
+)
+@pytest.mark.parametrize("mode", ["mock", "real"])
+def test_bad_start_payload_is_refused_before_any_effect(
+    mode, field, value, zomboid_home, runtime
+):
+    engine = Engine(
+        mode, zomboid_dir=zomboid_home, runtime=runtime, server_factory=forbidden_factory
+    )
+    before = engine.snapshot()
+
+    ok, message = engine.action("start", {"preset": "demo", field: value})
+
+    assert not ok and message
+    assert engine._thread is None
+    assert engine.snapshot() == before
+
+
+@pytest.mark.parametrize("duration_s", [30, 3600])
+def test_duration_bounds_are_accepted(duration_s, runtime):
+    engine = Engine("mock", runtime=runtime)
+    ok, message = engine.action("start", {"preset": "demo", "duration_s": duration_s})
+    assert ok, message
+    assert engine.snapshot()["config"]["duration_s"] == duration_s
+    interrupt(engine)
+
+
+@pytest.mark.parametrize("name", [[], {}, 5, None])
+def test_action_name_of_a_wrong_type_is_refused(name, runtime):
+    ok, message = Engine("mock", runtime=runtime).action(name)
+    assert not ok and "action inconnue" in message
+
+
 def test_second_start_is_refused_at_once(zomboid_home, runtime):
     engine = real_engine(zomboid_home, runtime)
 

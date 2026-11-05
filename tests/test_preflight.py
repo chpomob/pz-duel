@@ -300,6 +300,33 @@ def test_install_mod_option_installs_and_exits(tmp_path):
     assert mod_fingerprint(destination) in done.stdout
 
 
+@pytest.mark.parametrize("through", ["option", "variable"])
+def test_relative_install_is_launchable(tmp_path, monkeypatch, through):
+    """Relatif, le chemin se résoudrait deux fois : `cwd`, puis le script sous ce `cwd`."""
+    install = make_install(tmp_path / "jeu" / "pz")
+    monkeypatch.chdir(tmp_path)
+    if through == "option":
+        detection = detect_pz("jeu/pz", {}, tmp_path)
+    else:
+        detection = detect_pz(None, {ENV_VAR: "jeu/pz"}, tmp_path)
+
+    assert detection.status == PRESENT
+    assert detection.path == install and detection.path.is_absolute()
+    done = subprocess.run([str(detection.path / SCRIPT)], cwd=detection.path, check=False)
+    assert done.returncode == 0
+
+
+def test_preflight_returns_an_absolute_install(ready, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert ready(pz_dir="pz").values["pz_dir"] == str(tmp_path / "pz")
+    assert ready(pz_dir=None, env={ENV_VAR: "pz"}).values["pz_dir"] == str(tmp_path / "pz")
+
+
+def test_unresolvable_install_fails_the_preflight(ready):
+    (failure,) = ready(pz_dir="~utilisateur-inconnu-du-systeme/pz").failures
+    assert "PZ absent" in failure and "--pz-dir" in failure
+
+
 def test_invalid_pz_dir_option_stops_the_service(tmp_path):
     done = run_main(tmp_path, "--pz-dir", str(tmp_path / "nulle_part"), "--no-browser")
     assert done.returncode != 0

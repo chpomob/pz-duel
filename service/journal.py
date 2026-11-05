@@ -59,6 +59,9 @@ class Journal:
     `clock` rend l'heure murale en millisecondes. Une ligne refusée ou impossible à
     sérialiser ne consomme pas de `n`. Le verrou couvre `n`, `ts_ms` et l'écriture,
     `fsync` compris : l'ordre des lignes est celui de `n`.
+
+    Une ligne coupée par une panne d'écriture reste au plus en fin de fichier, où
+    `read_journal` la sépare : la ligne suivante la retire avant de s'écrire.
     """
 
     def __init__(self, dir: str | os.PathLike[str], clock: Callable[[], float]) -> None:
@@ -68,6 +71,8 @@ class Journal:
         self._clock = clock
         self._lock = threading.Lock()
         self._next_n = FIRST_N
+        self._end = 0
+        self._torn = False
         self._file = open(self.path, "xb", buffering=0)
 
     def write(
@@ -94,13 +99,24 @@ class Journal:
                 "data": data,
             }
             line = dump_line(record)
-            written = self._file.write(line)
-            if written != len(line):
-                raise OSError(f"écriture partielle du journal : {written} octets sur {len(line)}")
+            self._append(line)
             self._next_n += 1
             if type == SYNCED_TYPE:
                 os.fsync(self._file.fileno())
         return record
+
+    def _append(self, line: bytes) -> None:
+        """Écrit `line` après la dernière ligne entière ; sous le verrou de `write`."""
+        if self._torn:
+            os.ftruncate(self._file.fileno(), self._end)
+            self._file.seek(self._end)
+            self._torn = False
+        self._torn = True
+        written = self._file.write(line)
+        if written != len(line):
+            raise OSError(f"écriture partielle du journal : {written} octets sur {len(line)}")
+        self._torn = False
+        self._end += written
 
     def close(self) -> None:
         with self._lock:

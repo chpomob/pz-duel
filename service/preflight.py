@@ -48,7 +48,7 @@ INSTALL_HINT = "lancez `python3 -m service.main --install-mod`"
 
 @dataclass(frozen=True)
 class PzDetection:
-    """`path` est le dossier de `start-server.sh`, `None` quand `status` vaut « absent »."""
+    """`path` est le dossier absolu de `start-server.sh`, `None` si `status` vaut « absent »."""
 
     status: str
     path: Path | None
@@ -75,7 +75,9 @@ def _absent(reason: str) -> PzDetection:
 def _accept(script: Path) -> PzDetection:
     if not os.access(script, os.X_OK):
         return _absent(f"{script} n'est pas exécutable ; corrigez avec `chmod +x`.")
-    return PzDetection(PRESENT, script.parent, f"PZ présent : {script.parent}")
+    # Absolu : le serveur se lance avec ce dossier pour `cwd` et pour préfixe de son script.
+    folder = script.parent.resolve()
+    return PzDetection(PRESENT, folder, f"PZ présent : {folder}")
 
 
 def detect_pz(pz_dir: Any, env: Mapping[str, str], home: Path) -> PzDetection:
@@ -88,7 +90,10 @@ def detect_pz(pz_dir: Any, env: Mapping[str, str], home: Path) -> PzDetection:
     label = "--pz-dir" if pz_dir is not None else ENV_VAR
     explicit = pz_dir if pz_dir is not None else env.get(ENV_VAR) or None
     if explicit is not None:
-        folder = Path(explicit).expanduser()
+        try:
+            folder = Path(explicit).expanduser()
+        except RuntimeError as exc:
+            return _absent(f"{explicit} ne se résout pas ({exc}) ; corrigez {label}.")
         for candidate in (folder / GAME_SUBDIR / SCRIPT, folder / SCRIPT):
             if os.path.isfile(candidate):
                 return _accept(candidate)

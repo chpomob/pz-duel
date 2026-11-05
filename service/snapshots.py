@@ -6,6 +6,11 @@ Il n'apparaît sous son nom que par un `rename` final : sa présence vaut donc s
 Capture et restauration portent sur toute la paire. Tout est copié avant le premier
 `rename` : une panne de copie, d'un côté comme de l'autre, ne touche à aucun monde, et le
 service ne se retrouve jamais avec deux mondes d'origine différente.
+
+Une passe de création pose un marqueur avant de lancer les serveurs et ne le retire qu'une
+fois sa capture faite. Un monde trouvé avec ce marqueur vient donc d'une passe inachevée,
+même si le service a été tué : il n'est jamais capturé, il est invalidé. Sans marqueur, un
+monde existant reste celui de l'utilisateur, et il est capturé.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ DB_DIR = "db"
 SNAPSHOT_WORLD = "world"
 STAGED = "new"
 REPLACED = "old"
+CREATION_MARKER = ".creation-en-cours"
 SNAPSHOT_MODE = 0o700
 
 Copy = Callable[[Path, Path], None]
@@ -42,6 +48,14 @@ def copy_path(src: Path, dst: Path) -> None:
         shutil.copytree(src, dst, symlinks=True)
     else:
         shutil.copy2(src, dst)
+
+
+def remove_path(path: Path) -> None:
+    """Retire un dossier ou un fichier, absent compris ; un lien n'est pas suivi."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def _is_running(server: ServerProcess) -> bool:
@@ -90,6 +104,7 @@ class SnapshotStore:
     ) -> None:
         self._zomboid_dir = Path(zomboid_dir)
         self._root = self._zomboid_dir / SNAPSHOTS_DIR
+        self._marker = self._root / CREATION_MARKER
         self._ports = load_runtime()["ports"] if ports is None else ports
         self._copy = copy
 
@@ -99,6 +114,33 @@ class SnapshotStore:
     def has_world(self, side: str) -> bool:
         """Vrai dès qu'une trace du monde existe : une moitié de monde n'est pas un vide."""
         return any(os.path.lexists(path) for path in self._world_parts(side))
+
+    def creation_pending(self) -> bool:
+        return os.path.lexists(self._marker)
+
+    def begin_creation(self) -> None:
+        """Pose le marqueur, durable avant que le premier serveur n'écrive son monde."""
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._marker.touch()
+        os.sync()
+
+    def end_creation(self) -> None:
+        self._marker.unlink(missing_ok=True)
+
+    def discard_creation(self, pair: ServerPair) -> None:
+        """Efface ce qu'une passe inachevée a créé, serveurs arrêtés et ports libres.
+
+        Une passe ne démarre que sans aucun monde : ceux-ci ne peuvent venir que d'elle.
+        Le marqueur part en dernier : une panne ici sera reprise au lancement suivant.
+        """
+        self._require_stopped(pair, "invalidation")
+        try:
+            for side in pair.servers:
+                for part in self._world_parts(side):
+                    remove_path(part)
+            self.end_creation()
+        except OSError as exc:
+            raise SnapshotError(f"invalidation impossible : {exc}") from exc
 
     def capture(self, pair: ServerPair) -> None:
         """Capture les deux mondes, serveurs arrêtés, sans jamais écraser un snapshot."""
@@ -196,10 +238,18 @@ def prepare_worlds(
     snapshots = [side for side in sides if store.has(side)]
     worlds = [side for side in sides if store.has_world(side)]
     if len(snapshots) == len(sides):
+        # Un marqueur ici dit seulement qu'une coupure a suivi la capture : elle est complète.
+        store.end_creation()
         store.restore(pair)
     elif snapshots:
         raise SnapshotError(
             f"lancement refusé : snapshot présent seulement pour {', '.join(snapshots)}"
+        )
+    elif store.creation_pending():
+        store.discard_creation(pair)
+        raise SnapshotError(
+            "lancement refusé : monde laissé par une passe de création interrompue, invalidé "
+            "sans capture ; relancez le duel pour recréer les deux mondes"
         )
     elif len(worlds) == len(sides):
         store.capture(pair)
@@ -216,11 +266,19 @@ def _creation_pass(
     pair: ServerPair, store: SnapshotStore, prepare_launch: Callable[[], None]
 ) -> None:
     prepare_launch()
+    store.begin_creation()
     ready = pair.start() and pair.wait_ready()
     # Aussi après un échec ou une annulation : au retour, plus aucun serveur ne tourne.
     stopped = pair.stop()
-    if not ready:
-        raise SnapshotError(f"passe de création en échec : {pair.failure or 'interrompue'}")
+    failure = None if ready else f"passe de création en échec : {pair.failure or 'interrompue'}"
     if not stopped:
-        raise SnapshotError("passe de création en échec : arrêt des serveurs incomplet")
-    store.capture(pair)
+        # Rien ne s'efface sous un serveur : le marqueur reste, le lancement suivant reprend.
+        raise SnapshotError(failure or "passe de création en échec : arrêt des serveurs incomplet")
+    try:
+        if failure is not None:
+            raise SnapshotError(failure)
+        store.capture(pair)
+    except SnapshotError as exc:
+        store.discard_creation(pair)
+        raise SnapshotError(f"{exc} ; monde partiel invalidé") from exc
+    store.end_creation()

@@ -254,3 +254,34 @@ def test_line_separator_inside_string_stays_one_record(journal):
     journal.write("event", {"w": "a b\u0085c"})
 
     assert read_journal(journal.path).records[0]["data"]["w"] == "a b\u0085c"
+
+
+class TornFile:
+    """Tient lieu du fichier : sa prochaine écriture s'arrête à la moitié de la ligne."""
+
+    def __init__(self, file) -> None:
+        self._file = file
+
+    def __getattr__(self, name):
+        return getattr(self._file, name)
+
+    def write(self, line: bytes) -> int:
+        return self._file.write(line[: len(line) // 2])
+
+
+def test_torn_write_never_reaches_the_middle_of_the_journal(journal):
+    journal.write("state", {"phase": "running"})
+    healthy = journal._file
+    journal._file = TornFile(healthy)
+    with pytest.raises(OSError, match="écriture partielle"):
+        journal.write("event", {"kind": "torn"})
+    journal._file = healthy
+
+    # La coupure reste lisible comme une dernière ligne incomplète, sans `n` consommé.
+    assert read_journal(journal.path).incomplete
+
+    journal.write("state", {"phase": "stopping"})
+    content = read_journal(journal.path)
+    assert content.incomplete is None
+    assert [record["n"] for record in content.records] == [1, 2]
+    assert [record["data"]["phase"] for record in content.records] == ["running", "stopping"]
