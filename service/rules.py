@@ -5,8 +5,9 @@ nommant la règle, ou la section hors règle, et le champ. Les bornes viennent d
 `limits`, le catalogue a la forme de `service/effects.json`.
 
 `RuleEvaluator` évalue une table validée pour un camp, sans horloge, fichier ni réseau.
-`MatchCore` y ajoute la grille de ticks et les files de lots : il ne lit ni horloge, ni
-fichier, ni réseau, et rend ses enregistrements dans l'ordre d'écriture du journal.
+`MatchCore` y ajoute la grille de ticks, les budgets, les files de lots et la fin de
+match : il ne lit ni horloge, ni fichier, ni réseau, et rend ses enregistrements dans
+l'ordre d'écriture du journal.
 """
 
 from __future__ import annotations
@@ -18,9 +19,10 @@ import math
 import re
 from bisect import bisect_left, bisect_right, insort
 from collections import deque
-from collections.abc import Collection, Mapping, MutableMapping
+from collections.abc import Callable, Collection, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -37,6 +39,7 @@ MS_PER_S = 1000
 KILL_ATOM = "zombie_kill"
 DUEL_ORIGIN = "duel"
 CMD_RESULT = "cmd_result"
+PLAYER_DEATH = "player_death"
 RESTARTING = "restarting"
 # Absents de la commande : `target` devient le camp visé, `cap_per_min` reste au budget.
 NON_COMMAND_PARAMS = ("target", "cap_per_min")
@@ -161,6 +164,7 @@ class _RunningEffect:
 
     target: str
     duration_ms: int
+    timeout_ms: int
     release_ms: int | None = None
 
 
@@ -689,12 +693,15 @@ class RuleEvaluator:
 
 
 class MatchCore:
-    """Cœur déterministe d'un match : horloge à ticks, évaluation et files par cible.
+    """Cœur déterministe d'un match : horloge à ticks, évaluation, budgets et fin.
 
     Tout se compte en millisecondes entières depuis `t0_ms` et en index de tick, `mt`
     n'étant calculé qu'à la sortie. `t_ms` date les événements et ne cadence jamais les
     ticks. Un enregistrement a les arguments de `Journal.write` : `type`, `data`, `side`
     et `mt`. `reserve_seq` agit tout de suite, car une sonde part hors de tout tick.
+
+    `result` reste nul jusqu'à la fin du match, dont `match_end` est le dernier
+    enregistrement : passé ce tick, plus rien ne s'exécute et `mt` ne bouge plus (D11).
     """
 
     def __init__(
@@ -708,9 +715,12 @@ class MatchCore:
         self.scores = {side: 0 for side in SIDES}
         self.catalog = catalog
         self.duration_s = duration_s
+        self.result: Mapping[str, Any] | None = None
         self._t0_ms = t0_ms
         self._tick_ms = runtime["tick_ms"]
         self._rate_window_ms = runtime["rate_window_s"] * MS_PER_S
+        self._max_units = runtime["max_units_per_command"]
+        self._cmd_timeout_ms = runtime["cmd_result_timeout_s"] * MS_PER_S
         budget = table["budget"]
         self._threats_per_window = budget["threats_per_minute"]
         self._concurrent_effects = budget["concurrent_effects"]
@@ -718,11 +728,17 @@ class MatchCore:
         self._evaluators = {side: RuleEvaluator(table, side, self.scores) for side in SIDES}
         self._tick = -1
         self._events: list[Mapping[str, Any]] = []
-        self._state_inputs: list[tuple[str, str]] = []
+        self._inputs: list[Callable[[], None]] = []
+        self._submitted_end: Mapping[str, Any] | None = None
+        self._ending: Mapping[str, Any] | None = None
         self._records: list[dict[str, Any]] = []
         # Un dict garde l'ordre d'insertion : c'est la file FIFO, indexée par clé de lot.
         self._lots: dict[str, dict[str, _Lot]] = {side: {} for side in SIDES}
         self._running: dict[int, _RunningEffect] = {}
+        # Commandes écrites sans `cmd_result` reçu, `cmd_timeout` ou non : `seq` → cible.
+        self._unanswered: dict[int, str] = {}
+        # Unités admises `(tick en ms, unités)` par camp auteur, règle et rang de l'effet.
+        self._admitted: dict[tuple[str, str, int], deque[tuple[int, int]]] = {}
         self._restarting: set[str] = set()
         self._last_sent: dict[tuple[str, str], int] = {}
         self._sent: dict[str, deque[int]] = {side: deque() for side in SIDES}
@@ -739,7 +755,16 @@ class MatchCore:
 
     def submit_state(self, side: str, state: str) -> None:
         """Rattache un changement d'état du serveur `side` au prochain tick."""
-        self._state_inputs.append((side, state))
+        self._inputs.append(partial(self._apply_state, side, state))
+
+    def submit_lost(self, seq: int) -> None:
+        """Rattache au prochain tick la perte de la commande `seq` par un redémarrage."""
+        self._inputs.append(partial(self._apply_lost, seq))
+
+    def submit_end(self, result: Mapping[str, Any]) -> None:
+        """Rattache une fin décidée par le service (D12) : seule la première compte."""
+        if self._submitted_end is None:
+            self._submitted_end = result
 
     def reserve_seq(self, seq: int) -> None:
         """Consomme le `seq` d'une commande écrite hors du cœur, comme une sonde."""
@@ -749,22 +774,34 @@ class MatchCore:
         """Exécute dans l'ordre tous les ticks non clos jusqu'à l'instant courant."""
         last_tick = (now_ms - self._t0_ms) // self._tick_ms
         records: list[dict[str, Any]] = []
-        while self._tick < last_tick:
+        while self.result is None and self._tick < last_tick:
             records += self.run_tick()
         return records
 
     def run_tick(self) -> list[dict[str, Any]]:
-        """Exécute le tick suivant : événements, intrants, échéances, puis émission."""
+        """Exécute le tick suivant : événements, intrants, échéances, puis émission.
+
+        Un tick de fin n'émet rien. Une mort du tick passe avant une fin soumise, qui
+        passe elle-même avant le minuteur : c'est l'ordre du traitement dans le tick.
+        """
+        if self.result is not None:
+            return []
         self._tick += 1
         self._records = []
         events, self._events = self._events, []
         for event in sorted(events, key=lambda e: (e["t_ms"], e["src"], e["boot"], e["seq"])):
             self._process_event(event)
-        inputs, self._state_inputs = self._state_inputs, []
-        for side, state in inputs:
-            self._apply_state(side, state)
+        inputs, self._inputs = self._inputs, []
+        for apply_input in inputs:
+            apply_input()
+        self._ending = self._ending or self._submitted_end
         self._release_due()
-        self._serve_queues()
+        if self._ending is None and self._now_ms >= self.duration_s * MS_PER_S:
+            self._ending = self._timer_result()
+        if self._ending is None:
+            self._serve_queues()
+        else:
+            self._finish(self._ending)
         return self._records
 
     @property
@@ -796,11 +833,18 @@ class MatchCore:
         if kind == CMD_RESULT:
             self._settle(event["data"]["seq"])
         elif side is not None:
+            if kind == PLAYER_DEATH and te_ms >= 0 and self._ending is None:
+                self._ending = self._death_result(side)
             for fired in self._evaluators[side].feed(event, te_ms):
                 self._apply_rule(fired)
 
     def _settle(self, seq: int) -> None:
-        """Date la fin d'un effet : ni un doublon, ni une sonde n'y changent rien."""
+        """Date la fin d'un effet : ni un doublon, ni une sonde n'y changent rien.
+
+        Après un `cmd_timeout` ou un `lost_on_restart`, l'effet n'est plus suivi : un
+        `cmd_result` tardif ne libère donc pas une seconde fois sa place.
+        """
+        self._unanswered.pop(seq, None)
         effect = self._running.get(seq)
         if effect is not None and effect.release_ms is None:
             effect.release_ms = self._now_ms + effect.duration_ms
@@ -813,19 +857,44 @@ class MatchCore:
             "multipliers": dict(fired.multipliers),
         }
         self._record("rule_fired", data, fired.side)
-        for effect in fired.effects:
-            self._enqueue(fired, effect)
+        for rank, effect in enumerate(fired.effects):
+            self._enqueue(fired, effect, rank)
 
-    def _enqueue(self, fired: FiredRule, effect: FiredEffect) -> None:
+    def _admit(self, fired: FiredRule, effect: FiredEffect, rank: int, units: int) -> int:
+        """Rend les unités admises par `cap_per_min` sur `]mt − 60, mt]`, journalise le reste.
+
+        Un camp a son propre compte : une règle s'évalue par camp, et les kills de l'un
+        n'entament pas le plafond de l'autre.
+        """
+        admitted = self._admitted.setdefault((fired.side, fired.rule, rank), deque())
+        while admitted and admitted[0][0] <= self._now_ms - self._rate_window_ms:
+            admitted.popleft()
+        room = max(0, effect.cap_per_min - sum(count for _, count in admitted))
+        taken = min(units, room)
+        if taken:
+            admitted.append((self._now_ms, taken))
+        if taken < units:
+            data = {"rule": fired.rule, "kind": effect.params["kind"], "units": units - taken}
+            self._record("effect_capped", data, effect.target)
+        return taken
+
+    def _enqueue(self, fired: FiredRule, effect: FiredEffect, rank: int) -> None:
         """Crée le lot de l'effet ou l'y cumule : `n` seul reste hors de la clé."""
         params = dict(effect.params)
         units = params.pop("n", None)
+        if units is not None and effect.cap_per_min is not None:
+            units = self._admit(fired, effect, rank, units)
+            if units == 0:
+                return
         key = json.dumps(params, sort_keys=True)
         lots = self._lots[effect.target]
         t_ms = fired.event["t_ms"]
         lot = lots.get(key)
         if lot is None:
-            lots[key] = _Lot(dict(effect.params), fired.rule, fired.event, t_ms)
+            lot_params = dict(effect.params)
+            if units is not None:
+                lot_params["n"] = units
+            lots[key] = _Lot(lot_params, fired.rule, fired.event, t_ms)
             return
         lot.oldest_t_ms = min(lot.oldest_t_ms, t_ms)
         if units is not None:
@@ -841,10 +910,47 @@ class MatchCore:
         else:
             self._restarting.discard(side)
 
+    def _apply_lost(self, seq: int) -> None:
+        """Libère la place de `seq`, s'il est sans `cmd_result` et pas déjà perdu.
+
+        `pop` tolère la place déjà rendue par `cmd_timeout`. Les fenêtres de
+        `threats_per_minute` et de cooldown gardent cette commande.
+        """
+        target = self._unanswered.pop(seq, None)
+        if target is not None:
+            self._running.pop(seq, None)
+            self._record("lost_on_restart", {"seq": seq}, target)
+
     def _release_due(self) -> None:
+        """Rend les places échues, par `seq` croissant : `cmd_timeout` ou fin de `duration_s`."""
         for seq, effect in list(self._running.items()):
-            if effect.release_ms is not None and effect.release_ms <= self._now_ms:
+            if effect.release_ms is None:
+                if effect.timeout_ms <= self._now_ms:
+                    del self._running[seq]
+                    self._record("cmd_timeout", {"seq": seq}, effect.target)
+            elif effect.release_ms <= self._now_ms:
                 del self._running[seq]
+
+    def _timer_result(self) -> dict[str, Any]:
+        first, second = (self.scores[side] for side in SIDES)
+        if first == second:
+            return {"outcome": "draw", "winner": None, "reason": "minuteur à 0, égalité"}
+        winner = SIDES[0] if first > second else SIDES[1]
+        return {"outcome": "win", "winner": winner, "reason": "minuteur à 0, meilleur score"}
+
+    def _death_result(self, side: str) -> dict[str, Any]:
+        reason = f"mort subite du camp {side}"
+        return {"outcome": "death", "winner": _opponent(side), "reason": reason}
+
+    def _finish(self, result: Mapping[str, Any]) -> None:
+        """Jette les lots restants, puis clôt le match sur son unique `match_end`."""
+        for target in SIDES:
+            for lot in self._lots[target].values():
+                data = {"rule": lot.rule, "kind": lot.params["kind"], "units": lot.params.get("n")}
+                self._record("effect_dropped", data, target)
+            self._lots[target].clear()
+        self.result = result
+        self._record("match_end", {"result": result, "score": dict(self.scores)}, None)
 
     def _serve_queues(self) -> None:
         """Sert A puis B ; la première tête bloquée n'arrête que sa propre file."""
@@ -854,8 +960,14 @@ class MatchCore:
                 key, lot = next(iter(lots.items()))
                 if not self._may_send(target, lot.params["kind"]):
                     break
-                del lots[key]
-                self._send(target, lot)
+                units = lot.params.get("n")
+                if units is not None and units > self._max_units:
+                    # Une tranche est une commande : le reste du lot garde la tête.
+                    lot.params["n"] = units - self._max_units
+                    self._send(target, lot, {**lot.params, "n": self._max_units})
+                else:
+                    del lots[key]
+                    self._send(target, lot, lot.params)
 
     def _may_send(self, target: str, kind: str) -> bool:
         if target in self._restarting:
@@ -871,13 +983,15 @@ class MatchCore:
         running = sum(effect.target == target for effect in self._running.values())
         return running < self._concurrent_effects
 
-    def _send(self, target: str, lot: _Lot) -> None:
+    def _send(self, target: str, lot: _Lot, params: Mapping[str, Any]) -> None:
         self._last_seq += 1
         origin = {"rule": lot.rule, "boot": lot.event["boot"], "event_seq": lot.event["seq"]}
-        command = {"v": PROTOCOL_VERSION, "seq": self._last_seq, **lot.params, "origin": origin}
+        command = {"v": PROTOCOL_VERSION, "seq": self._last_seq, **params, "origin": origin}
         latency_ms = self._t0_ms + self._now_ms - lot.oldest_t_ms
         self._record("command", {"command": command, "latency_ms": latency_ms}, target)
-        self._last_sent[target, lot.params["kind"]] = self._now_ms
+        self._last_sent[target, params["kind"]] = self._now_ms
         self._sent[target].append(self._now_ms)
-        duration_ms = lot.params.get("duration_s", 0) * MS_PER_S
-        self._running[self._last_seq] = _RunningEffect(target, duration_ms)
+        duration_ms = params.get("duration_s", 0) * MS_PER_S
+        timeout_ms = self._now_ms + self._cmd_timeout_ms
+        self._running[self._last_seq] = _RunningEffect(target, duration_ms, timeout_ms)
+        self._unanswered[self._last_seq] = target

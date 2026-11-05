@@ -1,8 +1,7 @@
 """R4 : horloge à ticks de `MatchCore` (AC73, AC74, AC75).
 
 Les événements passent par `parse_event` et les tables par `load_table` : le cœur ne
-voit que ce que le contrat et le chargeur admettent. La partie `match_end` d'AC75
-arrive avec la fin de match.
+voit que ce que le contrat et le chargeur admettent.
 """
 
 from __future__ import annotations
@@ -215,6 +214,16 @@ def test_tick_order():
         assert records[-1]["type"] == "command"
         assert len(of_type(records, "cmd_result")) == 1
 
+    # Un tick qui traite `match_end` n'émet rien, pas même le lot de son propre kill.
+    core = make_core(cooldown_s=0)
+    core.advance(at(4.75))
+    core.submit_event(event(5, seq=1))
+    core.submit_end({"outcome": "forfeit", "winner": "A", "reason": "absence de B"})
+    records = core.advance(at(5))
+    assert [r["type"] for r in records] == ["event", "rule_fired", "effect_dropped", "match_end"]
+    assert {r["mt"] for r in records} == {5}
+    assert core.advance(at(6)) == [] and core.mt == 5
+
 
 def test_service_inputs_after_events_before_emission():
     core = make_core()
@@ -231,6 +240,9 @@ def test_records_fit_journal(tmp_path):
     core.advance(at(0))
     core.submit_event(event(0.1))
     records = core.advance(at(0.25))
+    core.submit_event(event(0.3, seq=2))
+    core.submit_end({"outcome": "draw", "winner": None, "reason": "fin soumise"})
+    records += core.advance(at(0.5))
     journal = Journal(tmp_path, clock=lambda: T0_MS)
     for record in records:
         journal.write(**record)
@@ -241,5 +253,9 @@ def test_records_fit_journal(tmp_path):
         ("event", 0.25, "A"),
         ("rule_fired", 0.25, "A"),
         ("command", 0.25, "B"),
+        ("event", 0.5, "A"),
+        ("rule_fired", 0.5, "A"),
+        ("effect_dropped", 0.5, "B"),
+        ("match_end", 0.5, None),
     ]
     assert written[1]["data"]["event"] == {"src": "A", "boot": 1, "seq": 1}

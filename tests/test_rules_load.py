@@ -10,10 +10,12 @@ from pathlib import Path
 import pytest
 
 from service import engine, rules
+from service.protocol import parse_event
 from service.rules import TableError, When, load_table, parse_when, rules_hash
 
 PRESETS_DIR = Path(rules.__file__).resolve().parent / "presets"
 SHIPPED = ("demo", "duel_rapide", "hardcore", "pression")
+T0_MS = 1_793_830_000_000
 CARE_ITEMS = [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}]
 
 
@@ -211,8 +213,27 @@ def read_preset(name: str) -> dict:
     return json.loads((PRESETS_DIR / f"{name}.json").read_text(encoding="utf-8"))
 
 
+def first_command_n(raw: dict, catalog: dict, runtime: dict) -> int:
+    """Rend le `n` de la commande produite par un premier kill de A."""
+    table = load_table(raw, catalog, runtime["limits"], file_stem=raw["id"])
+    core = rules.MatchCore(table, runtime, catalog, T0_MS, raw["duration_s"])
+    line = {
+        "v": 1,
+        "boot": 1,
+        "seq": 1,
+        "t_ms": T0_MS,
+        "src": "A",
+        "side": "A",
+        "kind": "zombie_kill",
+        "data": {"origin": "world"},
+    }
+    core.submit_event(parse_event(line, catalog))
+    commands = [r for r in core.advance(T0_MS) if r["type"] == "command"]
+    assert len(commands) == 1
+    return commands[0]["data"]["command"]["n"]
+
+
 def test_shipped_presets_and_data_driven(runtime):
-    """Première moitié d'AC31 : le passage à la commande n=5 est complété en P9."""
     catalog = rules.load_effects()
     assert sorted(path.stem for path in PRESETS_DIR.glob("*.json")) == list(SHIPPED)
     for name in SHIPPED:
@@ -224,6 +245,8 @@ def test_shipped_presets_and_data_driven(runtime):
     loaded = load_table(edited, catalog, runtime["limits"], file_stem="duel_rapide")
     assert kills_effect(loaded)["n"] == 5
     assert rules_hash(loaded) != rules_hash(read_preset("duel_rapide"))
+    assert first_command_n(read_preset("duel_rapide"), catalog, runtime) == 2
+    assert first_command_n(edited, catalog, runtime) == 5
 
 
 def effects_by_rule(preset: dict) -> dict[str, list[dict]]:
