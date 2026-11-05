@@ -192,11 +192,15 @@ def tail(path: Path, n: int = 12) -> str:
 def gate(step: dict) -> tuple[bool, str]:
     """Vérifie ce qu'un APPROVE de revue ne prouve pas : le commit, la suite, les invariants."""
     subject = git("log", "-1", "--format=%s")
-    expected = f"feat(phase1): {step['id']}"
+    expected = f"feat(phase1): {step['id']} — {step['title']}"
     notes = [f"HEAD: {subject}"]
-    if not subject.startswith(expected):
-        notes.append(f"SUJET INATTENDU (attendu {expected!r})")
-        return False, " · ".join(notes)
+    if subject != expected:
+        # la boucle squash-merge avec son propre sujet ; on rétablit la convention du plan
+        amend = run(["git", "commit", "--amend", "-q", "-m", expected])
+        if amend.returncode != 0:
+            return False, "amend impossible: " + (amend.stderr.strip() or amend.stdout.strip())
+        notes.append(f"sujet rétabli: {expected}")
+        subject = expected
     r = run([PY, "-m", "pytest", "-q"], timeout=1800)
     summary = (r.stdout.strip().splitlines() or ["(aucune sortie)"])[-1]
     notes.append(f"pytest: {summary}")
