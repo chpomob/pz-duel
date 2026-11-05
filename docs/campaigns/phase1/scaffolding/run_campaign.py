@@ -248,13 +248,14 @@ def main() -> int:
     selected = [s for s in steps if s["id"] not in GATE_STEPS]
     if args.only:
         wanted = {x.strip() for x in args.only.split(",")}
-        selected = [s for s in steps if s["id"] in wanted]
+        selected = [s for s in selected if s["id"] in wanted]
     elif args.start_at:
-        idx = next((i for i, s in enumerate(steps) if s["id"] == args.start_at), None)
+        # l'index se cherche dans la liste FILTRÉE : sinon P24 (gate) revient dans la sélection
+        idx = next((i for i, s in enumerate(selected) if s["id"] == args.start_at), None)
         if idx is None:
             print(f"étape inconnue: {args.start_at}", file=sys.stderr)
             return 2
-        selected = steps[idx:]
+        selected = selected[idx:]
 
     require_clean()
     log(f"campagne phase1 : {len(selected)} étape(s), de {selected[0]['id']} à {selected[-1]['id']}")
