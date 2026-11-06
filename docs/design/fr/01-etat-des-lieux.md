@@ -4,6 +4,10 @@ Date : 04/11/2026 · Cible : Project Zomboid **Build 42 stable (42.20.x)** · Po
 
 > **Décision (04/11/2026)** : architecture retenue = **deux serveurs dédiés sur la machine d'un joueur**, temps non accéléré par construction. Détail de conception, config, horloge, pause et budget révisé : `02-archi-deux-serveurs.md`. Les sections 4 et 5 ci-dessous (archi A, gating `setGameSpeed`) restent comme référence de l'option écartée.
 
+Le concept lui-même — deux parties de Project Zomboid reliées, les actions de l'un devenant des menaces
+chez l'autre — vient de **Harumate** ([twitch.tv/harumate](https://www.twitch.tv/harumate)). Cette
+étude en est une implémentation indépendante.
+
 ---
 
 ## 1. Verdict court

@@ -12,6 +12,13 @@ chez A fait apparaître deux zombies chez B. Un craft réussi chez B envoie une 
 L'idée est celle d'un duel à la Tetris, transposée à la survie : le monde de chacun est un terrain
 de jeu séparé, et la seule chose qui circule est la conséquence de ce qu'on y fait.
 
+## D'où vient l'idée
+
+Le concept — deux parties de Project Zomboid reliées pour que les actions de l'un deviennent des
+menaces chez l'autre — a été décrit par **Harumate**, streameur français sur Project Zomboid, sur sa
+chaîne : [twitch.tv/harumate](https://www.twitch.tv/harumate). Ce dépôt est une implémentation
+indépendante de cette idée, sans lien avec lui ; l'idée, elle, est la sienne.
+
 ## Comment ça marche
 
 ```

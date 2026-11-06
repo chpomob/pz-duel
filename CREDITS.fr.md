@@ -5,6 +5,13 @@
 
 Ce projet n'existerait pas sans le travail de la communauté PZ. Règle de maison : **on crédite toujours, on ne recopie rien sans le dire**, et on ne réutilise aucun code de mod tiers sans licence compatible.
 
+## Origine de l'idée
+
+Le concept — relier deux parties de Project Zomboid pour que les actions de chaque joueur deviennent
+des menaces dans le monde de l'autre — vient de **Harumate**
+([twitch.tv/harumate](https://www.twitch.tv/harumate)), streameur français sur Project Zomboid. Il est
+crédité pour l'idée ; ce dépôt en est une implémentation indépendante, sans lien avec lui.
+
 ## Ce que le projet reprend, et de qui
 
 | Projet | Auteur(s) | Licence / statut | Ce qu'on en reprend | Ce qu'on ne reprend pas |

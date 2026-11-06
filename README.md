@@ -12,6 +12,13 @@ spawns two zombies on B. A successful craft on B sends a horde to A.
 Think of it as a Tetris-style duel transposed to survival: each world is its own board, and the only
 thing that travels is the consequence of what you do on yours.
 
+## Where the idea comes from
+
+The concept — two separate Project Zomboid games linked so that each side's actions become threats on
+the other — was described by **Harumate**, a French Project Zomboid streamer, on his channel:
+[twitch.tv/harumate](https://www.twitch.tv/harumate). This repository is an independent
+implementation of that idea, not affiliated with him; the idea itself is his.
+
 ## How it works
 
 ```

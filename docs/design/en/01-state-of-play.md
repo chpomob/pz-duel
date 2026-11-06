@@ -6,6 +6,10 @@ Date: 04/11/2026 · Target: Project Zomboid **Build 42 stable (42.20.x)** · Ref
 
 > **Decision (04/11/2026)**: retained architecture = **two dedicated servers on one player's machine**, time not accelerated by construction. Design detail, config, clock, pause and revised budget: `02-two-server-architecture.md`. Sections 4 and 5 below (archi A, `setGameSpeed` gating) remain as a reference for the discarded option.
 
+The concept itself — two linked Project Zomboid games, each side's actions becoming threats in the
+other's world — comes from **Harumate** ([twitch.tv/harumate](https://www.twitch.tv/harumate)). This
+study is an independent implementation of it.
+
 ---
 
 ## 1. Short verdict
