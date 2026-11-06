@@ -22,11 +22,13 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from . import paths
 from .journal import Journal, read_journal
+from .platforms import Platform, current
 from .preflight import detect_pz, run_preflight
 from .proofs import PROOFS_NAME, HookProofs
 from .protocol import PROTOCOL_VERSION, SIDES
@@ -90,8 +92,6 @@ ACTIONS = {"start", "cancel", "rematch", "simulate_join", "open_game"}
 MODE_MOCK = "mock"
 MODE_REAL = "real"
 MODES = (MODE_MOCK, MODE_REAL)
-# Lanceur du client, posé à côté du dossier que `detect_pz` rend.
-CLIENT_SCRIPT = "projectzomboid.sh"
 # `start-server.sh` fixe `-Dzomboid.steam=0` : le client doit quitter le mode Steam lui aussi.
 NO_STEAM_FLAG = "-nosteam"
 # Un client qui tient ce délai a démarré : un refus d'options sort bien avant.
@@ -163,20 +163,32 @@ class ClientLaunchError(Exception):
     """Client non lancé : le message dit la cause, sans jamais citer les arguments."""
 
 
-def launch_client(script: Path, args: Sequence[str]) -> subprocess.Popen:
-    """Lance le client par son script, détaché du service, et rend son processus démarré.
+def _spawn_detached(command: Sequence[str], platform: Platform) -> subprocess.Popen:
+    *first, last = platform.client_popen_attempts()
+    streams = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    for attempt in first:
+        try:
+            return subprocess.Popen(command, **streams, **attempt)
+        except PermissionError:
+            continue
+    return subprocess.Popen(command, **streams, **last)
 
-    Le script garde le client au premier plan et finit toujours par `exit 0` : le code ne
-    prouve rien, seul compte qu'il tourne encore au bout de `CLIENT_START_GRACE_S`.
+
+def launch_client(
+    script: Path, args: Sequence[str], platform: Platform | None = None
+) -> subprocess.Popen:
+    """Lance le client, détaché du service, et rend son processus démarré.
+
+    Le script Linux garde le client au premier plan et finit toujours par `exit 0` : le code
+    ne prouve rien, seul compte qu'il tourne encore au bout de `CLIENT_START_GRACE_S`.
     """
+    platform = current() if platform is None else platform
     try:
-        process = subprocess.Popen(
-            [str(script), *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        process = _spawn_detached([str(script), *args], platform)
     except OSError as exc:
         raise ClientLaunchError(f"{script.name} ne démarre pas ({exc.strerror})") from exc
     try:
@@ -1560,6 +1572,7 @@ class Engine:
         matches_dir: str | os.PathLike[str] | None = None,
         client_launcher: Callable[[Path, Sequence[str]], subprocess.Popen] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
+        platform: Platform | None = None,
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"mode inconnu : {mode}")
@@ -1574,10 +1587,19 @@ class Engine:
         )
         self._clock = time.time if clock is None else clock
         self._monotonic = time.monotonic if monotonic is None else monotonic
-        self._client_launcher = launch_client if client_launcher is None else client_launcher
+        self._platform = current() if platform is None else platform
+        self._client_launcher = (
+            partial(launch_client, platform=self._platform)
+            if client_launcher is None
+            else client_launcher
+        )
         self._client: subprocess.Popen | None = None
         self._client_starting = False
-        self._server_factory = ServerProcess if server_factory is None else server_factory
+        self._server_factory = (
+            partial(ServerProcess, platform=self._platform)
+            if server_factory is None
+            else server_factory
+        )
         self.lock = threading.RLock()
         self.state = MatchState(mode=mode)
         self.state.reset_steps()
@@ -1725,7 +1747,7 @@ class Engine:
     def _open_game_real(self, password: str, address: str) -> tuple[bool, str]:
         """Lance le client de l'hôte vers le serveur A. La commande n'est jamais journalisée.
 
-        Les serveurs tournent sans Steam, le client aussi, et par son seul script : Steam ne
+        Les serveurs tournent sans Steam, le client aussi, et par son seul programme : Steam ne
         rendrait aucun constat du lancement. Un succès dit que le client tourne, pas qu'il
         est connecté.
         """
@@ -1733,7 +1755,8 @@ class Engine:
         script = self._client_script()
         try:
             if script is None:
-                raise ClientLaunchError(f"client PZ introuvable ({CLIENT_SCRIPT} absent)")
+                program = self._platform.client_program
+                raise ClientLaunchError(f"client PZ introuvable ({program} absent)")
             client = self._client_launcher(script, args)
         except ClientLaunchError as exc:
             manual = f"lancez PZ à la main avec {NO_STEAM_FLAG}, puis rejoignez {address}"
@@ -1748,10 +1771,10 @@ class Engine:
         return True, message
 
     def _client_script(self) -> Path | None:
-        folder = detect_pz(self.pz_dir, os.environ, Path.home()).path
+        folder = detect_pz(self.pz_dir, os.environ, Path.home(), platform=self._platform).path
         if folder is None:
             return None
-        script = folder.parent / CLIENT_SCRIPT
+        script = self._platform.client_file(folder)
         return script if os.access(script, os.X_OK) else None
 
     # -- moteur ----------------------------------------------------------
@@ -1833,6 +1856,7 @@ class Engine:
             effects=self.effects,
             pz_dir=self.pz_dir,
             zomboid_dir=self.zomboid_dir,
+            platform=self._platform,
         )
         if self._aborted():
             return

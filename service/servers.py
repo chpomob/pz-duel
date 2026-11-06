@@ -5,7 +5,8 @@ texte passe par `surrogateescape` et sans traduction des fins de ligne, si bien 
 commentaire français ou un octet invalide ressort à l'identique.
 
 `start-server.sh` lance `java` sans `exec` : le script n'est pas le serveur. Tout ce qui
-décide de la fin d'un serveur regarde donc son groupe de processus, jamais le seul script.
+décide de la fin d'un serveur regarde donc son arbre de processus, jamais le seul script :
+un groupe sous Linux, un Job sous Windows, dont `service/platforms.py` porte les différences.
 
 Les droits POSIX du `.ini` ne valent que si `platform.posix_modes` : sous Windows, ni
 `fchmod` ni `chmod`, et `ini_failure` reste à `None`. `policy` et `platform` vont à
@@ -17,7 +18,6 @@ from __future__ import annotations
 import os
 import re
 import secrets
-import signal
 import stat
 import subprocess
 import tempfile
@@ -29,8 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from .platforms import Platform, current, replace_file
-from .preflight import SCRIPT
+from .platforms import Platform, ProcessTree, WindowsKernel, current, replace_file
 from .protocol import SIDES
 from .rcon import RconClient, RconError
 from .rules import MS_PER_S
@@ -182,14 +181,17 @@ def mods_setting(table: Mapping[str, Any]) -> str:
     return MODS_SEPARATOR.join(table["mods"])
 
 
-def launch_command(side: str, cfg: Mapping[str, Any]) -> list[str]:
+def launch_command(
+    side: str, cfg: Mapping[str, Any], platform: Platform | None = None
+) -> list[str]:
     """Commande d'un serveur. `cfg` porte `pz_dir`, `ports` et `admin_password`.
 
     Elle contient le mot de passe admin : à ne journaliser qu'à travers un `Redactor`.
     """
+    platform = current() if platform is None else platform
     ports = cfg["ports"][side]
     return [
-        str(Path(cfg["pz_dir"]) / SCRIPT),
+        platform.join(cfg["pz_dir"], platform.server_script),
         "-servername",
         server_name(side),
         "-port",
@@ -228,11 +230,12 @@ class Redactor:
 
 
 class ServerProcess:
-    """Un serveur et son groupe de processus. `start` peut resservir une fois l'arrêt fini.
+    """Un serveur et son arbre de processus. `start` peut resservir une fois l'arrêt fini.
 
     `cfg` porte ce que demande `launch_command`, plus `rcon_password`, `zomboid_dir` et les
     délais de `runtime.json`. `server_X.log` est ouvert en ajout : la passe de création et
-    un redémarrage écrivent à la suite du lancement précédent.
+    un redémarrage écrivent à la suite du lancement précédent. `kernel` remplace les appels
+    Win32 d'une plateforme Windows.
     """
 
     def __init__(
@@ -243,6 +246,7 @@ class ServerProcess:
         redactor: Redactor,
         *,
         platform: Platform | None = None,
+        kernel: WindowsKernel | None = None,
     ) -> None:
         self.side = side
         self.build: str | None = None
@@ -251,6 +255,7 @@ class ServerProcess:
         self.log_path = Path(match_dir) / f"server_{side}.log"
         self._cfg = cfg
         self._platform = current() if platform is None else platform
+        self._kernel = kernel
         self.redactor = redactor
         self._poll_s = cfg["tick_ms"] / MS_PER_S
         self._ini_path = Path(cfg["zomboid_dir"]) / "Server" / f"{server_name(side)}.ini"
@@ -258,11 +263,11 @@ class ServerProcess:
         self._listening = re.compile(rf"server is listening on port {port}\b")
         self._tail: deque[str] = deque(maxlen=cfg["log_tail_lines"])
         self._process: subprocess.Popen[bytes] | None = None
+        self._tree: ProcessTree | None = None
         self._reader: threading.Thread | None = None
         self._started_seen = False
         self._ready = threading.Event()
         self._ini_failure: str | None = None
-        self._group_gone = False
         self._stop_requested = False
         self._unexpected = False
         self._state_lock = threading.Lock()
@@ -274,7 +279,7 @@ class ServerProcess:
 
     @property
     def running(self) -> bool:
-        """Le groupe de processus décide, pas le script : `java` peut lui survivre."""
+        """L'arbre de processus décide, pas le script : `java` peut lui survivre."""
         with self._stop_lock:
             return self._process is not None and self._group_alive()
 
@@ -299,14 +304,17 @@ class ServerProcess:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             log = open(self.log_path, "ab", buffering=0)
             try:
+                command = launch_command(self.side, self._cfg, self._platform)
+                self._platform.check_arguments(command)
                 process = subprocess.Popen(
-                    launch_command(self.side, self._cfg),
+                    command,
                     cwd=self._cfg["pz_dir"],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True,
+                    **self._platform.server_popen_kwargs(),
                 )
+                tree = self._adopt(process)
             except BaseException:
                 log.close()
                 raise
@@ -317,11 +325,11 @@ class ServerProcess:
             self._started_seen = False
             self._ready.clear()
             self._ini_failure = None
-            self._group_gone = False
             with self._state_lock:
                 self._stop_requested = False
                 self._unexpected = False
                 self._process = process
+                self._tree = tree
             self._reader = threading.Thread(
                 target=self._read_output,
                 args=(process.stdout, log),
@@ -329,6 +337,14 @@ class ServerProcess:
                 daemon=True,
             )
             self._reader.start()
+
+    def _adopt(self, process: subprocess.Popen[bytes]) -> ProcessTree:
+        try:
+            return self._platform.process_tree(process, self._kernel)
+        except BaseException:
+            # L'arbre a tué le processus : `with` referme ses tubes et le ramasse.
+            with process:
+                raise
 
     def log_tail(self) -> list[str]:
         """Dernières lignes expurgées. Attend brièvement le fil, si le script vient de sortir."""
@@ -347,7 +363,8 @@ class ServerProcess:
         """Arrêt gradué. Rend vrai quand plus aucun processus du groupe ne subsiste.
 
         Le retour reste borné : un zombie que personne ne ramasse garde `killpg` positif
-        même après SIGKILL, et l'appelant ne doit pas rester bloqué pour autant.
+        même après SIGKILL, et l'appelant ne doit pas rester bloqué pour autant. Les paliers
+        gardent leurs noms sous Windows, où aucun signal n'est envoyé (D-F).
         """
         self.exited_unexpectedly()
         with self._state_lock:
@@ -369,11 +386,11 @@ class ServerProcess:
         if self._wait_group_gone(deadline):
             return True
         self.stop_stage = STOP_SIGTERM
-        self._signal_group(signal.SIGTERM)
+        self._signal_group(self._tree.terminate)
         if self._wait_group_gone(time.monotonic() + self._cfg["kill_grace_s"]):
             return True
         self.stop_stage = STOP_SIGKILL
-        self._signal_group(signal.SIGKILL)
+        self._signal_group(self._tree.kill)
         return self._wait_group_gone(time.monotonic() + self._cfg["kill_grace_s"])
 
     def _ask_quit(self, deadline: float) -> None:
@@ -405,19 +422,7 @@ class ServerProcess:
             pass
 
     def _group_alive(self) -> bool:
-        if self._group_gone:
-            # Un groupe éteint libère son numéro : le sonder viserait peut-être un inconnu.
-            return False
-        # Le script non ramassé compterait encore dans le groupe.
-        self._process.poll()
-        try:
-            os.killpg(self._process.pid, 0)
-        except ProcessLookupError:
-            self._group_gone = True
-            return False
-        except PermissionError:
-            return True
-        return True
+        return self._tree.alive()
 
     def _wait_group_gone(self, deadline: float) -> bool:
         while self._group_alive():
@@ -427,12 +432,9 @@ class ServerProcess:
             time.sleep(min(self._poll_s, remaining))
         return True
 
-    def _signal_group(self, signum: signal.Signals) -> None:
+    def _signal_group(self, end: Callable[[], None]) -> None:
         if self._group_alive():
-            try:
-                os.killpg(self._process.pid, signum)
-            except ProcessLookupError:
-                pass
+            end()
 
     def _read_output(self, stdout: BinaryIO, log: BinaryIO) -> None:
         """Vide le tube jusqu'à sa fermeture : un tube plein bloquerait le serveur sans erreur.

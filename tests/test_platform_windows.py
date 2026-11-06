@@ -1,4 +1,4 @@
-"""R1, R3 : plateformes, remplacement tolérant, écrivains, préflight (AC4 à AC6, AC13 à AC17).
+"""R1 à R3 : plateformes, écrivains, préflight, processus (AC4 à AC17).
 
 D-A : un test qui n'a de sens que sur un seul système est défini dans un bloc `if` de ce
 module, il n'est pas sauté. Les branches Windows s'exécutent ici par injection (D-B).
@@ -8,33 +8,76 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import ctypes
 import hashlib
 import json
+import logging
 import math
+import ntpath
 import os
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from functools import partial
+from itertools import cycle
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NamedTuple
+from urllib.request import Request, urlopen
 
 import pytest
 
+from conftest import ZOMBOID_SUBDIRS
+from doubles.fake_server import PosixKernel, WindowsLaunchOnPosix, install_fake_server
+from test_snapshots import (  # noqa: F401
+    ENGINE_READY,
+    PLAYER_PASSWORD,
+    READY_LINES,
+    engine_rig,
+    free_ports,
+)
+from service import engine as engine_module
 from service import platforms, preflight, replay, rules, servers, transport
 from service import proofs as proofs_module
-from service.engine import MODE_REAL, Engine, MatchSecrets, RealMatch
+from service.engine import (
+    MODE_REAL,
+    ClientLaunchError,
+    Engine,
+    MatchSecrets,
+    RealMatch,
+    launch_client,
+)
 from service.journal import read_journal
-from service.platforms import LINUX, WINDOWS, ReplaceError, replace_file
+from service.platforms import (
+    CREATE_BREAKAWAY_FROM_JOB,
+    CREATE_NEW_PROCESS_GROUP,
+    CREATE_NO_WINDOW,
+    CREATE_SUSPENDED,
+    DETACHED_PROCESS,
+    LINUX,
+    WINDOWS,
+    PosixProcessTree,
+    ReplaceError,
+    UnsafeArgument,
+    WindowsKernel,
+    WindowsProcessTree,
+    replace_file,
+)
 from service.proofs import PROOFS_NAME, HookProofs
 from service.protocol import PROTOCOL_VERSION, SIDES, dump_line
 from service.rules import load_effects, load_runtime
 from service.servers import (
+    REDACTED,
     STARTED_MARKER,
+    STOP_RCON,
+    STOP_SIGKILL,
     Redactor,
     ServerProcess,
+    launch_command,
     read_ini,
     server_name,
     write_ini,
@@ -797,3 +840,947 @@ if sys.platform == "win32":
         monkeypatch.setattr(preflight, "_bind", refuse)
         (failure,) = preflight.check_ports({"A": {"rcon": 27015}})[1]
         assert "Port 27015/TCP" in failure and "inutilisable" in failure
+
+
+# R2 : commande, drapeaux et contrôle des arguments ------------------------------------------
+
+GAME_DIR = r"C:\Program Files (x86)\Steam\steamapps\common\Project Zomboid"
+ADMIN_MARKER = "adminsecretmarker"
+RCON_MARKER = "rconsecretmarker"
+CLIENT_GRACE_S = 0.05
+WAIT_CLIENT_EXIT_S = 10
+LEAKY_LINE = "commande : -adminpassword {adminpassword}"
+
+
+def launch_cfg(runtime: dict, pz_dir: str, admin: str = ADMIN_MARKER) -> dict:
+    return {**runtime, "pz_dir": pz_dir, "admin_password": admin}
+
+
+@pytest.mark.parametrize("side", SIDES)
+def test_windows_command_keeps_its_eight_arguments(runtime, side):
+    ports = runtime["ports"][side]
+
+    command = launch_command(side, launch_cfg(runtime, GAME_DIR), WINDOWS)
+
+    assert command == [
+        GAME_DIR + r"\StartServer64.bat",
+        "-servername",
+        server_name(side),
+        "-port",
+        str(ports["game"]),
+        "-udpport",
+        str(ports["udp"]),
+        "-adminpassword",
+        ADMIN_MARKER,
+    ]
+
+
+def test_linux_command_uses_the_linux_script(runtime):
+    command = launch_command("A", launch_cfg(runtime, "/opt/pz"), LINUX)
+
+    assert command[0] == "/opt/pz/start-server.sh"
+    assert len(command[1:]) == 8
+
+
+def test_server_popen_options_follow_the_platform():
+    assert LINUX.server_popen_kwargs() == {"start_new_session": True}
+    assert WINDOWS.server_popen_kwargs() == {
+        "creationflags": CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    }
+
+
+def test_client_popen_attempts_follow_the_platform():
+    assert LINUX.client_popen_attempts() == ({"start_new_session": True},)
+    detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    assert WINDOWS.client_popen_attempts() == (
+        {"creationflags": detached | CREATE_BREAKAWAY_FROM_JOB},
+        {"creationflags": detached},
+    )
+
+
+def test_client_file_follows_the_platform(tmp_path):
+    game = tmp_path / "ProjectZomboid" / "projectzomboid"
+
+    assert WINDOWS.client_file(game) == game / "ProjectZomboid64.exe"
+    assert LINUX.client_file(game) == game.parent / "projectzomboid.sh"
+
+
+@pytest.mark.parametrize(
+    "folder",
+    [
+        GAME_DIR,
+        r"D:\Games(SSD)\Project Zomboid",
+        r"D:\Games(SSD)\ProjectZomboid",
+        r"D:\Jeux & Co\Project Zomboid",
+        r"D:\Jeux^2 <1>\Project Zomboid",
+    ],
+    ids=["espaces", "parentheses", "parentheses-sans-blanc", "esperluette", "autres-entre-guillemets"],
+)
+def test_quoted_or_literal_folders_are_accepted(runtime, folder):
+    WINDOWS.check_arguments(launch_command("A", launch_cfg(runtime, folder), WINDOWS))
+
+
+@pytest.mark.parametrize(
+    "folder",
+    [r"D:\100%\Project Zomboid", r"D:\Wow!\Project Zomboid", r"D:\A&B\PZ", r"D:\A^B\PZ"],
+    ids=["pourcent", "exclamation", "esperluette-nue", "circonflexe-nu"],
+)
+def test_interpreted_folders_are_refused(runtime, folder):
+    with pytest.raises(UnsafeArgument, match="argument 0"):
+        WINDOWS.check_arguments(launch_command("A", launch_cfg(runtime, folder), WINDOWS))
+
+
+@pytest.mark.parametrize("character", list('&|<>^%!"\r\n'))
+def test_interpreted_password_is_refused_without_being_cited(runtime, character):
+    password = f"secret{character}marker"
+    command = launch_command("A", launch_cfg(runtime, GAME_DIR, password), WINDOWS)
+
+    with pytest.raises(UnsafeArgument, match="argument 8") as caught:
+        WINDOWS.check_arguments(command)
+
+    assert "secret" not in str(caught.value)
+    assert "marker" not in str(caught.value)
+
+
+def test_linux_arguments_are_not_checked_against_cmd():
+    LINUX.check_arguments(["/opt/a&b/start-server.sh", "100%"])
+
+
+def test_refused_argument_never_reaches_popen(tmp_path, runtime, monkeypatch):
+    launch = WindowsLaunchOnPosix()
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    cfg = {
+        **launch_cfg(runtime, str(tmp_path), "a&calc"),
+        "zomboid_dir": tmp_path,
+        "rcon_password": RCON_MARKER,
+    }
+    server = ServerProcess(
+        "A", cfg, tmp_path / "match", Redactor(()), platform=WINDOWS, kernel=PosixKernel()
+    )
+
+    with pytest.raises(OSError, match="cmd.exe"):
+        server.start()
+
+    assert launch.calls == []
+
+
+# R2 : le client ------------------------------------------------------------------------------
+
+
+def test_windows_missing_client_is_not_retried(tmp_path, monkeypatch):
+    launch = WindowsLaunchOnPosix()
+    monkeypatch.setattr(subprocess, "Popen", launch)
+
+    with pytest.raises(ClientLaunchError, match="ne démarre pas") as caught:
+        launch_client(tmp_path / WINDOWS.client_program, ["+password", "marker"], WINDOWS)
+
+    assert "marker" not in str(caught.value)
+    assert len(launch.calls) == 1
+
+
+# R2 : l'arbre, sur un `kernel` scripté -------------------------------------------------------
+
+
+class Root:
+    """Tient lieu de `Popen` pour l'arbre : aucun vrai processus n'est en jeu."""
+
+    pid = 4242
+
+    def __init__(self):
+        self.killed = False
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        self.killed = True
+
+
+class ScriptedKernel:
+    def __init__(self, active=(1,)):
+        self.calls = []
+        self.active = iter(active)
+
+    def __getattr__(self, name):
+        def call(*args):
+            self.calls.append((name, *args))
+            return len(self.calls)
+
+        return call
+
+    def active_processes(self, job):
+        count = next(self.active)
+        if isinstance(count, Exception):
+            raise count
+        return count
+
+
+def test_tree_terminate_ends_the_root_and_kill_ends_the_job():
+    kernel = ScriptedKernel()
+    tree = WindowsProcessTree(Root(), kernel)
+    kernel.calls.clear()
+
+    tree.terminate()
+    tree.kill()
+
+    names = [call[0] for call in kernel.calls]
+    assert names == ["terminate_process", "terminate_job"]
+
+
+def test_tree_counts_the_job_and_closes_it_once():
+    kernel = ScriptedKernel(active=[2, 1, 0])
+    tree = WindowsProcessTree(Root(), kernel)
+
+    assert tree.alive() and tree.alive()
+    assert not [call for call in kernel.calls if call[0] == "close"]
+    assert not tree.alive()
+    assert not tree.alive()
+    assert len([call for call in kernel.calls if call[0] == "close"]) == 2
+
+
+def test_failed_probe_proves_no_end():
+    tree = WindowsProcessTree(Root(), ScriptedKernel(active=[OSError("refused")]))
+
+    assert tree.alive()
+
+
+@pytest.mark.parametrize("method", ["terminate", "kill"])
+def test_refused_end_does_not_raise(method):
+    kernel = PosixKernel(failing=("terminate_process", "terminate_job"))
+    root = Root()
+    tree = WindowsProcessTree(root, kernel)
+
+    getattr(tree, method)()
+
+    assert not root.killed
+
+
+def test_failed_adoption_kills_the_suspended_process():
+    root = Root()
+
+    with pytest.raises(OSError, match="resume"):
+        WindowsProcessTree(root, PosixKernel(failing=("resume",)))
+
+    assert root.killed
+
+
+def test_process_tree_follows_the_platform():
+    assert isinstance(LINUX.process_tree(Root()), PosixProcessTree)
+    assert isinstance(WINDOWS.process_tree(Root(), ScriptedKernel()), WindowsProcessTree)
+
+
+# R2 : `WindowsKernel`, sur des bibliothèques simulées ----------------------------------------
+
+PID = 4242
+THREADS = [(11, PID), (12, 999), (13, PID)]
+
+
+def fake_kernel32(calls: list, threads=THREADS, **overrides) -> SimpleNamespace:
+    """`kernel32` en simples fonctions : `_declare` peut y poser ses prototypes."""
+    walk = iter(())
+
+    def record(name, result):
+        def call(*args):
+            calls.append((name, *args))
+            return result
+
+        return call
+
+    def next_thread(snapshot, entry):
+        try:
+            thread_id, owner = next(walk)
+        except StopIteration:
+            return 0
+        entry._obj.th32ThreadID = thread_id
+        entry._obj.th32OwnerProcessID = owner
+        return 1
+
+    def first_thread(snapshot, entry):
+        nonlocal walk
+        walk = iter(threads)
+        return next_thread(snapshot, entry)
+
+    names = {
+        "OpenProcess": 7,
+        "OpenThread": 8,
+        "CloseHandle": 1,
+        "CreateJobObjectW": 9,
+        "SetInformationJobObject": 1,
+        "QueryInformationJobObject": 1,
+        "AssignProcessToJobObject": 1,
+        "TerminateJobObject": 1,
+        "TerminateProcess": 1,
+        "CreateToolhelp32Snapshot": 10,
+        "ResumeThread": 1,
+    }
+    functions = {name: record(name, result) for name, result in names.items()}
+    functions |= {"Thread32First": first_thread, "Thread32Next": next_thread}
+    return SimpleNamespace(**(functions | overrides))
+
+
+def nt_resume(calls: list, status: int) -> SimpleNamespace:
+    def resume(handle):
+        calls.append(("NtResumeProcess", handle))
+        return status
+
+    return SimpleNamespace(NtResumeProcess=resume)
+
+
+def test_resume_goes_through_nt_resume_process():
+    calls: list = []
+    kernel = WindowsKernel(fake_kernel32(calls), nt_resume(calls, 0))
+
+    kernel.resume(7, PID)
+
+    assert calls == [("NtResumeProcess", 7)]
+
+
+@pytest.mark.parametrize(
+    "make_ntdll",
+    [lambda calls: SimpleNamespace(), lambda calls: nt_resume(calls, -1)],
+    ids=["absent", "refus"],
+)
+def test_resume_falls_back_on_the_threads_of_the_process(make_ntdll):
+    calls: list = []
+    kernel = WindowsKernel(fake_kernel32(calls), make_ntdll(calls))
+
+    kernel.resume(7, PID)
+
+    opened = [call[3] for call in calls if call[0] == "OpenThread"]
+    assert opened == [11, 13]
+    assert [call[0] for call in calls].count("ResumeThread") == 2
+    closed = [call[1] for call in calls if call[0] == "CloseHandle"]
+    assert closed == [8, 8, 10], "chaque fil, puis le relevé"
+
+
+def test_resume_without_a_thread_fails():
+    calls: list = []
+    kernel = WindowsKernel(fake_kernel32(calls, threads=[(12, 999)]), SimpleNamespace())
+
+    with pytest.raises(OSError, match=str(PID)):
+        kernel.resume(7, PID)
+
+
+def test_refused_thread_resume_is_an_error(monkeypatch):
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    calls: list = []
+    refused = fake_kernel32(calls, ResumeThread=lambda thread: platforms.RESUME_FAILED)
+    kernel = WindowsKernel(refused, SimpleNamespace())
+
+    with pytest.raises(OSError, match="ResumeThread"):
+        kernel.resume(7, PID)
+
+    assert [call[1] for call in calls if call[0] == "CloseHandle"] == [8, 10]
+
+
+def test_job_kills_on_close_and_its_handle_is_not_inheritable():
+    limits = []
+
+    def set_limits(job, kind, info, size):
+        limits.append((job, kind, info._obj.BasicLimitInformation.LimitFlags, size))
+        return 1
+
+    calls: list = []
+    kernel = WindowsKernel(
+        fake_kernel32(calls, SetInformationJobObject=set_limits), SimpleNamespace()
+    )
+
+    assert kernel.create_job() == 9
+
+    assert ("CreateJobObjectW", None, None) in calls, "attributs de sécurité : aucun héritage"
+    assert limits == [
+        (
+            9,
+            platforms.JOB_EXTENDED_LIMIT_INFORMATION,
+            platforms.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            ctypes.sizeof(platforms._JobExtendedLimits),
+        )
+    ]
+
+
+def test_job_without_its_limit_is_closed_and_refused(monkeypatch):
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    calls: list = []
+    refused = fake_kernel32(calls, SetInformationJobObject=lambda *args: 0)
+    kernel = WindowsKernel(refused, SimpleNamespace())
+
+    with pytest.raises(OSError, match="SetInformationJobObject"):
+        kernel.create_job()
+
+    assert ("CloseHandle", 9) in calls
+
+
+def test_active_processes_reads_the_accounting_of_the_job():
+    def query(job, kind, info, size, returned):
+        assert kind == platforms.JOB_BASIC_ACCOUNTING_INFORMATION
+        info._obj.ActiveProcesses = 3
+        return 1
+
+    kernel = WindowsKernel(
+        fake_kernel32([], QueryInformationJobObject=query), SimpleNamespace()
+    )
+
+    assert kernel.active_processes(9) == 3
+
+
+def test_win32_structures_have_their_64_bit_sizes():
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        assert ctypes.sizeof(platforms._JobExtendedLimits) == 144
+    assert ctypes.sizeof(platforms._JobAccounting) == 48
+    assert ctypes.sizeof(platforms._ThreadEntry) == 28
+
+
+# Le double ------------------------------------------------------------------------------------
+
+
+def test_windows_double_is_a_batch_that_calls_python(tmp_path):
+    script = install_fake_server(tmp_path, {"script_tail": "PAUSE"}, WINDOWS)
+
+    assert script == tmp_path / "StartServer64.bat"
+    lines = script.read_bytes().decode().split("\r\n")
+    assert lines[0] == "@echo off"
+    assert sys.executable in lines[1] and lines[1].endswith(" %*")
+    assert lines[2:] == ["PAUSE", ""]
+
+
+# AC7 et AC12 : le vrai `Engine`, plateforme injectée. Ces tests jouent les processus sur le
+# double POSIX ; sur le vrai Windows, le bloc suivant les remplace (D-A).
+
+if sys.platform != "win32":
+
+    def write_client(path: Path, body: str) -> Path:
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+
+    def test_windows_client_breaks_away_and_stays_detached(tmp_path, monkeypatch):
+        monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", CLIENT_GRACE_S)
+        launch = WindowsLaunchOnPosix()
+        monkeypatch.setattr(subprocess, "Popen", launch)
+        client = write_client(tmp_path / WINDOWS.client_program, "exec sleep 1")
+
+        process = launch_client(client, ["-nosteam"], WINDOWS)
+
+        assert process.poll() is None
+        process.kill()
+        process.wait()
+        [(command, options)] = launch.calls
+        assert command == [str(client), "-nosteam"]
+        assert options["creationflags"] & CREATE_BREAKAWAY_FROM_JOB
+        assert options["creationflags"] & DETACHED_PROCESS
+        assert options["stdout"] == subprocess.DEVNULL
+
+
+    def test_windows_client_falls_back_when_the_job_refuses_breakaway(tmp_path, monkeypatch):
+        def refuse(flags: int) -> None:
+            if flags & CREATE_BREAKAWAY_FROM_JOB:
+                raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", CLIENT_GRACE_S)
+        launch = WindowsLaunchOnPosix(refuse)
+        monkeypatch.setattr(subprocess, "Popen", launch)
+        client = write_client(tmp_path / WINDOWS.client_program, "exec sleep 1")
+
+        process = launch_client(client, [], WINDOWS)
+
+        process.kill()
+        process.wait()
+        first, second = (options["creationflags"] for _, options in launch.calls)
+        assert first & CREATE_BREAKAWAY_FROM_JOB
+        assert not second & CREATE_BREAKAWAY_FROM_JOB
+
+    def test_double_records_the_arguments_it_receives(tmp_path):
+        args_file = tmp_path / "args.json"
+        script = install_fake_server(tmp_path, {"args_file": str(args_file), "exit_code": 0}, LINUX)
+        arguments = [
+            "-servername", "duelA", "-port", "1", "-udpport", "2", "-adminpassword", "a b",
+        ]  # fmt: skip
+
+        subprocess.run([script, *arguments], check=True, timeout=SUBPROCESS_TIMEOUT_S)
+
+        assert json.loads(args_file.read_text(encoding="utf-8")) == arguments
+
+    @pytest.fixture
+    def marked_secrets(monkeypatch):
+        drawn = cycle((ADMIN_MARKER, RCON_MARKER))
+        monkeypatch.setattr("service.engine.gen_secret", lambda: next(drawn))
+
+
+    def engine_on(rig, platform, monkeypatch, **scenario) -> Engine:
+        """Moteur du banc `engine_rig` sur `platform`, le double POSIX jouant les processus."""
+        rig.build(**scenario)
+        if platform is LINUX:
+            return rig.engine
+        monkeypatch.setattr(subprocess, "Popen", WindowsLaunchOnPosix())
+        real_preflight = engine_module.run_preflight
+        monkeypatch.setattr(
+            engine_module, "run_preflight", partial(real_preflight, ram_reader=lambda: 1)
+        )
+        (rig.pz_dir / WINDOWS.server_script).write_text("", encoding="utf-8")
+        write_client(rig.pz_dir / WINDOWS.client_program, "exec sleep 1")
+
+        def factory(side, cfg, match_dir, redactor) -> ServerProcess:
+            server = ServerProcess(
+                side, cfg, match_dir, redactor, platform=WINDOWS, kernel=PosixKernel()
+            )
+            rig.servers.append(server)
+            return server
+
+        rig.engine = Engine(
+            "real",
+            zomboid_dir=rig.zomboid,
+            pz_dir=rig.pz_dir,
+            runtime=rig.runtime,
+            matches_dir=rig.matches,
+            server_factory=factory,
+            platform=WINDOWS,
+        )
+        return rig.engine
+
+
+    def exposed_text(engine: Engine, rig, caplog, *messages: str) -> str:
+        """Tout ce qui sort : messages, état, log du service et fichiers du match.
+
+        Au lobby seulement, `public_config` publie `host_password` à l'hôte, pour le repli manuel
+        (`service/state.py`) : cette clé de l'état est écartée ici, rien d'autre.
+        """
+        state = engine.snapshot()
+        config = {key: value for key, value in state["config"].items() if key != "host_password"}
+        if state["phase"] != "lobby":
+            assert config == state["config"]
+        files = [path for path in rig.matches.rglob("*") if path.is_file()]
+        return "\n".join(
+            [
+                *messages,
+                json.dumps({**state, "config": config}, ensure_ascii=False),
+                json.dumps(engine.state.logs, ensure_ascii=False),
+                caplog.text,
+                *(path.read_text(encoding="utf-8") for path in files),
+            ]
+        )
+
+
+    def test_engine_launches_windows_servers_and_client_as_specified(
+        engine_rig, marked_secrets, monkeypatch, caplog
+    ):
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", CLIENT_GRACE_S)
+        rig = engine_rig
+        engine = engine_on(rig, WINDOWS, monkeypatch, lines=[LEAKY_LINE, *ENGINE_READY])
+        launch = subprocess.Popen
+
+        rig.start()
+        state = rig.wait("lobby", "error")
+        assert state["phase"] == "lobby", state["error"]
+
+        for side in SIDES:
+            ports = rig.runtime["ports"][side]
+            commands = [c for c, _ in launch.calls if server_name(side) in c]
+            assert commands, "le serveur a été lancé"
+            assert commands[-1] == [
+                ntpath.join(str(rig.pz_dir), "StartServer64.bat"),
+                "-servername",
+                server_name(side),
+                "-port",
+                str(ports["game"]),
+                "-udpport",
+                str(ports["udp"]),
+                "-adminpassword",
+                ADMIN_MARKER,
+            ]
+        flags = {options["creationflags"] for _, options in launch.calls}
+        assert flags == {WINDOWS.server_popen_kwargs()["creationflags"]}
+        for server in rig.servers:
+            assert server._cfg["stop_timeout_s"] == rig.runtime["stop_timeout_s"]
+            assert server._cfg["kill_grace_s"] == rig.runtime["kill_grace_s"]
+
+        ok, message = engine.action("open_game")
+        assert ok, message
+        client, _ = launch.calls[-1]
+        address, password = state["config"]["host_address"], state["config"]["host_password"]
+        assert client == [
+            str(rig.pz_dir / "ProjectZomboid64.exe"),
+            "-nosteam",
+            "+connect",
+            address,
+            "+password",
+            password,
+        ]
+        engine._client.kill()
+        engine._client.wait()
+
+        text = exposed_text(engine, rig, caplog, message)
+        assert ADMIN_MARKER not in text and RCON_MARKER not in text
+        assert password not in text
+        assert f"-adminpassword {REDACTED}" in text
+
+
+    PLATFORMS = pytest.mark.parametrize("platform", [LINUX, WINDOWS], ids=["linux", "windows"])
+
+
+    def assert_no_password(engine, rig, caplog, password, *messages) -> None:
+        text = exposed_text(engine, rig, caplog, *messages)
+        for secret in (ADMIN_MARKER, RCON_MARKER, password):
+            assert secret not in text
+
+
+    @PLATFORMS
+    def test_missing_server_script_reveals_no_password(
+        engine_rig, marked_secrets, monkeypatch, caplog, platform
+    ):
+        caplog.set_level(logging.DEBUG)
+        rig = engine_rig
+        engine = engine_on(rig, platform, monkeypatch)
+        real_preflight = engine_module.run_preflight
+
+        def preflight_then_lose_the_script(*args, **kwargs):
+            result = real_preflight(*args, **kwargs)
+            (rig.pz_dir / LINUX.server_script).unlink()
+            return result
+
+        monkeypatch.setattr(engine_module, "run_preflight", preflight_then_lose_the_script)
+
+        rig.start()
+        state = rig.wait("error", "lobby")
+
+        assert state["phase"] == "error"
+        assert "lancement impossible" in state["error"]
+        assert_no_password(engine, rig, caplog, engine.state.config["host_password"], state["error"])
+
+
+    @PLATFORMS
+    def test_immediate_server_exit_reveals_no_password(
+        engine_rig, marked_secrets, monkeypatch, caplog, platform
+    ):
+        caplog.set_level(logging.DEBUG)
+        rig = engine_rig
+        engine = engine_on(rig, platform, monkeypatch, lines=[LEAKY_LINE], exit_code=3)
+
+        rig.start()
+        state = rig.wait("error", "lobby")
+
+        assert state["phase"] == "error"
+        assert "sortie anticipée, code 3" in state["error"]
+        assert f"-adminpassword {REDACTED}" in state["error"]
+        assert_no_password(engine, rig, caplog, engine.state.config["host_password"], state["error"])
+
+
+    def in_lobby(rig) -> dict:
+        rig.start()
+        state = rig.wait("lobby", "error")
+        assert state["phase"] == "lobby", state["error"]
+        return state
+
+
+    @PLATFORMS
+    def test_missing_client_reveals_no_password(
+        engine_rig, marked_secrets, monkeypatch, caplog, platform
+    ):
+        caplog.set_level(logging.DEBUG)
+        rig = engine_rig
+        engine = engine_on(rig, platform, monkeypatch)
+        state = in_lobby(rig)
+        client = platform.client_file(rig.pz_dir)
+        client.unlink(missing_ok=True)
+        if platform is WINDOWS:
+            # La détection exige ce fichier : il reste, mais ne s'exécute plus.
+            client.write_text("", encoding="utf-8")
+            client.chmod(0o600)
+
+        ok, message = engine.action("open_game")
+
+        assert not ok
+        assert f"{platform.client_program} absent" in message
+        assert_no_password(engine, rig, caplog, state["config"]["host_password"], message)
+
+
+    @PLATFORMS
+    def test_immediate_client_exit_reveals_no_password(
+        engine_rig, marked_secrets, monkeypatch, caplog, platform
+    ):
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", WAIT_CLIENT_EXIT_S)
+        rig = engine_rig
+        engine = engine_on(rig, platform, monkeypatch)
+        state = in_lobby(rig)
+        write_client(platform.client_file(rig.pz_dir), "exit 3")
+
+        ok, message = engine.action("open_game")
+
+        assert not ok
+        assert "s'est arrêté aussitôt (code 3)" in message
+        assert_no_password(engine, rig, caplog, state["config"]["host_password"], message)
+
+
+# AC8 à AC11 sur le vrai Windows (D-A) --------------------------------------------------------
+
+if sys.platform == "win32":
+    REPO_SERVICE = REPO / "tests" / "doubles" / "run_service.py"
+    SERVICE_URL_PREFIX = "interface : "
+    FAST_STOP = {"tick_ms": 10, "stop_timeout_s": 1, "kill_grace_s": 2, "rcon_timeout_s": 1}
+    WAIT_S = 30
+    POLL_S = 0.05
+    SERVICE_GONE_S = 5
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x102
+    CREATE_NEW_CONSOLE = 0x00000010
+    TREE_SIZE = 4
+    # Le script et le double précèdent leurs enfants dans la sortie.
+    CHILDREN_START = 2
+    # Pas d'ancre : l'invite de `PAUSE` n'a pas de fin de ligne, et un enfant peut la suivre.
+    TREE_PID = re.compile(r"fake (?:script|server|child|grandchild) pid=(\d+)")
+    TREE = {"child": True, "child_depth": 1, "announce_pids": True}
+    # `AttachConsole` veut un processus sans console : ce script tourne donc à part.
+    CLOSE_CONSOLE = """
+import ctypes, sys
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+kernel32.FreeConsole()
+if not kernel32.AttachConsole(int(sys.argv[1])):
+    sys.exit("AttachConsole failed: " + str(ctypes.get_last_error()))
+window = kernel32.GetConsoleWindow()
+if not window or not user32.PostMessageW(window, 0x0010, 0, 0):
+    sys.exit("no console window to close")
+"""
+
+    def windows_pid_alive(pid: int) -> bool:
+        """Sonde sans effet : sous Windows, `os.kill(pid, 0)` tuerait le processus."""
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def wait_until(condition: Callable[[], bool], timeout_s: float = WAIT_S) -> None:
+        deadline = time.monotonic() + timeout_s
+        while not condition():
+            assert time.monotonic() < deadline, "condition jamais atteinte"
+            time.sleep(POLL_S)
+
+    def tree_pids(lines: list[str]) -> list[int]:
+        return [int(pid) for line in lines for pid in TREE_PID.findall(line)]
+
+    def real_server(pz_dir: Path, zomboid: Path, scenario: dict, **overrides) -> ServerProcess:
+        pz_dir.mkdir(parents=True, exist_ok=True)
+        install_fake_server(pz_dir, scenario)
+        cfg = {
+            **load_runtime(),
+            **FAST_STOP,
+            **overrides,
+            "pz_dir": pz_dir,
+            "zomboid_dir": zomboid,
+            "admin_password": ADMIN_MARKER,
+            "rcon_password": RCON_MARKER,
+        }
+        return ServerProcess("A", cfg, zomboid / "match", Redactor((ADMIN_MARKER, RCON_MARKER)))
+
+    def ready_tree(server: ServerProcess, count: int) -> list[int]:
+        server.start()
+        wait_until(lambda: server.ready and len(tree_pids(server.log_tail())) == count)
+        return tree_pids(server.log_tail())
+
+    def test_windows_server_starts_from_a_folder_with_spaces_and_parentheses(tmp_path):
+        pz_dir = tmp_path / "Program Files (x86)" / "Project Zomboid"
+        args_file = tmp_path / "args.json"
+        scenario = {"lines": READY_LINES, "args_file": str(args_file)}
+        server = real_server(pz_dir, tmp_path, scenario)
+
+        server.start()
+        wait_until(lambda: server.ready)
+
+        expected = launch_command("A", server._cfg)
+        assert expected[0] == str(pz_dir / "StartServer64.bat")
+        assert json.loads(args_file.read_text(encoding="utf-8")) == expected[1:]
+        assert server.stop()
+
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            {"orphan_child": True, "exit_code": 0},
+            {"refuse_quit": True},
+        ],
+        ids=["script-sur-pause", "double-sourd"],
+    )
+    def test_windows_stop_ends_a_paused_tree_at_the_sigkill_stage(tmp_path, scenario):
+        full = {"lines": READY_LINES, "script_tail": "PAUSE", **TREE, **scenario}
+        server = real_server(tmp_path / "pz", tmp_path, full)
+        pids = ready_tree(server, TREE_SIZE)
+        assert all(map(windows_pid_alive, pids[CHILDREN_START:]))
+
+        assert server.stop()
+
+        assert server.stop_stage == STOP_SIGKILL
+        assert not server.running
+        assert not any(map(windows_pid_alive, pids))
+
+    def test_windows_early_child_cannot_escape_the_job(tmp_path):
+        """Le double lance son enfant dès le départ : la suspension l'a déjà mis dans le Job."""
+        scenario = {"lines": READY_LINES, "refuse_quit": True, **TREE}
+        server = real_server(tmp_path / "pz", tmp_path, scenario)
+        pids = ready_tree(server, TREE_SIZE)
+
+        server._tree.kill()
+
+        wait_until(lambda: not any(map(windows_pid_alive, pids)), FAST_STOP["kill_grace_s"])
+        assert not server.running
+
+    def test_windows_normal_stop_goes_through_rcon(tmp_path):
+        with socket.create_server(("127.0.0.1", 0)) as probe:
+            port = probe.getsockname()[1]
+        runtime = load_runtime()
+        ports = {**runtime["ports"], "A": {**runtime["ports"]["A"], "rcon": port}}
+        scenario = {"lines": READY_LINES, "rcon_password": RCON_MARKER, "rcon_port": port}
+        server = real_server(tmp_path / "pz", tmp_path, scenario, ports=ports)
+
+        server.start()
+        wait_until(lambda: server.ready)
+
+        assert server.stop()
+        assert server.stop_stage == STOP_RCON
+        assert not server.running
+
+    def test_windows_failed_launches_reveal_no_password(tmp_path):
+        missing = real_server(tmp_path / "pz", tmp_path, {})
+        (tmp_path / "pz" / "StartServer64.bat").unlink()
+        with pytest.raises(OSError) as caught:
+            missing.start()
+        assert ADMIN_MARKER not in missing.redactor.redact_exception(caught.value)
+
+        leaky = {"lines": [LEAKY_LINE], "exit_code": 3}
+        server = real_server(tmp_path / "pz2", tmp_path, leaky)
+        server.start()
+        wait_until(lambda: server.exit_code == 3)
+        assert f"-adminpassword {REDACTED}" in server.log_tail()[-1]
+        log = server.log_path.read_text(encoding="utf-8")
+        assert ADMIN_MARKER not in log
+
+    class WindowsService:
+        """`service.main` dans son processus, ses deux doubles lancés et leurs pids relevés."""
+
+        def __init__(self, root: Path, creationflags: int = 0) -> None:
+            runtime = load_runtime()
+            self.matches = root / "matches"
+            zomboid = root / "Zomboid"
+            pz_dir = root / "pz"
+            pz_dir.mkdir()
+            for name in ZOMBOID_SUBDIRS:
+                (zomboid / name).mkdir(parents=True)
+            preflight.install_mod(preflight.MOD_SRC, zomboid)
+            install_fake_server(pz_dir, TREE)
+            (pz_dir / WINDOWS.client_program).write_bytes(b"")
+            config = root / "service.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "zomboid_dir": str(zomboid),
+                        "matches_dir": str(self.matches),
+                        "runtime": {
+                            **runtime,
+                            **FAST_STOP,
+                            "min_free_ram_mb": 0,
+                            "ports": free_ports(runtime),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.process = subprocess.Popen(
+                [
+                    sys.executable, str(REPO_SERVICE), str(config),
+                    "--mode", "real", "--no-browser", "--port", "0", "--pz-dir", str(pz_dir),
+                ],
+                env={**os.environ, "PYTHONPATH": str(REPO)},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                creationflags=creationflags,
+            )  # fmt: skip
+            self.url = self._read_url()
+
+        def _read_url(self) -> str:
+            for line in self.process.stdout:
+                if SERVICE_URL_PREFIX in line:
+                    return line.split(SERVICE_URL_PREFIX)[1].strip()
+            raise AssertionError("le service est sorti sans publier son URL")
+
+        def start_doubles(self) -> list[int]:
+            payload = {"action": "start", "preset": "demo", "password": PLAYER_PASSWORD}
+            headers = {"Content-Type": "application/json"}
+            request = Request(f"{self.url}api/action", json.dumps(payload).encode(), headers)
+            urlopen(request, timeout=SUBPROCESS_TIMEOUT_S).close()
+            wait_until(self._doubles_up)
+            return self.pids()
+
+        def _doubles_up(self) -> bool:
+            with urlopen(f"{self.url}api/state", timeout=SUBPROCESS_TIMEOUT_S) as response:
+                state = json.load(response)
+            assert state["phase"] != "error", state["error"]
+            return len(self.pids()) == len(SIDES) * TREE_SIZE
+
+        def pids(self) -> list[int]:
+            lines = [
+                line
+                for path in self.matches.glob("*/server_*.log")
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            return tree_pids(lines)
+
+        def close(self) -> None:
+            """Filet d'un test en échec : un survivant ne doit pas bloquer la suite."""
+            self.process.kill()
+            for pid in filter(windows_pid_alive, self.pids()):
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            self.process.communicate(timeout=SUBPROCESS_TIMEOUT_S)
+
+    @contextlib.contextmanager
+    def running_service(root: Path, creationflags: int = 0) -> Iterator[WindowsService]:
+        service = WindowsService(root, creationflags)
+        try:
+            yield service
+        finally:
+            service.close()
+
+    def assert_tree_ends_with_the_service(service: WindowsService, pids: list[int]) -> None:
+        service.process.wait(SUBPROCESS_TIMEOUT_S)
+        wait_until(lambda: not any(map(windows_pid_alive, pids)), SERVICE_GONE_S)
+
+    def test_windows_forced_end_of_the_service_leaves_no_double(tmp_path):
+        with running_service(tmp_path) as service:
+            pids = service.start_doubles()
+            assert all(map(windows_pid_alive, pids))
+
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(service.process.pid)],
+                check=True,
+                capture_output=True,
+                timeout=SUBPROCESS_TIMEOUT_S,
+            )
+
+            assert_tree_ends_with_the_service(service, pids)
+
+    def test_windows_closed_console_leaves_no_double(tmp_path):
+        with running_service(tmp_path, CREATE_NEW_CONSOLE) as service:
+            pids = service.start_doubles()
+            assert all(map(windows_pid_alive, pids))
+
+            closer = subprocess.run(
+                [sys.executable, "-c", CLOSE_CONSOLE, str(service.process.pid)],
+                capture_output=True,
+                text=True,
+                timeout=SUBPROCESS_TIMEOUT_S,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+            assert closer.returncode == 0, closer.stderr
+
+            assert_tree_ends_with_the_service(service, pids)

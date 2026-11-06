@@ -20,7 +20,12 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from doubles.fake_server import FakeRcon, install_fake_server
+from doubles.fake_server import (
+    FakeRcon,
+    PosixKernel,
+    WindowsLaunchOnPosix,
+    install_fake_server,
+)
 from test_snapshots import PLAYER_PASSWORD, engine_rig, make_world  # noqa: F401
 from service.engine import STOP_INCOMPLETE, Engine
 from service.platforms import WINDOWS
@@ -530,7 +535,7 @@ class Harness:
         self.state = MatchState()
         self.state.reset_steps()
 
-    def server(self, side: str = "A", *, platform=None, **scenario) -> ServerProcess:
+    def server(self, side: str = "A", *, platform=None, kernel=None, **scenario) -> ServerProcess:
         pz_dir = self.root / f"pz{side}"
         pz_dir.mkdir(exist_ok=True)
         if "rcon_password" in scenario:
@@ -543,7 +548,9 @@ class Harness:
             "admin_password": "admin-marker",
             "rcon_password": "rcon-marker",
         }
-        server = ServerProcess(side, cfg, self.match_dir, self.redactor, platform=platform)
+        server = ServerProcess(
+            side, cfg, self.match_dir, self.redactor, platform=platform, kernel=kernel
+        )
         self.servers.append(server)
         return self.servers[-1]
 
@@ -570,6 +577,14 @@ def harness(tmp_path, runtime):
     built = Harness(tmp_path, runtime)
     yield built
     built.cleanup()
+
+
+@pytest.fixture
+def windows_launch(monkeypatch):
+    """`Popen` d'une plateforme Windows injectée : la branche tourne sur le double POSIX."""
+    launch = WindowsLaunchOnPosix()
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    return launch
 
 
 def start_ready(server: ServerProcess) -> ServerProcess:
@@ -816,7 +831,7 @@ def test_ini_mode_restored_once_ready(harness):
     assert server.stop()
 
 
-def test_windows_ini_failure_stays_none_once_ready(harness, monkeypatch):
+def test_windows_ini_failure_stays_none_once_ready(harness, monkeypatch, windows_launch):
     """AC16 : la plateforme injectée ne touche pas aux droits, même là où `chmod` échouerait."""
     calls = []
 
@@ -828,7 +843,7 @@ def test_windows_ini_failure_stays_none_once_ready(harness, monkeypatch):
     ini.parent.mkdir(parents=True)
     ini.write_text("RCONPassword=rcon-marker\n", encoding="utf-8")
     ini.chmod(0o644)
-    server = harness.server(platform=WINDOWS, lines=READY_LINES)
+    server = harness.server(platform=WINDOWS, kernel=PosixKernel(), lines=READY_LINES)
     monkeypatch.setattr(os, "chmod", refuse)
 
     start_ready(server)
@@ -929,6 +944,125 @@ def test_graded_stop_kills_group(harness):
     assert not group_alive(pgid)
     assert not pid_alive(child)
     assert not server.exited_unexpectedly()
+
+
+# R2 : les mêmes paliers sous Windows, plateforme injectée et `kernel` joué sur le double.
+
+
+def windows_server(harness, kernel, **scenario) -> ServerProcess:
+    return harness.server(platform=WINDOWS, kernel=kernel, lines=READY_LINES, **scenario)
+
+
+def test_windows_server_enters_its_job_before_it_resumes(harness, windows_launch):
+    kernel = PosixKernel()
+    server = start_ready(windows_server(harness, kernel))
+
+    assert kernel.calls[:4] == ["open_process", "create_job", "assign", "resume"]
+    assert server.running
+    assert server.stop()
+
+
+def test_windows_stop_starts_with_rcon(harness, windows_launch):
+    kernel = PosixKernel()
+    server = start_ready(windows_server(harness, kernel, rcon_password="rcon-marker"))
+
+    assert server.stop()
+
+    assert server.stop_stage == STOP_RCON
+    assert server.exit_code == 0
+    assert "terminate_process" not in kernel.calls
+
+
+def test_windows_stop_falls_back_on_stdin(harness, windows_launch):
+    kernel = PosixKernel()
+    server = start_ready(windows_server(harness, kernel))
+
+    assert server.stop()
+
+    assert server.stop_stage == STOP_STDIN
+    assert "terminate_process" not in kernel.calls
+
+
+def test_windows_sigterm_stage_ends_the_root_only(harness, windows_launch):
+    kernel = PosixKernel()
+    server = start_ready(windows_server(harness, kernel, refuse_quit=True))
+
+    assert server.stop()
+
+    assert server.stop_stage == STOP_SIGTERM
+    assert "terminate_process" in kernel.calls
+    assert "terminate_job" not in kernel.calls
+    assert not server.running
+
+
+def test_windows_sigkill_stage_ends_the_job_on_the_configured_delays(harness, windows_launch):
+    harness.runtime.update(stop_timeout_s=0.25, kill_grace_s=0.15)
+    kernel = PosixKernel()
+    server = start_ready(windows_server(harness, kernel, refuse_quit=True, child=True))
+    child = pid_after(server, "fake child pid=")
+    begin = time.monotonic()
+
+    assert server.stop()
+
+    assert server.stop_stage == STOP_SIGKILL
+    assert not server.running
+    assert not pid_alive(child)
+    assert kernel.times["terminate_process"] - begin >= 0.25
+    assert kernel.times["terminate_job"] - kernel.times["terminate_process"] >= 0.15
+    assert not kernel.handles, "un Job vide ne doit pas rester ouvert"
+
+
+def test_windows_job_stays_open_while_the_tree_lives(harness, windows_launch):
+    """Fermé plus tôt, le handle tuerait l'arbre : le script sorti, l'enfant reste suivi."""
+    kernel = PosixKernel()
+    server = start_ready(
+        windows_server(harness, kernel, child=True, orphan_child=True, exit_code=0)
+    )
+    child = pid_after(server, "fake child pid=")
+    until(lambda: server.exit_code is not None)
+
+    assert server.running
+    assert "close" not in kernel.calls
+    assert server.stop()
+    assert not pid_alive(child)
+
+
+def test_windows_restart_takes_a_new_job(harness, windows_launch):
+    kernel = PosixKernel()
+    server = start_ready(windows_server(harness, kernel))
+    assert server.stop()
+
+    start_ready(server)
+
+    assert kernel.calls.count("create_job") == 2
+    assert server.stop()
+    assert not kernel.handles
+
+
+@pytest.mark.parametrize("failing", ["open_process", "create_job", "assign", "resume"])
+def test_windows_job_failure_leaves_nothing_behind(harness, windows_launch, failing):
+    """Job absent : sans cette fin, le processus resterait suspendu pour toujours."""
+    kernel = PosixKernel(failing=(failing,))
+    server = windows_server(harness, kernel, child=True)
+
+    with pytest.raises(OSError, match=failing):
+        server.start()
+
+    assert not kernel.handles
+    assert not server.running
+    assert server.stop()
+
+
+def test_windows_job_failure_is_a_launch_failure(harness, windows_launch):
+    kernel = PosixKernel(failing=("create_job",))
+    servers = {"A": windows_server(harness, kernel)}
+    pair = ServerPair(servers, harness.runtime, partial(apply_status, harness.state))
+
+    assert not pair.start()
+
+    assert "lancement impossible" in pair.failure
+    assert "admin-marker" not in pair.failure
+    assert harness.step("A")["state"] == "error"
 
 
 def test_stop_is_bounded_when_group_lingers(harness, monkeypatch):

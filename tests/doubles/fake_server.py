@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Double de `start-server.sh` : sortie scriptée, enfant, refus de quitter, crash, RCON.
+"""Double du script serveur : sortie scriptée, enfants, refus de quitter, crash, RCON.
 
 Il reçoit les arguments d'un vrai serveur. `install_fake_server` le pose à la place du
-script dans un dossier d'installation factice. Le scénario est un objet JSON :
+script de la plateforme dans un dossier d'installation factice. Le scénario est un objet
+JSON :
 
 - `lines` : sortie standard ; `{servername}`, `{port}`, `{udpport}`, `{adminpassword}` et
   `{cwd}` y sont remplacés ; `line_delay_s` les espace ;
 - `stderr_lines` : erreur standard, écrite avant `lines` ;
-- `child` : lance un enfant dans le groupe, dont le pid est imprimé, et qui vit au plus
+- `args_file` : y écrit en JSON les arguments reçus, tels quels ;
+- `announce_pids` : imprime `fake script pid=<parent>` et `fake server pid=<le double>` ;
+- `child` : lance un enfant dans l'arbre, dont le pid est imprimé, et qui vit au plus
   `child_life_s` : un test interrompu ne laisse rien derrière lui ;
+- `child_depth` : générations de descendants sous cet enfant, 0 par défaut ; chacune imprime
+  `fake grandchild pid=<pid>` ;
 - `orphan_child` : sort sans tuer l'enfant, comme le script qui précède son `java` ;
 - `refuse_quit` : ignore `quit` sur l'entrée standard et par RCON ;
 - `ignore_sigterm` : ignore SIGTERM, enfant compris, car l'ignorance se transmet ;
 - `exit_code` : crash, sortie immédiate avec ce code après les lignes ;
+- `script_tail` : ligne ajoutée au `.bat` après le double, `PAUSE` pour un script qui attend
+  une touche ; le script POSIX fait `exec`, il n'a pas de suite ;
 - `rcon_password` : ouvre le RCON factice et imprime `fake rcon port=<port>` ; il écoute
   sur `rcon_port` s'il est donné, sinon sur un port libre. En sortant, le double imprime
   `fake rcon commands=<commandes reçues>`.
@@ -44,6 +51,9 @@ EXEC = 2
 RESPONSE = 0
 AUTH_REFUSED = -1
 DEFAULT_CHILD_LIFE_S = 60
+CHILD_FLAG = "--fake-child"
+# `--scenario <chemin>` précède les arguments d'un vrai serveur.
+SERVER_ARGS_START = 3
 REPLIES = {"save": "World saved"}
 
 
@@ -127,19 +137,142 @@ class FakeRcon:
                 send_packet(conn, packet_id, RESPONSE, REPLIES.get(body, ""))
 
 
-def install_fake_server(pz_dir: Path, scenario: dict[str, Any]) -> Path:
-    """Pose un `start-server.sh` qui exécute ce double avec `scenario`."""
+def install_fake_server(
+    pz_dir: Path, scenario: dict[str, Any], platform: Any = None
+) -> Path:
+    """Pose le script de `platform`, la plateforme de l'hôte par défaut, sur ce double.
+
+    L'import reste ici : le double lui-même tourne sans le dépôt dans son chemin.
+    """
+    from service.platforms import current
+
+    platform = current() if platform is None else platform
     scenario_path = pz_dir / "fake_scenario.json"
     scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
     command = [sys.executable, str(Path(__file__).resolve()), "--scenario", str(scenario_path)]
-    script = pz_dir / "start-server.sh"
-    script.write_text(f'#!/bin/sh\nexec {shlex.join(command)} "$@"\n', encoding="utf-8")
-    script.chmod(0o755)
+    script = pz_dir / platform.server_script
+    if platform.posix_modes:
+        script.write_text(f'#!/bin/sh\nexec {shlex.join(command)} "$@"\n', encoding="utf-8")
+        script.chmod(0o755)
+        return script
+    lines = ["@echo off", f"{subprocess.list2cmdline(command)} %*"]
+    if "script_tail" in scenario:
+        lines.append(scenario["script_tail"])
+    script.write_text("".join(f"{line}\r\n" for line in lines), encoding="utf-8", newline="")
     return script
+
+
+class WindowsLaunchOnPosix:
+    """Tient lieu de `subprocess.Popen` quand la plateforme Windows est injectée sous Linux.
+
+    `calls` garde chaque commande et ses options. Un script Windows part par le script POSIX
+    du même dossier, que le test a posé : le double joue ainsi le vrai processus.
+    `refuse(flags)` peut lever à la place du lancement.
+    """
+
+    def __init__(self, refuse: Callable[[int], None] = lambda flags: None) -> None:
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self._real = subprocess.Popen
+        self._refuse = refuse
+
+    def __call__(self, command: list[str], **options: Any) -> subprocess.Popen:
+        from service.platforms import LINUX, WINDOWS
+
+        self.calls.append((list(command), dict(options)))
+        self._refuse(options.pop("creationflags"))
+        folder, _, name = command[0].rpartition("\\")
+        program = command[0]
+        if name == WINDOWS.server_script:
+            program = str(Path(folder) / LINUX.server_script)
+        return self._real([program, *command[1:]], start_new_session=True, **options)
+
+
+class PosixKernel:
+    """La couture `kernel` jouée sur l'hôte POSIX : un Job y est le groupe de son processus.
+
+    `calls` garde chaque appel dans l'ordre, `times` l'instant des deux fins forcées, et
+    `failing` nomme les appels qui lèvent `OSError`. Aucun processus n'est vraiment suspendu.
+    """
+
+    def __init__(self, failing: tuple[str, ...] = ()) -> None:
+        self.calls: list[str] = []
+        self.times: dict[str, float] = {}
+        self.failing = failing
+        self.handles: set[int] = set()
+        self._next_handle = 1
+        self._pids: dict[int, int] = {}
+
+    def _call(self, name: str) -> None:
+        self.calls.append(name)
+        if name in self.failing:
+            raise OSError(f"{name} refused")
+
+    def _handle(self, pid: int | None = None) -> int:
+        handle = self._next_handle
+        self._next_handle += 1
+        self.handles.add(handle)
+        if pid is not None:
+            self._pids[handle] = pid
+        return handle
+
+    def open_process(self, pid: int) -> int:
+        self._call("open_process")
+        return self._handle(pid)
+
+    def create_job(self) -> int:
+        self._call("create_job")
+        return self._handle()
+
+    def assign(self, job: int, process: int) -> None:
+        self._call("assign")
+        self._pids[job] = self._pids[process]
+
+    def resume(self, process: int, pid: int) -> None:
+        self._call("resume")
+
+    def active_processes(self, job: int) -> int:
+        self._call("active_processes")
+        try:
+            os.killpg(self._pids[job], 0)
+        except ProcessLookupError:
+            return 0
+        return 1
+
+    def terminate_process(self, process: int, code: int) -> None:
+        self.times["terminate_process"] = time.monotonic()
+        self._call("terminate_process")
+        os.kill(self._pids[process], signal.SIGKILL)
+
+    def terminate_job(self, job: int, code: int) -> None:
+        self.times["terminate_job"] = time.monotonic()
+        self._call("terminate_job")
+        os.killpg(self._pids[job], signal.SIGKILL)
+
+    def close(self, handle: int) -> None:
+        self.calls.append("close")
+        self.handles.remove(handle)
 
 
 def print_line(text: str) -> None:
     print(text, flush=True)
+
+
+def spawn_child(life_s: float, depth: int) -> subprocess.Popen:
+    """Python, et non `sleep` : le double doit aussi tourner sous Windows.
+
+    `stdout` est explicite : sans lui, `close_fds` n'y transmet aucun handle à l'enfant.
+    """
+    script = str(Path(__file__).resolve())
+    command = [sys.executable, script, CHILD_FLAG, str(life_s), str(depth)]
+    return subprocess.Popen(command, stdout=sys.stdout)
+
+
+def run_child(life_s: str, depth: str) -> int:
+    if int(depth):
+        grandchild = spawn_child(float(life_s), int(depth) - 1)
+        print_line(f"fake grandchild pid={grandchild.pid}")
+    time.sleep(float(life_s))
+    return 0
 
 
 def main() -> int:
@@ -149,13 +282,20 @@ def main() -> int:
         parser.add_argument(name, required=True)
     args = parser.parse_args()
     scenario = json.loads(Path(args.scenario).read_text(encoding="utf-8"))
+    if "args_file" in scenario:
+        received = json.dumps(sys.argv[SERVER_ARGS_START:])
+        Path(scenario["args_file"]).write_text(received, encoding="utf-8")
+
+    if scenario.get("announce_pids"):
+        print_line(f"fake script pid={os.getppid()}")
+        print_line(f"fake server pid={os.getpid()}")
 
     if scenario.get("ignore_sigterm"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     child = None
     if scenario.get("child"):
         life_s = scenario.get("child_life_s", DEFAULT_CHILD_LIFE_S)
-        child = subprocess.Popen(["sleep", str(life_s)])
+        child = spawn_child(life_s, scenario.get("child_depth", 0))
         print_line(f"fake child pid={child.pid}")
 
     stop = threading.Event()
@@ -198,4 +338,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == [CHILD_FLAG]:
+        sys.exit(run_child(*sys.argv[2:]))
     sys.exit(main())
