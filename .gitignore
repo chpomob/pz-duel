@@ -11,3 +11,4 @@ docs/campaigns/phase1/plan-run/
 matches/
 docs/runs/
 /docs/campaigns/phase2/run/
+docs/campaigns/**/campaign.log
