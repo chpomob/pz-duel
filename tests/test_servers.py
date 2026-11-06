@@ -23,6 +23,7 @@ import pytest
 from doubles.fake_server import FakeRcon, install_fake_server
 from test_snapshots import PLAYER_PASSWORD, engine_rig, make_world  # noqa: F401
 from service.engine import STOP_INCOMPLETE, Engine
+from service.platforms import WINDOWS
 from service.rcon import MAX_PACKET_SIZE, RconClient, RconError
 from service.servers import (
     REDACTED,
@@ -529,7 +530,7 @@ class Harness:
         self.state = MatchState()
         self.state.reset_steps()
 
-    def server(self, side: str = "A", **scenario) -> ServerProcess:
+    def server(self, side: str = "A", *, platform=None, **scenario) -> ServerProcess:
         pz_dir = self.root / f"pz{side}"
         pz_dir.mkdir(exist_ok=True)
         if "rcon_password" in scenario:
@@ -542,7 +543,8 @@ class Harness:
             "admin_password": "admin-marker",
             "rcon_password": "rcon-marker",
         }
-        self.servers.append(ServerProcess(side, cfg, self.match_dir, self.redactor))
+        server = ServerProcess(side, cfg, self.match_dir, self.redactor, platform=platform)
+        self.servers.append(server)
         return self.servers[-1]
 
     def pair(self, a: dict, b: dict, **overrides) -> ServerPair:
@@ -811,6 +813,29 @@ def test_ini_mode_restored_once_ready(harness):
     server = start_ready(harness.server(lines=READY_LINES))
     assert stat.S_IMODE(ini.stat().st_mode) == 0o600
     assert server.ini_failure is None
+    assert server.stop()
+
+
+def test_windows_ini_failure_stays_none_once_ready(harness, monkeypatch):
+    """AC16 : la plateforme injectée ne touche pas aux droits, même là où `chmod` échouerait."""
+    calls = []
+
+    def refuse(path, mode):
+        calls.append(path)
+        raise PermissionError("refusé")
+
+    ini = harness.root / "Zomboid" / "Server" / "duelA.ini"
+    ini.parent.mkdir(parents=True)
+    ini.write_text("RCONPassword=rcon-marker\n", encoding="utf-8")
+    ini.chmod(0o644)
+    server = harness.server(platform=WINDOWS, lines=READY_LINES)
+    monkeypatch.setattr(os, "chmod", refuse)
+
+    start_ready(server)
+
+    assert server.ini_failure is None
+    assert not calls
+    assert stat.S_IMODE(ini.stat().st_mode) == 0o644
     assert server.stop()
 
 

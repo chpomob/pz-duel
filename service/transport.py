@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from .platforms import Platform, replace_file
 from .protocol import (
     PROTOCOL_VERSION,
     SIDE_MISMATCH,
@@ -45,6 +46,8 @@ POLL_MAX = 1 << 20
 POLL_RECORDS = 1 << 14
 # Le travail d'un `drain`, donc d'une passe de `pump` : le retard se résorbe sur les suivantes.
 DRAIN_PASSES = 4
+# Sous Windows, un descripteur s'ouvre en texte par défaut : `\n` y deviendrait `\r\n`.
+O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 @dataclass(frozen=True)
@@ -202,6 +205,9 @@ class CommandChannel:
     la lecture de `ack` et la troncature, et aucun verrou ne le garantit à leur place.
     Avant `prepare_restart`, l'appelant vide `out` : un `cmd_result` déjà écrit mais
     non lu deviendrait sinon un faux `lost_on_restart`.
+
+    `policy` et `platform` vont à `replace_file` : voir `service/platforms.py`. Sous Windows,
+    `write_session` peut donc retenir son appelant jusqu'à `replace_timeout_s`.
     """
 
     def __init__(
@@ -210,6 +216,8 @@ class CommandChannel:
         lua_dir: str | os.PathLike[str],
         *,
         clock: Callable[[], float] = time.monotonic,
+        policy: Mapping[str, Any] | None = None,
+        platform: Platform | None = None,
     ) -> None:
         lua_dir = Path(lua_dir)
         self.side = side
@@ -221,6 +229,8 @@ class CommandChannel:
         self.boot: int | None = None
         self.last_seq = 0
         self._clock = clock
+        self._policy = policy
+        self._platform = platform
         self._awaiting_ack: dict[int, float] = {}
         self._in_has_lines = False
         self._reported_ack: tuple[int, int] | None = None
@@ -236,7 +246,7 @@ class CommandChannel:
             # Le mod ignorerait cette ligne sans rien dire.
             raise ValueError(f"`seq` {seq} non croissant : dernier écrit {self.last_seq}")
         line = dump_line(command)
-        fd = os.open(self.in_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        fd = os.open(self.in_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | O_BINARY, 0o644)
         try:
             written = os.write(fd, line)
             self.last_seq = seq
@@ -282,7 +292,8 @@ class CommandChannel:
         """Remplace `session` d'un bloc et fait de `boot` le `boot` courant.
 
         Le mod ne traite aucune commande sur une session illisible : le contenu est
-        contrôlé avant d'écrire, et un fichier temporaire évite tout état intermédiaire.
+        contrôlé avant d'écrire, et un fichier temporaire évite tout état intermédiaire. Sur
+        un échec, ce temporaire est retiré, l'ancienne session reste, et rien ne change ici.
         """
         session = {
             "v": PROTOCOL_VERSION,
@@ -293,11 +304,17 @@ class CommandChannel:
         }
         parse_session(session)
         temporary = self.session_path.with_name(self.session_path.name + ".tmp")
-        with open(temporary, "wb") as handle:
-            handle.write(dump_line(session))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.session_path)
+        try:
+            with open(temporary, "wb") as handle:
+                handle.write(dump_line(session))
+                handle.flush()
+                os.fsync(handle.fileno())
+            replace_file(
+                temporary, self.session_path, policy=self._policy, platform=self._platform
+            )
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         self.match = match
         self.boot = boot
         self.last_seq = cmd_floor

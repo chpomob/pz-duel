@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from .platforms import Platform, replace_file
 from .protocol import SIDES
 
 PROOFS_NAME = "hook_proofs.json"
@@ -27,11 +28,23 @@ MAX_PAIRS = 32
 
 
 class HookProofs:
-    """Le fichier se relit à chaque question : il est petit, et le service n'y écrit qu'ici."""
+    """Le fichier se relit à chaque question : il est petit, et le service n'y écrit qu'ici.
 
-    def __init__(self, path: Path, report: Callable[[str], None]) -> None:
+    `policy` et `platform` vont à `replace_file` : voir `service/platforms.py`.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        report: Callable[[str], None],
+        *,
+        policy: Mapping[str, Any] | None = None,
+        platform: Platform | None = None,
+    ) -> None:
         self._path = path
         self._report = report
+        self._policy = policy
+        self._platform = platform
 
     def failed_sides(self, pair: str, hook: str) -> list[str]:
         """Rend les camps de l'échec constaté, vide s'il n'y en a pas."""
@@ -72,12 +85,18 @@ class HookProofs:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             handle, name = tempfile.mkstemp(dir=self._path.parent, prefix=f".{PROOFS_NAME}.")
-            with os.fdopen(handle, "w", encoding="utf-8") as out:
-                # Sans tri : l'ordre du fichier est l'ancienneté que la prochaine écriture relit.
-                json.dump(dict(pairs), out, ensure_ascii=False)
-            os.replace(name, self._path)
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8") as out:
+                    # Sans tri : l'ordre du fichier est l'ancienneté que la prochaine écriture relit.
+                    json.dump(dict(pairs), out, ensure_ascii=False)
+                replace_file(name, self._path, policy=self._policy, platform=self._platform)
+            except BaseException:
+                os.unlink(name)
+                raise
         except OSError as exc:
-            self._report(f"preuve de hook non enregistrée, {self._path.name} : {exc.strerror}")
+            # `ReplaceError` n'a pas de `strerror` : son motif est son message.
+            reason = exc.strerror or exc
+            self._report(f"preuve de hook non enregistrée, {self._path.name} : {reason}")
 
 
 def _well_formed(loaded: Any) -> bool:

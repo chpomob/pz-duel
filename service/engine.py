@@ -478,7 +478,9 @@ class RealMatch:
         self._store = SnapshotStore(zomboid_dir, ports=runtime["ports"])
         lua_dir = zomboid_dir / LUA_DIR
         self._lua_dir = lua_dir
-        self._channels = {side: CommandChannel(side, lua_dir, clock=monotonic) for side in SIDES}
+        self._channels = {
+            side: CommandChannel(side, lua_dir, clock=monotonic, policy=runtime) for side in SIDES
+        }
         self._readers = {
             side: OutReader(channel.out_path, side, effects)
             for side, channel in self._channels.items()
@@ -541,12 +543,13 @@ class RealMatch:
                 "Mods": mods_setting(self.table),
                 **self.runtime["managed_ini"],
             }
-            write_ini(server_dir / f"{name}.ini", managed)
+            write_ini(server_dir / f"{name}.ini", managed, policy=self.runtime)
             try:
                 write_sandbox(
                     server_dir / f"{name}_SandboxVars.lua",
                     self.config["day_length"],
                     self.runtime["sandbox_start"],
+                    policy=self.runtime,
                 )
             except FileNotFoundError:
                 pass
@@ -1566,7 +1569,9 @@ class Engine:
         self.runtime = load_runtime() if runtime is None else runtime
         self.effects = load_effects() if effects is None else effects
         self.matches_dir = MATCHES_DIR if matches_dir is None else Path(matches_dir)
-        self._proofs = HookProofs(self.matches_dir / PROOFS_NAME, LOGGER.warning)
+        self._proofs = HookProofs(
+            self.matches_dir / PROOFS_NAME, LOGGER.warning, policy=self.runtime
+        )
         self._clock = time.time if clock is None else clock
         self._monotonic = time.monotonic if monotonic is None else monotonic
         self._client_launcher = launch_client if client_launcher is None else client_launcher

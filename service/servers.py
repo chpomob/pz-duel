@@ -6,6 +6,10 @@ commentaire français ou un octet invalide ressort à l'identique.
 
 `start-server.sh` lance `java` sans `exec` : le script n'est pas le serveur. Tout ce qui
 décide de la fin d'un serveur regarde donc son groupe de processus, jamais le seul script.
+
+Les droits POSIX du `.ini` ne valent que si `platform.posix_modes` : sous Windows, ni
+`fchmod` ni `chmod`, et `ini_failure` reste à `None`. `policy` et `platform` vont à
+`replace_file` : voir `service/platforms.py`.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .platforms import Platform, current, replace_file
 from .preflight import SCRIPT
 from .protocol import SIDES
 from .rcon import RconClient, RconError
@@ -66,24 +71,39 @@ def _read_text(path: Path) -> str:
         return handle.read()
 
 
-def _replace_file(path: Path, text: str, mode: int) -> None:
+def _replace_file(
+    path: Path,
+    text: str,
+    mode: int,
+    *,
+    policy: Mapping[str, Any] | None = None,
+    platform: Platform | None = None,
+) -> None:
     """Remplace `path` d'un seul `rename` : un lecteur voit l'ancien ou le nouveau fichier."""
+    platform = current() if platform is None else platform
     fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
         with os.fdopen(
             fd, "w", encoding=ENCODING, errors=ENCODING_ERRORS, newline=""
         ) as handle:
-            os.fchmod(handle.fileno(), mode)
+            if platform.posix_modes:
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        replace_file(temp_name, path, policy=policy, platform=platform)
     except BaseException:
         os.unlink(temp_name)
         raise
 
 
-def write_ini(path: str | Path, managed: Mapping[str, Any]) -> None:
+def write_ini(
+    path: str | Path,
+    managed: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any] | None = None,
+    platform: Platform | None = None,
+) -> None:
     """Réécrit les clés de `managed`, ajoute les absentes et laisse le fichier en `0600`.
 
     Un fichier absent est créé partiel : PZ le complète à la première création (H1).
@@ -115,7 +135,7 @@ def write_ini(path: str | Path, managed: Mapping[str, Any]) -> None:
         if text and not text.endswith("\n"):
             text += eol
         text += "".join(f"{key}={value}{eol}" for key, value in missing.items())
-    _replace_file(path, text, INI_MODE)
+    _replace_file(path, text, INI_MODE, policy=policy, platform=platform)
 
 
 def read_ini(path: str | Path) -> dict[str, str]:
@@ -127,7 +147,14 @@ def read_ini(path: str | Path) -> dict[str, str]:
     return values
 
 
-def write_sandbox(path: str | Path, day_length: int, start: Mapping[str, Any]) -> None:
+def write_sandbox(
+    path: str | Path,
+    day_length: int,
+    start: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any] | None = None,
+    platform: Platform | None = None,
+) -> None:
     """Fixe `DayLength` et les clés de `start`, nommées exactement et en début de ligne.
 
     Une clé introuvable refuse l'écriture : le contrat ne pourrait pas tenir.
@@ -141,7 +168,8 @@ def write_sandbox(path: str | Path, day_length: int, start: Mapping[str, Any]) -
         )
         if not count:
             raise ValueError(f"clé {key} introuvable dans {path.name}")
-    _replace_file(path, text, stat.S_IMODE(path.stat().st_mode))
+    mode = stat.S_IMODE(path.stat().st_mode)
+    _replace_file(path, text, mode, policy=policy, platform=platform)
 
 
 def server_name(side: str) -> str:
@@ -208,7 +236,13 @@ class ServerProcess:
     """
 
     def __init__(
-        self, side: str, cfg: Mapping[str, Any], match_dir: str | Path, redactor: Redactor
+        self,
+        side: str,
+        cfg: Mapping[str, Any],
+        match_dir: str | Path,
+        redactor: Redactor,
+        *,
+        platform: Platform | None = None,
     ) -> None:
         self.side = side
         self.build: str | None = None
@@ -216,6 +250,7 @@ class ServerProcess:
         self.log_error: str | None = None
         self.log_path = Path(match_dir) / f"server_{side}.log"
         self._cfg = cfg
+        self._platform = current() if platform is None else platform
         self.redactor = redactor
         self._poll_s = cfg["tick_ms"] / MS_PER_S
         self._ini_path = Path(cfg["zomboid_dir"]) / "Server" / f"{server_name(side)}.ini"
@@ -430,6 +465,8 @@ class ServerProcess:
 
     def _secure_ini(self) -> None:
         """PZ peut réécrire le `.ini` au démarrage et en relâcher les droits."""
+        if not self._platform.posix_modes:
+            return
         try:
             os.chmod(self._ini_path, INI_MODE)
         except FileNotFoundError:
