@@ -1,0 +1,37 @@
+{
+  "phase": "revise",
+  "exit_code": 0,
+  "commit_sha": "fb0cf606cad601f4c59702bce299ecfe9ac7216d",
+  "stdout": "READ: findings.json\nplan.md revised on disk: all 3 findings addressed (P1, P2, P3), step ids P1-P19 unchanged, findings-input: true. A script check found every step's Files inside spec targets, every target covered, and no unordered shared-file pair.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 135.72442434122786,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3083,
+          "completion_tokens": 63,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "revise",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3083,
+      "completion_tokens": 63,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "revise",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

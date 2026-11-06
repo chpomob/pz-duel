@@ -1,0 +1,37 @@
+{
+  "phase": "plan",
+  "exit_code": 0,
+  "commit_sha": "b53328e9a3fc6bbedb4e44188801b6334a9a82c7",
+  "stdout": "READ: spec.md\nplan.md written to /home/chpo/pz-duel/plan.md: 19 steps (P1-P19), all 62 ACs and R1-R10 covered, findings-input: false. A script checked AC coverage, contiguous ids, the five fields per step and dependency order. One deviation needs validation: tests/conftest.py is outside spec targets but must set USERPROFILE for AC54 (declared in plan.md, section \"\u00c9cart \u00e0 targets \u00e0 valider\"). P7 and P18 need operator approval: draft PR, then a test tag and pre-release. Baseline at 8aa7335: 1214 passed, 5 skipped, 1219 collected.",
+  "execution": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "returncode": 0,
+        "elapsed": 524.3001444460824,
+        "retryable": false,
+        "reason": "success",
+        "usage": {
+          "model": "other",
+          "prompt_tokens": 3170,
+          "completion_tokens": 134,
+          "est_cost_usd": 0.0,
+          "estimated": true,
+          "phase": "plan",
+          "persona": "plan-writer"
+        }
+      }
+    ],
+    "cap_events": [],
+    "usage": {
+      "model": "other",
+      "prompt_tokens": 3170,
+      "completion_tokens": 134,
+      "est_cost_usd": 0.0,
+      "estimated": true,
+      "phase": "plan",
+      "persona": "plan-writer"
+    }
+  },
+  "provider_history": []
+}

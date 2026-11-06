@@ -1,0 +1,127 @@
+{
+  "verdict": "APPROVED",
+  "findings": [],
+  "infrastructure": false,
+  "provider_history": [],
+  "reason": "",
+  "loops": 1,
+  "branch": "plan/phase2/1",
+  "merged": false,
+  "artifacts_dir": "/home/chpo/pz-duel/docs/campaigns/phase2/plan-run/phase2",
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 11828,
+        "completion_tokens": 840,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "plan": {
+        "prompt_tokens": 3170,
+        "completion_tokens": 134,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "challenge": {
+        "prompt_tokens": 2775,
+        "completion_tokens": 478,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "revise": {
+        "prompt_tokens": 3083,
+        "completion_tokens": 63,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "verify": {
+        "prompt_tokens": 2800,
+        "completion_tokens": 165,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "plan-writer": {
+        "prompt_tokens": 6253,
+        "completion_tokens": 197,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "plan-challenger": {
+        "prompt_tokens": 5575,
+        "completion_tokens": 643,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 11828,
+      "completion_tokens": 840,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 3170,
+        "completion_tokens": 134,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "plan",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2775,
+        "completion_tokens": 478,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "challenge",
+        "persona": "plan-challenger"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 3083,
+        "completion_tokens": 63,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "revise",
+        "persona": "plan-writer"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2800,
+        "completion_tokens": 165,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "verify",
+        "persona": "plan-challenger"
+      }
+    ]
+  },
+  "complexity": {
+    "score": 48306,
+    "level": "high",
+    "recommended_agents": 6,
+    "stats": {
+      "chars": 41706,
+      "files": 0,
+      "source_lines": 90,
+      "hunks": 0,
+      "requirements": 10,
+      "modules": 0
+    },
+    "tier": "high",
+    "max_agents": 6,
+    "summary": "high: 41706 chars, 0 files, 90 source lines, 0 hunks, 10 requirements, 0 modules"
+  },
+  "contract": {
+    "settle": "APPROVE",
+    "ac_status": {},
+    "failures": []
+  },
+  "status": "clean",
+  "error": ""
+}
