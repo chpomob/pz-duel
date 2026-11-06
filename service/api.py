@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -24,6 +25,14 @@ TYPES = {
 # peut viser l'API, ou la lire par rebinding DNS. Seuls ces noms désignent ce service.
 LOCAL_NAMES = ("127.0.0.1", "localhost")
 JSON_TYPE = "application/json"
+# Tout champ qui nomme une chose s'ajoute ici : `test_api_security` balaie le service.
+IDENTIFIER_FIELDS = ("action", "preset", "mode", "side")
+IDENTIFIER_MAX = 64
+IDENTIFIER = re.compile(rf"[A-Za-z0-9_-]{{1,{IDENTIFIER_MAX}}}")
+
+
+def is_identifier(value: object) -> bool:
+    return isinstance(value, str) and IDENTIFIER.fullmatch(value) is not None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,8 +55,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _json(self, code: int, payload) -> None:
-        self._send(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                   "application/json; charset=utf-8")
+        # Tout en ASCII : un surrogate isolé sort échappé, là où UTF-8 lèverait sans répondre.
+        self._send(code, json.dumps(payload).encode("ascii"), "application/json; charset=utf-8")
 
     def _static(self, rel: str) -> None:
         rel = rel.lstrip("/") or "index.html"
@@ -74,9 +83,37 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _path(self) -> str | None:
+        """Rend le chemin demandé ; sinon répond 400 et rend `None`."""
+        try:
+            return urlparse(self.path).path
+        except ValueError:
+            self._json(400, {"ok": False, "error": "chemin invalide"})
+            return None
+
+    def _body(self) -> bytes | None:
+        """Rend le corps annoncé ; sinon répond 400 et rend `None`."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._json(400, {"ok": False, "error": "Content-Length invalide"})
+            return None
+        return self.rfile.read(length) if length else b"{}"
+
+    def _bad_identifier(self, payload: dict) -> str | None:
+        """Nomme le premier champ refusé, sans citer sa valeur : elle peut tout contenir."""
+        for field in IDENTIFIER_FIELDS:
+            if field in payload and not is_identifier(payload[field]):
+                return field
+        return None
+
     # -- routes ----------------------------------------------------------
     def do_GET(self):
-        path = urlparse(self.path).path
+        path = self._path()
+        if path is None:
+            return
         if path.startswith("/api/") and self._refused():
             return
         if path == "/api/state":
@@ -91,14 +128,15 @@ class Handler(BaseHTTPRequestHandler):
         self._static(path)
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        path = self._path()
+        if path is None:
+            return
         if path != "/api/action":
             self._json(404, {"error": "not found"})
             return
-        length = int(self.headers.get("Content-Length") or 0)
         # Le corps se lit même pour un refus : fermer sur des octets non lus couperait la réponse.
-        raw = self.rfile.read(length) if length else b"{}"
-        if self._refused():
+        raw = self._body()
+        if raw is None or self._refused():
             return
         if self.headers.get_content_type() != JSON_TYPE:
             self._json(415, {"ok": False, "error": f"Content-Type attendu : {JSON_TYPE}"})
@@ -110,6 +148,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(payload, dict):
             self._json(400, {"ok": False, "error": "objet JSON attendu"})
+            return
+        field = self._bad_identifier(payload)
+        if field is not None:
+            error = f"{field} refusé : lettres, chiffres, _ ou -, {IDENTIFIER_MAX} au plus"
+            self._json(400, {"ok": False, "error": error})
             return
         action = payload.get("action", "")
         ok, msg = self.engine.action(action, payload)

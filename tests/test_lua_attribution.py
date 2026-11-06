@@ -128,6 +128,7 @@ class Game:
         self.now = START_MS
         self.hooks = Hooks()
         self.out: list[str] = []
+        self.commands = b""
         self.online: list[Player] = []
         self.player = self.connect("hote")
         body = Stub(getOverallBodyHealth=lambda: 100)
@@ -155,6 +156,8 @@ class Game:
         return player
 
     def _reader(self, name: str, _create: bool) -> Reader | None:
+        if name == f"duel_{SIDE}_in.txt":
+            return Reader(self.commands)
         return Reader(dump_line(SESSION)) if name == f"duel_{SIDE}_session.txt" else None
 
     def _writer(self, name: str, _create: bool, _append: bool) -> Writer:
@@ -282,3 +285,18 @@ def test_camp_atoms_name_their_player(game):
     for kind in ("build", "damage_taken", "explosion"):
         [line] = game.lines(kind)
         assert (line["side"], line["data"]["player"]) == (SIDE, "hote"), kind
+
+
+def test_due_command_leaves_the_middle_of_pending_and_answers_once(game):
+    """`table.remove` du vrai mod : la commande prête sort de `pending`, l'autre y reste."""
+    waiting = {"v": 1, "seq": 1, "kind": "inconnu", "warn_s": 5}
+    due = {"v": 1, "seq": 2, "kind": "inconnu"}
+    game.commands = dump_line(waiting) + dump_line(due)
+
+    game.flush()
+    assert [line["data"]["seq"] for line in game.lines("cmd_result")] == [2]
+
+    game.after(5_000)
+    results = game.lines("cmd_result")
+    assert [line["data"]["seq"] for line in results] == [2, 1]
+    assert {line["data"]["reason"] for line in results} == {"unknown_kind"}

@@ -1,8 +1,26 @@
 """Interprète Lua réduit : exécute le vrai `DuelCore.lua` sans le jeu ni dépendance.
 
-Il couvre la syntaxe de Lua 5.1 et la seule bibliothèque que le mod appelle. Il ne prouve
-rien de Kahlua ni des classes du jeu : les objets Java y sont des objets Python écrits par
-le test. Les nombres sont ceux de Python, les chaînes aussi : `#` y compte des caractères.
+Il couvre la syntaxe de Lua 5.1 et toute la bibliothèque que le mod appelle :
+`test_mini_lua` balaie le mod et échoue sur une fonction absente d'ici. Les fonctions
+présentes suivent Lua 5.1, y compris sur l'infini, NaN et les mauvais arguments.
+
+Écarts assumés, et pourquoi ils ne faussent pas les preuves actuelles :
+
+- Objets Java simulés : ce sont des objets Python écrits par le test. Les preuves portent
+  sur la logique du mod, jamais sur Kahlua ni sur les classes du jeu ; ce qui en dépend
+  relève de `limites-connues.md`.
+- `#` compte des caractères, pas des octets. Ce qui vient d'un fichier arrive octet par
+  octet par `string.char`, donc un caractère vaut un octet. Seuls les littéraux du mod et
+  les textes des objets simulés peuvent différer ; ils passent par `encodeString`, qui
+  recopie chaque unité telle quelle : le texte produit est le même. Les autres `#` de
+  chaînes mesurent des nombres, en ASCII.
+- Les nombres sont ceux de Python : un entier reste un `int`, sans plafond à 2^53. Le mod ne
+  manipule ni division ni modulo, et ses entiers sont des horodatages et des `seq`, loin
+  de cette limite. `math.floor` et `math.ceil` laissent intacts les flottants au-delà.
+- `string.format` et les motifs passent par `%` et `re`, restreints aux formes que le mod
+  emploie. Une forme nouvelle lèverait ou se lirait mal : ce sont des tests qui le diraient,
+  pas le balayage, qui ne voit que les noms de fonctions.
+- `pairs` suit l'ordre d'insertion. Le mod ne s'appuie sur aucun ordre, Lua n'en donnant pas.
 """
 
 from __future__ import annotations
@@ -76,7 +94,7 @@ def _unescape(text: str) -> str:
     return re.sub(r"\\(\d{1,3}|.)", replace, text[1:-1], flags=re.DOTALL)
 
 
-def _tokens(source: str) -> list[tuple[str, Any]]:
+def tokenize(source: str) -> list[tuple[str, Any]]:
     found: list[tuple[str, Any]] = []
     index = 0
     while index < len(source):
@@ -108,7 +126,7 @@ class _Parser:
     """Rend l'arbre sous forme de tuples, dont le premier élément nomme le nœud."""
 
     def __init__(self, source: str) -> None:
-        self.tokens = _tokens(source)
+        self.tokens = tokenize(source)
         self.at = 0
 
     def peek(self, text: str) -> bool:
@@ -404,6 +422,53 @@ def _sub(text: str, first: int, last: int = -1) -> str:
     return text[max(first, 1) - 1 : max(last, 0)]
 
 
+def _number_argument(value: Any, function: str) -> int | float:
+    """`luaL_checknumber` : un nombre ou son écriture en texte, ni booléen ni `nil`."""
+    number = _tonumber(value) if isinstance(value, str) else value
+    if isinstance(number, bool) or not isinstance(number, (int, float)):
+        raise LuaError(f"bad argument #1 to '{function}' (number expected, got {_type(value)})")
+    return number
+
+
+def _rounding(name: str, rounded: Callable[[float], int]) -> Callable[..., int | float]:
+    """L'arrondi de C : l'infini et NaN se rendent tels quels, là où Python lève."""
+
+    def function(value: Any = None) -> int | float:
+        number = _number_argument(value, name)
+        if isinstance(number, int) or not math.isfinite(number) or abs(number) >= 2**53:
+            return number
+        return rounded(number)
+
+    return function
+
+
+def _real(name: str, compute: Callable[[float], float]) -> Callable[..., float]:
+    """Le calcul de C : hors du domaine, il rend NaN, là où Python lève."""
+
+    def function(value: Any = None) -> float:
+        try:
+            return compute(_number_argument(value, name))
+        except ValueError:
+            return math.nan
+
+    return function
+
+
+def _remove(table: Any, position: Any = None) -> list[Any]:
+    """`table.remove` : hors de `1..#t`, ne touche à rien et ne rend aucune valeur."""
+    if not isinstance(table, Table):
+        raise LuaError(f"bad argument #1 to 'remove' (table expected, got {_type(table)})")
+    size = table.length()
+    index = size if position is None else int(_number_argument(position, "remove"))
+    if not 1 <= index <= size:
+        return []
+    removed = table.get(index)
+    for at in range(index, size):
+        table.set(at, table.get(at + 1))
+    table.set(size, None)
+    return [removed]
+
+
 def _tonumber(value: Any, base: int = 10) -> Any:
     if isinstance(value, (int, float)):
         return value
@@ -433,7 +498,16 @@ class Lua:
     def __init__(self, host: dict[str, Any] | None = None) -> None:
         self.scope = _Scope()
         library = {
-            "math": self._library(floor=lambda v: math.floor(v), huge=math.inf, random=lambda *_: 1),
+            "math": self._library(
+                ceil=_rounding("ceil", math.ceil),
+                cos=_real("cos", math.cos),
+                floor=_rounding("floor", math.floor),
+                huge=math.inf,
+                rad=_real("rad", math.radians),
+                random=lambda *_: 1,
+                sin=_real("sin", math.sin),
+                sqrt=_real("sqrt", math.sqrt),
+            ),
             "string": self._library(
                 char=lambda *codes: "".join(map(chr, codes)),
                 format=lambda form, *values: form % values,
@@ -444,6 +518,7 @@ class Lua:
                 concat=lambda table, sep="": sep.join(
                     _text(table.get(i)) for i in range(1, table.length() + 1)
                 ),
+                remove=_remove,
             ),
             "error": self._error,
             "ipairs": self._ipairs,
