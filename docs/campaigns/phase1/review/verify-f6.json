@@ -1,0 +1,37 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A6",
+      "status": "PARTIAL",
+      "evidence": "service/api.py:29,59,154 : identifiants ASCII validés, refus sans valeur réfléchie et sérialisation ASCII protégeant aussi les clés et valeurs imbriquées. Mais service/api.py:103 laisse encore une entrée textuelle provoquer une exception sans réponse JSON : Content-Length: 9223372036854775808 déborde lors de rfile.read(length)."
+    },
+    {
+      "id": "MINI_LUA",
+      "status": "PARTIAL",
+      "evidence": "tests/doubles/mini_lua.py:433,457 : arrondis et table.remove implémentés. tests/test_mini_lua.py:68 : le balayage existe ; par lecture, supprimer table.remove rend provided faux et fait échouer l’assertion ligne 71. Ce mécanisme n’a pas été exécuté, conformément à la restriction cat. Cependant, tests/doubles/mini_lua.py:436 refuse les arguments supplémentaires de floor/ceil, contrairement à Lua ; cet écart reste non documenté."
+    }
+  ],
+  "new_findings": [
+    {
+      "severity": "major",
+      "title": "Content-Length peut encore interrompre la réponse HTTP",
+      "evidence": "service/api.py:97,103,138 : une longueur positive dépassant Py_ssize_t est acceptée par int puis provoque OverflowError dans read, avant tout contrôle Host et sans interception. Exemple : POST /api/action avec Content-Length: 9223372036854775808."
+    },
+    {
+      "severity": "minor",
+      "title": "floor et ceil refusent les arguments supplémentaires autorisés par Lua",
+      "evidence": "tests/doubles/mini_lua.py:436,564 : pcall(math.floor, 2.7, 0) produit un échec TypeError avec le double, tandis que Lua ignore l’argument supplémentaire et renvoie true, 2 ; même défaut pour ceil. La documentation initiale ne mentionne pas cette restriction."
+    }
+  ],
+  "read_files": [
+    "service/api.py",
+    "service/engine.py",
+    "service/protocol.py",
+    "tests/doubles/mini_lua.py",
+    "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+    "tests/test_lua_attribution.py",
+    "tests/test_api_security.py",
+    "tests/test_mini_lua.py"
+  ]
+}
