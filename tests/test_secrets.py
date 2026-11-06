@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from functools import partial
 from itertools import cycle
 from pathlib import Path
+from traceback import format_exception
 from urllib.request import urlopen
 
 import pytest
@@ -19,7 +20,9 @@ from test_match import Duel
 from test_snapshots import ENGINE_READY, engine_rig  # noqa: F401
 from service.api import make_server
 from service.engine import Engine
+from service.guest_launcher import LauncherRefused, build_launcher
 from service.journal import JOURNAL_NAME
+from service.preflight import MOD_SRC
 from service.servers import REDACTED, launch_command, read_ini
 
 ADMIN_MARKER = "admin-secret-marker"
@@ -153,3 +156,21 @@ def test_failed_server_tail_is_redacted(engine_rig, marked_secrets):
     assert state["phase"] == "error"
     assert f"-adminpassword {REDACTED}" in state["error"]
     assert_clean(json.dumps(state, ensure_ascii=False))
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ["hors-liste " + ADMIN_MARKER, f"{RCON_MARKER}%", f"{ADMIN_MARKER}\n", f"é{RCON_MARKER}"],
+)
+@pytest.mark.parametrize("make_args", [lambda s: ("192.0.2.1", s), lambda s: (s, "abc")])
+def test_launcher_refusal_never_cites_the_value(runtime, caplog, secret, make_args):
+    """Refus du mot de passe comme de l'adresse : ni message, ni chaîne d'exceptions, ni log."""
+    caplog.set_level(logging.DEBUG)
+    address, password = make_args(secret)
+
+    with pytest.raises(LauncherRefused) as refused:
+        build_launcher(address, runtime["ports"]["B"]["game"], password, MOD_SRC)
+
+    assert_clean("".join(format_exception(refused.value)))
+    assert_clean(repr(refused.value))
+    assert_clean(caplog.text)

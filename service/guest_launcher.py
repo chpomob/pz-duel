@@ -1,0 +1,324 @@
+"""Le `.bat` autonome de l'invité : un fichier, sans archive, fonction pure de ses entrées.
+
+D-G : le `.bat` porte chaque fichier du mod en base64, avec son chemin relatif et son SHA-256,
+triés par nom. Ni zip ni `Expand-Archive` : les octets ne dépendent d'aucune version de zlib.
+La logique est du PowerShell 5.1, relue dans le `.bat` par `$env:PZDUEL_SELF`, sans
+`-EncodedCommand`.
+
+D-H : mot de passe et adresse passent par une liste blanche, et tout le reste est refusé sans
+citer la valeur. Rien n'est échappé : aucune valeur admise ne porte de caractère que `cmd` ou
+PowerShell interpréterait. Elles voyagent en plus sur une ligne de données, hors du texte du
+script : celui-ci est identique pour tous les duels, et le mot de passe ne figure pas dans ce
+que la journalisation des blocs de script de Windows conserverait.
+
+Disposition : `cmd` lit l'en-tête et s'arrête à `exit /b`. Tout ce qui suit n'est lu que par
+PowerShell, entre des marqueurs qui occupent seuls leur ligne.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import ipaddress
+import os
+import re
+from pathlib import Path
+
+CRLF = "\r\n"
+# `cmd` coupe une ligne à 8191 caractères ; AC30 fixe le plafond du format.
+MAX_LINE_BYTES = 8000
+MAX_LAUNCHER_BYTES = 256 * 1024
+BASE64_LINE_CHARS = 6000
+MAX_PORT = 65535
+
+PASSWORD_ALLOWED = re.compile(r"[A-Za-z0-9._-]+")
+HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
+MAX_HOST_CHARS = 253
+MAX_LABEL_CHARS = 63
+LOOPBACK_NAME = "localhost"
+
+ADDRESS_REFUSED = "address refused: it must be an IPv4 address or a host name guests can reach"
+PORT_REFUSED = "port refused: it must be a whole number from 1 to 65535"
+PASSWORD_REFUSED = "password refused: only letters, digits, '.', '_' and '-' are allowed"
+MOD_REFUSED = "mod refused: the folder holds no file"
+FORMAT_REFUSED = "launcher refused: it would not fit the size limits of a .bat file"
+
+SCRIPT_MARK = "::PZDUEL-SCRIPT"
+DATA_MARK = "::PZDUEL-DATA"
+JOIN_MARK = "::PZDUEL-JOIN"
+MOD_MARK = "::PZDUEL-MOD"
+FILE_MARK = "::PZDUEL-FILE"
+
+# Le chemin complet : `cmd` essaierait sinon `powershell.exe` dans le dossier de téléchargement.
+# Pas de `%` dans la commande, et rien que des apostrophes dedans : elle est entre guillemets.
+BATCH = rf"""@echo off
+setlocal EnableExtensions DisableDelayedExpansion
+set "PZDUEL_SELF=%~f0"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$l=[IO.File]::ReadAllLines($env:PZDUEL_SELF,[Text.Encoding]::ASCII);$b=[Array]::IndexOf($l,'{SCRIPT_MARK}');$e=[Array]::IndexOf($l,'{DATA_MARK}');& ([ScriptBlock]::Create($l[($b+1)..($e-1)] -join [Environment]::NewLine)) $l"
+set "PZDUEL_CODE=%ERRORLEVEL%"
+if not "%PZDUEL_CODE%"=="0" echo pz-duel: the launcher failed. If no cause is shown above, PowerShell is probably blocked on this PC.
+if not "%PZDUEL_CODE%"=="0" pause
+exit /b %PZDUEL_CODE%"""
+
+# PowerShell 5.1. `[IO.Path]::Combine` plutôt que `Join-Path`, qui lève sur un disque absent.
+# Les chemins restent sans séparateur écrit en dur.
+POWERSHELL = r"""param([string[]]$Lines)
+$ErrorActionPreference = 'Stop'
+$ClientName = 'ProjectZomboid64.exe'
+$ModId = 'duelcore'
+$Damaged = 'This launcher file is damaged. Ask the host for a new one.'
+
+function Get-Libraries([string]$Steam) {
+    try {
+        $file = [IO.Path]::Combine($Steam, 'steamapps', 'libraryfolders.vdf')
+        if (-not [IO.File]::Exists($file)) { return }
+        $text = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)
+    } catch {
+        return
+    }
+    $depth = 0
+    $key = $null
+    $found = @()
+    foreach ($match in [regex]::Matches($text, '(?s)"(?:[^"\\]|\\.)*"|[{}]|"')) {
+        $token = $match.Value
+        if ($token -eq '"') { return }
+        if ($token -eq '{' -or $token -eq '}') {
+            if ($token -eq '{') { $depth++ } else { $depth-- }
+            $key = $null
+            if ($depth -lt 0) { return }
+        } elseif ($null -eq $key) {
+            $key = $token.Substring(1, $token.Length - 2)
+        } else {
+            $value = [regex]::Replace($token.Substring(1, $token.Length - 2), '(?s)\\(.)', '$1')
+            $current = $depth -eq 2 -and $key -ieq 'path'
+            $legacy = $depth -eq 1 -and $key -match '^[0-9]+$'
+            if ($value -and ($current -or $legacy)) { $found += $value }
+            $key = $null
+        }
+    }
+    if ($depth -eq 0) { $found }
+}
+
+function Get-SteamRoots {
+    $default = ${env:ProgramFiles(x86)}
+    if ($default) { [IO.Path]::Combine($default, 'Steam') }
+    $keys = @(
+        @('HKCU:\Software\Valve\Steam', 'SteamPath'),
+        @('HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'InstallPath')
+    )
+    foreach ($entry in $keys) {
+        try {
+            $value = (Get-ItemProperty -LiteralPath $entry[0] -Name $entry[1]).($entry[1])
+            if ($value) { $value }
+        } catch {
+        }
+    }
+}
+
+function Find-Client {
+    $roots = @(Get-SteamRoots)
+    $folders = $roots
+    foreach ($root in $roots) { $folders += @(Get-Libraries $root) }
+    foreach ($folder in $folders) {
+        try {
+            $client = [IO.Path]::Combine($folder, 'steamapps', 'common', 'ProjectZomboid', $ClientName)
+            if ([IO.File]::Exists($client)) { return $client }
+        } catch {
+        }
+    }
+}
+
+function Read-Client {
+    Write-Host 'Project Zomboid was not found automatically.'
+    $answer = $null
+    try {
+        $answer = Read-Host "Paste the folder that holds $ClientName, then press Enter"
+    } catch {
+    }
+    if ($answer) { $answer = $answer.Trim().Trim('"') }
+    if (-not $answer) { throw 'Project Zomboid was not found and no folder was given.' }
+    $client = [IO.Path]::Combine($answer, $ClientName)
+    if (-not [IO.File]::Exists($client)) { throw "$ClientName is not in the folder: $answer" }
+    $client
+}
+
+function Read-Join([string[]]$Lines, [int]$Data) {
+    $join = $Lines[$Data + 1].Split(' ')
+    if ($join.Count -ne 4 -or $join[0] -cne '::PZDUEL-JOIN') { throw $Damaged }
+    $join
+}
+
+function Write-Mod([string[]]$Lines, [int]$Data, [string]$Root) {
+    $entries = New-Object Collections.ArrayList
+    $entry = $null
+    for ($i = $Data + 3; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        if ($line.StartsWith('::PZDUEL-FILE ')) {
+            $fields = $line.Split(' ')
+            $entry = @{ Sum = $fields[1]; Name = $fields[2]; Data = New-Object Text.StringBuilder }
+            [void]$entries.Add($entry)
+        } elseif ($null -ne $entry) {
+            [void]$entry.Data.Append($line)
+        }
+    }
+    $header = $Lines[$Data + 2].Split(' ')
+    if ($header.Count -ne 2 -or $header[0] -cne '::PZDUEL-MOD' -or $header[1] -cne [string]$entries.Count) {
+        throw $Damaged
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    foreach ($entry in $entries) {
+        try {
+            $name = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($entry.Name))
+            $bytes = [Convert]::FromBase64String($entry.Data.ToString())
+        } catch {
+            throw $Damaged
+        }
+        $file = [IO.Path]::Combine($Root, $name)
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($file))
+        [IO.File]::WriteAllBytes($file, $bytes)
+        $hash = $sha.ComputeHash([IO.File]::ReadAllBytes($file))
+        $sum = [BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()
+        if ($sum -cne $entry.Sum) { throw $Damaged }
+    }
+}
+
+function Start-Client([string]$Client, [string[]]$Join) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $Client
+    $info.Arguments = '-nosteam +connect ' + $Join[1] + ':' + $Join[2] + ' +password ' + $Join[3]
+    $info.WorkingDirectory = [IO.Path]::GetDirectoryName($Client)
+    $info.UseShellExecute = $true
+    [void][Diagnostics.Process]::Start($info)
+}
+
+$stage = $null
+$keepStage = $false
+$code = 1
+try {
+    $data = [Array]::IndexOf($Lines, '::PZDUEL-DATA')
+    $join = Read-Join $Lines $data
+    $client = Find-Client
+    if (-not $client) { $client = Read-Client }
+    if (-not $env:USERPROFILE) { throw 'USERPROFILE is not set.' }
+    $zomboid = [IO.Path]::Combine($env:USERPROFILE, 'Zomboid')
+    $mods = [IO.Path]::Combine($zomboid, 'mods')
+    $target = [IO.Path]::Combine($mods, $ModId)
+    $stage = [IO.Path]::Combine($zomboid, '.' + $ModId + '-' + [Guid]::NewGuid().ToString('N'))
+    $staged = [IO.Path]::Combine($stage, 'new')
+    $previous = [IO.Path]::Combine($stage, 'previous')
+    $rejected = [IO.Path]::Combine($stage, 'rejected')
+    Write-Host 'Checking the duel mod...'
+    Write-Mod $Lines $data $staged
+    [void][IO.Directory]::CreateDirectory($mods)
+    $replacing = Test-Path -LiteralPath $target
+    if ($replacing) { Move-Item -LiteralPath $target -Destination $previous }
+    try {
+        Move-Item -LiteralPath $staged -Destination $target
+        Write-Host 'Starting Project Zomboid...'
+        Start-Client $client $join
+    } catch {
+        $cause = $_.Exception.Message
+        try {
+            if (Test-Path -LiteralPath $target) { Move-Item -LiteralPath $target -Destination $rejected }
+            if ($replacing) { Move-Item -LiteralPath $previous -Destination $target }
+        } catch {
+            $keepStage = $true
+            throw "$cause The previous mod could not be put back; it is kept in: $previous"
+        }
+        throw $cause
+    }
+    $code = 0
+} catch {
+    Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+    if (-not $keepStage) { Write-Host 'The game was not started and the installed mod was not changed.' }
+    Write-Host 'If Project Zomboid is running, close it and run this file again.'
+} finally {
+    if ($stage -and -not $keepStage -and (Test-Path -LiteralPath $stage)) {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+exit $code"""
+
+
+class LauncherRefused(ValueError):
+    """Valeur que le `.bat` ne peut pas porter. Le message ne la cite jamais : secret possible."""
+
+
+def _is_usable_ipv4(text: str) -> bool:
+    try:
+        address = ipaddress.IPv4Address(text)
+    except ValueError:
+        return False
+    return not (address.is_loopback or address.is_link_local or address.is_unspecified)
+
+
+def is_usable_address(address: object) -> bool:
+    """H7 : une IPv4 ou un nom d'hôte, sans la boucle, l'adresse nulle ni le lien local.
+
+    Un dernier label qui commence par un chiffre n'est pas un nom : `127.1`, `2130706433` ou
+    `0x7f.1` désignent la boucle pour le résolveur, et seule une IPv4 complète est admise.
+    """
+    if not isinstance(address, str):
+        return False
+    name = address.removesuffix(".")
+    labels = name.split(".")
+    if len(name) > MAX_HOST_CHARS:
+        return False
+    if not all(len(item) <= MAX_LABEL_CHARS and HOST_LABEL.fullmatch(item) for item in labels):
+        return False
+    if labels[-1][0].isdigit():
+        return _is_usable_ipv4(address)
+    return labels[-1].lower() != LOOPBACK_NAME
+
+
+def _is_port(port: object) -> bool:
+    return isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= MAX_PORT
+
+
+def _mod_lines(mod_src: str | os.PathLike[str]) -> list[str]:
+    """Rend le mod en lignes de données, avec les fichiers et l'ordre de `mod_fingerprint`."""
+    root = Path(mod_src)
+    files = {path.relative_to(root).as_posix(): path for path in root.rglob("*") if path.is_file()}
+    if not files:
+        raise LauncherRefused(MOD_REFUSED)
+    lines = [f"{MOD_MARK} {len(files)}"]
+    for name in sorted(files):
+        content = files[name].read_bytes()
+        encoded_name = base64.b64encode(name.encode("utf-8")).decode("ascii")
+        lines.append(f"{FILE_MARK} {hashlib.sha256(content).hexdigest()} {encoded_name}")
+        encoded = base64.b64encode(content).decode("ascii")
+        lines += [
+            encoded[start : start + BASE64_LINE_CHARS]
+            for start in range(0, len(encoded), BASE64_LINE_CHARS)
+        ]
+    return lines
+
+
+def build_launcher(
+    address: str,
+    port: int,
+    password: str,
+    mod_src: str | os.PathLike[str],
+) -> bytes:
+    """Rend les octets du `.bat`, ou lève `LauncherRefused`. Rien n'est écrit (R6).
+
+    Les mêmes entrées rendent les mêmes octets : ni date, ni tirage, ni chemin de l'hôte.
+    """
+    if not is_usable_address(address):
+        raise LauncherRefused(ADDRESS_REFUSED)
+    if not _is_port(port):
+        raise LauncherRefused(PORT_REFUSED)
+    if not isinstance(password, str) or not PASSWORD_ALLOWED.fullmatch(password):
+        raise LauncherRefused(PASSWORD_REFUSED)
+    lines = [
+        *BATCH.splitlines(),
+        SCRIPT_MARK,
+        *POWERSHELL.splitlines(),
+        DATA_MARK,
+        f"{JOIN_MARK} {address} {port} {password}",
+        *_mod_lines(mod_src),
+    ]
+    launcher = (CRLF.join(lines) + CRLF).encode("ascii")
+    if max(map(len, lines)) > MAX_LINE_BYTES or len(launcher) >= MAX_LAUNCHER_BYTES:
+        raise LauncherRefused(FORMAT_REFUSED)
+    return launcher
