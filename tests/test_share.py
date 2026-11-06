@@ -389,13 +389,28 @@ def test_ac36_launcher_is_refused_outside_the_lobby(engine_rig, monkeypatch, api
     assert PLAYER_PASSWORD.encode() not in body
 
 
-def test_ac36_generation_writes_nothing_and_answers_as_an_attachment(
-    engine_rig, monkeypatch, tmp_path, api_port
-):
+def data_home(monkeypatch, tmp_path: Path) -> Path:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     monkeypatch.setenv("XDG_DATA_HOME", str(data_dir))
     monkeypatch.setenv("LOCALAPPDATA", str(data_dir))
+    return data_dir
+
+
+def assert_no_launcher_written(rig, data_dir: Path, tmp_path: Path) -> None:
+    """Cherche le lanceur par son nom partout, et tout `.bat` dans les dossiers du service.
+
+    Le reste de `tmp_path` porte la fausse installation de PZ, et son `StartServer64.bat`.
+    """
+    named = tmp_path.rglob(LAUNCHER_NAME)
+    batches = (path for folder in (rig.matches, data_dir) for path in folder.rglob("*.bat"))
+    assert not {*named, *batches}
+
+
+def test_ac36_generation_writes_nothing_and_answers_as_an_attachment(
+    engine_rig, monkeypatch, tmp_path, api_port
+):
+    data_dir = data_home(monkeypatch, tmp_path)
     detect(monkeypatch, LAN_ADDRESS)
     lobby = Lobby(engine_rig, PRESET)
 
@@ -405,7 +420,7 @@ def test_ac36_generation_writes_nothing_and_answers_as_an_attachment(
     assert join_line(launcher)[2] == PLAYER_PASSWORD
     assert headers["Content-Disposition"] == f'attachment; filename="{LAUNCHER_NAME}"'
     assert headers["Cache-Control"] == "no-store"
-    assert not list(tmp_path.rglob("*.bat"))
+    assert_no_launcher_written(engine_rig, data_dir, tmp_path)
     files = [
         path
         for folder in (engine_rig.matches, data_dir)
@@ -415,6 +430,31 @@ def test_ac36_generation_writes_nothing_and_answers_as_an_attachment(
     assert files, "le balayage ne voit plus les fichiers de match"
     for path in files:
         assert PLAYER_PASSWORD.encode() not in path.read_bytes(), path
+
+
+@pytest.mark.parametrize("written", [LAUNCHER_NAME, f"nested/{LAUNCHER_NAME}", "renamed.bat"])
+def test_ac36_launcher_written_by_the_route_is_caught(
+    engine_rig, monkeypatch, tmp_path, api_port, written
+):
+    data_dir = data_home(monkeypatch, tmp_path)
+    detect(monkeypatch, LAN_ADDRESS)
+    lobby = Lobby(engine_rig, PRESET)
+    (engine_rig.pz_dir / "StartServer64.bat").touch()
+    assert_no_launcher_written(engine_rig, data_dir, tmp_path)
+    generate = lobby.engine.guest_launcher
+    target = data_dir / written
+
+    def generate_and_write() -> bytes:
+        launcher = generate()
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(launcher)
+        return launcher
+
+    monkeypatch.setattr(lobby.engine, "guest_launcher", generate_and_write)
+
+    assert request(api_port(lobby.engine), "GET", LAUNCHER_ROUTE)[0] == 200
+    with pytest.raises(AssertionError):
+        assert_no_launcher_written(engine_rig, data_dir, tmp_path)
 
 
 def test_unlisted_password_gives_a_reason_and_no_launcher(engine_rig, monkeypatch, api_port):

@@ -22,7 +22,7 @@ from doubles.fake_mod import FakeMod
 from doubles.fake_server import install_fake_server, kill_tree, on_host, write_script
 from test_preflight import free_ports, zomboid_home  # noqa: F401
 from service import snapshots
-from service.engine import Engine
+from service.engine import Engine, RealMatch
 from service.journal import JOURNAL_NAME, read_journal
 from service.platforms import current
 from service.preflight import MOD_SRC, install_mod
@@ -95,6 +95,8 @@ else
 fi
 exec {inner} "$@"
 """
+# `cmd` n'ouvre `>>` que seul à écrire, et le `xcopy` de l'autre camp peut tenir `out` à cet
+# instant : sans reprise, les `caps` se perdraient en silence. `sh` n'a pas cette exclusion.
 ENGINE_BATCH = r"""set "name=%2"
 set "side=%name:duel=%"
 set "out={zomboid}\Lua\duel_%side%_out.txt"
@@ -109,8 +111,14 @@ xcopy "{zomboid}\Lua" "%seen%\Lua" /e /i /q /y >nul
 dir /b /a:d "{zomboid}\duel-snapshots" > "%seen%\snapshots" 2>nul
 if not exist "{zomboid}\Saves\Multiplayer\%2" goto creation_pass
 {on_match_launch}
-type "{caps}\%side%" >> "%out%" 2>nul
-goto launch
+set tries=0
+:write_caps
+if not exist "{caps}\%side%" goto launch
+set /a tries+=1
+type "{caps}\%side%" >> "%out%" 2>nul && goto launch
+if %tries% geq 3 goto launch
+ping -n 2 127.0.0.1 >nul
+goto write_caps
 :creation_pass
 mkdir "{zomboid}\Saves\Multiplayer\%2\map"
 copy /b /y "{created}" "{zomboid}\Saves\Multiplayer\%2\map\chunk.bin" >nul
@@ -127,6 +135,10 @@ ENGINE_SANDBOX = (
 BUILD = "42.21.0"
 ENGINE_READY = [f"version={BUILD}", *READY_LINES]
 WAIT_S = 10
+# `wait` compte aussi le lancement : une fenêtre égale à l'attente n'y laisserait rien voir.
+CONTRACT_WINDOW_S = WAIT_S / 4
+# Ce que la fenêtre peut consommer de l'attente, retard du fil compris.
+CONTRACT_WINDOW_MAX_S = WAIT_S / 2
 WAIT_POLL_S = 0.01
 OBSERVED_KEYS = ("phase", "score", "clock", "players", "servers", "result", "error")
 PLAYER_PASSWORD = "player-marker"
@@ -148,7 +160,7 @@ class EngineRig:
         self.sandbox_file = tmp_path / "sandbox"
         self.sandbox_file.write_bytes(ENGINE_SANDBOX.replace(r"\n", "\n").encode())
         self.runtime = {**runtime, **FAST_TIMEOUTS, "min_free_ram_mb": 0}
-        self.runtime["contract_timeout_s"] = WAIT_S
+        self.runtime["contract_timeout_s"] = CONTRACT_WINDOW_S
         host = current()
         if host.client_in_game_dir:
             host.client_file(self.pz_dir).write_bytes(b"MZ")
@@ -427,6 +439,31 @@ def captured(rig):
         alter_world(rig.zomboid, side)
     rig.events.clear()
     return pair, store, origin
+
+
+def test_contract_window_closes_after_its_term_and_inside_the_wait(engine_rig, monkeypatch):
+    """Sans `caps`, le refus suit la fenêtre entière et laisse sa marge à l'attente."""
+    spans = []
+    read_caps = RealMatch.wait_caps
+
+    def timed(match):
+        opened = time.monotonic()
+        caps = read_caps(match)
+        spans.append(time.monotonic() - opened)
+        return caps
+
+    monkeypatch.setattr(RealMatch, "wait_caps", timed)
+    engine_rig.build()
+    for side in SIDES:
+        (engine_rig.caps_dir / side).unlink()
+
+    engine_rig.start()
+    state = engine_rig.wait("error", "lobby")
+
+    assert state["phase"] == "error"
+    assert "caps de A non reçu" in state["error"]
+    [span] = spans
+    assert CONTRACT_WINDOW_S <= span <= CONTRACT_WINDOW_MAX_S
 
 
 def test_restore_exact(rig, captured):
