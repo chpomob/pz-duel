@@ -15,6 +15,9 @@ from service.protocol import PROTOCOL_VERSION, dump_line, parse_session
 
 OWN_SIDE = object()
 SERVER_KINDS = ("beat", "caps", "cmd_result", "hook_seen")
+# Relevé sur le vrai jeu (README, premier contact), pour `DayLength`=1 et `PauseEmpty=false`.
+EMPTY_BEAT_S = 10
+EMPTY_AGE_PER_BEAT = 0.27
 
 
 class FakeMod:
@@ -124,3 +127,19 @@ class FakeMod:
         """Réécrit `ack`, qui ne contient jamais qu'une ligne."""
         ack = {"v": PROTOCOL_VERSION, "boot": self.boot if boot is None else boot, "seq": seq}
         self.ack_path.write_bytes(dump_line(ack))
+
+
+class EmptyServer:
+    """Serveur sans joueur : il tique, bat toutes les 10 s, et son âge avance au rythme nominal."""
+
+    def __init__(self, mod: FakeMod, age: float = 0.0, start_s: float = 0.0) -> None:
+        self.mod = mod
+        self.age = age
+        self.next_beat_s = start_s + EMPTY_BEAT_S
+
+    def run_until(self, now_s: float) -> None:
+        """Émet les `beat` échus à l'instant `now_s`, en secondes de match."""
+        while self.next_beat_s <= now_s:
+            self.age += EMPTY_AGE_PER_BEAT
+            self.mod.beat(age=self.age, players=())
+            self.next_beat_s += EMPTY_BEAT_S

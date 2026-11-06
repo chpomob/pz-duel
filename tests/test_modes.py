@@ -21,6 +21,7 @@ from service.api import make_server
 from service.engine import ACTIONS, Engine, load_presets
 from service.preflight import MOD_SRC, install_mod
 from service.servers import ServerProcess
+from service.state import PHASE_LABELS
 
 SIMULATED = "simulé"
 CHECK_STEPS = ("preflight", "serverA", "serverB", "contract")
@@ -58,17 +59,32 @@ class FastClock:
         return self.now
 
 
+class FakeClient:
+    """Processus du client tel que l'engine le suit : vivant jusqu'à `exit`."""
+
+    def __init__(self) -> None:
+        self.code: int | None = None
+
+    def poll(self) -> int | None:
+        return self.code
+
+    def exit(self) -> None:
+        self.code = 0
+
+
 class Launcher:
     """Faux lanceur du client : il note l'appel, et échoue sur `failure`."""
 
     def __init__(self, failure: str | None = None) -> None:
         self.failure = failure
         self.calls: list[tuple[Path, list[str]]] = []
+        self.client = FakeClient()
 
-    def __call__(self, script, args) -> None:
+    def __call__(self, script, args) -> FakeClient:
         self.calls.append((script, list(args)))
         if self.failure is not None:
             raise engine_module.ClientLaunchError(self.failure)
+        return self.client
 
 
 def forbidden_factory(*args, **kwargs):
@@ -374,6 +390,7 @@ HOST_CONFIG = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:1726
 def client_engine(zomboid_home, runtime, pz_dir: Path, launcher) -> Engine:
     engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir, client_launcher=launcher)
     engine.state.config = dict(HOST_CONFIG)
+    engine.state.phase = "lobby"
     return engine
 
 
@@ -446,11 +463,90 @@ def test_open_game_keeps_the_engine_free_while_launching(zomboid_home, tmp_path,
         other = threading.Thread(target=probe)
         other.start()
         other.join()
+        return FakeClient()
 
     engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
 
     assert engine.action("open_game")[0] is True
     assert free == [True]
+
+
+@pytest.mark.parametrize(
+    "phase", sorted(set(PHASE_LABELS) - {"lobby"}), ids=lambda phase: phase
+)
+def test_open_game_is_refused_outside_the_lobby(zomboid_home, tmp_path, runtime, phase):
+    """`config` survit à la fin du duel : sans garde, le client viserait un serveur arrêté."""
+    pz_dir, _ = client_install(tmp_path)
+    launcher = Launcher()
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine.state.phase = phase
+
+    ok, message = engine.action("open_game")
+
+    assert ok is False
+    assert message == f"impossible d'ouvrir le jeu en phase {phase} : il s'ouvre au lobby"
+    assert launcher.calls == []
+
+
+def test_open_game_is_refused_outside_the_lobby_in_mock_too(runtime):
+    engine = Engine("mock", runtime=runtime, clock=FastClock())
+
+    assert engine.action("open_game")[0] is False
+
+
+def test_second_open_game_is_refused_while_the_first_is_starting(zomboid_home, tmp_path, runtime):
+    """Deux appels rapprochés : le premier regarde encore le démarrage, hors du verrou."""
+    pz_dir, _ = client_install(tmp_path)
+    starting, release = threading.Event(), threading.Event()
+    calls: list[list[str]] = []
+
+    def launcher(script, args):
+        calls.append(list(args))
+        starting.set()
+        release.wait(WAIT_S)
+        return FakeClient()
+
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    first: list[tuple[bool, str]] = []
+    thread = threading.Thread(target=lambda: first.append(engine.action("open_game")))
+    thread.start()
+    assert starting.wait(WAIT_S)
+
+    ok, message = engine.action("open_game")
+    release.set()
+    thread.join(WAIT_S)
+
+    assert ok is False
+    assert message == "client PZ déjà lancé : rejoignez 127.0.0.1:17261 depuis celui-ci"
+    assert first[0][0] is True
+    assert len(calls) == 1
+
+
+def test_open_game_waits_for_the_client_to_exit_before_relaunching(zomboid_home, tmp_path, runtime):
+    pz_dir, _ = client_install(tmp_path)
+    launcher = Launcher()
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+
+    assert engine.action("open_game")[0] is True
+    assert engine.action("open_game")[0] is False
+    assert len(launcher.calls) == 1
+
+    launcher.client.exit()
+
+    assert engine.action("open_game")[0] is True
+    assert len(launcher.calls) == 2
+
+
+def test_failed_open_game_leaves_the_next_attempt_free(zomboid_home, tmp_path, runtime):
+    pz_dir, _ = client_install(tmp_path)
+    launcher = Launcher("options refusées")
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+
+    assert engine.action("open_game")[0] is False
+    launcher.failure = None
+
+    assert engine.action("open_game")[0] is True
+    assert len(launcher.calls) == 2
 
 
 def write_script(path: Path, body: str) -> Path:
@@ -464,7 +560,8 @@ def test_default_client_launcher_accepts_a_client_that_stays_up(tmp_path, monkey
     marker = tmp_path / "args"
     script = write_script(tmp_path / "pz.sh", f'echo "$@" > {marker}\nexec sleep 1')
 
-    assert engine_module.launch_client(script, ["-nosteam", "+connect"]) is None
+    process = engine_module.launch_client(script, ["-nosteam", "+connect"])
+    assert process.poll() is None, "l'engine suit ce processus pour refuser un second client"
     deadline = time.monotonic() + WAIT_S
     while not (marker.exists() and marker.read_text(encoding="utf-8")):
         assert time.monotonic() < deadline
@@ -492,7 +589,8 @@ def test_default_passwords_are_distinct_and_unrelated_to_the_code(zomboid_home, 
     engine = real_engine(zomboid_home, runtime)
 
     assert engine.action("start", {"preset": "demo"})[0]
-    config = settle(engine)["config"]
+    settle(engine)
+    config = engine.state.config
 
     assert config["password"] != config["host_password"]
     assert config["code"] not in (config["password"], config["host_password"])

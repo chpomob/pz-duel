@@ -156,8 +156,8 @@ class ClientLaunchError(Exception):
     """Client non lancé : le message dit la cause, sans jamais citer les arguments."""
 
 
-def launch_client(script: Path, args: Sequence[str]) -> None:
-    """Lance le client par son script, détaché du service, et le regarde démarrer.
+def launch_client(script: Path, args: Sequence[str]) -> subprocess.Popen:
+    """Lance le client par son script, détaché du service, et rend son processus démarré.
 
     Le script garde le client au premier plan et finit toujours par `exit 0` : le code ne
     prouve rien, seul compte qu'il tourne encore au bout de `CLIENT_START_GRACE_S`.
@@ -175,7 +175,7 @@ def launch_client(script: Path, args: Sequence[str]) -> None:
     try:
         code = process.wait(CLIENT_START_GRACE_S)
     except subprocess.TimeoutExpired:
-        return
+        return process
     raise ClientLaunchError(f"{script.name} s'est arrêté aussitôt (code {code}), options refusées ?")
 
 
@@ -560,8 +560,9 @@ class RealMatch:
         """Une passe à l'instant monotone `now_ms` ; rend le motif d'un arrêt, `result` dit la fin.
 
         Seul ce fil écrit sur les canaux. L'absence de heartbeat n'est une panne qu'en
-        `running` : un serveur vide ne tique pas (H3). L'entrée en `running` précède la
-        lecture de `out` : ce que le mod a écrit depuis `t0_ms` doit atteindre le cœur.
+        `running` : un serveur vide bat toutes les 10 s, mais rien n'exige ce `beat` avant la
+        première connexion. L'entrée en `running` précède la lecture de `out` : ce que le mod
+        a écrit depuis `t0_ms` doit atteindre le cœur.
 
         Les sorties se relèvent avant cette lecture, qui devient la dernière de ce serveur :
         relevées après, un `cmd_result` écrit juste avant la sortie resterait non lu, et sa
@@ -823,8 +824,8 @@ class RealMatch:
         Le monde relancé a perdu son temps d'arrêt et repart de sa dernière sauvegarde : son
         âge ne se compare plus à l'ancien repère. Son premier heartbeat une fois disponible
         ouvre donc un repère neuf, pris au dernier âge connu pour l'autre camp. Un serveur
-        vide ne tique pas : attendre ce heartbeat écarte aussi le temps de reconnexion du
-        joueur. La relance ne compte ainsi pas comme dérive, et ce qui suit se mesure.
+        vide tique (`PauseEmpty=false`) : ce heartbeat n'attend pas le retour du joueur, dont
+        la reconnexion se mesure comme le reste. La relance ne compte ainsi pas comme dérive.
         """
         if side in self._unavailable:
             return
@@ -1340,7 +1341,7 @@ class Engine:
         clock: Callable[[], float] | None = None,
         monotonic: Callable[[], float] | None = None,
         matches_dir: str | os.PathLike[str] | None = None,
-        client_launcher: Callable[[Path, Sequence[str]], None] | None = None,
+        client_launcher: Callable[[Path, Sequence[str]], subprocess.Popen] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
     ) -> None:
         if mode not in MODES:
@@ -1354,6 +1355,8 @@ class Engine:
         self._clock = time.time if clock is None else clock
         self._monotonic = time.monotonic if monotonic is None else monotonic
         self._client_launcher = launch_client if client_launcher is None else client_launcher
+        self._client: subprocess.Popen | None = None
+        self._client_starting = False
         self._server_factory = ServerProcess if server_factory is None else server_factory
         self.lock = threading.RLock()
         self.state = MatchState(mode=mode)
@@ -1400,8 +1403,8 @@ class Engine:
         payload = payload or {}
         if not isinstance(name, str) or name not in ACTIONS:
             return False, f"action inconnue: {name}"
-        if name == "open_game" and self.real:
-            return self._open_game_real()
+        if name == "open_game":
+            return self._open_game()
         with self.lock:
             phase = self.state.phase
             if self._closing and name in ("start", "rematch"):
@@ -1447,9 +1450,6 @@ class Engine:
                 self.state.log("adversaire simulé connecté")
                 self.state.event("adversaire connecté", "B")
                 return True, "invité connecté"
-            if name == "open_game":
-                self.state.log("lancement du client PZ demandé (simulé)")
-                return True, "client PZ lancé (simulé)"
         return False, "action non traitée"
 
     def shutdown(self) -> bool:
@@ -1475,24 +1475,46 @@ class Engine:
             thread.join()
         return stopped and not self._stop_incomplete
 
-    def _open_game_real(self) -> tuple[bool, str]:
+    def _open_game(self) -> tuple[bool, str]:
+        """Ouvre le client depuis le lobby : ailleurs, A est arrêté ou la partie déjà jouée.
+
+        Le verrou reste libre pendant que `launch_client` regarde le démarrage :
+        `_client_starting` retient donc le second appel, jusqu'à ce que `_client` prenne le relais.
+        """
+        with self.lock:
+            phase = self.state.phase
+            if phase != "lobby":
+                return False, f"impossible d'ouvrir le jeu en phase {phase} : il s'ouvre au lobby"
+            if not self.real:
+                self.state.log("lancement du client PZ demandé (simulé)")
+                return True, "client PZ lancé (simulé)"
+            password = self.state.config["host_password"]
+            address = self.state.config["host_address"]
+            if self._client_starting or self._client_alive():
+                return False, f"client PZ déjà lancé : rejoignez {address} depuis celui-ci"
+            self._client_starting = True
+        try:
+            return self._open_game_real(password, address)
+        finally:
+            with self.lock:
+                self._client_starting = False
+
+    def _client_alive(self) -> bool:
+        return self._client is not None and self._client.poll() is None
+
+    def _open_game_real(self, password: str, address: str) -> tuple[bool, str]:
         """Lance le client de l'hôte vers le serveur A. La commande n'est jamais journalisée.
 
         Les serveurs tournent sans Steam, le client aussi, et par son seul script : Steam ne
         rendrait aucun constat du lancement. Un succès dit que le client tourne, pas qu'il
-        est connecté. Le verrou reste libre pendant que `launch_client` regarde le démarrage.
+        est connecté.
         """
-        with self.lock:
-            password = self.state.config.get("host_password")
-            address = self.state.config.get("host_address")
-        if not password:
-            return False, "aucun duel préparé : démarrez un duel avant d'ouvrir le jeu"
         args = [NO_STEAM_FLAG, "+connect", address, "+password", password]
         script = self._client_script()
         try:
             if script is None:
                 raise ClientLaunchError(f"client PZ introuvable ({CLIENT_SCRIPT} absent)")
-            self._client_launcher(script, args)
+            client = self._client_launcher(script, args)
         except ClientLaunchError as exc:
             manual = f"lancez PZ à la main avec {NO_STEAM_FLAG}, puis rejoignez {address}"
             message = f"{exc} : {manual}"
@@ -1501,6 +1523,7 @@ class Engine:
             return False, message
         message = f"client PZ lancé sans Steam : vérifiez en jeu la connexion à {address}"
         with self.lock:
+            self._client = client
             self.state.log(message)
         return True, message
 

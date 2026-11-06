@@ -26,6 +26,7 @@ Par les tests de `tests/test_modes.py`, avec un faux lanceur ou un faux script. 
 - Script absent ou non exécutable : aucun lancement, échec qui nomme le fichier et donne la marche à suivre à la main.
 - Script qui ne démarre pas, ou qui s'arrête dans les 2 s, quel que soit son code : échec. Le vrai script finit par `exit 0` : son code ne prouve rien.
 - Le mot de passe ne figure ni dans les messages ni dans les logs du service.
+- Hors de la phase `lobby` : refus explicite, aucun lancement. Tant que le client lancé tourne, ou démarre encore : second lancement refusé.
 
 ### Non prouvé
 
@@ -34,3 +35,11 @@ Par les tests de `tests/test_modes.py`, avec un faux lanceur ou un faux script. 
 - Un refus après 2 s : un client qui tient ce délai compte comme lancé. C'est pourquoi le succès dit de vérifier la connexion en jeu.
 
 Le service constate la présence d'un joueur par les `beat` du mod, jamais par ce lancement.
+
+## Machine mono-utilisateur
+
+Le service suppose une machine de bureau à un seul utilisateur. Sur une machine partagée, tout compte local peut lire les mots de passe et piloter le duel : ne l'y lancez pas.
+
+- **API locale sans jeton.** Le contrôle de `Host` et d'`Origin` n'arrête que les navigateurs. Un processus local qui envoie `Host: 127.0.0.1:<port>` sans `Origin` lit `/api/state` et poste les actions, dont `start` et `cancel`.
+- **Mots de passe dans `/api/state`.** `config.password`, celui de B, y reste à toute phase. `config.host_password`, celui de A, n'y paraît qu'en phase `lobby`, où l'hôte en a besoin.
+- **Secrets dans `ps`.** Le mot de passe admin figure dans la ligne de commande de chaque serveur (`-adminpassword`), et celui de A dans celle du client lancé par `Ouvrir PZ`.

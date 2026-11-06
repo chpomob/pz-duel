@@ -102,7 +102,7 @@ Ces points tranchent des écarts entre les documents de conception, le brief et 
 | Second port UDP | `duelA.ini` et `duelB.ini` ont tous deux `UDPPort=16262` | Ports UDP distincts, passés par `-udpport` (argument présent dans `GameServer.class`) et écrits dans le `.ini` |
 | Port de l'invitation | le mock invite sur 17261, le serveur de l'hôte | En réel, l'hôte joue sur A et l'invité reçoit le port de B |
 | Unité de la dérive | `02` : « secondes de jeu » ; `07` : « 60 s » | Secondes réelles. Avec `DayLength=1`, 60 s de jeu valent 0,625 s réelle : ce seuil invaliderait tout match |
-| Base de la dérive | spike 0 : un serveur vide n'avance pas au rythme nominal | Avance d'horloge depuis le début du match, pas valeur absolue |
+| Base de la dérive | spike 0 avait vu un serveur vide s'écarter du rythme nominal ; le premier contact le contredit avec `PauseEmpty=false` (README). Un monde relancé repart toutefois de sa dernière sauvegarde | Avance d'horloge depuis le début du match, pas valeur absolue |
 | Granularité | `07` : lots de 10-15 s, mais p95 < 3 s | Transport à 1 s. Les lots naissent du cooldown (§ Budgets) : le premier effet part aussitôt, les suivants se cumulent |
 | Cooldown et plafond | `per_effect_cooldown_s: 20` rendrait faux « 1 kill → 2 zombies (max 60/min) » si l'effet était jeté | Le cooldown diffère et cumule ; seul `cap_per_min` retire des unités |
 | Dédup par `seq` | le fichier `out` est en ajout et un mod relancé perd son compteur : la dédup par `seq` seul jetterait de vrais événements | Clé `(boot, seq)`, `boot` fourni par le service à chaque lancement |
@@ -112,7 +112,7 @@ Ces points tranchent des écarts entre les documents de conception, le brief et 
 | `defender_bonus` | `06` : un nom d'effet ; or `supply_drop` exige des paramètres | Objet effet complet, de même schéma qu'un effet de règle |
 | Acceptation du contrat | `06` : l'invité accepte ; aucun écran invité n'existe | En phase 1 le contrat est scellé par hash côté service ; la connexion de l'invité vaut acceptation |
 | Repli de `damage_taken` | `07` : repli sur `OnCharacterDeath` + PV du heartbeat ; ce repli donnerait un atome de sémantique différente, non observé | Aucune source de substitution : sans `hook_seen`, l'atome est retiré des atomes actifs du match, et la table est jouée sans ce qui en dépend (§ Cycle de vie) |
-| Fin de la fenêtre de contrat | à l'étape `contract` aucun joueur n'est connecté (H3) : un hook qui exige un coup ne peut pas y être vu, tout preset qui en dépend serait toujours refusé | La fenêtre de contrat s'étend jusqu'à l'entrée en décompte (§ Cycle de vie) |
+| Fin de la fenêtre de contrat | à l'étape `contract` aucun joueur n'est connecté : un hook qui exige un coup ne peut pas y être vu, tout preset qui en dépend serait toujours refusé | La fenêtre de contrat s'étend jusqu'à l'entrée en décompte (§ Cycle de vie) |
 | Contenu de `supply_drop` | R3 interdit tout équilibrage dans le mod ; aucun champ ne portait les objets | Le contenu est dans la table (`items`), borné par `limits` et restreint au catalogue `supply_items` |
 | Temps du moteur | `mt` « tiré de `t_ms` » excluait toute émission en silence | Grille de ticks de 250 ms, cadencée par l'instant courant ; `t_ms` date les événements, jamais les ticks (§ Horloge du moteur) |
 
@@ -124,7 +124,7 @@ Hypothèses non vérifiées, à confirmer au premier lancement réel :
 
 - H1 : un `.ini` partiel écrit avant la première création d'un `servername` est conservé et complété par PZ. La relecture du contrat détecte l'échec.
 - H2 : un client doit posséder le mod `duelcore` localement pour rejoindre, même sans code client. Sans Workshop, l'invité copie donc le dossier à la main (README).
-- H3 : le serveur arrête de tiquer sans joueur (spike 0). Aucun heartbeat n'est donc exigé avant la première connexion.
+- H3 : **contredite** au premier contact (README). Avec `PauseEmpty=false`, un serveur vide tique et bat toutes les 10 s. Aucun heartbeat n'est exigé avant la première connexion : le service en reçoit seulement plus tôt.
 
 ### Contrat de transport
 
@@ -455,7 +455,8 @@ Le rejeu compare ensuite les `command` et les `late_event` produits à ceux du j
 - En réel, `simulate_join` est refusé, aucun texte d'état ne contient « simulé », aucune donnée de score ou de dérive n'est aléatoire. Un échec réel ne bascule jamais vers le mock.
 - En réel, un `preset` inconnu est refusé, alors que le code actuel prend silencieusement le premier.
 - `open_game` en réel lance le client par Steam avec `+connect 127.0.0.1:<port de A>` et `+password`, ou répond `ok=false` avec un message si Steam est introuvable.
-- L'API `/api/state` et `/api/action` reste compatible : mêmes actions, champs existants conservés, ajouts seulement.
+- L'API `/api/state` et `/api/action` reste compatible : mêmes actions, champs existants conservés, ajouts seulement. Seule exception : `config.host_password` n'y paraît qu'en phase `lobby`.
+- `open_game` n'est accepté qu'en phase `lobby`, et refusé tant qu'un client lancé par le service tourne.
 - Secrets : le mot de passe admin et le mot de passe RCON n'apparaissent ni dans `/api/state`, ni dans les `logs`, ni dans `matches/`, ni dans les lignes de commande journalisées. Toute sortie de serveur passe par une expurgation avant écriture ou affichage.
 - Reste à risque, assumé : `-adminpassword` est visible dans `ps` pendant la vie du processus (le brief impose l'argument) et le `.ini` contient `RCONPassword` en clair (PZ le lit là), d'où `0600`.
 - Le mot de passe joueur n'est pas un secret d'administration : il reste dans `invite` et `config`, mais pas dans le journal.

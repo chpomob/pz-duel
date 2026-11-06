@@ -7,9 +7,11 @@ import json
 import math
 import threading
 import shutil
+from pathlib import Path
 
 import pytest
 
+from doubles.fake_mod import EMPTY_AGE_PER_BEAT, EmptyServer, FakeMod
 from test_contract import (
     L_S,
     MS,
@@ -20,6 +22,7 @@ from test_contract import (
     crash_and_hold,
     state_entered_at,
 )
+from test_modes import call
 from test_servers import stopped_for_good
 from test_snapshots import (  # noqa: F401
     PLAYER_PASSWORD,
@@ -31,11 +34,12 @@ from test_snapshots import (  # noqa: F401
     worlds_state,
 )
 from service import engine as engine_module
+from service.api import make_server
 from service.journal import JOURNAL_NAME, JournalError
 from service.protocol import dump_line, parse_session
 from service.replay import main as replay_main
 from service.servers import read_ini
-from service.state import MatchState
+from service.state import PHASE_LABELS, MatchState
 from service.transport import POLL_MAX
 from service.verdict import VerdictError, spawn_status, verdict
 
@@ -277,6 +281,45 @@ def test_players_come_from_beats_and_silence_is_no_failure(engine_rig):
     lobby.mods["A"].beat(players=())
     engine_rig.until(lambda s: s["players"]["A"] is None)
     assert lobby.state()["phase"] == "lobby"
+
+
+@pytest.mark.parametrize("phase", sorted(PHASE_LABELS), ids=lambda phase: phase)
+def test_host_password_is_public_in_the_lobby_only(phase):
+    config = {"host_password": "marqueur-hote", "password": "invite"}
+    state = MatchState(phase=phase, config=config)
+
+    assert ("host_password" in state.to_dict()["config"]) is (phase == "lobby")
+    assert state.to_dict()["config"]["password"] == "invite"
+    assert config["host_password"] == "marqueur-hote", "la revanche relit ce mot de passe"
+
+
+def test_api_state_drops_the_host_password_once_the_match_runs(engine_rig):
+    """Au lobby, l'hôte le lit à l'écran ; ensuite, ni `/api/state` ni `/api/action` ne le rendent."""
+    duel = Duel(engine_rig)
+    server = make_server(duel.engine)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/api"
+    secret = duel.engine.state.config["host_password"]
+    try:
+        _, lobby = call(f"{base}/state")
+        assert lobby["phase"] == "lobby"
+        assert lobby["config"]["host_password"] == secret
+
+        duel.start_match()
+        _, running = call(f"{base}/state")
+        _, reply = call(f"{base}/action", {"action": "open_game"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(WAIT_S)
+
+    assert running["phase"] == "running"
+    assert "host_password" not in running["config"]
+    assert secret not in json.dumps(running)
+    assert reply["ok"] is False
+    assert secret not in json.dumps(reply)
+    assert duel.engine.state.config["host_password"] == secret
 
 
 def test_each_side_has_its_own_password(engine_rig):
@@ -1459,6 +1502,86 @@ def test_drift_decides_after_the_return(engine_rig, presets):
     assert duel.replays()
 
 
+def test_empty_server_double_ticks_and_beats_every_ten_seconds(tmp_path):
+    """H3 contredite : avec `PauseEmpty=false`, un serveur vide tique et bat au rythme nominal."""
+    mod = FakeMod(tmp_path, "A")
+
+    empty = EmptyServer(mod, age=1.0, start_s=40)
+    empty.run_until(49)
+    assert not mod.out_path.exists()
+    empty.run_until(60)
+
+    lines = [json.loads(line) for line in mod.out_path.read_bytes().splitlines()]
+    assert [line["kind"] for line in lines] == ["beat", "beat"]
+    assert [line["data"]["players"] for line in lines] == [[], []]
+    assert [line["data"]["age"] for line in lines] == pytest.approx([1.27, 1.54])
+
+
+def test_restarted_empty_server_reopens_the_mark_before_its_player_returns(engine_rig, presets):
+    """Le serveur relancé bat sans attendre son joueur : son premier `beat` ouvre le repère.
+
+    Il avance ensuite au rythme de B pendant la reconnexion : aucune dérive ne s'y ajoute.
+    Un monde qui s'arrêterait, lui, creuserait l'écart à chaque `beat` de B.
+    """
+    edit_preset(presets, day_length=1, duration_s=RESTART_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.beat("A", age=3.0)
+    duel.beat("B", age=0.0)
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 0)
+    duel.at_match(11)
+    duel.beat("A", age=3.5)
+    duel.beat("B", age=0.0)
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 18.75)
+
+    release = crash_and_hold(duel, "A")
+    duel.at_match(40)
+    duel.beat("B", age=4.0)
+    duel.reach(41)
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    duel.mods["A"].read_session()
+
+    empty = EmptyServer(duel.mods["A"], age=1.0, start_s=41)
+    duel.at_match(51)
+    empty.run_until(51)
+    duel.reach(52)
+    age_b = 4.0
+    for now_s in (61, 71):
+        duel.at_match(now_s)
+        empty.run_until(now_s)
+        age_b += EMPTY_AGE_PER_BEAT
+        duel.beat("B", age=age_b)
+        state = duel.reach(now_s + 1)
+        assert state["phase"] == "running"
+        assert state["servers"]["A"] == "up"
+        assert state["players"]["A"] is None
+        assert state["clock"]["drift_s"] == 18.75
+
+    duel.at_match(75)
+    duel.beat("A", age=empty.age)
+    state = engine_rig.until(lambda s: s["players"]["A"] == PLAYERS["A"])
+    assert state["clock"]["drift_s"] == 18.75
+
+
+def test_no_text_still_states_that_an_empty_server_stops_ticking():
+    """H3 est contredite : le prochain lecteur ne doit pas raisonner sur cette prémisse."""
+    stale = ("ne tique" + " pas", "arrête de" + " tiquer")
+    root = Path(__file__).resolve().parent.parent
+    texts = [
+        *root.glob("service/*.py"),
+        *root.glob("tests/*.py"),
+        root / "docs/campaigns/phase1/spec.md",
+    ]
+
+    assert [
+        path.name
+        for path in texts
+        if any(phrase in path.read_text(encoding="utf-8") for phrase in stale)
+    ] == []
+
+
 def test_restart_keeps_the_match_and_the_acquired_drift(engine_rig, presets):
     """Comportement d'une relance réelle : le monde repart de sa dernière sauvegarde.
 
@@ -1485,7 +1608,7 @@ def test_restart_keeps_the_match_and_the_acquired_drift(engine_rig, presets):
 
     release.set()
     engine_rig.until(lambda s: s["servers"]["A"] == "up")
-    # Un serveur vide ne tique pas : le joueur met 30 s à revenir, et B avance encore.
+    # Premier heartbeat en retard sur les 10 s nominales : le repère attend A, et B avance encore.
     duel.at_match(60)
     duel.beat("B", age=5.0)
     duel.at_match(71)
@@ -1805,6 +1928,7 @@ def test_rematch(engine_rig, presets):
     origin = worlds_state(rig.zomboid)
     duel.start_match()
     first = duel.state()
+    host_password = duel.engine.state.config["host_password"]
     first_window = duel.engine._match.window
     assert first["capabilities"]["active_atoms"] is not None
 
@@ -1832,7 +1956,7 @@ def test_rematch(engine_rig, presets):
     assert state["phase"] == "lobby", state["error"]
     assert state["config"]["code"] == first["config"]["code"]
     assert state["config"]["password"] == first["config"]["password"] == PLAYER_PASSWORD
-    assert state["config"]["host_password"] == first["config"]["host_password"]
+    assert state["config"]["host_password"] == host_password
     assert state["invite"]["code"] == first["invite"]["code"]
     assert state["invite"]["password"] == PLAYER_PASSWORD
     assert state["match_id"] != first["match_id"]
@@ -1844,7 +1968,7 @@ def test_rematch(engine_rig, presets):
         assert (session["boot"], session["cmd_floor"]) == (1, 0)
         assert session["match"] == state["match_id"]
         ini = read_ini(rig.zomboid / "Server" / f"duel{side}.ini")
-        passwords = {"A": first["config"]["host_password"], "B": PLAYER_PASSWORD}
+        passwords = {"A": host_password, "B": PLAYER_PASSWORD}
         assert ini["Password"] == passwords[side]
     assert len(rig.seen("A")) == launches + 1
 

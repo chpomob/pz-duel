@@ -18,6 +18,10 @@ PHASE_LABELS = {
     "error": "erreur",
 }
 
+# Le lobby seul affiche à l'hôte son accès : ailleurs, ce mot de passe ne sort pas de l'état.
+HOST_SECRET_PHASE = "lobby"
+HOST_SECRET = "host_password"
+
 LAUNCH_STEPS = [
     ("preflight", "Préflight"),
     ("serverA", "Serveur A"),
@@ -81,13 +85,19 @@ class MatchState:
                     s["detail"] = detail
                 return
 
+    def public_config(self) -> dict:
+        """Rend `config` telle qu'elle sort de l'API ; `self.config` garde tout pour la revanche."""
+        if self.phase == HOST_SECRET_PHASE:
+            return self.config
+        return {key: value for key, value in self.config.items() if key != HOST_SECRET}
+
     def to_dict(self) -> dict:
         return {
             "version": self.version,
             "phase": self.phase,
             "phase_label": PHASE_LABELS.get(self.phase, self.phase),
             "mode": self.mode,
-            "config": self.config,
+            "config": self.public_config(),
             "steps": self.steps,
             "servers": self.servers,
             "players": self.players,
