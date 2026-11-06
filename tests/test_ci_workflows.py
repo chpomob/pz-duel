@@ -2,10 +2,15 @@
 
 Chaque exigence est une entrée de `ci_problems` ou de `release_problems`. Les mutants
 ci-dessous prouvent que ces lectures voient le défaut, y compris une étape seulement commentée.
+
+La documentation (R9) se lit de même : `start_problems` pour la section de démarrage des README,
+`limits_problems` pour `limites-connues`, chaque preuve citée y désignant un nom qui existe.
 """
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 from pathlib import Path
 
@@ -16,6 +21,8 @@ WORKFLOWS = REPO / ".github" / "workflows"
 TESTS_YML = WORKFLOWS / "tests.yml"
 RELEASE_YML = WORKFLOWS / "release.yml"
 BUILD_SPEC = REPO / "packaging" / "pz-duel.spec"
+RUNTIME = REPO / "service" / "runtime.json"
+LIMITS_DIR = REPO / "docs" / "campaigns" / "phase2"
 
 SUITE_PYTHONS = ["3.12", "3.13", "3.14"]
 BUILD_PYTHON = "3.13"
@@ -400,3 +407,290 @@ def test_release_builds_exactly_like_the_pull_requests():
         ]
 
     assert chain(RELEASE_YML) == chain(TESTS_YML)
+
+
+# ---------------------------------------------------------------- documentation (R9)
+EN, FR = "en", "fr"
+LANGUAGES = [EN, FR]
+README = {EN: REPO / "README.md", FR: REPO / "README.fr.md"}
+LIMITS = {EN: LIMITS_DIR / "limites-connues.md", FR: LIMITS_DIR / "limites-connues.fr.md"}
+START_HEADING = {EN: "## Getting started on Windows", FR: "## Démarrage sous Windows"}
+UNPROVEN_HEADING = {EN: "## Not proven on the real game", FR: "## Non prouvé sur le vrai jeu"}
+GUEST_SIDE = "B"
+
+# Ce que le joueur ne doit jamais avoir à taper, ni un bloc de code où le coller.
+TERMINAL = re.compile(
+    r"```|^\s*[$>]\s+\S+\s+-|--[a-z]"
+    r"|\b(?:python3?|pip|pytest|git|curl|wget|netsh|sudo|chmod|powershell|pwsh|cmd"
+    r"|taskkill|regedit)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+START_TERMS = {
+    EN: {
+        "smartscreen": r"SmartScreen",
+        "firewall": r"Windows Firewall",
+        "share port": r"share port",
+        "bat ban": r"Do not post or distribute the `\.bat`",
+        "rematch keeps": r"Rematch[^\n]*\n?[^\n]*`\.bat` you already sent stays valid",
+        "new duel stales": r"new duel can make a `\.bat` you already sent stale",
+        "send again": r"send the new `\.bat` again",
+    },
+    FR: {
+        "smartscreen": r"SmartScreen",
+        "firewall": r"pare-feu Windows",
+        "share port": r"port de partage",
+        "bat ban": r"Ne publiez pas et ne diffusez pas le `\.bat`",
+        "rematch keeps": r"Revanche[^\n]*\n?[^\n]*`\.bat` déjà envoyé reste valide",
+        "new duel stales": r"nouveau duel peut périmer un `\.bat` déjà envoyé",
+        "send again": r"renvoyer le nouveau `\.bat`",
+    },
+}
+UNPROVEN_TERMS = {
+    EN: {
+        "eight arguments": r"`StartServer64\.bat` passing on its 8 arguments",
+        "steam value": r"`-Dzomboid\.steam` against a `-nosteam` client",
+        "end of script": r"end-of-script behaviour",
+        "guest connection": r"A guest actually connecting",
+        "internet reach": r"Reaching an entered address from the Internet",
+        "not tested": r"service does not test an entered address",
+    },
+    FR: {
+        "eight arguments": r"transmission par `StartServer64\.bat` de ses 8 arguments",
+        "steam value": r"`-Dzomboid\.steam` face à un client `-nosteam`",
+        "end of script": r"comportement de fin de script",
+        "guest connection": r"connexion effective d'un invité",
+        "internet reach": r"joignabilité depuis Internet d'une adresse saisie",
+        "not tested": r"service ne teste pas une adresse saisie",
+    },
+}
+# P5, P11, P13, P14 et P15 ont relevé ce que `limites-connues` doit garder.
+LIMITS_TERMS = {
+    EN: {
+        "os.sync": r"`os\.sync`",
+        "powershell": r"constrained language mode",
+        "mark of the web": r"Mark of the Web",
+        "antivirus": r"Antivirus",
+        "visible password": r"password is visible",
+        "nt resume": r"`NtResumeProcess`",
+        "mei folder": r"`_MEI\*`",
+        "rebind": r"TIME_WAIT",
+        "error phase": r"`error` phase",
+    },
+    FR: {
+        "os.sync": r"`os\.sync`",
+        "powershell": r"mode de langage restreint",
+        "mark of the web": r"Mark of the Web",
+        "antivirus": r"antivirus",
+        "visible password": r"mot de passe client est visible",
+        "nt resume": r"`NtResumeProcess`",
+        "mei folder": r"`_MEI\*`",
+        "rebind": r"TIME_WAIT",
+        "error phase": r"phase `error`",
+    },
+}
+CITATION = re.compile(r"`([\w./-]+\.py)::(\w+)`")
+CI_RUN = re.compile(r"https://github\.com/chpomob/pz-duel/actions/runs/\d+")
+# Ni un chemin de fichier, ni le motif `test_windows_*`.
+BARE_TEST = re.compile(r"(?<![/\w])test_\w+(?![\w*])")
+
+
+def section(text: str, heading: str) -> str:
+    """Le corps d'une section de niveau 2, vide si elle manque."""
+    lines = text.splitlines()
+    if heading not in lines:
+        return ""
+    start = lines.index(heading) + 1
+    end = next(
+        (index for index in range(start, len(lines)) if lines[index].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def missing_terms(body: str, terms: dict[str, str]) -> list[str]:
+    # Le passage à la ligne d'un paragraphe ne doit pas faire disparaître un terme.
+    flat = re.sub(r"\s*\n\s*", " ", body)
+    return [name for name, term in terms.items() if not re.search(term, flat)]
+
+
+def shipped_ports() -> dict[str, int]:
+    runtime = json.loads(RUNTIME.read_text(encoding="utf-8"))
+    ports = runtime["ports"][GUEST_SIDE]
+    return {"game": ports["game"], "udp": ports["udp"], "share": runtime["share_port"]}
+
+
+def start_problems(text: str, language: str, ports: dict[str, int]) -> list[str]:
+    body = section(text, START_HEADING[language])
+    if not body:
+        return ["start: no getting started section"]
+    problems = [f"start: {name} missing" for name in missing_terms(body, START_TERMS[language])]
+    udp = f"\\*\\*{ports['game']}\\*\\*\\D+\\*\\*{ports['udp']}\\*\\*\\D+\\*\\*UDP\\*\\*"
+    if not re.search(udp, body):
+        problems.append("start: game ports are not given in UDP")
+    if not re.search(f"\\*\\*{ports['share']}\\*\\*\\D+\\*\\*TCP\\*\\*", body):
+        problems.append("start: share port is not given in TCP")
+    if LIMITS[language].name not in body:
+        problems.append("start: no link to the known limits")
+    command = TERMINAL.search(body)
+    if command:
+        problems.append(f"start: terminal command {command[0]!r}")
+    return problems
+
+
+def defined_names(path: Path) -> set[str]:
+    """Toutes les fonctions du fichier, y compris dans un bloc `if sys.platform == "win32"`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    kinds = (ast.FunctionDef, ast.AsyncFunctionDef)
+    return {node.name for node in ast.walk(tree) if isinstance(node, kinds)}
+
+
+def citation_problems(text: str) -> list[str]:
+    problems = []
+    for file, name in CITATION.findall(text):
+        path = REPO / file
+        if not path.is_file():
+            problems.append(f"limits: {file} does not exist")
+        elif name not in defined_names(path):
+            problems.append(f"limits: {file} has no {name}")
+    # Un nom sans son fichier échapperait au contrôle : il ne compte pas comme une preuve.
+    bare_names = BARE_TEST.findall(CITATION.sub("", text))
+    return problems + [f"limits: {name} is cited without its file" for name in bare_names]
+
+
+def limits_problems(text: str, language: str) -> list[str]:
+    unproven = section(text, UNPROVEN_HEADING[language])
+    if not unproven:
+        return ["limits: no list of what is not proven"]
+    names = missing_terms(unproven, UNPROVEN_TERMS[language])
+    problems = [f"limits: {name} missing from what is not proven" for name in names]
+    names = missing_terms(text, LIMITS_TERMS[language])
+    problems += [f"limits: {name} missing" for name in names]
+    for point in re.split(r"^### ", unproven, flags=re.MULTILINE)[1:]:
+        if not CITATION.search(point) and not CI_RUN.search(point):
+            problems.append(f"limits: no proof cited for {point.splitlines()[0]}")
+    return problems + citation_problems(text)
+
+
+def read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def flat_sub(pattern: str, text: str) -> str:
+    """Efface un terme, y compris coupé en deux lignes par le paragraphe."""
+    return re.sub(pattern.replace(" ", r"\s+"), "effaced", text)
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+def test_ac50_ac61_readme_has_the_getting_started_section(language):
+    assert start_problems(read(README[language]), language, shipped_ports()) == []
+
+
+@pytest.mark.parametrize(
+    ("language", "term"),
+    [(language, term) for language in LANGUAGES for term in START_TERMS[language]],
+)
+def test_ac50_ac61_missing_term_is_seen(language, term):
+    text = read(README[language])
+    mutated = flat_sub(START_TERMS[language][term], text)
+
+    assert mutated != text
+    assert f"start: {term} missing" in start_problems(mutated, language, shipped_ports())
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+@pytest.mark.parametrize("key", ["game", "udp", "share"])
+def test_ac50_ports_follow_the_runtime(language, key):
+    ports = {**shipped_ports(), key: 1}
+
+    assert start_problems(read(README[language]), language, ports) != []
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+def test_ac50_term_outside_the_section_does_not_count(language):
+    mutated = read(README[language]).replace(START_HEADING[language], "## Elsewhere")
+
+    assert start_problems(mutated, language, shipped_ports()) == [
+        "start: no getting started section"
+    ]
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+@pytest.mark.parametrize(
+    "command",
+    [
+        "```bash\nstart\n```",
+        "Run python -m service.main first.",
+        "Use netsh advfirewall to open the port.",
+        "Open PowerShell as administrator.",
+        "Start it with --mode real.",
+        "$ pz-duel -x",
+    ],
+)
+def test_ac50_terminal_command_in_the_section_is_seen(language, command):
+    text = read(README[language])
+    heading = START_HEADING[language]
+    mutated = text.replace(heading, f"{heading}\n\n{command}\n")
+
+    assert any("terminal" in item for item in start_problems(mutated, language, shipped_ports()))
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+def test_ac51_limits_list_what_is_not_proven(language):
+    assert limits_problems(read(LIMITS[language]), language) == []
+
+
+@pytest.mark.parametrize(
+    ("language", "term"),
+    [(language, term) for language in LANGUAGES for term in UNPROVEN_TERMS[language]],
+)
+def test_ac51_missing_point_is_seen(language, term):
+    text = read(LIMITS[language])
+    mutated = flat_sub(UNPROVEN_TERMS[language][term], text)
+
+    assert mutated != text
+    assert f"limits: {term} missing from what is not proven" in limits_problems(mutated, language)
+
+
+@pytest.mark.parametrize(
+    ("language", "term"),
+    [(language, term) for language in LANGUAGES for term in LIMITS_TERMS[language]],
+)
+def test_ac51_finding_of_an_earlier_step_is_kept(language, term):
+    text = read(LIMITS[language])
+    mutated = flat_sub(LIMITS_TERMS[language][term], text)
+
+    assert mutated != text
+    assert f"limits: {term} missing" in limits_problems(mutated, language)
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+def test_ac51_point_without_a_proof_is_seen(language):
+    text = read(LIMITS[language])
+    unproven = section(text, UNPROVEN_HEADING[language])
+    mutated = text.replace(unproven, CITATION.sub("no proof", unproven))
+
+    assert any("no proof cited" in item for item in limits_problems(mutated, language))
+
+
+@pytest.mark.parametrize(
+    ("citation", "expected"),
+    [
+        ("`tests/test_share.py::test_that_does_not_exist`", "has no test_that_does_not_exist"),
+        ("`tests/test_gone.py::test_anything`", "tests/test_gone.py does not exist"),
+        ("`test_windows_command_keeps_its_eight_arguments`", "cited without its file"),
+    ],
+)
+def test_ac51_cited_proof_must_name_something_that_exists(citation, expected):
+    assert any(expected in item for item in citation_problems(citation))
+
+
+def test_ac51_win32_block_counts_as_a_definition():
+    names = defined_names(REPO / "tests" / "test_guest_launcher.py")
+
+    assert "test_windows_launcher_installs_the_mod_and_connects" in names
+
+
+def test_ac51_both_languages_cite_the_same_proofs():
+    cited = {language: set(CITATION.findall(read(LIMITS[language]))) for language in LANGUAGES}
+
+    assert cited[EN] == cited[FR]

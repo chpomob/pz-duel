@@ -3,7 +3,8 @@
 *Français — [English version](README.md)*
 
 > ⚠️ **Prototype de concept — aucun duel réel n'a encore été joué.** Les serveurs, le mod et le
-> contrat sont prouvés sur le vrai jeu ; tout ce qui demande un joueur reste à constater.
+> contrat sont prouvés sur le vrai jeu sous Linux ; tout ce qui demande un joueur, et tout Windows,
+> reste à constater.
 
 Deux parties solo de Project Zomboid, reliées par un arbitre local : les joueurs ne se croisent
 jamais, mais **chaque action de l'un devient une pression dans le monde de l'autre**. Un zombie tué
@@ -41,7 +42,75 @@ indépendante de cette idée, sans lien avec lui ; l'idée, elle, est la sienne.
   loot et des véhicules différents. L'équité est dans les règles et les conditions de départ, pas
   dans l'identité des mondes.
 
-## Démarrage rapide (sans Project Zomboid)
+## Démarrage sous Windows
+
+> ⛔ **Pas encore jouable sous Windows.** Un vrai match s'arrête au lancement tant qu'un défaut connu
+> n'est pas corrigé, et rien de ce qui suit n'a été essayé sur une vraie machine Windows ni avec le vrai
+> jeu. C'est le parcours visé ; les [limites connues de la phase 2](docs/campaigns/phase2/limites-connues.fr.md)
+> disent ce qui est prouvé.
+
+Aucun terminal n'est nécessaire. Les deux joueurs ont besoin de Project Zomboid **42.21** sur Steam,
+sous Windows. L'hôte fait tourner les deux serveurs et a besoin d'environ 6 Go de RAM disponible.
+
+### Hôte
+
+1. **Téléchargez** `pz-duel.exe` depuis la [page des releases](https://github.com/chpomob/pz-duel/releases).
+   Il n'y a rien à installer.
+2. **Double-cliquez dessus.** Le fichier n'est pas signé : **SmartScreen** peut afficher « Windows a
+   protégé votre ordinateur ». Cliquez sur **Informations complémentaires**, puis sur **Exécuter quand
+   même**.
+3. **Vérifiez la carte Setup** de la page qui s'ouvre. Pour toute ligne marquée ✕, utilisez le bouton
+   proposé : `Install mod`, `Choose folder` ou `Check again`.
+4. **Lancez un duel** : `Configurer un duel`, choisissez un preset, puis `Launch duel`.
+5. **Répondez à l'invite du pare-feu Windows.** Windows peut demander si PZ Duel ou le serveur du jeu a
+   le droit d'utiliser le réseau : cliquez sur **Autoriser l'accès**. PZ Duel ne peut pas le faire à
+   votre place. Si vous avez refermé l'invite, votre invité n'entrera pas : ouvrez *Sécurité Windows*,
+   *Pare-feu et protection du réseau*, *Autoriser une application via le pare-feu*.
+6. **Invitez votre adversaire** depuis le lobby : `Copy link`, ou `Save launcher` pour obtenir
+   `pz-duel-join.bat`. Ensuite, `Ouvrir PZ` vous connecte à votre propre serveur.
+7. **Partez par `Quit`** dans la page. Fermer l'onglet du navigateur n'arrête pas PZ Duel.
+
+Si `Launch duel` finit sur une erreur, utilisez `Try again`. Si l'écran vous le demande, quittez et
+rouvrez PZ Duel.
+
+### Invité
+
+1. **Récupérez le `.bat`** sur le PC Windows qui a le jeu : ouvrez-y le lien de l'hôte, ou enregistrez
+   le fichier qu'il vous a envoyé. Le lien ne marche que pendant que l'hôte est dans le lobby. Scanner
+   le QR avec un téléphone met le fichier sur le téléphone, où il ne sert à rien.
+2. **Double-cliquez sur `pz-duel-join.bat`.** **SmartScreen** peut aussi prévenir ici : **Informations
+   complémentaires**, puis **Exécuter quand même**. Ne le faites que pour un fichier reçu d'une personne
+   de confiance.
+3. Il installe le mod et lance le jeu, connecté à l'hôte. S'il ne trouve pas le jeu, il demande le
+   dossier. En cas d'échec, votre mod existant reste tel quel et la fenêtre reste ouverte.
+
+### Jouer par Internet
+
+Sur le même réseau local, il n'y a rien de plus à faire. Sinon, l'hôte redirige ces ports de sa box
+vers son PC :
+
+- les ports **17271** et **17272** en **UDP**, pour jouer ;
+- le port de partage **17280** en **TCP**, pour le lien seulement. Si vous envoyez le `.bat` par
+  message, il est inutile.
+
+Saisissez ensuite votre adresse publique dans le lobby, sous *Public address*, et cliquez sur
+`Use this address` avant d'envoyer quoi que ce soit. PZ Duel ne peut pas tester cette adresse et ne
+fournit aucun relais.
+
+### Ne diffusez jamais le `.bat`
+
+**Ne publiez pas et ne diffusez pas le `.bat`.** Il contient votre adresse et le mot de passe du serveur
+de l'invité : quiconque l'a peut entrer. Envoyez-le à votre adversaire seul, en message privé.
+
+### Revanche ou nouveau duel
+
+- **Revanche** (`Revanche`) : un `.bat` déjà envoyé reste valide, tant que votre adresse n'a pas changé.
+  L'ancien lien ne marche plus, mais votre invité peut simplement relancer le même `.bat`.
+- **Nouveau duel** (`Nouveau duel`) : un nouveau duel peut périmer un `.bat` déjà envoyé, car un nouveau
+  mot de passe est tiré. Dans ce cas, il faut renvoyer le nouveau `.bat`. Saisir l'ancien mot de passe
+  dans le formulaire du duel garde l'ancien `.bat` valide.
+
+## Essayer depuis les sources (sans Project Zomboid)
 
 Le mode `mock` rejoue tout le parcours — préflight, serveurs, contrat, décompte, score — sans lancer
 un seul processus.
@@ -53,10 +122,10 @@ python3 -m service.main            # ouvre http://127.0.0.1:8765/
 
 Python **≥ 3.12**, aucune dépendance : le service est en bibliothèque standard uniquement.
 
-Parcours : `Configurer un duel` → preset **Démo 90 s** → `Lancer le duel` → dans le lobby,
+Parcours : `Configurer un duel` → preset **Démo 90 s** → `Launch duel` → dans le lobby,
 `Simuler l'adversaire`. Tout ce qui est simulé est annoncé comme tel.
 
-## Mode réel
+## Mode réel depuis les sources
 
 Il faut Project Zomboid **42.21** (le lanceur serveur est livré avec le jeu), 6 ports libres
 (jeu 17261/17271, UDP 17262/17272, RCON 27015/27016) et environ 6 Go de RAM disponible — chaque
@@ -110,7 +179,7 @@ Prouvé, sur cette installation (build 42.21.0), par `pytest -m pz_integration` 
 - arrêt par **RCON**, ports libérés, fichiers `.ini` en `0600`, **aucun secret** dans les fichiers de
   match, aucun processus résiduel ;
 - le lecteur de commandes lit une ligne au plus une fois, y compris ligne coupée ou `\n` manquant ;
-- 1 214 tests hors jeu couvrent le protocole, la table de relations, le score, le journal, le rejeu,
+- environ 2 000 tests hors jeu couvrent le protocole, la table de relations, le score, le journal, le rejeu,
   l'API locale et l'UI (suite verte sur Python 3.12 et 3.14).
 
 **Jamais exercé**, et c'est le cœur du produit :
@@ -127,7 +196,7 @@ plus bas ; tant qu'elle n'a pas été déroulée, ces cases restent ouvertes, et
 ## Tests
 
 ```bash
-python3 -m pytest -q                          # sans le jeu (1 214 tests, ~60 s)
+python3 -m pytest -q                          # sans le jeu (environ 2 000 tests, ~2 min 30)
 python3.12 -m pytest -q                       # plancher de version déclaré
 python3 -m pytest -m pz_integration           # vrais serveurs, ~2 min 30
 ```
@@ -179,14 +248,16 @@ service/          arbitre : préflight, serveurs, RCON, protocole, transport fic
                   table de relations, cœur de match, journal, rejeu, verdict, API locale
 mods/duelcore/    mod serveur (Lua) : capture les faits, publie ses capacités, applique les commandes
 ui/               interface locale (HTML/CSS/JS, aucune dépendance hors QR vendorisé)
-tests/            1 214 tests ; doubles de serveur, de mod et interpréteur Lua réduit
+packaging/        binaire Windows : point d'entrée et spec PyInstaller, test de fumée
+tests/            environ 2 000 tests ; doubles de serveur, de mod et interpréteur Lua réduit
 docs/campaigns/   spec (77 critères), plan (24 étapes), 4 revues de branche, 15 étapes de correction
 docs/design/      conception en 10 documents, anglais et français (voir l'index)
 ```
 
 ## Limites connues
 
-Le détail daté est dans [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md).
+Le détail daté est dans [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md),
+et pour Windows dans [`docs/campaigns/phase2/limites-connues.fr.md`](docs/campaigns/phase2/limites-connues.fr.md).
 Les plus importantes :
 
 - **La détection des dégâts repose sur un relevé de santé côté serveur** dont on n'a pas constaté

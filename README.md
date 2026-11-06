@@ -3,7 +3,8 @@
 *English — [version française](README.fr.md)*
 
 > ⚠️ **Concept prototype — not a single real duel has been played yet.** The servers, the mod and
-> the contract are proven against the real game; everything that needs a player is still unverified.
+> the contract are proven against the real game on Linux; everything that needs a player, and all of
+> Windows, is still unverified.
 
 Two separate Project Zomboid solo games, linked by a local referee: the players never meet, but
 **every action on one side becomes pressure in the other player's world**. One zombie killed on A
@@ -40,7 +41,70 @@ implementation of that idea, not affiliated with him; the idea itself is his.
 - No connection between the two players, no mirrored world: two separate saves, hence different loot
   and vehicles. Fairness lives in the rules and the starting conditions, not in identical worlds.
 
-## Quick start (no Project Zomboid needed)
+## Getting started on Windows
+
+> ⛔ **Not playable on Windows yet.** A real match stops at launch until a known defect is fixed, and
+> nothing below has been tried on a real Windows machine or with the real game. This is the intended
+> path; the [known limits of phase 2](docs/campaigns/phase2/limites-connues.md) say what is proven.
+
+You never need a terminal. Both players need Project Zomboid **42.21** from Steam, on Windows. The host
+runs both servers and needs about 6 GB of free RAM.
+
+### Host
+
+1. **Download** `pz-duel.exe` from the [Releases page](https://github.com/chpomob/pz-duel/releases).
+   There is nothing to install.
+2. **Double-click it.** The file is not signed, so **SmartScreen** may show "Windows protected your
+   PC". Click **More info**, then **Run anyway**.
+3. **Check the Setup card** in the page that opens. For any line marked ✕, use the button offered:
+   `Install mod`, `Choose folder` or `Check again`.
+4. **Start a duel**: `Configurer un duel`, pick a preset, then `Launch duel`.
+5. **Answer the Windows Firewall prompt.** Windows may ask whether PZ Duel or the game's server can use
+   the network: click **Allow access**. PZ Duel cannot do this for you. If you dismissed the prompt,
+   your guest will not get in: open *Windows Security*, *Firewall & network protection*, *Allow an app
+   through firewall*.
+6. **Invite your opponent** from the lobby: `Copy link`, or `Save launcher` to get
+   `pz-duel-join.bat`. Then `Ouvrir PZ` joins your own server.
+7. **Leave with `Quit`** in the page. Closing the browser tab does not stop PZ Duel.
+
+If `Launch duel` ends on an error, use `Try again`. If the screen tells you to, quit and reopen PZ Duel.
+
+### Guest
+
+1. **Get the `.bat`** on the Windows PC that has the game: open the host's link there, or save the file
+   the host sent. The link only works while the host is in the lobby. Scanning the QR code with a phone
+   puts the file on the phone, where it is no use.
+2. **Double-click `pz-duel-join.bat`.** **SmartScreen** may warn here too: **More info**, then **Run
+   anyway**. Only do this for a file from someone you trust.
+3. It installs the mod and starts the game, connected to the host. If it cannot find the game, it asks
+   for the folder. If anything fails, your existing mod is left as it was and the window stays open.
+
+### Playing over the Internet
+
+On the same local network, there is nothing more to do. Otherwise the host forwards these ports on
+their router to their PC:
+
+- ports **17271** and **17272** in **UDP**, to play;
+- the share port **17280** in **TCP**, for the link only. If you send the `.bat` by message, you can
+  skip it.
+
+Then enter your public address in the lobby, under *Public address*, and click `Use this address`
+before sending anything. PZ Duel cannot test that address, and it provides no relay.
+
+### Never share the `.bat` publicly
+
+**Do not post or distribute the `.bat`.** It holds your address and the password of the guest's server,
+so anyone who has it can join. Send it to your opponent only, in a private message.
+
+### Rematch or new duel
+
+- **Rematch** (`Revanche`): a `.bat` you already sent stays valid, as long as your address has not
+  changed. The old link no longer works, but your guest can simply run the same `.bat` again.
+- **New duel** (`Nouveau duel`): a new duel can make a `.bat` you already sent stale, because a new
+  password is drawn. If so, send the new `.bat` again. Typing the previous password in the duel form
+  keeps the old `.bat` valid.
+
+## Try it from source (no Project Zomboid needed)
 
 `mock` mode replays the whole flow — preflight, servers, contract, countdown, score — without
 launching a single process.
@@ -52,10 +116,10 @@ python3 -m service.main            # opens http://127.0.0.1:8765/
 
 Python **≥ 3.12**, no dependencies: the service is standard library only.
 
-Flow: `Configure a duel` → preset **Démo 90 s** → `Launch the duel` → in the lobby,
-`Simulate the opponent`. Anything simulated is labelled as such.
+Flow: `Configurer un duel` → preset **Démo 90 s** → `Launch duel` → in the lobby,
+`Simuler l'adversaire`. Anything simulated is labelled as such.
 
-## Real mode
+## Real mode from source
 
 Requires Project Zomboid **42.21** (the headless server launcher ships with the game), six free
 ports (game 17261/17271, UDP 17262/17272, RCON 27015/27016) and about 6 GB of free RAM — each
@@ -111,7 +175,7 @@ Proven on this machine (build 42.21.0) by `pytest -m pz_integration`:
 - shutdown through **RCON**, ports released, `.ini` files in `0600`, **no secret** in any match file,
   no leftover process;
 - the command reader reads a line at most once, including a cut line or a missing `\n`;
-- 1,214 tests outside the game cover the protocol, the relation table, scoring, the journal, replay,
+- about 2,000 tests outside the game cover the protocol, the relation table, scoring, the journal, replay,
   the local API and the UI (suite green on Python 3.12 and 3.14).
 
 **Never exercised**, and this is the heart of the product:
@@ -128,7 +192,7 @@ until it has been run, those boxes stay open — and the documents say so.
 ## Tests
 
 ```bash
-python3 -m pytest -q                          # without the game (1,214 tests, ~60 s)
+python3 -m pytest -q                          # without the game (about 2,000 tests, ~2 min 30)
 python3.12 -m pytest -q                       # declared version floor
 python3 -m pytest -m pz_integration           # real servers, ~2 min 30
 ```
@@ -180,14 +244,16 @@ service/          referee: preflight, servers, RCON, protocol, file transport,
                   relation table, match core, journal, replay, verdict, local API
 mods/duelcore/    server-side mod (Lua): captures facts, publishes capabilities, applies commands
 ui/               local interface (HTML/CSS/JS, no dependency beyond a vendored QR encoder)
-tests/            1,214 tests; server, mod and a reduced Lua interpreter as doubles
+packaging/        Windows binary: PyInstaller entry point and spec, smoke test
+tests/            about 2,000 tests; server, mod and a reduced Lua interpreter as doubles
 docs/campaigns/   spec (77 criteria), plan (24 steps), 4 branch reviews, 15 fix steps
 docs/design/      ten design notes, English and French (see the index)
 ```
 
 ## Known limits
 
-The dated detail lives in [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md).
+The dated detail lives in [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md),
+and for Windows in [`docs/campaigns/phase2/limites-connues.md`](docs/campaigns/phase2/limites-connues.md).
 The important ones:
 
 - **Damage detection relies on a server-side health reading** that has not been observed working for a
