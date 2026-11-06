@@ -119,6 +119,10 @@ def get_state(port: int, **headers: str) -> tuple[int, bytes]:
     return send(port, "/api/state", {"Host": f"127.0.0.1:{port}"} | headers)
 
 
+def get_path(port: int, path: str) -> int:
+    return send(port, path, {"Host": f"127.0.0.1:{port}"})[0]
+
+
 @pytest.mark.parametrize("origin", FOREIGN_ORIGINS)
 def test_foreign_origin_refused(api, origin):
     engine, port = api
@@ -722,6 +726,112 @@ def test_folder_keeps_its_text_up_to_the_engine(api):
     )
     assert status == 200 and answer["ok"] is True
     assert engine.actions == [folder]
+
+
+QUIT_ROUTE = "/api/quit"
+QUIT_BODY = b"{}"
+
+
+@pytest.fixture
+def quit_api():
+    """Un serveur dont `main` aurait posé la fonction d'arrêt : rend `(server, port, appels)`."""
+    server = make_server(RecordingEngine())
+    calls: list[int] = []
+    server.on_quit = lambda: calls.append(1)
+    threading.Thread(target=server.serve_forever, args=(POLL_S,), daemon=True).start()
+    yield server, server.server_address[1], calls
+    server.shutdown()
+    server.server_close()
+
+
+def test_quit_route_is_in_the_table_and_outside_the_actions():
+    assert QUIT_ROUTE in POST_PATHS
+    assert "quit" not in ACTIONS
+
+
+def test_quit_without_a_stop_function_is_refused(api):
+    engine, port = api
+    status, answer = post(port, QUIT_ROUTE, QUIT_BODY)
+    assert status == 409 and answer["ok"] is False
+    assert engine.actions == []
+
+
+def test_quit_calls_the_stop_function(quit_api):
+    _, port, calls = quit_api
+    status, answer = post(port, QUIT_ROUTE, QUIT_BODY)
+    assert status == 200 and answer["ok"] is True
+    # La réponse part avant l'appel : le client peut la tenir avant que `calls` soit rempli.
+    eventually(lambda: calls == [1])
+
+
+@pytest.mark.parametrize("origin", FOREIGN_ORIGINS)
+def test_quit_refuses_a_foreign_origin(quit_api, origin):
+    _, port, calls = quit_api
+    assert post(port, QUIT_ROUTE, QUIT_BODY, Origin=origin.format(port=port))[0] == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("host", FOREIGN_HOSTS)
+def test_quit_refuses_a_foreign_host(quit_api, host):
+    _, port, calls = quit_api
+    assert post(port, QUIT_ROUTE, QUIT_BODY, Host=host.format(port=port))[0] == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("content_type", FOREIGN_TYPES)
+def test_quit_requires_json_content_type(quit_api, content_type):
+    """Un formulaire d'une page web part sans préflight : il ne doit pas éteindre le service."""
+    _, port, calls = quit_api
+    headers = {"Host": f"127.0.0.1:{port}"}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    assert send(port, QUIT_ROUTE, headers, QUIT_BODY)[0] == 415
+    assert calls == []
+
+
+@pytest.mark.parametrize("body", [b"[1]", b"\xff", b""], ids=["array", "bad-utf8", "empty"])
+def test_quit_refuses_a_body_that_is_no_object(quit_api, body):
+    _, port, calls = quit_api
+    assert post(port, QUIT_ROUTE, body)[0] == 400
+    assert calls == []
+
+
+def test_get_never_quits(quit_api):
+    _, port, calls = quit_api
+    assert get_path(port, QUIT_ROUTE) == 404
+    assert calls == []
+
+
+def test_quit_answers_before_the_stop_starts(quit_api):
+    """Le client tient sa réponse pendant que la fonction d'arrêt attend encore."""
+    server, port, _ = quit_api
+    received, called = threading.Event(), threading.Event()
+    answered_first = []
+
+    def on_quit() -> None:
+        answered_first.append(received.wait(WAIT_S))
+        called.set()
+
+    server.on_quit = on_quit
+    status, _ = post(port, QUIT_ROUTE, QUIT_BODY)
+    received.set()
+
+    assert status == 200
+    assert called.wait(WAIT_S)
+    assert answered_first == [True]
+
+
+def test_client_gone_does_not_cancel_the_quit(quit_api, monkeypatch):
+    _, port, calls = quit_api
+
+    def gone(*_) -> None:
+        raise ConnectionResetError
+
+    monkeypatch.setattr(Handler, "_send", gone)
+    with pytest.raises(http.client.RemoteDisconnected):
+        post(port, QUIT_ROUTE, QUIT_BODY)
+
+    assert calls == [1]
 
 
 def explode(*_):

@@ -8,17 +8,24 @@ import shutil
 import socket
 import threading
 import time
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
+from doubles.fake_server import FakeRcon
+from test_match import Duel
 from test_modes import forbidden_factory, settle, step
 from test_preflight import assert_no_terminal, free_ports, make_install, zomboid_home  # noqa: F401
+from test_servers import Service, stopped_for_good, until
+from test_snapshots import engine_rig  # noqa: F401
 
 from service import engine as engine_module
+from service import main as main_module
 from service import paths
 from service.api import make_server
-from service.engine import ACTIONS, Engine
+from service.engine import ACTIONS, STOP_INCOMPLETE, Engine
 from service.platforms import LINUX, WINDOWS, current
 from service.preflight import (
     ABSENT,
@@ -32,11 +39,15 @@ from service.preflight import (
     install_mod,
     mod_fingerprint,
 )
+from service.servers import STATUS_DOWN, STOP_RCON
 
 JSON_TYPE = "application/json"
 INSTALL_ROUTE = "/api/setup/install-mod"
 FOLDER_ROUTE = "/api/setup/pz-dir"
 WRITE_ROUTES = (INSTALL_ROUTE, FOLDER_ROUTE)
+QUIT_ROUTE = "/api/quit"
+# Filet d'un test bloqué, au-delà de tout budget d'arrêt : c'est le test qui mesure le budget.
+MAIN_EXIT_S = 30
 POLL_S = 0.01
 WAIT_S = 5
 HELD_S = 0.05
@@ -482,3 +493,204 @@ def test_ac29_frozen_failure_messages_cite_no_terminal(
     assert {defect["kind"] for defect in defects} == {"pz", "port", "ram", "mod"}
     for message in shown:
         assert_no_terminal(message, tmp_path)
+
+
+# Sortie par l'UI ------------------------------------------------------------------------------
+
+
+class MainRun:
+    """`main()` sur son fil : le test garde le sien pour parler à l'API."""
+
+    def __init__(self, engine: Engine, servers: list, shutdowns: list) -> None:
+        self.servers = servers
+        self.shutdowns = shutdowns
+        self.code: int | str | None = None
+        argv = ["--mode", engine.mode, "--no-browser", "--port", "0"]
+        self.thread = threading.Thread(target=self.run, args=(argv, engine), daemon=True)
+        self.thread.start()
+
+    def run(self, argv: list[str], engine: Engine) -> None:
+        try:
+            main_module.main(argv, lambda mode, pz_dir: engine)
+            self.code = 0
+        except SystemExit as exc:
+            self.code = exc.code
+
+    @property
+    def port(self) -> int:
+        deadline = time.monotonic() + WAIT_S
+        while not self.servers:
+            assert time.monotonic() < deadline, "le service n'a jamais écouté"
+            time.sleep(POLL_S)
+        return self.servers[-1].server_address[1]
+
+    def wait(self) -> int | str | None:
+        self.thread.join(MAIN_EXIT_S)
+        assert not self.thread.is_alive(), "main() n'a pas rendu la main"
+        return self.code
+
+
+@pytest.fixture
+def run_main(monkeypatch):
+    """Rend de quoi lancer `main()`. Hors du fil principal, aucun signal ne se pose."""
+    monkeypatch.setattr(main_module, "STOP_SIGNALS", ())
+    servers: list = []
+    shutdowns: list = []
+
+    def recording_server(engine: Engine, **kwargs):
+        server = make_server(engine, **kwargs)
+        shutdown = server.shutdown
+        server.shutdown = lambda: shutdowns.append(1) or shutdown()
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr(main_module, "make_server", recording_server)
+    runs: list[MainRun] = []
+
+    def start(engine: Engine) -> MainRun:
+        runs.append(MainRun(engine, servers, shutdowns))
+        return runs[-1]
+
+    yield start
+    for run in runs:
+        if run.thread.is_alive():
+            run.servers[-1].on_quit()
+            run.thread.join(MAIN_EXIT_S)
+
+
+def running_duel(rig) -> Duel:
+    duel = Duel(rig)
+    duel.start_match()
+    return duel
+
+
+def stop_budget_s(rig) -> float:
+    return rig.runtime["stop_timeout_s"] + rig.runtime["kill_grace_s"]
+
+
+def quit_service(port: int) -> None:
+    status, answer = request(port, QUIT_ROUTE, {})
+    assert status == 200 and answer["ok"] is True
+
+
+def test_ac28_quit_during_a_real_match_goes_through_the_full_stop(engine_rig, run_main):  # noqa: F811
+    duel = running_duel(engine_rig)
+    match = duel.engine._match
+    servers = match.pair.servers.values()
+    assert len(servers) == 2 and all(server.running for server in servers)
+    run = run_main(duel.engine)
+    port = run.port
+
+    started = time.monotonic()
+    quit_service(port)
+    code = run.wait()
+
+    assert code == 0
+    assert time.monotonic() - started < stop_budget_s(engine_rig)
+    assert not any(server.running for server in servers)
+    assert stopped_for_good(engine_rig)
+    assert match._journal is None
+    phases = [r["data"]["phase"] for r in duel.records("state") if "phase" in r["data"]]
+    assert phases[-3:] == ["running", "stopping", "idle"]
+
+
+def test_ac28_quit_ends_the_service_process_with_code_zero(engine_rig, tmp_path):  # noqa: F811
+    """Un vrai processus : le code est celui que voit le système, et aucun signal n'y aide."""
+    engine_rig.build()
+    groups_dir = tmp_path / "no-groups"
+    groups_dir.mkdir()
+    service = Service(engine_rig, groups_dir)
+    try:
+        service.start_duel()
+        until(lambda: service.state()["phase"] in ("lobby", "error"))
+        state = service.state()
+        assert state["phase"] == "lobby", state["error"]
+
+        started = time.monotonic()
+        quit_service(urlparse(service.url).port)
+        code = service.stop()
+        elapsed_s = time.monotonic() - started
+    finally:
+        service.kill()
+
+    assert code == 0
+    assert elapsed_s < stop_budget_s(engine_rig)
+    records = engine_rig.journal(state["match_id"])
+    down = {r["side"] for r in records if r["data"].get("server") == STATUS_DOWN}
+    assert down == {"A", "B"}
+    phases = [r["data"]["phase"] for r in records if "phase" in r["data"]]
+    assert phases[-2:] == ["stopping", "idle"]
+
+
+def test_ac11_quit_stops_the_servers_through_rcon_first(engine_rig, run_main):  # noqa: F811
+    """Sur `windows-latest`, c'est AC11 par la sortie de l'UI : aucun signal n'y existe."""
+    duel = running_duel(engine_rig)
+    servers = duel.engine._match.pair.servers
+    run = run_main(duel.engine)
+
+    with ExitStack() as stack:
+        for side, server in servers.items():
+            # Le mot de passe est tiré par match : le double du script ne peut pas le connaître.
+            port = server._cfg["ports"][side]["rcon"]
+            password = server._cfg["rcon_password"]
+            rcon = FakeRcon(password, on_quit=server._write_quit, port=port)
+            stack.enter_context(rcon)
+        quit_service(run.port)
+        assert run.wait() == 0
+
+    assert [server.stop_stage for server in servers.values()] == [STOP_RCON, STOP_RCON]
+    assert stopped_for_good(engine_rig)
+
+
+def test_incomplete_stop_keeps_its_failure_code(engine_rig, run_main):  # noqa: F811
+    duel = running_duel(engine_rig)
+    duel.engine._match.pair.close = lambda: False
+    run = run_main(duel.engine)
+
+    quit_service(run.port)
+
+    assert run.wait() == STOP_INCOMPLETE
+
+
+def test_second_quit_answers_and_stops_once(run_main, runtime, tmp_path):
+    engine = Engine("mock", runtime=runtime, matches_dir=tmp_path / "matches")
+    entered, release = threading.Event(), threading.Event()
+    stops = []
+    stop_service = engine._stop_service
+
+    def held_stop() -> bool:
+        stops.append(1)
+        entered.set()
+        assert release.wait(WAIT_S)
+        return stop_service()
+
+    engine._stop_service = held_stop
+    run = run_main(engine)
+    port = run.port
+
+    quit_service(port)
+    assert entered.wait(WAIT_S)
+    quit_service(port)
+    release.set()
+
+    assert run.wait() == 0
+    assert len(stops) == 1
+    assert len(run.shutdowns) == 1
+
+
+@pytest.mark.parametrize(
+    "header", [{"Host": "evil.example"}, {"Origin": "http://evil.example"}], ids=["host", "origin"]
+)
+def test_ac27_foreign_quit_is_refused_and_the_service_stays(run_main, runtime, tmp_path, header):
+    engine = Engine("mock", runtime=runtime, matches_dir=tmp_path / "matches")
+    run = run_main(engine)
+    port = run.port
+
+    status, answer = request(port, QUIT_ROUTE, {}, **header)
+
+    assert status == 403 and answer["ok"] is False
+    assert request(port, "/api/state")[0] == 200
+    assert run.thread.is_alive()
+    assert engine._stopped is None
+    quit_service(port)
+    assert run.wait() == 0

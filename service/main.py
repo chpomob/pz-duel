@@ -261,8 +261,9 @@ def serve(
     engine = (Engine if make_engine is None else make_engine)(mode=args.mode, pz_dir=args.pz_dir)
     port = free_port(args.port)
     httpd = make_server(engine, port=port)
-    # Avant toute requête : aucun serveur ne peut partir sans que le signal l'arrête.
-    stop_on_signal(engine, httpd)
+    # Avant toute requête : aucun serveur ne peut partir sans que le signal l'arrête. La sortie
+    # par l'UI passe par le même fil : `engine.shutdown()` ne se fait pas depuis le fil du duel.
+    httpd.on_quit = stop_on_signal(engine, httpd)
     port = httpd.server_address[1]
     if on_bound is not None:
         on_bound(port)
@@ -279,7 +280,8 @@ def serve(
     try:
         httpd.serve_forever()
     finally:
-        # Sur signal, attend le fil d'arrêt ; sur panne de la boucle, c'est l'arrêt lui-même.
+        # Sur signal ou sortie par l'UI, attend le fil d'arrêt ; sur panne de la boucle, c'est
+        # l'arrêt lui-même.
         stopped = engine.shutdown()
         httpd.server_close()
     if not stopped:

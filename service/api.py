@@ -358,11 +358,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._setup_answer(*self.engine.set_pz_dir(folder))
 
+    def _post_quit(self, payload: dict) -> None:
+        on_quit = self.server.on_quit
+        if on_quit is None:
+            self._fail(409, "quit unavailable: this server has no stop function")
+            return
+        # La réponse part d'abord : coupée avant, l'UI croirait à une panne. Un client parti
+        # entre-temps n'annule pas la sortie qu'il a demandée.
+        try:
+            self._json(200, {"ok": True, "message": "PZ Duel is shutting down"})
+        finally:
+            on_quit()
+
     # Toute route passe par la même chaîne : `_refused`, lecture bornée, `Content-Type`.
     POST_ROUTES = {
         "/api/action": _post_action,
         "/api/setup/install-mod": _post_install_mod,
         "/api/setup/pz-dir": _post_pz_dir,
+        "/api/quit": _post_quit,
     }
 
 
@@ -393,6 +406,8 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     request_queue_size = CONNECTIONS_MAX  # une rafale se refuse, elle ne se perd pas en SYN
     # `HTTPServer` l'active, et `SO_REUSEADDR` laisserait sous Windows lier un port tenu.
     allow_reuse_address = False
+    # Posé par `main` : idempotent, il rend la main tout de suite. Sans lui, la sortie rend 409.
+    on_quit = None
 
     def __init__(self, *args, **kwargs) -> None:
         self._slots = threading.BoundedSemaphore(CONNECTIONS_MAX)
