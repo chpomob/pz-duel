@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import signal
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +11,8 @@ from typing import Any
 import pytest
 
 from doubles.fake_mod import FakeMod
+from doubles.fake_server import kill_tree
+from test_preflight import zomboid_home  # noqa: F401
 from test_servers import stopped_for_good
 from test_snapshots import PLAYER_PASSWORD, WAIT_S, engine_rig  # noqa: F401
 from service.engine import ContractWindow
@@ -309,8 +309,8 @@ class Lobby:
 
 
 def crash(lobby: Lobby, side: str) -> None:
-    """Tue le groupe du serveur : pour le moteur, une sortie que personne n'a demandée."""
-    os.killpg(lobby.engine._match.pair.servers[side]._process.pid, signal.SIGKILL)
+    """Tue l'arbre du serveur : pour le moteur, une sortie que personne n'a demandée."""
+    kill_tree(lobby.engine._match.pair.servers[side])
 
 
 def crash_and_hold(lobby: Lobby, side: str) -> threading.Event:

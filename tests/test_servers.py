@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
 import pytest
@@ -24,11 +25,15 @@ from doubles.fake_server import (
     FakeRcon,
     PosixKernel,
     WindowsLaunchOnPosix,
+    assert_private,
     install_fake_server,
+    kill_tree,
+    on_host,
+    windows_pid_alive,
 )
 from test_snapshots import PLAYER_PASSWORD, engine_rig, make_world  # noqa: F401
 from service.engine import STOP_INCOMPLETE, Engine
-from service.platforms import WINDOWS
+from service.platforms import TERMINATED_EXIT_CODE, WINDOWS, current
 from service.rcon import MAX_PACKET_SIZE, RconClient, RconError
 from service.servers import (
     REDACTED,
@@ -47,6 +52,13 @@ from service.servers import (
     write_sandbox,
 )
 from service.state import MatchState
+
+# Plateforme injectée : ces tests jouent les processus sur le double POSIX, qui n'existe pas
+# sous Windows, où le vrai Job prend le relais.
+injected_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX double; replaced by test_windows_stop_ends_a_paused_tree_at_the_sigkill_stage",
+)
 
 PROCESS_TIMEOUT_S = 10
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -139,7 +151,7 @@ def test_managed_keys_only(tmp_path):
     after = path.read_bytes().split(b"\n")
     assert after[-1] == b""
     after = after[:-1]
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert_private(path)
 
     added = after[len(before) :]
     assert added == [b"UPnP=false"]
@@ -190,7 +202,7 @@ def test_write_ini_creates_partial_file(tmp_path):
     path = tmp_path / "Server" / "duelB.ini"
     write_ini(path, {"Mods": "duelcore"})
     assert path.read_bytes() == b"Mods=duelcore\n"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert_private(path)
 
 
 @pytest.mark.parametrize("value", ["x\nPublic=true", "x\rPublic=true"])
@@ -232,6 +244,8 @@ def test_population_start_multiplier_untouched(sandbox, runtime):
 
 def test_write_sandbox_exact_keys(sandbox):
     sandbox.chmod(0o664)
+    # Windows ne garde de `chmod` que la lecture seule : c'est le mode rendu qui doit rester.
+    mode = 0o664 if current().posix_modes else stat.S_IMODE(sandbox.stat().st_mode)
     start = {"StartYear": 1, "StartMonth": 7, "StartDay": 9, "StartTime": 2}
     write_sandbox(sandbox, 1, start)
     expected = (
@@ -242,7 +256,7 @@ def test_write_sandbox_exact_keys(sandbox):
         .replace("StartTime = 5, -- le matin", "StartTime = 2, -- le matin")
     )
     assert sandbox.read_text(encoding="utf-8") == expected
-    assert stat.S_IMODE(sandbox.stat().st_mode) == 0o664
+    assert stat.S_IMODE(sandbox.stat().st_mode) == mode
 
 
 def test_write_sandbox_refuses_missing_key(sandbox, runtime):
@@ -259,7 +273,7 @@ def test_write_sandbox_refuses_missing_key(sandbox, runtime):
 )
 def test_launch_arguments(launch_cfg, tmp_path, side, name, game, udp):
     command = launch_command(side, launch_cfg)
-    assert command[0] == str(tmp_path / "start-server.sh")
+    assert command[0] == str(tmp_path / current().server_script)
     options = dict(zip(command[1::2], command[2::2]))
     assert options == {
         "-servername": name,
@@ -367,16 +381,19 @@ def test_rcon_requires_connection():
         RconClient(1, "rcon-marker", RCON_TIMEOUT_S).save()
 
 
-def start_double(pz_dir: Path, launch_cfg: dict, scenario: dict) -> subprocess.Popen:
+def start_double(pz_dir: Path, launch_cfg: dict, scenario: dict) -> SimpleNamespace:
+    """Rend de quoi appeler `kill_tree`, sous les noms que porte un `ServerProcess`."""
     install_fake_server(pz_dir, scenario)
-    return subprocess.Popen(
+    host = current()
+    process = subprocess.Popen(
         launch_command("A", launch_cfg),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        start_new_session=True,
+        **host.server_popen_kwargs(),
     )
+    return SimpleNamespace(_process=process, _tree=host.process_tree(process))
 
 
 @pytest.fixture
@@ -386,15 +403,15 @@ def double(tmp_path, launch_cfg):
 
     def start(**scenario):
         started.append(start_double(tmp_path, launch_cfg, scenario))
-        return started[-1]
+        return started[-1]._process
 
     yield start
-    for process in started:
+    for double in started:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            kill_tree(double)
         except ProcessLookupError:
             pass
-        process.communicate()
+        double._process.communicate()
 
 
 def value_after(process: subprocess.Popen, prefix: str) -> int:
@@ -434,6 +451,11 @@ def test_double_crash_exit_code(double):
     assert double(exit_code=3).wait(timeout=PROCESS_TIMEOUT_S) == 3
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no SIGTERM to ignore; replaced by "
+    "test_windows_stop_ends_a_paused_tree_at_the_sigkill_stage",
+)
 def test_double_refuses_quit_and_sigterm(double):
     process = double(
         child=True, refuse_quit=True, ignore_sigterm=True, rcon_password="rcon-marker"
@@ -453,6 +475,11 @@ def test_double_refuses_quit_and_sigterm(double):
     assert process.wait(timeout=PROCESS_TIMEOUT_S) == -signal.SIGKILL
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no process group to probe; replaced by "
+    "test_windows_stop_ends_a_paused_tree_at_the_sigkill_stage",
+)
 def test_double_child_outlives_script(double):
     process = double(child=True, orphan_child=True, exit_code=0)
     child = value_after(process, "fake child pid=")
@@ -486,15 +513,28 @@ def free_tcp_port() -> int:
         return listener.getsockname()[1]
 
 
-def group_alive(pgid: int) -> bool:
+def group_of(server: ServerProcess):
+    """Ce que `group_alive` sonde : le groupe sous POSIX, l'arbre sous Windows.
+
+    Sous Windows, le numéro du script ne dirait rien de l'arbre, et une sonde par `os.kill`
+    tuerait le processus.
+    """
+    return server._tree if sys.platform == "win32" else server._process.pid
+
+
+def group_alive(group) -> bool:
+    if sys.platform == "win32":
+        return group.alive()
     try:
-        os.killpg(pgid, 0)
+        os.killpg(group, 0)
     except ProcessLookupError:
         return False
     return True
 
 
 def pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        return windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -566,7 +606,7 @@ class Harness:
         for server in self.servers:
             if server._process is not None:
                 try:
-                    os.killpg(server._process.pid, signal.SIGKILL)
+                    kill_tree(server)
                 except ProcessLookupError:
                     pass
                 server._process.wait()
@@ -629,7 +669,7 @@ def test_readiness_paths(harness, a, b, reason):
     pair = harness.pair(a, b, server_start_timeout_s=timeout_s)
     begin = time.monotonic()
     assert pair.start()
-    groups = [server._process.pid for server in pair.servers.values()]
+    groups = [group_of(server) for server in pair.servers.values()]
 
     ready = pair.wait_ready()
 
@@ -667,12 +707,12 @@ def test_failure_detail_carries_redacted_tail(harness):
 
 def test_launch_failure_stops_other_server(harness):
     pair = harness.pair({"lines": READY_LINES}, {"lines": READY_LINES})
-    (harness.root / "pzB" / "start-server.sh").unlink()
+    (harness.root / "pzB" / current().server_script).unlink()
     assert not pair.start()
     assert "lancement impossible" in pair.failure
     assert harness.step("B")["state"] == "error"
     assert not pair.wait_ready()
-    assert not group_alive(pair.servers["A"]._process.pid)
+    assert not group_alive(group_of(pair.servers["A"]))
 
 
 def test_stop_interrupts_wait_without_error(harness):
@@ -735,7 +775,7 @@ def test_stop_after_failure_check_never_follows_with_up(harness):
 
 def test_stop_during_start_keeps_next_server_down(harness):
     pair = harness.pair({"lines": READY_LINES}, {"lines": READY_LINES})
-    (harness.root / "pzB" / "start-server.sh").unlink()
+    (harness.root / "pzB" / current().server_script).unlink()
     first = pair.servers["A"]
     real_start = first.start
 
@@ -748,7 +788,7 @@ def test_stop_during_start_keeps_next_server_down(harness):
     assert pair.failure is None
     assert pair.servers["B"]._process is None
     assert pair.stop()
-    assert not group_alive(first._process.pid)
+    assert not group_alive(group_of(first))
 
 
 def test_close_forbids_any_later_start(harness):
@@ -812,6 +852,10 @@ def test_output_is_merged_redacted_and_drained(harness):
     assert not any("marker" in line for line in server.log_tail())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no /dev/full; replaced by test_windows_log_failure_keeps_draining",
+)
 def test_log_failure_keeps_draining(harness):
     harness.match_dir.mkdir(parents=True)
     (harness.match_dir / "server_A.log").symlink_to("/dev/full")
@@ -820,6 +864,10 @@ def test_log_failure_keeps_draining(harness):
     assert server.stop()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no POSIX mode; replaced by test_windows_ini_write_and_ready_server_report_no_failure",
+)
 def test_ini_mode_restored_once_ready(harness):
     ini = harness.root / "Zomboid" / "Server" / "duelA.ini"
     ini.parent.mkdir(parents=True)
@@ -831,6 +879,7 @@ def test_ini_mode_restored_once_ready(harness):
     assert server.stop()
 
 
+@injected_windows
 def test_windows_ini_failure_stays_none_once_ready(harness, monkeypatch, windows_launch):
     """AC16 : la plateforme injectée ne touche pas aux droits, même là où `chmod` échouerait."""
     calls = []
@@ -854,6 +903,10 @@ def test_windows_ini_failure_stays_none_once_ready(harness, monkeypatch, windows
     assert server.stop()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no POSIX mode; replaced by test_windows_ini_write_and_ready_server_report_no_failure",
+)
 def test_ini_mode_failure_fails_start(harness, monkeypatch):
     def refuse(path, mode):
         raise PermissionError("refusé")
@@ -896,8 +949,13 @@ def test_stop_sigterm_after_stop_timeout(harness):
     begin = time.monotonic()
     assert server.stop()
     assert time.monotonic() - begin >= harness.runtime["stop_timeout_s"]
-    assert server.stop_stage == STOP_SIGTERM
-    assert server.exit_code == -signal.SIGTERM
+    if sys.platform == "win32":
+        # Le palier `sigterm` y finit le `.bat` seul : le double sourd attend la fin du Job.
+        assert server.stop_stage == STOP_SIGKILL
+        assert server.exit_code == TERMINATED_EXIT_CODE
+    else:
+        assert server.stop_stage == STOP_SIGTERM
+        assert server.exit_code == -signal.SIGTERM
 
 
 def test_stop_timeout_bounds_rcon_attempt(harness):
@@ -907,7 +965,10 @@ def test_stop_timeout_bounds_rcon_attempt(harness):
         begin = time.monotonic()
         assert server.stop()
     assert time.monotonic() - begin < harness.runtime["rcon_timeout_s"]
-    assert server.stop_stage == STOP_SIGTERM
+    if sys.platform == "win32":
+        assert server.stop_stage == STOP_SIGKILL
+    else:
+        assert server.stop_stage == STOP_SIGTERM
 
 
 def test_stop_waits_for_child_after_script_exit(harness):
@@ -917,7 +978,11 @@ def test_stop_waits_for_child_after_script_exit(harness):
     child = pid_after(server, "fake child pid=")
     assert server.stop()
     assert server.exit_code == 0
-    assert server.stop_stage == STOP_SIGTERM
+    if sys.platform == "win32":
+        # La racine déjà sortie, seul le Job atteint l'enfant.
+        assert server.stop_stage == STOP_SIGKILL
+    else:
+        assert server.stop_stage == STOP_SIGTERM
     assert not pid_alive(child)
 
 
@@ -932,7 +997,7 @@ def test_graded_stop_kills_group(harness):
         )
     )
     child = pid_after(server, "fake child pid=")
-    pgid = server._process.pid
+    group = group_of(server)
     begin = time.monotonic()
 
     assert server.stop()
@@ -940,8 +1005,11 @@ def test_graded_stop_kills_group(harness):
     runtime = harness.runtime
     assert time.monotonic() - begin >= runtime["stop_timeout_s"] + runtime["kill_grace_s"]
     assert server.stop_stage == STOP_SIGKILL
-    assert server.exit_code == -signal.SIGKILL
-    assert not group_alive(pgid)
+    if sys.platform == "win32":
+        assert server.exit_code == TERMINATED_EXIT_CODE
+    else:
+        assert server.exit_code == -signal.SIGKILL
+    assert not group_alive(group)
     assert not pid_alive(child)
     assert not server.exited_unexpectedly()
 
@@ -953,6 +1021,7 @@ def windows_server(harness, kernel, **scenario) -> ServerProcess:
     return harness.server(platform=WINDOWS, kernel=kernel, lines=READY_LINES, **scenario)
 
 
+@injected_windows
 def test_windows_server_enters_its_job_before_it_resumes(harness, windows_launch):
     kernel = PosixKernel()
     server = start_ready(windows_server(harness, kernel))
@@ -962,6 +1031,7 @@ def test_windows_server_enters_its_job_before_it_resumes(harness, windows_launch
     assert server.stop()
 
 
+@injected_windows
 def test_windows_stop_starts_with_rcon(harness, windows_launch):
     kernel = PosixKernel()
     server = start_ready(windows_server(harness, kernel, rcon_password="rcon-marker"))
@@ -973,6 +1043,7 @@ def test_windows_stop_starts_with_rcon(harness, windows_launch):
     assert "terminate_process" not in kernel.calls
 
 
+@injected_windows
 def test_windows_stop_falls_back_on_stdin(harness, windows_launch):
     kernel = PosixKernel()
     server = start_ready(windows_server(harness, kernel))
@@ -983,6 +1054,7 @@ def test_windows_stop_falls_back_on_stdin(harness, windows_launch):
     assert "terminate_process" not in kernel.calls
 
 
+@injected_windows
 def test_windows_sigterm_stage_ends_the_root_only(harness, windows_launch):
     kernel = PosixKernel()
     server = start_ready(windows_server(harness, kernel, refuse_quit=True))
@@ -995,6 +1067,7 @@ def test_windows_sigterm_stage_ends_the_root_only(harness, windows_launch):
     assert not server.running
 
 
+@injected_windows
 def test_windows_sigkill_stage_ends_the_job_on_the_configured_delays(harness, windows_launch):
     harness.runtime.update(stop_timeout_s=0.25, kill_grace_s=0.15)
     kernel = PosixKernel()
@@ -1012,6 +1085,7 @@ def test_windows_sigkill_stage_ends_the_job_on_the_configured_delays(harness, wi
     assert not kernel.handles, "un Job vide ne doit pas rester ouvert"
 
 
+@injected_windows
 def test_windows_job_stays_open_while_the_tree_lives(harness, windows_launch):
     """Fermé plus tôt, le handle tuerait l'arbre : le script sorti, l'enfant reste suivi."""
     kernel = PosixKernel()
@@ -1027,6 +1101,7 @@ def test_windows_job_stays_open_while_the_tree_lives(harness, windows_launch):
     assert not pid_alive(child)
 
 
+@injected_windows
 def test_windows_restart_takes_a_new_job(harness, windows_launch):
     kernel = PosixKernel()
     server = start_ready(windows_server(harness, kernel))
@@ -1039,6 +1114,7 @@ def test_windows_restart_takes_a_new_job(harness, windows_launch):
     assert not kernel.handles
 
 
+@injected_windows
 @pytest.mark.parametrize("failing", ["open_process", "create_job", "assign", "resume"])
 def test_windows_job_failure_leaves_nothing_behind(harness, windows_launch, failing):
     """Job absent : sans cette fin, le processus resterait suspendu pour toujours."""
@@ -1053,6 +1129,7 @@ def test_windows_job_failure_leaves_nothing_behind(harness, windows_launch, fail
     assert server.stop()
 
 
+@injected_windows
 def test_windows_job_failure_is_a_launch_failure(harness, windows_launch):
     kernel = PosixKernel(failing=("create_job",))
     servers = {"A": windows_server(harness, kernel)}
@@ -1065,6 +1142,10 @@ def test_windows_job_failure_is_a_launch_failure(harness, windows_launch):
     assert harness.step("A")["state"] == "error"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no os.killpg to hold back; replaced by test_failed_probe_proves_no_end",
+)
 def test_stop_is_bounded_when_group_lingers(harness, monkeypatch):
     server = start_ready(harness.server(lines=READY_LINES))
     real_killpg = os.killpg
@@ -1092,8 +1173,8 @@ def test_exited_unexpectedly_distinguishes_requested_stop(harness):
     assert not stopped.exited_unexpectedly()
 
 
-def launched_groups(rig) -> list[int]:
-    return [server._process.pid for server in rig.servers if server._process]
+def launched_groups(rig) -> list:
+    return [group_of(server) for server in rig.servers if server._process]
 
 
 def stopped_for_good(rig) -> bool:
@@ -1128,7 +1209,13 @@ def cancel(rig) -> None:
 
 
 def contract_error(rig) -> None:
-    rig.build(on_match_launch=f"""sed -i 's/^Mods=.*/Mods=autre/' "{rig.zomboid}/Server/$2.ini" """)
+    rig.build(
+        on_match_launch=on_host(
+            f"""sed -i 's/^Mods=.*/Mods=autre/' "{rig.zomboid}/Server/$2.ini" """,
+            # `read_ini` retient la dernière occurrence.
+            f'echo Mods=autre>> "{rig.zomboid}\\Server\\%2.ini"',
+        )
+    )
     rig.start()
     state = rig.wait("error", "lobby")
     assert state["phase"] == "error"
@@ -1246,6 +1333,13 @@ def sigint_then_sigterm_to_service(rig) -> list[int]:
     return signals_to_service(rig, signal.SIGINT, signal.SIGTERM)
 
 
+NO_SIGNAL_TO_THE_SERVICE = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="SIGTERM is a forced end there; replaced by "
+    "test_windows_forced_end_of_the_service_leaves_no_double",
+)
+
+
 def cancelled_launch(scenario):
     """Rend les groupes lancés par `scenario`, joué dans le processus du test."""
 
@@ -1263,8 +1357,8 @@ def cancelled_launch(scenario):
         cancelled_launch(cancel_during_creation_pass),
         cancelled_launch(cancel_during_starting),
         cancelled_launch(contract_error),
-        sigterm_to_service,
-        sigint_then_sigterm_to_service,
+        pytest.param(sigterm_to_service, marks=NO_SIGNAL_TO_THE_SERVICE),
+        pytest.param(sigint_then_sigterm_to_service, marks=NO_SIGNAL_TO_THE_SERVICE),
     ],
     ids=lambda scenario: scenario.__name__,
 )
@@ -1377,7 +1471,10 @@ def test_missing_caps_refused_after_timeout(engine_rig):
 
 
 def test_server_crash_on_match_launch_is_an_error(engine_rig):
-    crash = 'if [ "$2" = duelB ]; then echo "boom"; exit 3; fi'
+    crash = on_host(
+        'if [ "$2" = duelB ]; then echo "boom"; exit 3; fi',
+        'if "%2"=="duelB" (echo boom& exit /b 3)',
+    )
     engine_rig.build(on_match_launch=crash)
 
     engine_rig.start()
@@ -1395,8 +1492,7 @@ def test_server_lost_in_lobby_is_an_error(engine_rig):
     state = engine_rig.wait("lobby", "error")
     assert state["phase"] == "lobby", state["error"]
 
-    server = engine_rig.engine._match.pair.servers["A"]
-    os.killpg(server._process.pid, signal.SIGKILL)
+    kill_tree(engine_rig.engine._match.pair.servers["A"])
     state = engine_rig.wait("error")
 
     assert "serveur A : sortie inattendue" in state["error"]

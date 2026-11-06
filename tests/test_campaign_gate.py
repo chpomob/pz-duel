@@ -5,9 +5,12 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
+
+from doubles.fake_server import write_script
 
 SCRIPT = (
     Path(__file__).resolve().parent.parent
@@ -45,6 +48,8 @@ def repo(tmp_path):
     sh(root, "git", "init", "-q", "-b", "master")
     sh(root, "git", "config", "user.name", "test")
     sh(root, "git", "config", "user.email", "test@example.invalid")
+    # Le `.gitignore` se compare en octets : Git pour Windows convertirait ses fins de ligne.
+    sh(root, "git", "config", "core.autocrlf", "false")
     (root / ".gitignore").write_bytes(IGNORED)
     sh(root, "git", "add", ".gitignore")
     commit(root, "previous.txt", PREVIOUS)
@@ -55,9 +60,10 @@ def repo(tmp_path):
 def harness(repo, tmp_path, monkeypatch):
     """Le harnais, pointé sur un dépôt jetable et une suite de tests qui passe."""
     module = load_harness()
-    fake_python = tmp_path / "python"
-    fake_python.write_text("#!/bin/sh\necho '1 passed'\n", encoding="utf-8")
-    fake_python.chmod(0o755)
+    fake_python = write_script(tmp_path / "python", "echo '1 passed'", "echo 1 passed")
+    if sys.platform == "win32":
+        # `text=True` y décode en cp1252 : le `—` des sujets de commit ne se relirait pas.
+        monkeypatch.setattr(subprocess, "run", partial(subprocess.run, encoding="utf-8"))
     monkeypatch.setattr(module, "REPO", repo)
     monkeypatch.setattr(module, "PY", str(fake_python))
     monkeypatch.setattr(module, "log", lambda *args, **kwargs: None)

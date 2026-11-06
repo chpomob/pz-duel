@@ -10,6 +10,7 @@ import ast
 import contextlib
 import ctypes
 import hashlib
+import io
 import json
 import logging
 import math
@@ -19,9 +20,10 @@ import re
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from functools import partial
 from itertools import cycle
 from pathlib import Path
@@ -32,7 +34,14 @@ from urllib.request import Request, urlopen
 import pytest
 
 from conftest import ZOMBOID_SUBDIRS
-from doubles.fake_server import PosixKernel, WindowsLaunchOnPosix, install_fake_server
+from doubles.fake_server import (
+    PosixKernel,
+    WindowsLaunchOnPosix,
+    compile_windows_client,
+    install_fake_server,
+    plan_windows_client,
+    windows_pid_alive,
+)
 from test_snapshots import (  # noqa: F401
     ENGINE_READY,
     PLAYER_PASSWORD,
@@ -520,8 +529,21 @@ def test_lasting_hold_keeps_the_old_content_and_no_temporary(tmp_path, monkeypat
     assert folder_of(writer) == [writer.target.name]
 
 
+# Le chemin POSIX de ces deux écrivains passe par `os.fchmod`, absent sous Windows.
+NO_FCHMOD = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no os.fchmod; replaced by test_windows_writer_gives_up_after_the_delay",
+)
+
+
 @pytest.mark.parametrize(
-    "make_writer", [session_writer, ini_writer, sandbox_writer], ids=lambda make: make.__name__
+    "make_writer",
+    [
+        session_writer,
+        pytest.param(ini_writer, marks=NO_FCHMOD),
+        pytest.param(sandbox_writer, marks=NO_FCHMOD),
+    ],
+    ids=lambda make: make.__name__,
 )
 def test_linux_failure_leaves_no_temporary(tmp_path, monkeypatch, make_writer):
     writer = make_writer(tmp_path, platform=LINUX)
@@ -1522,8 +1544,6 @@ if sys.platform == "win32":
     WAIT_S = 30
     POLL_S = 0.05
     SERVICE_GONE_S = 5
-    SYNCHRONIZE = 0x00100000
-    WAIT_TIMEOUT = 0x102
     CREATE_NEW_CONSOLE = 0x00000010
     TREE_SIZE = 4
     # Le script et le double précèdent leurs enfants dans la sortie.
@@ -1545,20 +1565,6 @@ window = kernel32.GetConsoleWindow()
 if not window or not user32.PostMessageW(window, 0x0010, 0, 0):
     sys.exit("no console window to close")
 """
-
-    def windows_pid_alive(pid: int) -> bool:
-        """Sonde sans effet : sous Windows, `os.kill(pid, 0)` tuerait le processus."""
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-        if not handle:
-            return False
-        try:
-            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-        finally:
-            kernel32.CloseHandle(handle)
 
     def wait_until(condition: Callable[[], bool], timeout_s: float = WAIT_S) -> None:
         deadline = time.monotonic() + timeout_s
@@ -1662,6 +1668,38 @@ if not window or not user32.PostMessageW(window, 0x0010, 0, 0):
         assert f"-adminpassword {REDACTED}" in server.log_tail()[-1]
         log = server.log_path.read_text(encoding="utf-8")
         assert ADMIN_MARKER not in log
+
+    def test_windows_log_failure_keeps_draining(tmp_path, monkeypatch):
+        """Pendant de `/dev/full` : le journal refuse d'écrire, et le tube reste lu."""
+
+        class FullLog(io.RawIOBase):
+            def writable(self) -> bool:
+                return True
+
+            def write(self, data) -> int:
+                raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(servers, "open", lambda *args, **kwargs: FullLog(), raising=False)
+        flood = ["x" * 1024] * 256
+        server = real_server(tmp_path / "pz", tmp_path, {"lines": [*flood, *READY_LINES]})
+
+        server.start()
+        wait_until(lambda: server.ready)
+
+        assert "OSError" in server.log_error
+        assert server.stop()
+
+    def test_windows_client_double_is_a_real_pe(tmp_path):
+        """Sans `csc.exe`, la compilation lève : ce test échoue, il ne saute pas."""
+        client = compile_windows_client(tmp_path / "client.exe")
+        args_file = tmp_path / "args"
+        plan_windows_client(client, args_file, code=3)
+
+        done = subprocess.run([str(client), "-nosteam"], timeout=SUBPROCESS_TIMEOUT_S)
+
+        assert client.read_bytes()[:2] == b"MZ"
+        assert done.returncode == 3
+        assert args_file.read_text(encoding="utf-8") == "-nosteam\n"
 
     class WindowsService:
         """`service.main` dans son processus, ses deux doubles lancés et leurs pids relevés."""
@@ -1784,3 +1822,209 @@ if not window or not user32.PostMessageW(window, 0x0010, 0, 0):
             assert closer.returncode == 0, closer.stderr
 
             assert_tree_ends_with_the_service(service, pids)
+
+
+# AC53 et AC62 : la suite ne perd aucun test, et chaque skip nomme un test qui existe ---------
+
+BASELINE = "1d854d0"
+COLLECT_TIMEOUT_S = 180
+TESTS_DIR = REPO / "tests"
+GATED_MODULES = ("test_snapshots", "test_contract", "test_modes", "test_campaign_gate")
+POSIX_NAMES = ("SIGKILL", "killpg")
+WINDOWS_ONLY = "sys.platform == 'win32'"
+NOT_WINDOWS = "sys.platform != 'win32'"
+TEST_NAME = re.compile(r"\btest_\w+")
+
+
+def extract_baseline(target: Path) -> None:
+    done = subprocess.run(
+        ["git", "archive", "--format=tar", BASELINE],
+        cwd=REPO,
+        capture_output=True,
+        timeout=COLLECT_TIMEOUT_S,
+    )
+    assert done.returncode == 0, f"{BASELINE} is unreachable: {done.stderr.decode()}"
+    with tarfile.open(fileobj=io.BytesIO(done.stdout)) as archive:
+        archive.extractall(target, filter="data")
+
+
+def collected_functions(root: Path) -> set[str]:
+    """Les fonctions de test de `root`, identifiants de paramètres retirés."""
+    env = {name: value for name, value in os.environ.items() if name != "PYTEST_ADDOPTS"}
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+        cwd=root,
+        env={**env, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=COLLECT_TIMEOUT_S,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    return {line.split("[", 1)[0] for line in done.stdout.splitlines() if "::" in line}
+
+
+def test_every_baseline_test_still_exists(tmp_path):
+    extract_baseline(tmp_path)
+
+    baseline = collected_functions(tmp_path)
+
+    assert baseline
+    assert baseline - collected_functions(REPO) == set()
+
+
+def test_conftest_is_the_one_of_the_baseline():
+    done = subprocess.run(
+        ["git", "diff", "--name-only", BASELINE, "--", "tests/conftest.py"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=SUBPROCESS_TIMEOUT_S,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == ""
+
+
+def is_windows_skip(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "skipif"
+        and "win32" in ast.unparse(node.args[0])
+    )
+
+
+def skip_reason(call: ast.Call) -> str:
+    """Littérale, sinon l'analyse statique ne pourrait pas la lire : c'est donc un échec."""
+    reason = next((word.value for word in call.keywords if word.arg == "reason"), None)
+    assert isinstance(reason, ast.Constant), ast.unparse(call)
+    return reason.value
+
+
+def skip_markers(tree: ast.Module) -> set[str]:
+    """Les noms qui portent un skip Windows : `injected = pytest.mark.skipif(...)`."""
+    return {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and is_windows_skip(node.value)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+
+def windows_tests(body: list[ast.stmt], markers: set[str]) -> Iterator[str]:
+    """Les tests qui s'exécutent sous Windows : blocs `if` compris, skips et blocs POSIX exclus."""
+    for node in body:
+        if isinstance(node, ast.If):
+            guard = ast.unparse(node.test)
+            if guard != NOT_WINDOWS:
+                yield from windows_tests(node.body, markers)
+            if guard != WINDOWS_ONLY:
+                yield from windows_tests(node.orelse, markers)
+        elif isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            skipped = any(
+                is_windows_skip(mark) or ast.unparse(mark) in markers
+                for mark in node.decorator_list
+            )
+            if not skipped:
+                yield node.name
+
+
+def citation_problems(sources: Mapping[str, str]) -> list[str]:
+    """Rend chaque skip Windows sans test cité, ou citant un test absent de Windows (AC62)."""
+    trees = {name: ast.parse(source) for name, source in sources.items()}
+    existing = {
+        test
+        for tree in trees.values()
+        for test in windows_tests(tree.body, skip_markers(tree))
+    }
+    problems = []
+    for name, tree in trees.items():
+        for node in ast.walk(tree):
+            if is_windows_skip(node):
+                reason = skip_reason(node)
+                cited = TEST_NAME.findall(reason)
+                problems += [f"{name}: no test named: {reason}"] * (not cited)
+                missing = [test for test in cited if test not in existing]
+                problems += [f"{name}: no such test: {test}" for test in missing]
+    return problems
+
+
+def test_sources() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8") for path in TESTS_DIR.glob("test_*.py")}
+
+
+test_sources.__test__ = False
+
+
+def test_windows_skips_name_a_test_that_runs_on_windows():
+    sources = test_sources()
+    assert any("skipif" in source and "win32" in source for source in sources.values())
+    assert citation_problems(sources) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "problem"),
+    [
+        pytest.param(
+            'S = pytest.mark.skipif(sys.platform == "win32", reason="see test_gone")\n',
+            "no such test: test_gone",
+            id="absent",
+        ),
+        pytest.param(
+            'S = pytest.mark.skipif(sys.platform == "win32", reason="no equivalent")\n',
+            "no test named",
+            id="sans-nom",
+        ),
+        pytest.param(
+            'if sys.platform != "win32":\n    def test_posix(): pass\n'
+            'S = pytest.mark.skipif(sys.platform == "win32", reason="see test_posix")\n',
+            "no such test: test_posix",
+            id="bloc-posix",
+        ),
+        pytest.param(
+            'S = pytest.mark.skipif(sys.platform == "win32", reason="see test_self")\n'
+            "@S\ndef test_self(): pass\n",
+            "no such test: test_self",
+            id="lui-meme-saute",
+        ),
+    ],
+)
+def test_bad_citation_is_reported(source, problem):
+    (found,) = citation_problems({"test_x.py": source})
+    assert problem in found
+
+
+def test_windows_block_test_counts_as_a_citation():
+    source = (
+        'if sys.platform == "win32":\n    def test_real(): pass\n'
+        'S = pytest.mark.skipif(sys.platform == "win32", reason="see test_real")\n'
+    )
+    assert citation_problems({"test_x.py": source}) == []
+
+
+@pytest.mark.parametrize("module", GATED_MODULES)
+def test_gated_modules_leave_posix_stops_to_the_helpers(module):
+    """AC62 : plus aucun appel direct, c'est `kill_tree` et `write_script` qui choisissent."""
+    source = (TESTS_DIR / f"{module}.py").read_text(encoding="utf-8")
+    names = {
+        node.attr for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Attribute)
+    }
+    assert not names & set(POSIX_NAMES)
+    assert "#!/bin/sh" not in source
+
+
+def test_no_posix_name_is_evaluated_at_collection():
+    """`signal.SIGKILL` hors d'une fonction casserait la collecte sous Windows."""
+
+    def outside_functions(node: ast.AST) -> Iterator[ast.AST]:
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                yield child
+                yield from outside_functions(child)
+
+    paths = [*TESTS_DIR.glob("test_*.py"), *TESTS_DIR.glob("doubles/*.py")]
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        evaluated = {n.attr for n in outside_functions(tree) if isinstance(n, ast.Attribute)}
+        assert not evaluated & set(POSIX_NAMES), path

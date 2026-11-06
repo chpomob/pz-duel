@@ -9,10 +9,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import partial
 from itertools import cycle
+from pathlib import Path
 from urllib.request import urlopen
 
 import pytest
 
+from doubles.fake_server import assert_private, on_host
 from test_match import Duel
 from test_snapshots import ENGINE_READY, engine_rig  # noqa: F401
 from service.api import make_server
@@ -32,9 +34,17 @@ LEAKY_LINES = [
 HTTP_TIMEOUT_S = 5
 
 
-def assert_clean(text: str) -> None:
-    for marker in MARKERS:
+def assert_clean(text: str, markers: tuple[str, ...] = MARKERS) -> None:
+    for marker in markers:
         assert marker not in text
+
+
+def sweep(folder: Path, markers: tuple[str, ...] = MARKERS) -> list[Path]:
+    """Relit tout `folder` et rend les fichiers vus : l'appelant dit combien il en attend."""
+    files = [path for path in folder.rglob("*") if path.is_file()]
+    for path in files:
+        assert_clean(path.read_text(encoding="utf-8"), markers)
+    return files
 
 
 @pytest.fixture
@@ -91,8 +101,10 @@ def test_no_secret_leak(engine_rig, marked_secrets, monkeypatch, caplog):
     monkeypatch.setattr(engine_rig, "build", partial(engine_rig.build, lines=LEAKY_LINES))
     duel = Duel(engine_rig)
     engine = duel.engine
-    ini = read_ini(engine_rig.zomboid / "Server" / "duelA.ini")
+    ini_path = engine_rig.zomboid / "Server" / "duelA.ini"
+    ini = read_ini(ini_path)
     assert ini["RCONPassword"] == RCON_MARKER
+    assert_private(ini_path)
     assert engine_rig.configs[0]["admin_password"] == ADMIN_MARKER
 
     def explode(side, cfg, match_dir, redactor):
@@ -120,10 +132,7 @@ def test_no_secret_leak(engine_rig, marked_secrets, monkeypatch, caplog):
     assert f"-adminpassword {REDACTED}" in server_log
     assert f"RCONPassword={REDACTED}" in server_log
     # Tout `matches/`, au-delà de ce que l'AC cite : `server_B.log` compris.
-    files = [path for path in engine_rig.matches.rglob("*") if path.is_file()]
-    assert len(files) >= 3
-    for path in files:
-        assert_clean(path.read_text(encoding="utf-8"))
+    assert len(sweep(engine_rig.matches)) >= 3
 
     records = engine_rig.journal(duel.match_id)
     assert any(r["data"].get("data", {}).get("reason") == f"exception {REDACTED}" for r in records)
@@ -131,7 +140,12 @@ def test_no_secret_leak(engine_rig, marked_secrets, monkeypatch, caplog):
 
 
 def test_failed_server_tail_is_redacted(engine_rig, marked_secrets):
-    engine_rig.build(on_match_launch='echo "commande : $*"; exit 3')
+    engine_rig.build(
+        on_match_launch=on_host(
+            'echo "commande : $*"; exit 3',
+            "echo commande : %*\nexit /b 3",
+        )
+    )
 
     engine_rig.start()
     state = engine_rig.wait("error", "lobby")

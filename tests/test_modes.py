@@ -13,12 +13,14 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from test_preflight import free_ports, make_install
+from doubles.fake_server import compile_windows_client, plan_windows_client, write_script
+from test_preflight import free_ports, make_install, zomboid_home  # noqa: F401
 
 from service import engine as engine_module
 from service import main as main_module
 from service.api import make_server
 from service.engine import ACTIONS, Engine, load_presets
+from service.platforms import current
 from service.preflight import MOD_SRC, install_mod
 from service.servers import ServerProcess
 from service.state import PHASE_LABELS
@@ -373,15 +375,17 @@ def test_no_valid_preset_is_a_refusal(tmp_path, monkeypatch, runtime):
 
 
 def client_install(root: Path) -> tuple[Path, Path]:
-    """Rend le dossier à passer en `pz_dir` et le script du client, à l'endroit du jeu."""
-    game = root / "ProjectZomboid" / "projectzomboid"
-    game.mkdir(parents=True)
-    server_script = game / "start-server.sh"
-    client_script = game.parent / "projectzomboid.sh"
-    for script in (server_script, client_script):
-        script.write_text("#!/bin/sh\n", encoding="utf-8")
-        script.chmod(0o755)
-    return game.parent, client_script
+    """Rend le dossier à passer en `pz_dir` et le client de l'hôte, à l'endroit du jeu."""
+    host = current()
+    game = root / "ProjectZomboid" / host.game_subdir
+    game.mkdir(parents=True, exist_ok=True)
+    write_script(game / host.server_script, "", "")
+    client = host.client_file(game)
+    if host.posix_modes:
+        write_script(client, "", "")
+    else:
+        client.write_bytes(b"MZ")
+    return client.parent, client
 
 
 HOST_CONFIG = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
@@ -430,7 +434,7 @@ def test_open_game_without_the_client_fails_explicitly(zomboid_home, tmp_path, r
 
     assert ok is False
     assert launcher.calls == []
-    assert "client PZ introuvable (projectzomboid.sh absent)" in message
+    assert f"client PZ introuvable ({current().client_program} absent)" in message
     assert "à la main avec -nosteam, puis rejoignez 127.0.0.1:17261" in message
     assert "marqueur-hote" not in message
     assert engine.snapshot()["logs"][-1]["level"] == "warn"
@@ -549,16 +553,34 @@ def test_failed_open_game_leaves_the_next_attempt_free(zomboid_home, tmp_path, r
     assert len(launcher.calls) == 2
 
 
-def write_script(path: Path, body: str) -> Path:
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(0o755)
-    return path
+@pytest.fixture(scope="session")
+def compiled_client(tmp_path_factory):
+    """Le double de `ProjectZomboid64.exe`, un vrai PE. Rien à compiler hors de Windows."""
+    if sys.platform != "win32":
+        return None
+    return compile_windows_client(tmp_path_factory.mktemp("client") / "client.exe")
 
 
-def test_default_client_launcher_accepts_a_client_that_stays_up(tmp_path, monkeypatch):
+def write_client(compiled, path: Path, sh_body: str, args_file: Path, **plan) -> Path:
+    """Rend un client lançable : ce script sous POSIX, le PE compilé sous Windows."""
+    if compiled is None:
+        return write_script(path, sh_body, "")
+    plan_windows_client(compiled, args_file, **plan)
+    return compiled
+
+
+def test_default_client_launcher_accepts_a_client_that_stays_up(
+    tmp_path, monkeypatch, compiled_client
+):
     monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", 0.05)
     marker = tmp_path / "args"
-    script = write_script(tmp_path / "pz.sh", f'echo "$@" > {marker}\nexec sleep 1')
+    script = write_client(
+        compiled_client,
+        tmp_path / "pz.sh",
+        f'echo "$@" > {marker}\nexec sleep 1',
+        marker,
+        stay_ms=1000,
+    )
 
     process = engine_module.launch_client(script, ["-nosteam", "+connect"])
     assert process.poll() is None, "l'engine suit ce processus pour refuser un second client"
@@ -569,12 +591,17 @@ def test_default_client_launcher_accepts_a_client_that_stays_up(tmp_path, monkey
 
 
 @pytest.mark.parametrize("code", [0, 3], ids=["exit-0-du-vrai-script", "refus"])
-def test_default_client_launcher_refuses_an_early_exit(tmp_path, monkeypatch, code):
+def test_default_client_launcher_refuses_an_early_exit(
+    tmp_path, monkeypatch, code, compiled_client
+):
     """`projectzomboid.sh` finit par `exit 0` même quand le client n'a pas tenu."""
     monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", WAIT_S)
-    script = write_script(tmp_path / "pz.sh", f"exit {code}")
+    script = write_client(
+        compiled_client, tmp_path / "pz.sh", f"exit {code}", tmp_path / "args", code=code
+    )
 
-    with pytest.raises(engine_module.ClientLaunchError, match=f"pz.sh s'est arrêté aussitôt \\(code {code}\\)"):
+    stopped = f"{re.escape(script.name)} s'est arrêté aussitôt \\(code {code}\\)"
+    with pytest.raises(engine_module.ClientLaunchError, match=stopped):
         engine_module.launch_client(script, ["+password", "marqueur-hote"])
 
 

@@ -11,7 +11,6 @@ import json
 import os
 import shlex
 import shutil
-import signal
 import socket
 import threading
 import time
@@ -20,11 +19,12 @@ from pathlib import Path
 import pytest
 
 from doubles.fake_mod import FakeMod
-from doubles.fake_server import install_fake_server
-from test_preflight import free_ports
+from doubles.fake_server import install_fake_server, kill_tree, on_host, write_script
+from test_preflight import free_ports, zomboid_home  # noqa: F401
 from service import snapshots
 from service.engine import Engine
 from service.journal import JOURNAL_NAME, read_journal
+from service.platforms import current
 from service.preflight import MOD_SRC, install_mod
 from service.replay import START_FIELDS
 from service.rules import load_runtime
@@ -44,24 +44,36 @@ CANCEL_DELAY_S = 0.2
 READY_LINES = ["*** SERVER STARTED ****", "server is listening on port {port}"]
 MANAGED = {"PauseEmpty": "false", "Mods": "duelcore"}
 # Le double lancé à la place de PZ relève le disque, puis crée le monde comme le ferait PZ.
-RECORDING_SCRIPT = """#!/bin/sh
-seen="{launches}/$2"
+RECORDING_SCRIPT = """seen="{launches}/$2"
 mkdir -p "$seen"
 cp "{zomboid}/Server/$2.ini" "$seen/"
 cp -r "{zomboid}/Lua" "$seen/Lua"
 {create_world}
 exec {inner} "$@"
 """
-CREATE_WORLD = 'mkdir -p "{zomboid}/Saves/Multiplayer/$2/map"\n' + (
+# Le même double pour `cmd`. Un `echo` y finirait par CRLF : les octets attendus sont copiés
+# depuis `created` et `sandbox_file`, que les bancs écrivent eux-mêmes.
+RECORDING_BATCH = r"""set "seen={launches}\%2"
+mkdir "%seen%" 2>nul
+copy /y "{zomboid}\Server\%2.ini" "%seen%\" >nul
+if not exist "%seen%\Lua" xcopy "{zomboid}\Lua" "%seen%\Lua" /e /i /q /y >nul
+{create_world}
+call "{inner}" %*
+"""
+CREATE_WORLD = on_host(
+    'mkdir -p "{zomboid}/Saves/Multiplayer/$2/map"\n'
     'echo created > "{zomboid}/Saves/Multiplayer/$2/map/chunk.bin"\n'
-    'echo created > "{zomboid}/db/$2.db"'
+    'echo created > "{zomboid}/db/$2.db"',
+    r"""mkdir "{zomboid}\Saves\Multiplayer\%2\map" 2>nul
+copy /b /y "{created}" "{zomboid}\Saves\Multiplayer\%2\map\chunk.bin" >nul
+copy /b /y "{created}" "{zomboid}\db\%2.db" >nul""",
 )
+CREATED_BYTES = b"created\n"
 
 
 # Double d'un vrai lancement : relève le disque, puis agit comme PZ et comme le mod. Sans
 # monde, c'est la passe de création : elle crée monde et sandbox, et son `caps` est périmé.
-ENGINE_SCRIPT = """#!/bin/sh
-side="${{2#duel}}"
+ENGINE_SCRIPT = """side="${{2#duel}}"
 mkdir -p "{launches}/$2"
 seen="{launches}/$2/$(ls "{launches}/$2" | wc -l)"
 mkdir "$seen"
@@ -82,6 +94,32 @@ else
   cat "{caps}/stale_$side" >> "$out"
 fi
 exec {inner} "$@"
+"""
+ENGINE_BATCH = r"""set "name=%2"
+set "side=%name:duel=%"
+set "out={zomboid}\Lua\duel_%side%_out.txt"
+mkdir "{launches}\%2" 2>nul
+set count=0
+for /f %%i in ('dir /b "{launches}\%2"') do set /a count+=1
+set "seen={launches}\%2\%count%"
+mkdir "%seen%"
+copy /y "{zomboid}\Server\%2.ini" "%seen%\" >nul
+copy /y "{zomboid}\Server\%2_SandboxVars.lua" "%seen%\" >nul 2>nul
+xcopy "{zomboid}\Lua" "%seen%\Lua" /e /i /q /y >nul
+dir /b /a:d "{zomboid}\duel-snapshots" > "%seen%\snapshots" 2>nul
+if not exist "{zomboid}\Saves\Multiplayer\%2" goto creation_pass
+{on_match_launch}
+type "{caps}\%side%" >> "%out%" 2>nul
+goto launch
+:creation_pass
+mkdir "{zomboid}\Saves\Multiplayer\%2\map"
+copy /b /y "{created}" "{zomboid}\Saves\Multiplayer\%2\map\chunk.bin" >nul
+copy /b /y "{created}" "{zomboid}\db\%2.db" >nul
+copy /b /y "{sandbox_file}" "{zomboid}\Server\%2_SandboxVars.lua" >nul
+echo Mods=rewritten by PZ>> "{zomboid}\Server\%2.ini"
+type "{caps}\stale_%side%" >> "%out%"
+:launch
+call "{inner}" %*
 """
 ENGINE_SANDBOX = (
     r"DayLength = 4,\nStartYear = 3,\nStartMonth = 1,\nStartDay = 2,\nStartTime = 5,\n"
@@ -105,8 +143,15 @@ class EngineRig:
         self.caps_dir = tmp_path / "caps"
         self.pz_dir.mkdir()
         self.caps_dir.mkdir()
+        self.created = tmp_path / "created"
+        self.created.write_bytes(CREATED_BYTES)
+        self.sandbox_file = tmp_path / "sandbox"
+        self.sandbox_file.write_bytes(ENGINE_SANDBOX.replace(r"\n", "\n").encode())
         self.runtime = {**runtime, **FAST_TIMEOUTS, "min_free_ram_mb": 0}
         self.runtime["contract_timeout_s"] = WAIT_S
+        host = current()
+        if host.client_in_game_dir:
+            host.client_file(self.pz_dir).write_bytes(b"MZ")
         self.runtime["ports"] = free_ports(runtime)
         self.servers: list[ServerProcess] = []
         self.configs: list[dict] = []
@@ -114,25 +159,29 @@ class EngineRig:
         install_mod(MOD_SRC, zomboid)
 
     def build(
-        self, lines: list[str] | None = None, on_match_launch: str = ":", **scenario
+        self,
+        lines: list[str] | None = None,
+        on_match_launch: str = on_host(":", "rem"),
+        **scenario,
     ) -> Engine:
         """Pose le double et rend le moteur ; `on_match_launch` agit hors passe de création."""
         script = install_fake_server(
             self.pz_dir, {"lines": ENGINE_READY if lines is None else lines, **scenario}
         )
-        inner = script.rename(self.pz_dir / "inner-server.sh")
-        script.write_text(
-            ENGINE_SCRIPT.format(
-                launches=self.launches,
-                zomboid=self.zomboid,
-                caps=self.caps_dir,
-                inner=shlex.quote(str(inner)),
-                sandbox=ENGINE_SANDBOX,
-                on_match_launch=on_match_launch,
+        inner = script.replace(script.with_stem("inner-server"))
+        values = {
+            "launches": self.launches,
+            "zomboid": self.zomboid,
+            "caps": self.caps_dir,
+            "on_match_launch": on_match_launch,
+        }
+        write_script(
+            script,
+            ENGINE_SCRIPT.format(**values, inner=shlex.quote(str(inner)), sandbox=ENGINE_SANDBOX),
+            ENGINE_BATCH.format(
+                **values, inner=inner, created=self.created, sandbox_file=self.sandbox_file
             ),
-            encoding="utf-8",
         )
-        script.chmod(0o755)
         self.engine = Engine(
             "real",
             zomboid_dir=self.zomboid,
@@ -205,11 +254,14 @@ class EngineRig:
                 self.engine._thread.join(WAIT_S)
         for server in self.servers:
             if server._process is not None and server._group_alive():
-                os.killpg(server._process.pid, signal.SIGKILL)
+                kill_tree(server)
 
 
 @pytest.fixture
-def engine_rig(tmp_path, zomboid_home, runtime):
+def engine_rig(tmp_path, zomboid_home, runtime, monkeypatch):
+    """`USERPROFILE` se pose ici aussi : un module qui importe ce banc sans la surcharge de
+    `zomboid_home`, comme `tests/test_match.py`, recevrait la fixture de `conftest` seule."""
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     built = EngineRig(tmp_path, zomboid_home, runtime)
     yield built
     built.cleanup()
@@ -226,7 +278,7 @@ def tree(root: Path) -> dict[str, bytes | str | None]:
     """Contenu exact : octets des fichiers, cible des liens, dossiers vides compris."""
     content: dict[str, bytes | str | None] = {}
     for path in sorted(root.rglob("*")):
-        name = str(path.relative_to(root))
+        name = path.relative_to(root).as_posix()
         if path.is_symlink():
             content[name] = f"-> {os.readlink(path)}"
         elif path.is_dir():
@@ -280,6 +332,8 @@ class Rig:
         self.root = tmp_path
         self.zomboid = zomboid
         self.launches = tmp_path / "launches"
+        self.created = tmp_path / "created"
+        self.created.write_bytes(CREATED_BYTES)
         self.runtime = {**runtime, **FAST_TIMEOUTS}
         self.runtime["ports"] = {
             side: {
@@ -300,17 +354,18 @@ class Rig:
             pz_dir = self.root / f"pz{side}"
             pz_dir.mkdir(exist_ok=True)
             script = install_fake_server(pz_dir, scenarios.get(side, {"lines": READY_LINES}))
-            inner = script.rename(pz_dir / "inner-server.sh")
-            script.write_text(
-                RECORDING_SCRIPT.format(
-                    launches=self.launches,
-                    zomboid=self.zomboid,
-                    inner=shlex.quote(str(inner)),
-                    create_world=create_world.format(zomboid=self.zomboid),
-                ),
-                encoding="utf-8",
+            # `replace` : un second `pair` repose le double, et `rename` y échouerait sous Windows.
+            inner = script.replace(script.with_stem("inner-server"))
+            values = {
+                "launches": self.launches,
+                "zomboid": self.zomboid,
+                "create_world": create_world.format(zomboid=self.zomboid, created=self.created),
+            }
+            write_script(
+                script,
+                RECORDING_SCRIPT.format(**values, inner=shlex.quote(str(inner))),
+                RECORDING_BATCH.format(**values, inner=inner),
             )
-            script.chmod(0o755)
             cfg = {
                 **self.runtime,
                 "pz_dir": pz_dir,
@@ -346,7 +401,7 @@ class Rig:
         for server in self.servers.values():
             if server._process is not None:
                 try:
-                    os.killpg(server._process.pid, signal.SIGKILL)
+                    kill_tree(server)
                 except ProcessLookupError:
                     pass
                 server._process.wait()
@@ -386,7 +441,7 @@ def test_restore_exact(rig, captured):
     assert worlds_state(rig.zomboid) == origin
     assert world_db(rig.zomboid, "A").read_bytes() == b"SQLite\x00A"
     assert "map/empty" in origin["A"][0]
-    assert os.readlink(world_dir(rig.zomboid, "A") / "latest") == "map/chunk.bin"
+    assert Path(os.readlink(world_dir(rig.zomboid, "A") / "latest")) == Path("map/chunk.bin")
     assert listing(rig.zomboid) == before
 
     # Le snapshot n'est pas consommé : la revanche repart du même monde.

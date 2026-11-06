@@ -31,11 +31,13 @@ implémentation indépendante, et le script tourne sans le dépôt dans son chem
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -55,6 +57,32 @@ CHILD_FLAG = "--fake-child"
 # `--scenario <chemin>` précède les arguments d'un vrai serveur.
 SERVER_ARGS_START = 3
 REPLIES = {"save": "World saved"}
+WINDOWS_HOST = "win32"
+SYNCHRONIZE = 0x00100000
+WAIT_TIMEOUT = 0x102
+# Le compilateur du .NET Framework, livré avec Windows et présent sur `windows-latest`.
+CSC = Path("Microsoft.NET") / "Framework64" / "v4.0.30319" / "csc.exe"
+COMPILE_TIMEOUT_S = 120
+# Double de `ProjectZomboid64.exe`, lancé détaché comme le vrai : il doit donc être un vrai PE.
+# `<exe>.plan` porte le code de sortie, la tenue en ms et le fichier des arguments : un seul
+# binaire sert ainsi à tous les tests.
+CLIENT_SOURCE = r"""
+using System;
+using System.IO;
+using System.Reflection;
+using System.Threading;
+
+static class FakeClient
+{
+    static int Main(string[] args)
+    {
+        string[] plan = File.ReadAllLines(Assembly.GetEntryAssembly().Location + ".plan");
+        File.WriteAllText(plan[2], string.Join(" ", args) + "\n");
+        Thread.Sleep(int.Parse(plan[1]));
+        return int.Parse(plan[0]);
+    }
+}
+"""
 
 
 def send_packet(conn: socket.socket, packet_id: int, kind: int, body: str) -> None:
@@ -103,7 +131,9 @@ class FakeRcon:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        self._listener.shutdown(socket.SHUT_RDWR)
+        # Elle réveille `accept` sous Linux ; Windows la refuse sur un socket d'écoute.
+        with contextlib.suppress(OSError):
+            self._listener.shutdown(socket.SHUT_RDWR)
         self._listener.close()
 
     def _serve(self) -> None:
@@ -160,6 +190,83 @@ def install_fake_server(
         lines.append(scenario["script_tail"])
     script.write_text("".join(f"{line}\r\n" for line in lines), encoding="utf-8", newline="")
     return script
+
+
+def on_host(sh: str, bat: str) -> str:
+    """Rend celui des deux textes que le système hôte exécute."""
+    return bat if sys.platform == WINDOWS_HOST else sh
+
+
+def write_script(path: Path, sh_body: str, bat_body: str) -> Path:
+    """Pose un script lançable sur l'hôte et rend son chemin, en `.bat` sous Windows."""
+    if sys.platform == WINDOWS_HOST:
+        script = path.with_suffix(".bat")
+        lines = ["@echo off", *bat_body.splitlines()]
+        script.write_text("".join(f"{line}\r\n" for line in lines), encoding="utf-8", newline="")
+        return script
+    path.write_text(f"#!/bin/sh\n{sh_body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def kill_tree(server: Any) -> None:
+    """Met fin à tout l'arbre de `server`, sans qu'il l'ait demandé : c'est une panne.
+
+    `signal.SIGKILL` et `os.killpg` restent dans le corps : ils n'existent pas sous Windows.
+    """
+    if sys.platform == WINDOWS_HOST:
+        server._tree.kill()
+        return
+    os.killpg(server._process.pid, signal.SIGKILL)
+
+
+def assert_private(path: Path) -> None:
+    """Le fichier porte un secret : `0600` sous POSIX. Windows n'a pas ces droits (AC16)."""
+    if sys.platform == WINDOWS_HOST:
+        assert path.is_file()
+        return
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def windows_pid_alive(pid: int) -> bool:
+    """Sonde sans effet : sous Windows, `os.kill(pid, 0)` tuerait le processus."""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def compile_windows_client(target: Path) -> Path:
+    """Compile le double du client en un vrai PE. Sans `csc.exe`, c'est une erreur, pas un skip."""
+    compiler = Path(os.environ["WINDIR"]) / CSC
+    if not compiler.is_file():
+        raise FileNotFoundError(f"{compiler} is required to build the client double")
+    source = target.with_suffix(".cs")
+    source.write_text(CLIENT_SOURCE, encoding="utf-8")
+    done = subprocess.run(
+        [str(compiler), "/nologo", f"/out:{target}", str(source)],
+        capture_output=True,
+        text=True,
+        timeout=COMPILE_TIMEOUT_S,
+    )
+    if done.returncode:
+        raise RuntimeError(f"{compiler} failed: {done.stdout}{done.stderr}")
+    return target
+
+
+def plan_windows_client(client: Path, args_file: Path, code: int = 0, stay_ms: int = 0) -> None:
+    """Dit à `client`, compilé par `compile_windows_client`, comment se comporter."""
+    plan = Path(f"{client}.plan")
+    plan.write_text(f"{code}\n{stay_ms}\n{args_file}\n", encoding="utf-8")
 
 
 class WindowsLaunchOnPosix:

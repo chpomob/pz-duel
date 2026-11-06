@@ -28,7 +28,6 @@ from service.preflight import (
     MOD_SRC,
     PRESENT,
     PROGRAM_FILES_VAR,
-    SCRIPT,
     STEAM_REGISTRY,
     WSAEACCES,
     WSAEADDRINUSE,
@@ -51,14 +50,32 @@ MIB = 1024 * 1024
 TERMINAL_WORDS = ("python", "--pz-dir", "--install-mod", "chmod")
 
 
-def make_install(folder: Path, mode: int = 0o755, platform=LINUX) -> Path:
+@pytest.fixture
+def zomboid_home(zomboid_home, monkeypatch):
+    """`Path.home()` lit `USERPROFILE` sous Windows : `HOME` seul laisserait le vrai profil.
+
+    `tests/conftest.py` reste tel quel : `test_contract`, `test_snapshots` et `test_modes`
+    importent cette surcharge.
+    """
+    monkeypatch.setenv("USERPROFILE", str(zomboid_home.parent))
+    return zomboid_home
+
+
+def make_install(folder: Path, mode: int = 0o755, platform=None) -> Path:
+    """Installation de `platform`, celle de l'hôte par défaut : son script s'y exécute."""
+    platform = current() if platform is None else platform
     folder.mkdir(parents=True)
     script = folder / platform.server_script
-    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.write_text("#!/bin/sh\n" if platform.posix_modes else "@echo off\r\n", encoding="utf-8")
     script.chmod(mode)
     if platform.client_in_game_dir:
         (folder / platform.client_program).write_bytes(b"MZ")
     return folder
+
+
+def detect_on_linux(pz_dir, env, home) -> preflight.PzDetection:
+    """Ces parcours décrivent la disposition de Steam sous Linux, quel que soit l'hôte."""
+    return detect_pz(pz_dir, env, home, platform=LINUX)
 
 
 def windows_env(tmp_path: Path) -> dict:
@@ -163,7 +180,7 @@ def test_each_failure_is_named(ready, zomboid_home, runtime, tmp_path):
     no_script = tmp_path / "sans_script"
     no_script.mkdir()
     (failure,) = ready(pz_dir=no_script).failures
-    assert SCRIPT in failure and str(no_script) in failure
+    assert current().server_script in failure and str(no_script) in failure
 
     port = runtime["ports"]["A"]["game"]
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as held:
@@ -198,10 +215,10 @@ def test_rcon_port_is_bound_in_tcp(ready, runtime):
 def test_ram_read_from_meminfo(ready, runtime, tmp_path):
     meminfo = tmp_path / "meminfo"
     meminfo.write_text("MemTotal: 9999999 kB\nMemAvailable: 3145728 kB\n", encoding="ascii")
-    assert ready(meminfo=meminfo).values["mem_available_mb"] == 3072
+    assert ready(meminfo=meminfo, platform=LINUX).values["mem_available_mb"] == 3072
 
     meminfo.write_text("MemTotal: 9999999 kB\n", encoding="ascii")
-    result = ready(meminfo=meminfo)
+    result = ready(meminfo=meminfo, platform=LINUX)
     assert result.values["mem_available_mb"] is None
     assert "MemAvailable" in result.failures[0]
 
@@ -227,7 +244,7 @@ def test_mod_content_is_checked(ready, zomboid_home, runtime):
     install_mod(MOD_SRC, zomboid_home)
     shutil.rmtree(version_dir / "media" / "lua" / "server")
     (failure,) = ready().failures
-    assert "media/lua/server" in failure and "--install-mod" in failure
+    assert str(Path("media/lua/server")) in failure and "--install-mod" in failure
 
 
 def test_fingerprint_covers_paths_and_contents(tmp_path):
@@ -270,22 +287,22 @@ def test_all_failures_are_reported_together(ready, tmp_path, zomboid_home):
 
 def test_detection_order(tmp_path):
     steam = tmp_path / ".local/share/Steam/steamapps/common/ProjectZomboid/projectzomboid"
-    make_install(steam)
-    from_env = make_install(tmp_path / "env")
-    from_flag = make_install(tmp_path / "flag")
+    make_install(steam, platform=LINUX)
+    from_env = make_install(tmp_path / "env", platform=LINUX)
+    from_flag = make_install(tmp_path / "flag", platform=LINUX)
     env = {ENV_VAR: str(from_env)}
 
-    assert detect_pz(from_flag, env, tmp_path).path == from_flag
-    assert detect_pz(None, env, tmp_path).path == from_env
-    found = detect_pz(None, {}, tmp_path)
+    assert detect_on_linux(from_flag, env, tmp_path).path == from_flag
+    assert detect_on_linux(None, env, tmp_path).path == from_env
+    found = detect_on_linux(None, {}, tmp_path)
     assert (found.status, found.path) == (PRESENT, steam)
-    assert detect_pz(None, {ENV_VAR: ""}, tmp_path).path == steam
+    assert detect_on_linux(None, {ENV_VAR: ""}, tmp_path).path == steam
 
 
 def test_game_subdir_is_followed(tmp_path):
-    game = make_install(tmp_path / "ProjectZomboid" / "projectzomboid")
-    assert detect_pz(tmp_path / "ProjectZomboid", {}, tmp_path).path == game
-    assert detect_pz(game, {}, tmp_path).path == game
+    game = make_install(tmp_path / "ProjectZomboid" / "projectzomboid", platform=LINUX)
+    assert detect_on_linux(tmp_path / "ProjectZomboid", {}, tmp_path).path == game
+    assert detect_on_linux(game, {}, tmp_path).path == game
 
 
 def test_steam_root_without_subdir_is_absent(tmp_path):
@@ -305,6 +322,10 @@ def test_invalid_explicit_choice_has_no_fallback(tmp_path):
     assert from_env.status == ABSENT and ENV_VAR in from_env.message
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no execute bit; replaced by test_windows_files_need_no_execute_bit",
+)
 def test_script_must_be_executable(tmp_path):
     folder = make_install(tmp_path / "pz", mode=0o644)
     detection = detect_pz(folder, {}, tmp_path)
@@ -350,7 +371,7 @@ def run_main(home: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-m", "service.main", *args],
         cwd=ROOT,
-        env={**os.environ, "HOME": str(home)},
+        env={**os.environ, "HOME": str(home), "USERPROFILE": str(home)},
         capture_output=True,
         text=True,
     )
@@ -376,7 +397,8 @@ def test_relative_install_is_launchable(tmp_path, monkeypatch, through):
 
     assert detection.status == PRESENT
     assert detection.path == install and detection.path.is_absolute()
-    done = subprocess.run([str(detection.path / SCRIPT)], cwd=detection.path, check=False)
+    script = detection.path / current().server_script
+    done = subprocess.run([str(script)], cwd=detection.path, check=False)
     assert done.returncode == 0
 
 
@@ -843,16 +865,17 @@ def frozen(monkeypatch):
 def test_frozen_detection_messages_cite_no_terminal(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
-    not_executable = make_install(tmp_path / "pz", mode=0o644)
     detections = [
         detect_pz(empty, {}, tmp_path),
         detect_pz(None, {ENV_VAR: str(empty)}, tmp_path),
         detect_pz(None, {}, tmp_path),
-        detect_pz(not_executable, {}, tmp_path),
         detect_pz("~utilisateur-inconnu-du-systeme/pz", {}, tmp_path),
         detect_on_windows(tmp_path, pz_dir=empty),
         detect_on_windows(tmp_path),
     ]
+    if current().posix_modes:
+        not_executable = make_install(tmp_path / "pz", mode=0o644)
+        detections.append(detect_pz(not_executable, {}, tmp_path))
     for detection in detections:
         assert detection.status == ABSENT
         assert_no_terminal(detection.message, tmp_path)
