@@ -1,0 +1,119 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A1",
+      "status": "RESOLVED",
+      "evidence": "service/api.py:63-75,80,101-105 : Host est limité aux adresses locales attendues, les Origin étrangers sont refusés et POST exige application/json ; le POST simple text/plain et la lecture par rebinding décrits sont bloqués."
+    },
+    {
+      "id": "A2",
+      "status": "RESOLVED",
+      "evidence": "docs/campaigns/phase1/scaffolding/run_campaign.py:215-225,287-298 : le SHA de master est relevé avant la boucle ; sans nouveau commit, gate refuse avant tout amend. Le corps du message est réutilisé."
+    },
+    {
+      "id": "A3",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:93,1413-1425 : le client est lancé directement avec -nosteam ; le chemin Steam incompatible a disparu et un échec propose une connexion manuelle sans Steam. La connexion effective reste non constatée dans README.md."
+    },
+    {
+      "id": "A4",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:450-457,570 : OnWeaponHitCharacter est enregistré avec selfProved ; noteHook est appelé après l'émission de damage_taken et seulement pour une cible joueur. Frapper un zombie ne valide plus le contrat."
+    },
+    {
+      "id": "A5",
+      "status": "RESOLVED",
+      "evidence": "service/snapshots.py:112-116,239-246,260-274 : un marqueur durable précède le démarrage ; une création interrompue est invalidée avant toute possibilité de capture des mondes laissés."
+    },
+    {
+      "id": "A6",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:1483-1491 et service/api.py:111-113 ferment DayLength inconnu et corps non objet. La classe des entrées provoquant une exception HTTP reste ouverte : en mode réel, {\"action\":\"start\",\"preset\":\"\\ud800\"} atteint service/engine.py:1316, qui reprend le surrogate isolé dans ActionRefused ; service/api.py:49 lève ensuite UnicodeEncodeError sans réponse JSON."
+    },
+    {
+      "id": "A7",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:836-878 : les erreurs de verdict sont interceptées, match_end est tenté et le résultat décidé est publié même si cette écriture échoue. service/journal.py:113-126 retire un fragment avant l'écriture suivante."
+    },
+    {
+      "id": "A8",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:500-514,976-987,1467-1468 ferme le mot de passe partagé et lie durablement chaque camp à une identité distincte. La robustesse du générateur gen_player_password n'est pas vérifiable dans les fichiers nommés autorisés : son implémentation n'a pas été lue."
+    },
+    {
+      "id": "A9",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:637-639,764-800 : l'écart acquis est conservé séparément et les repères d'âge sont reconstruits au retour du serveur ; le recul de sauvegarde et le temps de relance ne sont plus comparés à l'ancien repère."
+    },
+    {
+      "id": "A10",
+      "status": "RESOLVED",
+      "evidence": "docs/campaigns/phase1/scaffolding/run_campaign.py:162-175,288,303 : la restauration exige une référence antérieure et une égalité exacte avec celle-ci ; au lancement ou pour un autre contenu, le harnais refuse sans écraser .gitignore."
+    },
+    {
+      "id": "A11",
+      "status": "RESOLVED",
+      "evidence": "service/snapshots.py:26,178-183 : le module utilise désormais server.running et check_ports ; les accès à _process, _group_alive et _check_ports ont disparu de ce module."
+    },
+    {
+      "id": "A12",
+      "status": "RESOLVED",
+      "evidence": "README.md:15 indique désormais qu'aucun fichier de découverte n'est écrit et que l'URL est affichée ; service/main.py affiche effectivement cette URL."
+    },
+    {
+      "id": "A13",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:386-393,406-411,876-878 : les références sont purgées périodiquement ; l'auteur de secours exige aussi un coup récent, le même identifiant de zombie et un joueur encore connecté."
+    },
+    {
+      "id": "B1",
+      "status": "RESOLVED",
+      "evidence": "service/preflight.py:75-80 : _accept retourne script.parent.resolve(), rendant absolu le dossier d'installation avant son utilisation pour le lancement."
+    },
+    {
+      "id": "B2",
+      "status": "RESOLVED",
+      "evidence": "service/protocol.py:65-94,110 : _check_bounds parcourt récursivement tous les champs conservés et refuse les nombres non finis, y compris l'infini issu de 1e999."
+    },
+    {
+      "id": "B3",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:279-285,769-775,862-868 : séquences et plancher exigent un entier fini borné ; lastCmdSeq ne change qu'après cette validation."
+    },
+    {
+      "id": "B4",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:1462,1470,1483-1491 : la valeur effective de DayLength doit être un entier présent dans runtime.day_length_minutes avant la modification de l'état et le départ du fil de lancement."
+    },
+    {
+      "id": "B5",
+      "status": "RESOLVED",
+      "evidence": "service/rules.py, MatchCore._process_event et _settle : event.src est transmis au règlement ; _unanswered et l'effet ne sont modifiés que lorsque la source correspond à la cible suivie. Une autre source produit wrong_source."
+    }
+  ],
+  "new_findings": [
+    {
+      "severity": "minor",
+      "title": "La conformité des preuves mini_lua à Kahlua reste non vérifiée",
+      "evidence": "tests/doubles/mini_lua.py:433-447 fournit notamment table.concat mais pas table.remove, pourtant appelée par DuelCore.lua:816 ; math.floor utilise aussi directement Python, dont le comportement sur l'infini diffère. Ces écarts exigent d'examiner les cas réellement exécutés et les adaptations des tests consommateurs. Leurs fichiers ne figurent pas parmi les chemins nommés autorisés ; aucune conclusion attestant l'absence de preuve fondée sur une divergence ne peut être rendue."
+    }
+  ],
+  "read_files": [
+    "service/api.py",
+    "service/preflight.py",
+    "service/protocol.py",
+    "service/snapshots.py",
+    "docs/campaigns/phase1/scaffolding/run_campaign.py",
+    "service/effects.json",
+    "service/runtime.json",
+    "README.md",
+    "service/engine.py",
+    "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+    "tests/doubles/mini_lua.py",
+    "service/rules.py",
+    "service/journal.py",
+    "service/main.py",
+    ".gitignore"
+  ]
+}
