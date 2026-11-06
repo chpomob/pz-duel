@@ -15,6 +15,7 @@ import pytest
 
 from service.api import (
     BODY_MAX,
+    CONNECTIONS_MAX,
     IDENTIFIER_FIELDS,
     IDENTIFIER_MAX,
     PROTOCOL_REFUSED,
@@ -29,6 +30,9 @@ SECRET = "mot-de-passe-joueur"
 JSON_TYPE = "application/json"
 # `shutdown` attend un tour de `serve_forever` : la valeur par défaut coûte 0,5 s par test.
 POLL_S = 0.01
+WAIT_S = 3.0
+SHORT_READ_S = 0.1
+HELD = 3
 ACTION_BODY = json.dumps({"action": "start", "preset": "demo"}).encode()
 OTHER_PORT = 1
 LOCAL_NAMES = ("127.0.0.1", "localhost")
@@ -765,3 +769,144 @@ def test_drain_survives_a_departed_client():
     sink = Sink()
     sink.connection = Gone()
     Handler._drain(sink)
+
+
+def eventually(predicate) -> None:
+    deadline = time.monotonic() + WAIT_S
+    while not predicate():
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+
+def closed_by_the_server(conn: socket.socket) -> bool:
+    """Lit jusqu'à la fermeture : un délai ici dirait que le serveur a gardé le socket."""
+    conn.settimeout(WAIT_S)
+    try:
+        while conn.recv(4096):
+            pass
+    except ConnectionResetError:
+        pass
+    except TimeoutError:
+        return False
+    return True
+
+
+@pytest.fixture
+def short_read(monkeypatch):
+    monkeypatch.setattr("service.api.REQUEST_READ_S", SHORT_READ_S)
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [b"", b"GET / HT", b"GET / HTTP/1.1\r\n", b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Mi"],
+    ids=["rien", "ligne-partielle", "sans-en-tetes", "en-tetes-partiels"],
+)
+def test_incomplete_request_is_closed_in_time_and_frees_its_thread(short_read, sent):
+    server = serve(RecordingEngine())
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_address[1])) as conn:
+            conn.sendall(sent)
+            started = time.monotonic()
+            assert closed_by_the_server(conn)
+            assert time.monotonic() - started < WAIT_S
+        eventually(lambda: server._slots._value == CONNECTIONS_MAX)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dripping_client_does_not_renew_the_delay(short_read):
+    """Un octet à la fois : chaque `recv` réussit, seule l'échéance de l'en-tête l'arrête."""
+    server = serve(RecordingEngine())
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_address[1])) as conn:
+            conn.sendall(b"GET / HTTP/1.1\r\n")
+            conn.settimeout(SHORT_READ_S / 10)
+            deadline = time.monotonic() + WAIT_S
+            closed = False
+            while not closed and time.monotonic() < deadline:
+                try:
+                    conn.sendall(b"x")
+                    closed = conn.recv(1) == b""
+                except TimeoutError:
+                    pass
+                except OSError:
+                    closed = True
+            assert closed
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_request_in_time_is_still_answered_after_its_delay_is_lifted(short_read, api):
+    """Le corps garde son propre délai : celui de l'en-tête ne le coupe pas."""
+    _, port = api
+    head = (
+        f"POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Content-Type: {JSON_TYPE}\r\nContent-Length: {len(ACTION_BODY)}\r\n\r\n"
+    ).encode()
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
+        conn.sendall(head)
+        time.sleep(2 * SHORT_READ_S)
+        conn.sendall(ACTION_BODY)
+        answer = b""
+        while chunk := conn.recv(4096):
+            answer += chunk
+    assert split_answer(answer)[0] == 200
+
+
+def test_burst_beyond_the_bound_is_refused_in_json_without_a_thread(monkeypatch):
+    monkeypatch.setattr("service.api.CONNECTIONS_MAX", HELD)
+    server = make_server(RecordingEngine())
+    started = []
+    run = server.process_request_thread
+
+    def counted(request, client_address):
+        started.append(client_address)
+        run(request, client_address)
+
+    server.process_request_thread = counted
+    threading.Thread(target=server.serve_forever, args=(POLL_S,), daemon=True).start()
+    port = server.server_address[1]
+    held = [socket.create_connection(("127.0.0.1", port)) for _ in range(HELD)]
+    try:
+        eventually(lambda: len(started) == HELD)
+        for _ in range(3 * HELD):
+            answer = raw_answer(port, b"")
+            code, _, body = split_answer(answer)
+            assert code == 503
+            assert json.loads(body) == {
+                "ok": False,
+                "error": f"trop de connexions : {HELD} au plus",
+            }
+        assert len(started) == HELD
+    finally:
+        for conn in held:
+            conn.close()
+    try:
+        eventually(lambda: server._slots._value == HELD)
+        status, _ = send(port, "/api/state", {"Host": f"127.0.0.1:{port}"})
+        assert status == 200
+        assert len(started) == HELD + 1
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_thread_that_cannot_start_gives_its_place_back(monkeypatch):
+    server = make_server(RecordingEngine())
+
+    def no_thread(self):
+        raise RuntimeError("plus de fils")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    client, accepted = socket.socketpair()
+    try:
+        with pytest.raises(RuntimeError):
+            server.process_request(accepted, ("127.0.0.1", 0))
+        assert server._slots._value == CONNECTIONS_MAX
+    finally:
+        client.close()
+        accepted.close()
+        server.server_close()
+

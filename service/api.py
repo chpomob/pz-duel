@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
 import socket
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -36,6 +38,10 @@ IDENTIFIER = re.compile(rf"[A-Za-z0-9_-]{{1,{IDENTIFIER_MAX}}}")
 BODY_MAX = 1 << 20
 # Ce qu'un client obtient pour livrer tout son corps : sur la boucle locale, c'est très large.
 BODY_READ_S = 5.0
+# Délai de socket de toute connexion, et échéance de la ligne de requête et des en-têtes.
+REQUEST_READ_S = 5.0
+# Bien plus qu'un navigateur n'en ouvre : au-delà, le refus part sans créer de fil.
+CONNECTIONS_MAX = 32
 # Ni `int` ni `str.isdigit` : ils admettent `+5`, `1_0` ou `²`, qu'aucun client honnête n'envoie.
 DIGITS = re.compile(r"[0-9]+")
 # Les refus du parseur de `http.server`. Son message cite la requête : il ne sort jamais.
@@ -57,10 +63,34 @@ def is_identifier(value: object) -> bool:
     return isinstance(value, str) and IDENTIFIER.fullmatch(value) is not None
 
 
+class HeadReader(socket.SocketIO):
+    """Lit sous une échéance : un délai par `recv` se renouvellerait à chaque octet."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        super().__init__(connection, "rb")
+        self.connection = connection
+        self.deadline: float | None = None
+
+    def readinto(self, buffer) -> int | None:
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            self.connection.settimeout(left)
+        return super().readinto(buffer)
+
+
 class Handler(BaseHTTPRequestHandler):
     engine = None  # injecté par make_server
+    # `timeout`, injecté aussi, se pose sur le socket dès `setup`, avant toute lecture.
     server_version = "PZduel/0.1"
     answered = False  # vrai dès que l'en-tête de réponse part : plus rien ne peut le remplacer
+
+    def setup(self) -> None:
+        super().setup()
+        self.rfile.close()
+        self.head_reader = HeadReader(self.connection)
+        self.rfile = io.BufferedReader(self.head_reader)
 
     # -- utilitaires -----------------------------------------------------
     def log_message(self, fmt, *args):  # silence : l'UI est la source de vérité
@@ -79,6 +109,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400)
             return False
         if super().parse_request() and self.request_version != "HTTP/0.9":
+            self.head_reader.deadline = None
+            self.connection.settimeout(self.timeout)
             return True
         if not self.answered:
             self.send_error(400)
@@ -110,7 +142,11 @@ class Handler(BaseHTTPRequestHandler):
             LOG.debug("fin de lecture après refus", exc_info=True)
 
     def handle_one_request(self):
-        """Dernière barrière : l'imprévu devient une réponse JSON, sa trace reste au log."""
+        """Dernière barrière : l'imprévu devient une réponse JSON, sa trace reste au log.
+
+        L'échéance dépassée, `TimeoutError` ferme la connexion dans la bibliothèque.
+        """
+        self.head_reader.deadline = time.monotonic() + self.timeout
         try:
             super().handle_one_request()
         except Exception:
@@ -292,6 +328,57 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200 if ok else 409, {"ok": ok, "message": msg, "state": self.engine.snapshot()})
 
 
-def make_server(engine, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
-    handler = type("BoundHandler", (Handler,), {"engine": engine})
-    return ThreadingHTTPServer((host, port), handler)
+def turned_away() -> bytes:
+    """Le refus d'une connexion de trop, entier : il part sans `Handler` ni fil."""
+    error = f"trop de connexions : {CONNECTIONS_MAX} au plus"
+    body = json.dumps({"ok": False, "error": error}).encode("ascii")
+    head = (
+        "HTTP/1.0 503 Service Unavailable\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+    )
+    return head.encode("ascii") + body
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Un fil par connexion, `CONNECTIONS_MAX` au plus ; le refus ne bloque jamais `accept`."""
+
+    request_queue_size = CONNECTIONS_MAX  # une rafale se refuse, elle ne se perd pas en SYN
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._slots = threading.BoundedSemaphore(CONNECTIONS_MAX)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            self._turn_away(request)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:  # le fil n'a pas démarré : personne d'autre ne rendrait la place
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def _turn_away(self, request: socket.socket) -> None:
+        """Tourne sur le fil d'`accept`, sans attente : un refus tient au tampon du socket."""
+        try:
+            request.setblocking(False)
+            request.send(turned_away())
+            request.shutdown(socket.SHUT_WR)
+            request.recv(DRAIN_CHUNK)  # fermer sur des octets non lus couperait le refus
+        except OSError:  # rien à lire encore, ou le client est parti
+            LOG.debug("fin du refus de connexion", exc_info=True)
+
+
+def make_server(engine, host: str = "127.0.0.1", port: int = 0) -> BoundedHTTPServer:
+    handler = type("BoundHandler", (Handler,), {"engine": engine, "timeout": REQUEST_READ_S})
+    return BoundedHTTPServer((host, port), handler)

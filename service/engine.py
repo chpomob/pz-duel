@@ -454,6 +454,8 @@ class RealMatch:
         self._restarts = dict.fromkeys(SIDES, 0)
         # Camps en relance ou perdus : ni sortie, ni silence, ni absence n'y sont jugés.
         self._unavailable: set[str] = set()
+        self._exits_held: set[str] = set()
+        self._conclusion_aimed = False
         self._relaunched: queue.SimpleQueue[tuple[str, str | None]] = queue.SimpleQueue()
         self._relaunch_lock = threading.Lock()
         self._closing = threading.Event()
@@ -567,18 +569,25 @@ class RealMatch:
         Les sorties se relèvent avant cette lecture, qui devient la dernière de ce serveur :
         relevées après, un `cmd_result` écrit juste avant la sortie resterait non lu, et sa
         commande deviendrait un faux `lost_on_restart`.
+
+        Une passe lit un budget borné de `out`. Tant qu'il reste du retard, rien ne se juge sur
+        ce relevé partiel : les passes suivantes finissent la lecture, puis tranchent. Une fin
+        de match se juge en plus sur un repère pris une fois qu'elle est due.
         """
         exited = self._exited_sides()
         if exited and self._core is None:
             return self.lost_server()
         if self._countdown_over(now_ms):
             self._enter_running(now_ms)
+        for side in exited:
+            self._readers[side].aim_at_end()
         self._poll_out(now_ms)
         if self._core is not None:
+            self._aim_past_conclusion(now_ms)
             self._pump_match(now_ms, exited)
             return None
         self._poll_acks()
-        refusal = self._advance(now_ms)
+        refusal = None if self._reading_behind() else self._advance(now_ms)
         self._publish(now_ms)
         if refusal is None:
             return None
@@ -611,23 +620,61 @@ class RealMatch:
 
         self._on_state(change)
 
+    def _aim_past_conclusion(self, now_ms: int) -> None:
+        """Relit `out` jusqu'à sa fin dès qu'une conclusion est due, une seule fois par match.
+
+        Le repère d'une lecture en retard peut précéder ce qui la décide : un kill ou une mort
+        écrits après lui resteraient non lus au tick final. Un second repère, lui, laisserait un
+        écrivain retenir la fin : celui-ci est pris après l'échéance et ne bouge plus.
+        """
+        if self._conclusion_aimed or not self._core.conclusion_due(now_ms + self._t0_shift_ms):
+            return
+        self._conclusion_aimed = True
+        for reader in self._readers.values():
+            reader.aim_at_end()
+        self._poll_out(now_ms)
+
     def _pump_match(self, now_ms: int, exited: Sequence[str]) -> None:
         """Juge l'instant, avance le cœur, puis écrit ce qu'il rend : le tick reste son ordre.
 
         `out` est déjà lu : une fin soumise ici passe après les événements de son tick.
+        En retard de lecture, sorties et fins attendent, et une sortie reste relevée à la passe
+        suivante. Les ticks ordinaires continuent : ils vident la file du cœur à chaque tour,
+        et ce qui arrive après son tick s'y journalise en `late_event`. Rien ne part vers un
+        serveur sorti : seul le bilan de ses commandes attend la fin de sa lecture.
         """
         self._take_relaunches(now_ms)
+        core_ms = now_ms + self._t0_shift_ms
+        if self._reading_behind():
+            self._hold_commands_to(exited)
+            records = self._core.advance_short_of_end(core_ms)
+        else:
+            records = self._judged_tick(now_ms, core_ms, exited)
+        self._write_records(records)
+        self._poll_acks()
+        self._publish(now_ms)
+        self._publish_match(records)
+
+    def _judged_tick(
+        self, now_ms: int, core_ms: int, exited: Sequence[str]
+    ) -> list[dict[str, Any]]:
         for side in exited:
             self._on_server_exit(side)
         self._watch_beats(now_ms)
         end = self._drift_end() or self._absence_end(now_ms)
         if end is not None:
             self._core.submit_end(end)
-        records = self._core.advance(now_ms + self._t0_shift_ms)
-        self._write_records(records)
-        self._poll_acks()
-        self._publish(now_ms)
-        self._publish_match(records)
+        return self._core.advance(core_ms)
+
+    def _hold_commands_to(self, exited: Sequence[str]) -> None:
+        """Passe en relance, pour le cœur et le journal, les camps sortis pas encore relevés."""
+        for side in exited:
+            if side not in self._exits_held:
+                self._exits_held.add(side)
+                self._core.submit_state(side, RESTARTING)
+
+    def _reading_behind(self) -> bool:
+        return any(reader.behind for reader in self._readers.values())
 
     def _exited_sides(self) -> list[str]:
         return [
@@ -663,7 +710,10 @@ class RealMatch:
         self._last_age.pop(side, None)
         self._rebasing.add(side)
         self._on_status(side, RESTARTING, self._server_detail(side, cause))
-        self._core.submit_state(side, RESTARTING)
+        if side in self._exits_held:
+            self._exits_held.discard(side)
+        else:
+            self._core.submit_state(side, RESTARTING)
         for anomaly in lost:
             self._core.submit_lost(anomaly.data["seq"])
         message = f"serveur {side} : {cause}, relance du même monde"
@@ -947,7 +997,7 @@ class RealMatch:
         return FIRST_MT if mt is None else mt
 
     def _poll_out(self, now_ms: int) -> None:
-        """Lit tout ce que `out` contient : relance, absence et fin se décident sur ce relevé."""
+        """Lit `out` dans le budget d'une passe : `_reading_behind` dit s'il en reste."""
         for side, reader in self._readers.items():
             for events, anomalies in self._read_passes(side, reader):
                 self._record_anomalies(anomalies)

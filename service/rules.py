@@ -759,6 +759,7 @@ class MatchCore:
         self._events: list[Mapping[str, Any]] = []
         self._inputs: list[Callable[[], None]] = []
         self._submitted_end: Mapping[str, Any] | None = None
+        self._may_conclude = True
         self._ending: Mapping[str, Any] | None = None
         self._records: list[dict[str, Any]] = []
         # Un dict garde l'ordre d'insertion : c'est la file FIFO, indexée par clé de lot.
@@ -810,6 +811,27 @@ class MatchCore:
             records += self.run_tick()
         return records
 
+    def advance_short_of_end(self, now_ms: int) -> list[dict[str, Any]]:
+        """`advance` sans rien conclure : une fin ne se décide que sur une lecture finie.
+
+        Le tick du minuteur attend, et une mort reste en attente : une mort antérieure, encore
+        non lue, doit pouvoir passer devant au tick qui conclura. Une fin soumise, elle, ne
+        dépend pas de cette lecture, qu'une panne de `out` peut interdire de finir : elle clôt.
+        """
+        self._may_conclude = self._submitted_end is not None
+        try:
+            return self.advance(min(now_ms, self._t0_ms + self.duration_s * MS_PER_S - 1))
+        finally:
+            self._may_conclude = True
+
+    def conclusion_due(self, now_ms: int) -> bool:
+        """Dit si `advance(now_ms)` peut conclure, par le minuteur ou par une mort déjà reçue."""
+        if self.result is not None:
+            return False
+        last_tick = (now_ms - self._t0_ms) // self._tick_ms
+        timer_due = last_tick * self._tick_ms >= self.duration_s * MS_PER_S
+        return timer_due or any(self._is_fatal(event) for event in self._events)
+
     def run_tick(self) -> list[dict[str, Any]]:
         """Exécute le tick suivant : événements, intrants, échéances, puis émission.
 
@@ -821,6 +843,9 @@ class MatchCore:
         self._tick += 1
         self._records = []
         events, self._events = self._events, []
+        if not self._may_conclude:
+            self._events = [event for event in events if self._is_fatal(event)]
+            events = [event for event in events if not self._is_fatal(event)]
         for event in sorted(events, key=lambda e: (e["t_ms"], e["src"], e["boot"], e["seq"])):
             self._process_event(event)
         inputs, self._inputs = self._inputs, []
@@ -850,6 +875,11 @@ class MatchCore:
         """Compare `te` au dernier tick clos : au tick 0, aucun ne l'est encore."""
         return self._tick > 0 and te_ms <= self._now_ms - self._tick_ms
 
+    def _is_fatal(self, event: Mapping[str, Any]) -> bool:
+        """Dit si l'événement est une mort qui clôt le match : celle d'un camp, depuis `t0`."""
+        is_death = event["kind"] == PLAYER_DEATH and event["side"] is not None
+        return is_death and event["t_ms"] >= self._t0_ms
+
     def _process_event(self, event: Mapping[str, Any]) -> None:
         kind, side = event["kind"], event["side"]
         te_ms = event["t_ms"] - self._t0_ms
@@ -865,7 +895,7 @@ class MatchCore:
         if kind == CMD_RESULT:
             self._settle(event["src"], event["data"]["seq"])
         elif side is not None:
-            if kind == PLAYER_DEATH and te_ms >= 0 and self._ending is None:
+            if self._is_fatal(event) and self._ending is None:
                 self._ending = self._death_result(side)
             for fired in self._evaluators[side].feed(event, te_ms):
                 self._apply_rule(fired)

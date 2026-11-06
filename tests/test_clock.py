@@ -259,3 +259,49 @@ def test_records_fit_journal(tmp_path):
         ("match_end", 0.5, None),
     ]
     assert written[1]["data"]["event"] == {"src": "A", "boot": 1, "seq": 1}
+
+
+def test_short_of_end_holds_a_death_for_the_tick_that_may_conclude():
+    """Lue la première, la mort de B attend : celle de A, plus ancienne, décide en arrivant."""
+    core = make_core()
+    core.advance(at(1))
+    core.submit_event(event(2, seq=2, kind="player_death", side="B", data={}))
+    assert core.conclusion_due(at(2))
+
+    core.advance_short_of_end(at(3))
+    assert core.result is None
+
+    core.submit_event(event(1.5, seq=3, kind="player_death", side="A", data={}))
+    records = core.advance(at(3.25))
+    assert core.result["winner"] == "B"
+    assert of_type(records, "match_end")
+
+
+def test_short_of_end_keeps_what_does_not_conclude_moving():
+    core = make_core()
+    core.submit_event(event(0, seq=1, kind="player_death", side="B", data={}))
+    core.submit_event(event(-1, seq=2, kind="player_death", side="A", data={}))
+    core.submit_event(event(0, seq=3))
+    records = core.advance_short_of_end(at(0))
+
+    assert [r["data"]["seq"] for r in of_type(records, "event")] == [2, 3]
+    assert core.scores["A"] == 1
+
+
+def test_short_of_end_lets_a_submitted_end_close():
+    """Une panne de `out` soumet sa fin et interdit de finir la lecture : elle doit clore."""
+    core = make_core()
+    core.submit_event(event(0, seq=1, kind="player_death", side="B", data={}))
+    core.submit_end({"outcome": "invalidated", "winner": None, "reason": "panne"})
+    core.advance_short_of_end(at(0))
+
+    assert core.result["winner"] == "A"
+
+
+def test_conclusion_is_due_at_the_tick_of_the_timer_only():
+    core = make_core()
+    end_s = core.duration_s
+    assert not core.conclusion_due(at(end_s) - 1)
+    assert core.conclusion_due(at(end_s))
+    core.advance(at(end_s))
+    assert not core.conclusion_due(at(end_s))

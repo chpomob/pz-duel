@@ -40,7 +40,7 @@ from service.protocol import dump_line, parse_session
 from service.replay import main as replay_main
 from service.servers import read_ini
 from service.state import PHASE_LABELS, MatchState
-from service.transport import POLL_MAX
+from service.transport import DRAIN_PASSES, POLL_MAX
 from service.verdict import VerdictError, spawn_status, verdict
 
 PRESET = "demo"
@@ -1804,12 +1804,26 @@ def test_no_command_while_restarting(engine_rig, presets):
     assert duel.replays()
 
 
-@pytest.mark.parametrize("backlog", [b"", OVER_POLL_LINE], ids=["a_jour", "retard_de_lecture"])
-def test_result_written_before_exit_is_not_lost(engine_rig, presets, backlog):
+@pytest.mark.parametrize(
+    ("lead", "backlog", "passes"),
+    [
+        (b"", b"", DRAIN_PASSES),
+        (b"", OVER_POLL_LINE, DRAIN_PASSES),
+        (b"", OVER_POLL_LINE, 1),
+        (OVER_POLL_LINE, OVER_POLL_LINE, 1),
+    ],
+    ids=["a_jour", "retard_de_lecture", "budget_depasse", "repere_depasse"],
+)
+def test_result_written_before_exit_is_not_lost(
+    engine_rig, presets, lead, backlog, passes, monkeypatch
+):
     """`cmd_result` écrit juste avant la sortie : seule la commande muette est perdue.
 
-    Derrière plus de `POLL_MAX` octets en attente, il compte encore : la relance attend tout.
+    Derrière plus de `POLL_MAX` octets en attente, il compte encore : la relance attend tout,
+    y compris quand ce retard dépasse le budget de lecture d'une passe, ou quand `lead` a posé
+    un repère de lecture que le résultat dépasse.
     """
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", passes)
     duel = Duel(engine_rig)
     duel.start_match()
     duel.at_match(1)
@@ -1831,6 +1845,8 @@ def test_result_written_before_exit_is_not_lost(engine_rig, presets, backlog):
         Dans une passe qui exécute un tick : sinon le `cmd_result` lu ensuite passerait
         avant le `lost_on_restart` dans le tick, et masquerait une perte déclarée à tort.
         """
+        if now_ms >= due_ms:
+            duel.mods["A"].write_raw(lead)
         poll_out(now_ms)
         if now_ms >= due_ms:
             match._poll_out = poll_out
@@ -1859,8 +1875,13 @@ def test_result_written_before_exit_is_not_lost(engine_rig, presets, backlog):
     assert [r["data"]["data"]["seq"] for r in duel.records("cmd_result")][-1] == answered
 
 
-def test_final_tick_counts_a_kill_behind_a_read_backlog(engine_rig, presets):
-    """Le tick final conclut pour de bon : il ne laisse pas un kill au-delà de `POLL_MAX`."""
+@pytest.mark.parametrize("passes", [DRAIN_PASSES, 1], ids=["budget", "budget_depasse"])
+def test_final_tick_counts_a_kill_behind_a_read_backlog(engine_rig, presets, passes, monkeypatch):
+    """Le tick final conclut pour de bon : il ne laisse pas un kill au-delà de `POLL_MAX`.
+
+    Un retard plus long que le budget d'une passe retient ce tick jusqu'à la fin de la lecture.
+    """
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", passes)
     edit_preset(presets, duration_s=CLOCK_MATCH_S)
     duel = Duel(engine_rig)
     duel.start_match()
@@ -1884,6 +1905,136 @@ def test_final_tick_counts_a_kill_behind_a_read_backlog(engine_rig, presets):
 
     assert duel.finish()["result"]["winner"] == "A"
     assert duel.replays()
+
+
+def after_a_stale_goal(duel: Duel, te_s: float, side: str, write) -> None:
+    """À la passe de `te_s`, `write` écrit après le repère d'une lecture de `side` en retard.
+
+    Cette passe atteint alors le repère, retenu d'une passe antérieure, et clôt son retard
+    sans voir ce que `write` a écrit : la ligne de plus qui les sépare remplit son `poll`. Il
+    faut un budget d'une seule passe.
+    """
+    match = duel.engine._match
+    poll_out = match._poll_out
+    due_ms = int((L_S + duel.t0_s + te_s) * MS)
+
+    def behind_then_written(now_ms: int) -> None:
+        if now_ms >= due_ms:
+            match._poll_out = poll_out
+            reader = match._readers[side]
+            duel.mods[side].write_raw(OVER_POLL_LINE)
+            list(reader.drain())
+            assert reader.behind
+            duel.mods[side].write_raw(OVER_POLL_LINE)
+            write()
+        poll_out(now_ms)
+
+    match._poll_out = behind_then_written
+
+
+def test_final_tick_reads_past_a_goal_older_than_the_deadline(engine_rig, presets, monkeypatch):
+    """Un kill écrit après le repère d'une lecture en retard compte encore au tick final."""
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", 1)
+    edit_preset(presets, duration_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(CLOCK_MATCH_S - duel.step_s)
+
+    after_a_stale_goal(
+        duel, CLOCK_MATCH_S, "A", lambda: duel.mods["A"].emit("zombie_kill", KILL)
+    )
+    duel.mods["A"].t_ms = round((L_S + duel.t0_s + CLOCK_MATCH_S - duel.step_s / 4) * MS)
+    duel.at(duel.t0_s + CLOCK_MATCH_S)
+
+    assert duel.finish()["result"]["winner"] == "A"
+    assert duel.replays()
+
+
+def test_earlier_death_behind_a_backlog_beats_a_later_one(engine_rig, monkeypatch):
+    """La mort la plus ancienne décide, même lue après une plus récente de l'autre camp."""
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", 1)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(1)
+    death_ms = duel.mods["A"].t_ms
+
+    duel.mods["A"].write_raw(OVER_POLL_LINE * 3)
+    duel.mods["A"].emit("player_death", {}, t_ms=death_ms)
+    duel.mods["B"].emit("player_death", {}, t_ms=death_ms + 1)
+    duel.at_match(1 + duel.step_s)
+    duel.read("A")
+    duel.at_match(1 + 2 * duel.step_s)
+
+    state = duel.finish()
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "B")
+    assert duel.replays()
+
+
+def test_earlier_death_after_a_stale_goal_beats_a_later_one(engine_rig, monkeypatch):
+    """Une mort reçue relit l'autre camp au-delà d'un repère plus ancien qu'elle."""
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", 1)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(1)
+    death_ms = duel.mods["A"].t_ms
+
+    def deaths() -> None:
+        duel.mods["A"].emit("player_death", {}, t_ms=death_ms)
+        duel.mods["B"].emit("player_death", {}, t_ms=death_ms + 1)
+
+    after_a_stale_goal(duel, 1 + duel.step_s, "A", deaths)
+    duel.at_match(1 + duel.step_s)
+
+    state = duel.finish()
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "B")
+    assert duel.replays()
+
+
+def test_no_command_to_an_exited_server_during_a_read_backlog(engine_rig, monkeypatch):
+    """Tant que la lecture du serveur sorti finit, rien ne part vers lui : son budget reste."""
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", 1)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(1)
+    match = duel.engine._match
+    server = match.pair.servers["A"]
+    stop, release = server.stop, threading.Event()
+
+    def held_stop() -> bool:
+        release.wait(WAIT_S)
+        return stop()
+
+    server.stop = held_stop
+    pump = match.pump
+    te_s = 1 + duel.step_s
+    due_ms = int((L_S + duel.t0_s + te_s) * MS)
+    crashed = []
+
+    def exit_behind_a_backlog(now_ms: int) -> str | None:
+        """Dans une passe qui exécute un tick : le kill de B y vise un serveur déjà sorti."""
+        if now_ms >= due_ms and not crashed:
+            crashed.append(now_ms)
+            duel.mods["A"].write_raw(OVER_POLL_LINE * 2)
+            crash(duel, "A")
+            engine_rig.until(lambda _: server.exit_code is not None)
+            duel.mods["B"].emit("zombie_kill", KILL)
+        return pump(now_ms)
+
+    match.pump = exit_behind_a_backlog
+    duel.at_match(te_s)
+    engine_rig.until(lambda s: s["servers"]["A"] == "restarting")
+    duel.at_match(te_s + duel.step_s)
+    engine_rig.until(lambda s: s["score"]["B"] == 1)
+    duel.at_match(te_s + 2 * duel.step_s)
+    duel.reach(te_s + 3 * duel.step_s)
+
+    assert sent(duel, "A") == []
+    assert server_states(duel, "A") == ["restarting"]
+    release.set()
+    engine_rig.until(lambda s: s["servers"]["A"] == "up")
+    duel.at_match(te_s + 4 * duel.step_s)
+    assert len(wait_sent(duel, "A", 1)) == 1
+    assert duel.records("lost_on_restart") == []
 
 
 def refuse_launch(duel: Duel, server) -> None:

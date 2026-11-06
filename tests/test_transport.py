@@ -10,7 +10,7 @@ import pytest
 
 from service.protocol import parse_ack, parse_command, parse_event
 from service.rules import load_effects
-from service.transport import POLL_MAX, RECORD_MAX, CommandChannel, OutReader
+from service.transport import DRAIN_PASSES, POLL_MAX, RECORD_MAX, CommandChannel, OutReader
 from doubles.fake_mod import FakeMod
 
 EFFECTS_PATH = Path(__file__).resolve().parent.parent / "service" / "effects.json"
@@ -157,6 +157,101 @@ def test_drain_leaves_an_unfinished_line_for_later(mod, reader):
     assert anomalies == []
     assert events == [json.loads(line)]
     assert reader.offset == len(line)
+
+
+def small_bounds(monkeypatch, poll_max=4096, record_max=1024, passes=2) -> None:
+    monkeypatch.setattr("service.transport.POLL_MAX", poll_max)
+    monkeypatch.setattr("service.transport.RECORD_MAX", record_max)
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", passes)
+
+
+def test_drain_call_is_bounded_whatever_the_size_of_the_file(mod, reader, monkeypatch):
+    """Grosse sortie et queue sans `\\n` : chaque appel a son budget, les lignes valides passent."""
+    small_bounds(monkeypatch)
+    before = kills(mod, 40)
+    mod.write_raw(b"x" * (20 * 4096))
+    sizes = spied_reads(reader)
+    events, anomalies, calls = [], [], 0
+    while True:
+        del sizes[:]
+        calls += 1
+        found = drained(reader)
+        events += found[0]
+        anomalies += found[1]
+        assert len(sizes) <= 2 and sum(sizes) <= 2 * 4096
+        if not reader.behind:
+            break
+
+    assert calls > 5
+    assert reader.offset == mod.out_path.stat().st_size
+    assert [a.data["code"] for a in anomalies] == ["line_too_long"]
+    assert events == [json.loads(line) for line in before]
+
+    mod.write_raw(b"\n")
+    (after,) = kills(mod, 1)
+    assert drained(reader) == ([json.loads(after)], [])
+
+
+def test_records_of_a_pass_and_of_a_drain_are_bounded(mod, reader, monkeypatch):
+    """Des `\\n` seuls : peu d'octets, mais une anomalie par ligne sans ce plafond."""
+    monkeypatch.setattr("service.transport.POLL_RECORDS", 10)
+    mod.write_raw(b"\n" * 95)
+    (line,) = kills(mod, 1)
+
+    assert len(reader.poll().anomalies) == 10
+    assert reader.offset == 10
+    _, anomalies = drained(reader)
+    assert len(anomalies) == 10 * DRAIN_PASSES
+    assert reader.behind
+
+    events = []
+    while reader.behind:
+        events += drained(reader)[0]
+    assert events == [json.loads(line)]
+    assert reader.offset == mod.out_path.stat().st_size
+
+
+def test_exact_records_bound_keeps_the_tail_for_the_next_pass(mod, reader, monkeypatch):
+    monkeypatch.setattr("service.transport.POLL_RECORDS", 2)
+    lines = kills(mod, 2)
+    mod.write_raw(b"debut de ligne")
+
+    assert len(reader.poll().events) == 2
+    assert reader.offset == sum(map(len, lines))
+    assert reader.poll() == ([], [])
+    assert reader.offset == sum(map(len, lines))
+
+
+def test_goal_survives_the_calls_so_a_writer_cannot_retain_the_reader(mod, reader, monkeypatch):
+    lines = kills(mod, 6)
+    monkeypatch.setattr("service.transport.POLL_MAX", len(lines[0]))
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", 2)
+    calls = 0
+    while True:
+        calls += 1
+        drained(reader)
+        kills(mod, 3)
+        if not reader.behind:
+            break
+
+    assert calls == 3
+    assert reader.offset == sum(map(len, lines))
+
+
+def test_aim_at_end_covers_what_was_written_after_the_goal(mod, reader, monkeypatch):
+    """Une sortie de serveur se juge sur son dernier écrit, pas sur un repère antérieur."""
+    lines = kills(mod, 4)
+    monkeypatch.setattr("service.transport.POLL_MAX", len(lines[0]))
+    monkeypatch.setattr("service.transport.DRAIN_PASSES", 2)
+    drained(reader)
+    assert reader.behind
+    kills(mod, 3)
+    reader.aim_at_end()
+    drained(reader)
+    while reader.behind:
+        drained(reader)
+
+    assert reader.offset == mod.out_path.stat().st_size
 
 
 def test_drain_of_a_missing_file_is_empty(tmp_path):

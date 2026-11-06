@@ -3,8 +3,9 @@
 `OutReader` suit un fichier `duel_X_out.txt` en mode binaire : l'offset compte des
 octets, jamais des caractères, et ne franchit que des lignes complètes. Une ligne
 n'arrête jamais la lecture : elle devient un événement ou une anomalie. Une passe lit
-`POLL_MAX` octets au plus, et une ligne de plus de `RECORD_MAX` octets ne s'accumule pas.
-`drain` enchaîne ces passes pour qui doit décider sur tout ce qui est déjà écrit.
+`POLL_MAX` octets et `POLL_RECORDS` lignes au plus, et une ligne de plus de `RECORD_MAX`
+octets ne s'accumule pas. `drain` enchaîne `DRAIN_PASSES` de ces passes au plus : au-delà,
+`behind` dit à qui doit décider sur tout ce qui est écrit que sa lecture n'est pas finie.
 
 `CommandChannel` porte le sens service → mod et la garantie « au plus une fois ».
 """
@@ -40,6 +41,10 @@ LINE_TOO_LONG = "line_too_long"
 RECORD_MAX = 1 << 16
 # Doit dépasser `RECORD_MAX` : une ligne admise se voit alors entière à la passe qui la commence.
 POLL_MAX = 1 << 20
+# Une passe de lignes du contrat en compte moins : ce plafond n'arrête qu'une rafale de `\n`.
+POLL_RECORDS = 1 << 14
+# Le travail d'un `drain`, donc d'une passe de `pump` : le retard se résorbe sur les suivantes.
+DRAIN_PASSES = 4
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,12 @@ class OutReader:
         self.offset = 0
         self.last: tuple[int, int] | None = None
         self._skipping = False
+        self._goal = 0
+
+    @property
+    def behind(self) -> bool:
+        """Vrai si le dernier `drain` a épuisé son budget avant la fin de ce qu'il visait."""
+        return self._goal > 0
 
     def poll(self) -> PollResult:
         """Traite les lignes complètes ajoutées ; le reste attend la lecture suivante."""
@@ -81,14 +92,20 @@ class OutReader:
         chunk = self._read_from_offset()
         if self._skipping:
             chunk = self._skip_long_line(chunk)
-        complete = chunk[: chunk.rfind(b"\n") + 1]
-        for line in complete.split(b"\n")[:-1]:
-            if len(line) > RECORD_MAX:
+        start = 0
+        for _ in range(POLL_RECORDS):
+            end = chunk.find(b"\n", start)
+            if end < 0:
+                break
+            if end - start > RECORD_MAX:
                 self._report_long_line(result)
             else:
-                self._take(line, result)
-            self.offset += len(line) + 1
-        tail = len(chunk) - len(complete)
+                self._take(chunk[start:end], result)
+            self.offset += end - start + 1
+            start = end + 1
+        else:
+            return result  # Plafond atteint : le reste se relit à la passe suivante.
+        tail = len(chunk) - start
         if tail > RECORD_MAX:
             self._report_long_line(result)
             self.offset += tail
@@ -96,18 +113,25 @@ class OutReader:
         return result
 
     def drain(self) -> Iterator[PollResult]:
-        """Rend passe par passe ce que `out` contient à l'appel, la mémoire restant bornée.
+        """Rend passe par passe ce que `out` contient, `DRAIN_PASSES` passes au plus.
 
-        Une seule passe laisserait non lu ce qui dépasse `POLL_MAX`. Le repère est la taille
-        à l'appel : un écrivain qui continue ne retient pas le lecteur. Une passe sans progrès
-        clôt aussi la boucle : il ne reste alors qu'une ligne inachevée.
+        Chaque lot a les bornes de `poll`, et l'appel entier celles de son budget, quelle que
+        soit la taille du fichier. Budget épuisé, `behind` reste vrai et l'appel suivant
+        reprend vers le même repère : la taille vue par le premier. Ainsi, un écrivain qui
+        continue ne retient pas le lecteur, même sur plusieurs appels. Une passe sans progrès
+        clôt aussi la lecture : il ne reste alors qu'une ligne inachevée.
         """
-        end = self._size()
-        while True:
+        self._goal = self._goal or self._size()
+        for _ in range(DRAIN_PASSES):
             before = self.offset
             yield self.poll()
-            if self.offset >= end or self.offset == before:
+            if self.offset >= self._goal or self.offset == before:
+                self._goal = 0
                 return
+
+    def aim_at_end(self) -> None:
+        """Fait viser au prochain `drain` la fin de `out` : un repère ancien en ignorerait."""
+        self._goal = 0
 
     def _size(self) -> int:
         try:
