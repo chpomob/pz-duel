@@ -34,7 +34,8 @@ body {
 }
 h1 { margin: 0; font-size: 18px; letter-spacing: 3px; }
 #tagline { margin: 0; color: var(--dim); font-size: 12px; }
-.topright { display: flex; gap: 8px; }
+.topright { display: flex; gap: 8px; align-items: center; }
+button.quit { padding: 4px 11px; font-size: 12px; }
 
 .badge {
   font-size: 11px; padding: 4px 9px; border-radius: 999px;
@@ -62,7 +63,9 @@ main { max-width: 940px; margin: 26px auto 90px; padding: 0 18px; }
 .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px dashed var(--line); }
 .row:last-child { border-bottom: 0; }
 .row .k { color: var(--dim); font-size: 13px; }
-.row .v { font-variant-numeric: tabular-nums; }
+.row .v { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; text-align: right; }
+.row .v.good { color: var(--green); }
+.row .v.bad { color: var(--red); }
 
 button {
   font: inherit; color: var(--text); background: var(--panel2);
@@ -104,12 +107,15 @@ input:focus, select:focus { outline: 1px solid var(--amber); }
 .dot.down { background: var(--red); }
 .dot.busy { background: var(--amber); }
 
-.invite { display: grid; grid-template-columns: 180px 1fr; gap: 18px; align-items: start; }
-@media (max-width: 700px) { .invite { grid-template-columns: 1fr; } }
-.qr { background: #fff; padding: 8px; border-radius: 8px; width: 180px; height: 180px; }
-.qr svg { width: 100%; height: 100%; display: block; }
+.invite { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+.invite-body { flex: 1 1 260px; min-width: 0; }
+/* Taille naturelle : 4 px par module, même pour un long lien. Le blanc est la marge du QR. */
+.qr { background: #fff; padding: 16px; border-radius: 8px; max-width: 100%; }
+.qr svg { display: block; max-width: 100%; height: auto; }
 .invite .code { font-size: 26px; letter-spacing: 4px; font-weight: 700; color: var(--amber); }
-.invite .line { font-family: ui-monospace, monospace; font-size: 15px; margin: 6px 0; }
+.invite .line { font-family: ui-monospace, monospace; font-size: 15px; margin: 6px 0; overflow-wrap: anywhere; }
+.invite .link { font-size: 13px; }
+.address { margin: 14px 0 0; }
 
 .scorebar { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: center; margin: 8px 0 4px; }
 .side { text-align: center; }
@@ -125,6 +131,7 @@ input:focus, select:focus { outline: 1px solid var(--amber); }
 .countdown { font-size: 92px; text-align: center; color: var(--amber); font-weight: 800; line-height: 1; }
 .hint { color: var(--dim); font-size: 12.5px; }
 
+.notice { border-left: 3px solid var(--amber); padding: 10px 12px; background: #2a2416; border-radius: 6px; }
 .err { border-left: 3px solid var(--red); padding: 10px 12px; background: #2a1a16; border-radius: 6px; color: #f3b3a6; }
 
 .logs { position: fixed; bottom: 0; left: 0; right: 0; background: #10130c; border-top: 1px solid var(--line); }

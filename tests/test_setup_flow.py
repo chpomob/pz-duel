@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import http.client
+import inspect
 import json
+import re
 import shutil
 import socket
 import threading
@@ -21,6 +23,7 @@ from test_preflight import assert_no_terminal, free_ports, make_install, zomboid
 from test_servers import Service, stopped_for_good, until
 from test_snapshots import engine_rig  # noqa: F401
 
+from service import api as api_module
 from service import engine as engine_module
 from service import main as main_module
 from service import paths
@@ -46,6 +49,7 @@ INSTALL_ROUTE = "/api/setup/install-mod"
 FOLDER_ROUTE = "/api/setup/pz-dir"
 WRITE_ROUTES = (INSTALL_ROUTE, FOLDER_ROUTE)
 QUIT_ROUTE = "/api/quit"
+UI_DIR = Path(engine_module.__file__).parent.parent / "ui"
 # Filet d'un test bloqué, au-delà de tout budget d'arrêt : c'est le test qui mesure le budget.
 MAIN_EXIT_S = 30
 POLL_S = 0.01
@@ -694,3 +698,72 @@ def test_ac27_foreign_quit_is_refused_and_the_service_stays(run_main, runtime, t
     assert engine._stopped is None
     quit_service(port)
     assert run.wait() == 0
+
+
+# -- UI : lecture statique, le rendu se vérifie à la main ---------------------
+
+
+def ui_script() -> str:
+    return (UI_DIR / "app.js").read_text("utf-8")
+
+
+def test_ac26_can_launch_commands_the_disabled_attribute():
+    script = ui_script()
+
+    assert "const canLaunch = (setup) => Boolean(setup && setup.ok);" in script
+    (button,) = [line for line in script.splitlines() if 'data-action="start"' in line]
+    assert "Launch duel" in button
+    assert "${canLaunch(setup) ? '' : 'disabled'}" in button
+
+
+def test_setup_screen_handles_each_action_of_the_service():
+    script = ui_script()
+
+    for action in (INSTALL_MOD, CHOOSE_FOLDER):
+        assert f"defect.action === '{action}'" in script
+    assert f"d.action !== '{RETRY}'" in script
+    for kind in ("pz", "mod", "ram", "port"):
+        assert re.search(rf"setupRow\('[^']+', '{kind}'", script)
+    for label, action in (
+        ("Install mod", "install-mod"),
+        ("Choose folder", "choose-folder"),
+        ("Check again", "retry"),
+    ):
+        assert f'data-action="{action}"' in script and label in script
+        assert f"a === '{action}'" in script
+
+
+def test_setup_is_not_measured_at_the_pace_of_the_poll():
+    """Une mesure lie les ports : à 700 ms, elle gênerait le service qu'elle contrôle."""
+    script = ui_script()
+    poll = script[script.index("async function poll()") : script.index("async function refreshSetup")]
+
+    assert "/api/setup" not in poll
+    assert "if (S.phase !== setupPhase && SETTLED_PHASES.includes(S.phase)) refreshSetup();" in poll
+
+
+def test_error_screen_can_run_the_checks_again():
+    """Hors d'`idle`, `/api/setup` rend la dernière mesure : sans ce départ, l'UI resterait bloquée."""
+    script = ui_script()
+    error = script[script.index("function renderError()") : script.index("function renderQuit()")]
+
+    assert 'data-action="rematch"' in error
+
+
+def test_ui_only_calls_routes_of_the_service():
+    routes = set(re.findall(r"'(/api/[a-z/-]+)'", ui_script()))
+
+    assert {QUIT_ROUTE, *WRITE_ROUTES, "/api/setup", "/api/invite/address"} <= routes
+    source = inspect.getsource(api_module)
+    assert [route for route in routes if f'"{route}"' not in source] == []
+
+
+def test_quit_button_reaches_the_quit_route_and_its_end_screen():
+    script = ui_script()
+    page = (UI_DIR / "index.html").read_text("utf-8")
+
+    assert re.search(r'<button[^>]*data-action="quit"[^>]*>Quit</button>', page)
+    assert "if (a === 'quit') { return quit(); }" in script
+    assert f"await api('{QUIT_ROUTE}', {{}})" in script
+    assert "if (quitting) return renderQuit();" in script
+    assert "PZ Duel has stopped" in script

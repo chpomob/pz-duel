@@ -11,6 +11,7 @@ import re
 import socket
 import threading
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -21,7 +22,7 @@ from test_modes import FastClock, settle, wait_phase
 from test_snapshots import PLAYER_PASSWORD, engine_rig, free_port  # noqa: F401
 from service import engine as engine_module
 from service.api import CONNECTIONS_MAX, LAUNCHER_NAME, make_server
-from service.engine import Engine
+from service.engine import REMATCH_NOTE_TEXT, Engine
 from service.guest_launcher import JOIN_MARK, PASSWORD_REFUSED, LauncherRefused
 from service.servers import read_ini
 from service.share import ShareHandler, ShareServer
@@ -70,6 +71,15 @@ SHORT_READ_S = 0.2
 WAIT_S = 5
 STUB_TOKEN = "0123456789abcdef0123456789abcdef"
 STUB_PATH = f"/{STUB_TOKEN}/{LAUNCHER_NAME}"
+UI_DIR = Path(engine_module.__file__).parent.parent / "ui"
+# La table de la bibliothèque, ligne par ligne : L, M, Q, H pour chaque version.
+QR_LEVELS = "LMQH"
+QR_VERSIONS = 40
+# Mode octet, à partir de la version 10 : 4 bits de mode et 16 de longueur.
+QR_HEADER_BITS = 20
+BITS_PER_BYTE = 8
+# Le plus long nom admis par `is_usable_address` : 253 caractères, labels de 63 au plus.
+LONGEST_HOST = ".".join(["a" * 63] * 3 + ["a" * 61])
 OTHER_METHODS = ("POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT", "FOO")
 
 
@@ -1117,3 +1127,108 @@ def test_ac42_notice_is_absent_when_the_listener_runs(lobby):
 
 def test_ac42_notice_is_absent_in_mock(mock_lobby):
     assert "share_text" not in mock_lobby.snapshot()["invite"]
+
+
+# -- UI : lecture statique, le rendu se vérifie à la main ---------------------
+
+
+def ui_script() -> str:
+    return (UI_DIR / "app.js").read_text("utf-8")
+
+
+def invite_card() -> str:
+    script = ui_script()
+    return script[script.index("function inviteCard()") : script.index("function renderLive()")]
+
+
+def qr_capacity(level: str, version: int) -> int:
+    """Octets que la bibliothèque livrée range dans ce QR, lus dans sa propre table."""
+    source = (UI_DIR / "vendor" / "qrcode.js").read_text("utf-8")
+    table = source[source.index("RS_BLOCK_TABLE = [") : source.index("var qrRSBlock")]
+    rows = [
+        [int(value) for value in row.split(",")]
+        for row in re.findall(r"\[(\d+(?:, *\d+)+)\]", table)
+    ]
+    assert len(rows) == QR_VERSIONS * len(QR_LEVELS)
+    row = rows[(version - 1) * len(QR_LEVELS) + QR_LEVELS.index(level)]
+    # Triplets : nombre de blocs, taille totale, taille des données.
+    data_bytes = sum(row[i] * row[i + 2] for i in range(0, len(row), 3))
+    return (data_bytes * BITS_PER_BYTE - QR_HEADER_BITS) // BITS_PER_BYTE
+
+
+def test_ac37_ui_no_longer_knows_the_old_scheme():
+    files = [path for path in UI_DIR.rglob("*") if path.is_file()]
+
+    assert files
+    assert [path for path in files if b"pzduel://" in path.read_bytes()] == []
+
+
+def test_ac37_qr_and_copy_carry_the_text_of_the_invite():
+    script = ui_script()
+    qr = script[script.index("function renderQr()") : script.index("function renderLogs()")]
+
+    assert "const text = (S.invite || {}).qr_text;" in qr
+    assert "qr.addData(text);" in qr
+    assert "copy(S.invite.link)" in script
+
+
+def test_ac37_ui_saves_the_launcher_of_the_api():
+    script = ui_script()
+
+    assert f"fetch('{LAUNCHER_ROUTE}')" in script
+    assert f"const LAUNCHER_FILE = '{LAUNCHER_NAME}';" in script
+
+
+def test_ac60_ui_shows_the_note_of_the_invite():
+    assert "${inv.rematch_note ? `<p class=\"hint\">${esc(inv.rematch_note)}</p>` : ''}" in invite_card()
+    assert REMATCH_NOTE_TEXT not in ui_script()
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        "esc(inv.link)",
+        "esc(inv.scope_text)",
+        "esc(inv.share_text)",
+        "esc(inv.launcher_refused)",
+        'data-action="save-launcher"',
+        'data-action="set-address"',
+        'id="f-address"',
+    ],
+)
+def test_invite_screen_shows_what_the_service_says(shown):
+    assert shown in invite_card()
+
+
+def test_invite_screen_asks_for_an_address_when_there_is_none():
+    assert "inv.needs_address ? 'err' : 'notice'" in invite_card()
+
+
+def test_manual_block_stays_for_a_linux_guest():
+    """H2 : l'invité Linux n'a pas de `.bat`. Sans adresse, `ip` serait une adresse inutilisable."""
+    card = invite_card()
+    block = card[card.index("${inv.needs_address ? '' :") :]
+
+    assert "${esc(inv.ip)}:${inv.port}" in block
+    assert "esc(inv.password)" in block
+
+
+def test_address_entry_survives_the_poll():
+    """`poll` réécrit l'écran : le champ et le QR doivent tenir à cette cadence."""
+    script = ui_script()
+
+    assert "if (inner === shown) return;" in script
+    assert "if (ev.target.id === 'f-address') addressDraft = ev.target.value;" in script
+    assert 'value="${esc(addressDraft)}"' in invite_card()
+    assert "box.dataset.text === text" in script
+
+
+def test_qr_holds_the_link_of_the_longest_host(lobby):
+    assert len(LONGEST_HOST) == 253
+    assert lobby.engine.set_invite_address(LONGEST_HOST)[0]
+    text = lobby.state()["invite"]["qr_text"]
+    assert LONGEST_HOST in text
+
+    (level,) = re.findall(r"qrcode\(0, '([LMQH])'\)", ui_script())
+
+    assert len(text.encode("ascii")) <= qr_capacity(level, QR_VERSIONS)
