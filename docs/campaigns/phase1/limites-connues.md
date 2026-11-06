@@ -43,3 +43,25 @@ Le service suppose une machine de bureau à un seul utilisateur. Sur une machine
 - **API locale sans jeton.** Le contrôle de `Host` et d'`Origin` n'arrête que les navigateurs. Un processus local qui envoie `Host: 127.0.0.1:<port>` sans `Origin` lit `/api/state` et poste les actions, dont `start` et `cancel`.
 - **Mots de passe dans `/api/state`.** `config.password`, celui de B, y reste à toute phase. `config.host_password`, celui de A, n'y paraît qu'en phase `lobby`, où l'hôte en a besoin.
 - **Secrets dans `ps`.** Le mot de passe admin figure dans la ligne de commande de chaque serveur (`-adminpassword`), et celui de A dans celle du client lancé par `Ouvrir PZ`.
+
+## Constats de la revue de clôture laissés ouverts (2026-11-06)
+
+Réels, non corrigés, assumés pour la phase 1. Aucun ne change la promesse tenue ici — le service
+et le contrat — mais chacun a un effet observable, décrit tel quel.
+
+- **Deux joueurs avec le même pseudo bloquent le lobby sans cause visible.** La liaison d'identité
+  refuse le second, et rien dans l'UI ne dit pourquoi.
+- **Un serveur figé devient un forfait pour son joueur** : l'absence est comptée contre lui, et
+  rien ne le redémarre. À traiter avec la supervision des serveurs, en phase 2.
+- **Serveurs orphelins si le service meurt par `SIGHUP` ou par crash** : aucun processus ne les
+  récupère. Un arrêt propre les arrête.
+- **Le `Redactor` ne couvre pas les mots de passe joueurs** : la règle « `host_password` en lobby
+  seulement » ne protège qu'un champ nommé, pas la classe.
+- **Une écriture partielle dans le fichier `in` corrompt la commande suivante** : le mod lit une
+  ligne tronquée comme une commande invalide.
+- **L'URI d'invitation est construite sans encodage** : un mot de passe ou un nom contenant un
+  caractère réservé casse le lien.
+
+Ces six points sont des correctifs courts ; ils sont différés parce qu'aucun ne touche la chaîne
+prouvée (mod chargé, `caps`, contrat, arrêt RCON), et parce que les corriger sans le premier duel
+réel reviendrait à régler des cas dont on ignore la fréquence.
