@@ -57,11 +57,18 @@ def git(*args: str) -> str:
 
 def steps() -> list[dict]:
     out = []
-    for path in sorted(FIXES_DIR.glob("F*.md")):
+    for path in FIXES_DIR.glob("F*.md"):
         first = path.read_text(encoding="utf-8").splitlines()[0]
         title = first.split("—", 1)[1].strip() if "—" in first else path.stem
         out.append({"id": path.stem, "title": title, "path": path})
-    return out
+
+    # F9 < F10 < F11 : la comparaison de chaînes plaçait F10 avant F9.
+    def order(step: dict) -> tuple[str, int]:
+        head = step["id"].lstrip("F")
+        digits = "".join(ch for ch in head if ch.isdigit())
+        return ("F", int(digits) if digits else 0)
+
+    return sorted(out, key=order)
 
 
 def run_loop(step: dict) -> int:
@@ -116,7 +123,10 @@ def main() -> int:
             print(f"{s['id']} — {s['title']}")
         return 0
     if args.start_at:
-        todo = [s for s in todo if s["id"] >= args.start_at]
+        start = args.start_at
+        digits = "".join(ch for ch in start.lstrip("F") if ch.isdigit())
+        threshold = int(digits) if digits else 0
+        todo = [s for s in todo if int("".join(ch for ch in s["id"].lstrip("F") if ch.isdigit()) or 0) >= threshold]
 
     if git("status", "--porcelain"):
         print("arbre sale, rien n'est lancé", file=sys.stderr)
