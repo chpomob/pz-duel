@@ -1,0 +1,69 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A1",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:472 : damage_taken utilise désormais OnPlayerGetDamage, enregistré ligne 577. service/engine.py:1137 : sans preuve du hook, l'atome et ses règles sont retirés ; son absence ne bloque plus une table conservant d'autres atomes."
+    },
+    {
+      "id": "A2",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:1052 : les résultats réessayables programment un nouvel essai. Les lignes 1107-1115 conservent l'échéance initiale ; la ligne 1122 ne transforme l'attente en KO qu'à son expiration. tests/test_match.py:189 couvre les refus transitoires suivis d'un succès."
+    },
+    {
+      "id": "A3",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:652 : prepare_restart intercepte OSError et soumet une invalidation via _lose_server. Les lignes 957 et 1063 protègent respectivement la lecture de out et poll_ack ; _transport_failed, ligne 685, transmet la fin au cœur pour conserver résultat et scores."
+    },
+    {
+      "id": "A4",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:1356 : l'horloge de cadence est time.monotonic. La ligne 1700 l'utilise pour pump ; les lignes 598-599 fixent une seule correspondance avec t0 mural, puis la ligne 626 avance le cœur avec cette correspondance constante."
+    },
+    {
+      "id": "A5",
+      "status": "RESOLVED",
+      "evidence": "README.md:31 et docs/campaigns/phase1/limites-connues.md:39 : l'hypothèse mono-utilisateur est explicite, avec l'absence de jeton, l'accès local aux mots de passe et aux actions, et l'exposition du mot de passe admin dans ps."
+    },
+    {
+      "id": "A6",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:1484 : open_game refuse toute phase autre que lobby. Les lignes 1493-1500 utilisent _client_starting sous verrou pendant le lancement, puis _client_alive empêche un second lancement tant que le processus suivi tourne."
+    },
+    {
+      "id": "A7",
+      "status": "RESOLVED",
+      "evidence": "service/engine.py:562 et :824 : les commentaires reconnaissent les heartbeats du serveur vide et la reprise avant reconnexion. docs/campaigns/phase1/spec.md:127 marque H3 contredite ; tests/test_match.py:1572 et :1578 attendent des beats sans joueur et un nouveau repère avant son retour."
+    },
+    {
+      "id": "B1",
+      "status": "RESOLVED",
+      "evidence": "service/api.py:212 : _read_body impose une échéance monotone globale de 5 secondes, avec read1 et un timeout recalculé. La ligne 205 répond explicitement 408 ; la ligne 268 vérifie Host et Origin avant de lire le corps."
+    },
+    {
+      "id": "B2",
+      "status": "PARTIAL",
+      "evidence": "service/transport.py:78 et :132 : poll borne les allocations par POLL_MAX et écarte les lignes dépassant RECORD_MAX en avançant l'offset. Mais drain, ligne 98, enchaîne les lectures jusqu'à la taille initiale entière ; service/engine.py:957 l'épuise dans une seule passe avant advance. Une très grosse queue sans newline peut donc encore monopoliser la pompe : le travail par passe moteur reste non borné."
+    }
+  ],
+  "new_findings": [
+    {
+      "severity": "minor",
+      "title": "Une requête incomplète avant le corps retient encore indéfiniment un thread HTTP",
+      "evidence": "service/api.py:112 délègue la lecture initiale à BaseHTTPRequestHandler sans installer de timeout ; make_server, ligne 295, crée un ThreadingHTTPServer sans protection supplémentaire. Le seul délai de lecture commence dans _read_body, ligne 218. Un client qui laisse la ligne de requête ou les en-têtes inachevés n'atteint jamais ce délai et peut conserver thread et socket indéfiniment."
+    }
+  ],
+  "read_files": [
+    "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+    "service/engine.py",
+    "service/transport.py",
+    "service/api.py",
+    "service/servers.py",
+    "README.md",
+    "docs/campaigns/phase1/spec.md",
+    "docs/campaigns/phase1/limites-connues.md",
+    "tests/test_match.py",
+    "service/runtime.json"
+  ]
+}
