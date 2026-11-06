@@ -65,6 +65,8 @@ JOB_EXTENDED_LIMIT_INFORMATION = 9
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 INVALID_HANDLE = ctypes.c_void_p(-1).value
 RESUME_FAILED = 0xFFFFFFFF
+LOCK_BYTES = 1
+LOCK_FILE_MODE = 0o600
 
 
 class ReplaceError(OSError):
@@ -525,3 +527,46 @@ def replace_file(
                     f"file still in use after {timeout_s} s."
                 ) from exc
         sleep(min(retry_s, remaining_s))
+
+
+def _lock(descriptor: int, platform: Platform, module: Any) -> bool:
+    """Rend faux si le verrou est tenu. `module` remplace `msvcrt` ou `fcntl` dans un test."""
+    if platform.name == WINDOWS.name:
+        if module is None:
+            import msvcrt as module
+        try:
+            module.locking(descriptor, module.LK_NBLCK, LOCK_BYTES)
+        except OSError:
+            # Sur un descripteur tout juste ouvert, seul un verrou tenu fait échouer l'appel,
+            # et son `errno` ne se lit pas partout : wine le laisse à 0.
+            return False
+        return True
+    if module is None:
+        import fcntl as module
+    try:
+        module.flock(descriptor, module.LOCK_EX | module.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def take_instance_lock(
+    path: Path, *, platform: Platform | None = None, module: Any = None
+) -> int | None:
+    """Rend le descripteur qui tient le verrou de `path`, ou `None` si un autre le tient.
+
+    N'attend jamais : c'est à l'appelant de décider. Le noyau rend le verrou à la fin du
+    processus, même forcée, et le descripteur n'est pas héritable : un serveur lancé ne le
+    garde pas. Sous POSIX, une autre panne que le verrou tenu lève : `flock` peut manquer
+    sur un dossier réseau, et ce n'est pas un rival à attendre.
+    """
+    platform = current() if platform is None else platform
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, LOCK_FILE_MODE)
+    taken = False
+    try:
+        taken = _lock(descriptor, platform, module)
+    finally:
+        if not taken:
+            os.close(descriptor)
+    return descriptor if taken else None

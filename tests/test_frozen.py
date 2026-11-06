@@ -1,4 +1,4 @@
-"""R4 : résolution des ressources et des données en mode figé simulé (AC18, AC19).
+"""R4 : binaire figé simulé, résolution (AC18, AC19) et démarrage (AC20, AC21, AC22, AC56).
 
 `service/paths.py` se résout à l'import : chaque cas tourne dans un sous-processus qui pose
 `sys.frozen` et `sys._MEIPASS` avant le premier import de `service` (D-D). Le dossier
@@ -8,16 +8,28 @@ d'extraction est une copie marquée : une lecture qui passerait par le dépôt s
 from __future__ import annotations
 
 import ast
+import errno
 import hashlib
+import http.client
+import http.server
+import io
 import json
 import os
+import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
+from test_preflight import make_install
 
+from service import api, main as main_module, paths, platforms
 from service.journal import read_journal
 
 REPO = Path(__file__).resolve().parent.parent
@@ -296,3 +308,810 @@ def test_paths_imports_nothing_from_service():
 
     assert not [node for node in imports if isinstance(node, ast.ImportFrom) and node.level]
     assert SERVICE_DIR.name not in roots
+
+
+# Démarrage : `main()` tourne dans un sous-processus, sur son fil principal -------------------
+
+SERVICE_UP_S = 30
+POLL_S = 0.02
+PROBE_S = 0.2
+SHORT_WAIT_S = 1
+STOPPERS = 8
+LOG_RELATIVE = Path("pz-duel") / "pz-duel.log"
+LOG_RELATIVE_WINDOWS = Path("PZDuel") / "pz-duel.log"
+UNENCODABLE = "→✓"  # ni l'un ni l'autre n'existe en cp1252
+
+# Un fichier `stop` tient lieu de signal : `send_signal` tuerait le processus sous Windows.
+DRIVER = """
+import io, json, signal, sys, threading, time
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+out = Path(config["out"])
+if config["frozen"]:
+    sys.frozen = True
+    sys._MEIPASS = config["extraction"]
+
+from service import main as main_module, platforms
+from service.engine import Engine
+
+if config["wait_s"] is not None:
+    main_module.load_runtime = lambda: {"instance_wait_s": config["wait_s"]}
+
+
+def append(name, text):
+    with open(out / name, "a", encoding="utf-8") as file:
+        file.write(text + "\\n")
+
+
+take_lock = platforms.take_instance_lock
+
+
+def take_and_tell(path):
+    lock = take_lock(path)
+    append("locks.txt", "held" if lock is None else "taken")
+    return lock
+
+
+platforms.take_instance_lock = take_and_tell
+
+
+def make_engine(mode, pz_dir):
+    append("engines.txt", mode)
+    if config["fail"]:
+        raise RuntimeError("injected startup failure")
+    return Engine(mode, zomboid_dir=out / "Zomboid", pz_dir=pz_dir, matches_dir=out / "matches")
+
+
+def browser(url):
+    append("browser.txt", url)
+    if config["browser"] == "raise":
+        raise OSError("no browser here")
+    return config["browser"] == "open"
+
+
+def watch_stop():
+    while not (out / "stop").exists():
+        time.sleep(0.02)
+    signal.raise_signal(signal.SIGINT)
+
+
+threading.Thread(target=watch_stop, daemon=True).start()
+if config["streams"] == "none":
+    sys.stdout = sys.stderr = None
+elif config["streams"] == "cp1252":
+    sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    sys.stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+main_module.main(config["argv"], make_engine, browser=browser)
+"""
+
+
+def pick_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for(ready, timeout_s: float = SERVICE_UP_S):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if value := ready():
+            return value
+        time.sleep(POLL_S)
+    raise AssertionError("condition jamais atteinte")
+
+
+def get(port: int, path: str = "/api/state") -> http.client.HTTPResponse | None:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=SERVICE_UP_S)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        response.read()
+        return response
+    except OSError:
+        return None
+    finally:
+        connection.close()
+
+
+def api_state(port: int) -> dict:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=SERVICE_UP_S)
+    try:
+        connection.request("GET", "/api/state")
+        return json.loads(connection.getresponse().read())
+    finally:
+        connection.close()
+
+
+def lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+class Launch:
+    """Un `main()` dans son processus, ses traces dans `out`."""
+
+    def __init__(self, root: Path, env: dict, name: str = "first", **config) -> None:
+        self.out = root / name
+        self.out.mkdir()
+        self.port = config.get("port") or pick_port()
+        settings = {
+            "out": str(self.out),
+            "frozen": True,
+            "extraction": str(REPO),
+            "argv": ["--port", str(self.port), *config.pop("args", ())],
+            "browser": "open",
+            "streams": None,
+            "fail": False,
+            "wait_s": None,
+            **{key: value for key, value in config.items() if key != "port"},
+        }
+        config_path = self.out / "config.json"
+        config_path.write_text(json.dumps(settings), encoding="utf-8")
+        self.stdout = self.out / "stdout.txt"
+        with open(self.stdout, "wb") as output:
+            self.process = subprocess.Popen(
+                [sys.executable, "-c", DRIVER, str(config_path)],
+                cwd=self.out,
+                env={
+                    **os.environ, **env, "PYTHONPATH": str(REPO), "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                },
+                stdout=output,
+                stderr=subprocess.STDOUT,
+            )  # fmt: skip
+
+    @property
+    def engines(self) -> list[str]:
+        return lines(self.out / "engines.txt")
+
+    @property
+    def opened(self) -> list[str]:
+        return lines(self.out / "browser.txt")
+
+    @property
+    def lock_attempts(self) -> list[str]:
+        return lines(self.out / "locks.txt")
+
+    def served_port(self) -> int:
+        """Le port que le service annonce, qui n'est pas forcément celui demandé."""
+        said = self.stdout.read_text(encoding="utf-8")
+        found = re.search(r"interface : http://127\.0\.0\.1:(\d+)/", said)
+        return int(found[1]) if found else 0
+
+    def wait_up(self, port: int | None = None) -> None:
+        def up() -> bool:
+            assert self.process.poll() is None, self.stdout.read_text(encoding="utf-8")
+            response = get(self.port if port is None else port)
+            return response is not None and response.status == http.client.OK
+
+        wait_for(up)
+
+    def wait_exit(self) -> int:
+        return self.process.wait(SUBPROCESS_TIMEOUT_S)
+
+    def stop(self) -> int:
+        (self.out / "stop").touch()
+        return self.wait_exit()
+
+
+@pytest.fixture
+def launch(tmp_path, user_env):
+    """Lance des `main()` et n'en laisse aucun derrière le test."""
+    launched: list[Launch] = []
+
+    def start(name: str = "first", **config) -> Launch:
+        launched.append(Launch(tmp_path, user_env, name, **config))
+        return launched[-1]
+
+    yield start
+    for running in launched:
+        running.process.kill()
+        running.process.wait(SUBPROCESS_TIMEOUT_S)
+
+
+@pytest.fixture
+def log_file(tmp_path):
+    relative = LOG_RELATIVE_WINDOWS if sys.platform == "win32" else LOG_RELATIVE
+    return tmp_path / "data" / relative
+
+
+# AC20 ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "frozen, args, mode",
+    [(True, [], "real"), (True, ["--mode", "mock"], "mock"), (False, [], "mock")],
+)
+def test_ac20_default_mode(launch, frozen, args, mode):
+    running = launch(frozen=frozen, args=["--no-browser", *args])
+
+    running.wait_up()
+
+    assert running.engines == [mode]
+    assert api_state(running.port)["mode"] == mode
+    assert running.stop() == 0
+
+
+# AC21 ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("frozen", [True, False])
+@pytest.mark.parametrize("streams", ["none", "cp1252"])
+def test_ac21_serves_without_usable_streams(launch, tmp_path, frozen, streams):
+    # Le message de détection cite le dossier : il ne s'encode pas en cp1252.
+    install = make_install(tmp_path / f"pz {UNENCODABLE}")
+
+    running = launch(
+        frozen=frozen,
+        streams=streams,
+        args=["--no-browser", "--mode", "mock", "--pz-dir", str(install)],
+    )
+
+    running.wait_up()
+    assert running.stop() == 0
+
+
+def test_ac21_injected_failure_leaves_a_line_and_an_exit_code(launch, log_file):
+    running = launch(fail=True, streams="none", args=["--no-browser"])
+
+    assert running.wait_exit() != 0
+    assert "injected startup failure" in log_file.read_text(encoding="utf-8")
+
+
+def test_ac21_sys_exit_message_reaches_the_log(launch, tmp_path, log_file):
+    absent = tmp_path / "no-such-game"
+
+    running = launch(streams="none", args=["--no-browser", "--pz-dir", str(absent)])
+
+    assert running.wait_exit() != 0
+    assert running.engines == []
+    assert absent.name in log_file.read_text(encoding="utf-8")
+
+
+def test_ac21_usage_error_reaches_the_log(launch, log_file):
+    running = launch(streams="none", args=["--mode", "nonsense"])
+
+    assert running.wait_exit() != 0
+    assert "nonsense" in log_file.read_text(encoding="utf-8")
+
+
+def test_ac21_unusable_log_keeps_the_exit_code(launch, tmp_path):
+    (tmp_path / "data").write_text("a file where the data folder should be", encoding="utf-8")
+
+    running = launch(fail=True, streams="none", args=["--no-browser"])
+
+    assert running.wait_exit() != 0
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict"),
+        None,
+    ],
+    ids=["cp1252", "none"],
+)
+def test_report_never_raises(monkeypatch, stream):
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    main_module.report(f"PZ Duel {UNENCODABLE}")
+
+    if stream is not None:
+        assert b"PZ Duel \\u2192\\u2713" in stream.buffer.getvalue()
+
+
+def test_report_survives_a_closed_stream(monkeypatch):
+    closed = io.StringIO()
+    closed.close()
+    monkeypatch.setattr(sys, "stdout", closed)
+
+    main_module.report("PZ Duel")
+
+
+# AC56 ---------------------------------------------------------------------------------------
+
+
+def test_ac56_opens_the_interface_once(launch):
+    running = launch()
+
+    running.wait_up()
+    url = wait_for(lambda: running.opened)
+
+    assert url == [f"http://127.0.0.1:{running.port}/"]
+    assert get(running.port, "/").status == http.client.OK
+    assert running.stop() == 0
+    assert len(running.opened) == 1
+
+
+def test_ac56_no_browser_never_opens(launch):
+    running = launch(args=["--no-browser"])
+
+    running.wait_up()
+
+    assert running.stop() == 0
+    assert running.opened == []
+
+
+@pytest.mark.parametrize("outcome", ["refuse", "raise"])
+def test_ac56_failed_opening_keeps_the_service(launch, log_file, outcome):
+    running = launch(browser=outcome)
+
+    running.wait_up()
+    wait_for(lambda: running.opened)
+    url = f"http://127.0.0.1:{running.port}/"
+
+    def told() -> bool:
+        return log_file.read_text(encoding="utf-8").count(url) >= 2
+
+    wait_for(told)
+    assert get(running.port).status == http.client.OK
+    assert running.process.poll() is None
+    assert running.stop() == 0
+
+
+def test_open_interface_reports_the_outcome():
+    assert main_module.open_interface("http://u/", lambda url: True) is True
+    assert main_module.open_interface("http://u/", lambda url: False) is False
+
+
+def test_open_interface_uses_the_default_browser(monkeypatch):
+    opened = []
+    monkeypatch.setattr(main_module.webbrowser, "open", lambda url: opened.append(url) or True)
+
+    assert main_module.open_interface("http://u/") is True
+    assert opened == ["http://u/"]
+
+
+# AC22 ---------------------------------------------------------------------------------------
+
+
+class ForeignHandler(http.server.BaseHTTPRequestHandler):
+    server_header = "Foreign/1.0"
+    body = b'{"phase": "idle"}'
+
+    def version_string(self) -> str:
+        return self.server_header
+
+    def log_message(self, fmt, *args) -> None:
+        return
+
+    def do_GET(self) -> None:
+        self.send_response(http.client.OK)
+        self.send_header("Content-Length", str(len(self.body)))
+        self.end_headers()
+        self.wfile.write(self.body)
+
+
+def foreign_server(server_header: str = ForeignHandler.server_header, body=ForeignHandler.body):
+    handler = type("Handler", (ForeignHandler,), {"server_header": server_header, "body": body})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_ac22_second_launch_opens_the_running_service(launch):
+    first = launch(args=["--no-browser"])
+    first.wait_up()
+
+    second = launch("second", port=first.port)
+
+    assert second.wait_exit() == 0
+    assert second.opened == [f"http://127.0.0.1:{first.port}/"]
+    assert second.engines == []
+    assert get(first.port).status == http.client.OK
+    assert first.stop() == 0
+
+
+def test_ac22_service_is_found_on_a_later_port(launch):
+    foreign = foreign_server()
+    port = foreign.server_address[1]
+    try:
+        first = launch(port=port, args=["--no-browser"])
+        wait_for(lambda: first.engines)
+        second_port = wait_for(lambda: main_module.find_service(port, PROBE_S))
+
+        second = launch("second", port=port)
+
+        assert second.wait_exit() == 0
+        assert second.opened == [f"http://127.0.0.1:{second_port}/"]
+        assert second.engines == []
+        assert first.stop() == 0
+    finally:
+        foreign.shutdown()
+        foreign.server_close()
+
+
+def test_ac22_service_outside_the_candidates_is_found_by_its_recorded_port(launch):
+    first = launch(args=["--port", "0", "--no-browser"])
+    served = wait_for(first.served_port)
+    first.wait_up(served)
+
+    second = launch("second", port=first.port)
+
+    assert second.wait_exit() == 0
+    assert second.opened == [f"http://127.0.0.1:{served}/"]
+    assert second.engines == []
+    assert first.stop() == 0
+
+
+@pytest.mark.parametrize("recorded", ["not a port", "", "99999", "-1", "dead"])
+def test_stale_recorded_port_leaves_a_normal_start(launch, log_file, recorded):
+    path = log_file.parent / main_module.INSTANCE_PORT
+    path.parent.mkdir(parents=True)
+    path.write_text(str(pick_port()) if recorded == "dead" else recorded, encoding="ascii")
+
+    running = launch(args=["--no-browser"])
+
+    running.wait_up()
+    assert running.engines == ["real"]
+    assert path.read_text(encoding="ascii") == str(running.port)
+    assert running.stop() == 0
+
+
+def test_unwritable_port_record_keeps_the_service(launch, log_file):
+    (log_file.parent / main_module.INSTANCE_PORT).mkdir(parents=True)
+
+    running = launch(args=["--no-browser"])
+
+    running.wait_up()
+    assert f"Could not record port {running.port}" in log_file.read_text(encoding="utf-8")
+    assert running.stop() == 0
+
+
+def test_ac22_second_launch_honours_no_browser(launch):
+    first = launch(args=["--no-browser"])
+    first.wait_up()
+
+    second = launch("second", port=first.port, args=["--no-browser"])
+
+    assert second.wait_exit() == 0
+    assert second.opened == []
+    assert first.stop() == 0
+
+
+def test_ac22_foreign_port_leads_to_the_next_one(launch):
+    foreign = foreign_server()
+    port = foreign.server_address[1]
+    try:
+        running = launch(port=port)
+
+        url = wait_for(lambda: running.opened)[0]
+        served = int(url.rstrip("/").rsplit(":", 1)[1])
+
+        assert port < served < port + main_module.PORT_SPAN
+        assert running.engines == ["real"]
+        running.wait_up(served)
+        assert running.stop() == 0
+    finally:
+        foreign.shutdown()
+        foreign.server_close()
+
+
+def test_simultaneous_launches_build_one_engine(launch):
+    port = pick_port()
+
+    runs = [launch(f"run{index}", port=port) for index in range(3)]
+
+    wait_for(lambda: sum(run.process.poll() == 0 for run in runs) == len(runs) - 1)
+    winner = next(run for run in runs if run.process.poll() is None)
+    served = wait_for(lambda: winner.opened)
+    assert sum(len(run.engines) for run in runs) == 1
+    assert winner.engines == ["real"]
+    assert all(run.opened == served for run in runs)
+    assert winner.stop() == 0
+
+
+def test_silent_lock_holder_ends_the_loser_with_an_error(launch, log_file):
+    lock = platforms.take_instance_lock(log_file.parent / main_module.INSTANCE_LOCK)
+    try:
+        loser = launch(wait_s=SHORT_WAIT_S, streams="none")
+
+        assert loser.wait_exit() != 0
+        assert loser.engines == []
+        assert loser.opened == []
+        assert "did not answer" in log_file.read_text(encoding="utf-8")
+    finally:
+        os.close(lock)
+
+
+def test_lock_released_by_a_dead_winner_goes_to_the_waiting_loser(launch, log_file):
+    lock = platforms.take_instance_lock(log_file.parent / main_module.INSTANCE_LOCK)
+    loser = launch(args=["--no-browser"])
+    wait_for(lambda: loser.lock_attempts)
+    assert loser.engines == []
+
+    os.close(lock)
+
+    loser.wait_up()
+    assert loser.engines == ["real"]
+    assert loser.stop() == 0
+
+
+def test_lock_is_held_as_long_as_the_service_runs(launch, log_file):
+    running = launch(args=["--no-browser"])
+    running.wait_up()
+    path = log_file.parent / main_module.INSTANCE_LOCK
+
+    assert platforms.take_instance_lock(path) is None
+
+    assert running.stop() == 0
+    lock = platforms.take_instance_lock(path)
+    assert lock is not None
+    os.close(lock)
+
+
+@pytest.mark.parametrize(
+    "server_header, body",
+    [
+        ("Foreign/1.0", b'{"phase": "idle"}'),
+        ("PZduel/0.1", b"<html>not json</html>"),
+        ("PZduel/0.1", b"[1, 2]"),
+        ("PZduel/0.1", b'{"other": 1}'),
+    ],
+    ids=["header", "not-json", "not-object", "no-phase"],
+)
+def test_lookalike_is_not_a_service(server_header, body):
+    server = foreign_server(server_header, body)
+    try:
+        assert not main_module.is_service(server.server_address[1], SUBPROCESS_TIMEOUT_S)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_probe_recognises_the_real_header_and_state():
+    server = foreign_server(api.Handler.server_version, b'{"phase": "idle"}')
+    try:
+        assert main_module.is_service(server.server_address[1], SUBPROCESS_TIMEOUT_S)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_probe_gives_up_on_a_silent_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        started = time.monotonic()
+
+        assert not main_module.is_service(listener.getsockname()[1], PROBE_S)
+
+    assert time.monotonic() - started < SUBPROCESS_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.0 200 OK\r\n",
+        b"HTTP/1.0 200 OK\r\nServer: PZduel/0.1\r\nContent-Length: 1000\r\n\r\n",
+    ],
+    ids=["head", "body"],
+)
+def test_probe_deadline_holds_against_a_dripping_listener(head):
+    done = threading.Event()
+
+    def drip(listener: socket.socket) -> None:
+        peer, _ = listener.accept()
+        with peer:
+            try:
+                peer.sendall(head)
+                while not done.wait(PROBE_S / 4):
+                    peer.sendall(b"x")
+            except OSError:
+                pass
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        dripper = threading.Thread(target=drip, args=(listener,), daemon=True)
+        dripper.start()
+        started = time.monotonic()
+        try:
+            assert not main_module.is_service(listener.getsockname()[1], PROBE_S)
+            assert time.monotonic() - started < SHORT_WAIT_S
+        finally:
+            done.set()
+            dripper.join(SUBPROCESS_TIMEOUT_S)
+
+
+def test_probe_past_the_last_port_is_no_service():
+    assert not main_module.is_service(1 << 16, PROBE_S)
+
+
+# Depuis les sources (H3) ----------------------------------------------------------------------
+
+
+def test_sources_keep_messages_and_write_nothing_to_the_data_dir(launch, tmp_path):
+    running = launch(frozen=False, args=["--no-browser"])
+
+    running.wait_up()
+    assert running.stop() == 0
+
+    said = running.stdout.read_text(encoding="utf-8")
+    assert f"PZ Duel — interface : http://127.0.0.1:{running.port}/" in said
+    assert "Arrêt demandé : fermeture des serveurs" in said
+    assert not (tmp_path / "data").exists()
+
+
+def test_sources_start_beside_a_running_service(launch):
+    first = launch(frozen=False, args=["--no-browser"])
+    first.wait_up()
+
+    second = launch("second", frozen=False, port=first.port, args=["--no-browser"])
+
+    served = wait_for(second.served_port)
+    assert served != first.port
+    second.wait_up(served)
+    assert second.stop() == 0
+    assert second.engines == ["mock"]
+    assert second.lock_attempts == []
+    assert first.stop() == 0
+
+
+def test_sources_let_a_startup_exception_through(launch, tmp_path):
+    running = launch(frozen=False, fail=True, args=["--no-browser"])
+
+    assert running.wait_exit() != 0
+    assert "RuntimeError: injected startup failure" in running.stdout.read_text(encoding="utf-8")
+    assert not (tmp_path / "data").exists()
+
+
+# Signaux et arrêt --------------------------------------------------------------------------
+
+
+def test_stop_signals_follow_the_platform():
+    other = signal.SIGBREAK if sys.platform == "win32" else signal.SIGTERM
+
+    assert main_module.STOP_SIGNALS == (signal.SIGINT, other)
+
+
+class StopSpy:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.done = threading.Event()
+
+    def shutdown(self) -> None:
+        self.calls.append("shutdown")
+        if len(self.calls) == 2:
+            self.done.set()
+
+
+def test_stop_function_is_idempotent_across_threads_and_signals(monkeypatch):
+    handlers = {}
+    monkeypatch.setattr(signal, "signal", handlers.__setitem__)
+    spy = StopSpy()
+
+    stop = main_module.stop_on_signal(spy, spy)
+
+    threads = [threading.Thread(target=stop) for _ in range(STOPPERS)]
+    for thread in threads:
+        thread.start()
+    for signum, handler in handlers.items():
+        handler(signum, None)
+    for thread in threads:
+        thread.join(SUBPROCESS_TIMEOUT_S)
+
+    assert set(handlers) == set(main_module.STOP_SIGNALS)
+    assert spy.done.wait(SUBPROCESS_TIMEOUT_S)
+    stop()
+    assert spy.calls == ["shutdown", "shutdown"]
+
+
+# API : le port ne se partage pas ------------------------------------------------------------
+
+
+class RecordingSocket:
+    def __init__(self) -> None:
+        self.options: list[tuple[int, int, int]] = []
+
+    def setsockopt(self, level: int, option: int, value: int) -> None:
+        self.options.append((level, option, value))
+
+    def bind(self, address) -> None:
+        self.address = address
+
+    def getsockname(self):
+        return self.address
+
+    def close(self) -> None:
+        return
+
+
+def test_api_server_never_reuses_an_address():
+    assert api.BoundedHTTPServer.allow_reuse_address is False
+
+    server = api.make_server(None)
+    try:
+        with pytest.raises(OSError):
+            api.make_server(None, port=server.server_address[1])
+    finally:
+        server.server_close()
+
+
+def test_api_server_is_exclusive_where_the_option_exists(monkeypatch):
+    monkeypatch.setattr(socket, "SO_EXCLUSIVEADDRUSE", -5, raising=False)  # valeur de Winsock
+    server = api.BoundedHTTPServer(("127.0.0.1", 0), api.Handler, bind_and_activate=False)
+    real, server.socket = server.socket, RecordingSocket()
+    real.close()
+
+    server.server_bind()
+
+    assert server.socket.options == [(socket.SOL_SOCKET, -5, 1)]
+
+
+# Verrou d'instance ---------------------------------------------------------------------------
+
+
+def test_lock_excludes_a_second_holder_and_ends_with_its_descriptor(tmp_path):
+    path = tmp_path / "data" / main_module.INSTANCE_LOCK
+
+    first = platforms.take_instance_lock(path)
+
+    assert first is not None
+    assert platforms.take_instance_lock(path) is None
+    os.close(first)
+    second = platforms.take_instance_lock(path)
+    assert second is not None
+    os.close(second)
+
+
+def fake_msvcrt(error: OSError | None = None) -> types.SimpleNamespace:
+    calls = []
+
+    def locking(descriptor, mode, size):
+        calls.append((mode, size))
+        if error is not None:
+            raise error
+
+    return types.SimpleNamespace(locking=locking, LK_NBLCK=2, calls=calls)
+
+
+def test_windows_lock_goes_through_msvcrt_without_waiting(tmp_path):
+    module = fake_msvcrt()
+
+    lock = platforms.take_instance_lock(
+        tmp_path / "instance.lock", platform=platforms.WINDOWS, module=module
+    )
+
+    assert lock is not None
+    os.close(lock)
+    assert module.calls == [(module.LK_NBLCK, platforms.LOCK_BYTES)]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PermissionError(errno.EACCES, "held"), OSError(0, "Error")],
+    ids=["windows", "wine"],
+)
+def test_windows_held_lock_is_no_error(tmp_path, error):
+    lock = platforms.take_instance_lock(
+        tmp_path / "instance.lock", platform=platforms.WINDOWS, module=fake_msvcrt(error)
+    )
+
+    assert lock is None
+
+
+def fake_fcntl(error: OSError) -> types.SimpleNamespace:
+    def flock(descriptor, operation):
+        raise error
+
+    return types.SimpleNamespace(flock=flock, LOCK_EX=2, LOCK_NB=4)
+
+
+def test_posix_held_lock_is_no_error(tmp_path):
+    module = fake_fcntl(BlockingIOError(errno.EWOULDBLOCK, "held"))
+
+    lock = platforms.take_instance_lock(
+        tmp_path / "instance.lock", platform=platforms.LINUX, module=module
+    )
+
+    assert lock is None
+
+
+def test_posix_other_lock_failure_is_not_taken_for_a_rival(tmp_path):
+    module = fake_fcntl(OSError(errno.ENOLCK, "no locks"))
+
+    with pytest.raises(OSError, match="no locks"):
+        platforms.take_instance_lock(
+            tmp_path / "instance.lock", platform=platforms.LINUX, module=module
+        )

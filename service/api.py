@@ -31,6 +31,8 @@ TYPES = {
 # La liaison sur la boucle locale n'arrête pas le navigateur de l'utilisateur : une page web
 # peut viser l'API, ou la lire par rebinding DNS. Seuls ces noms désignent ce service.
 LOCAL_NAMES = ("127.0.0.1", "localhost")
+# Début de l'en-tête `Server` : `main` y reconnaît un service déjà actif.
+SERVER_TOKEN = "PZduel/"
 JSON_TYPE = "application/json"
 # Tout champ qui nomme une chose s'ajoute ici : `test_api_security` balaie le service.
 IDENTIFIER_FIELDS = ("action", "preset", "mode", "side")
@@ -85,7 +87,7 @@ class HeadReader(socket.SocketIO):
 class Handler(BaseHTTPRequestHandler):
     engine = None  # injecté par make_server
     # `timeout`, injecté aussi, se pose sur le socket dès `setup`, avant toute lecture.
-    server_version = "PZduel/0.1"
+    server_version = f"{SERVER_TOKEN}0.1"
     answered = False  # vrai dès que l'en-tête de réponse part : plus rien ne peut le remplacer
 
     def setup(self) -> None:
@@ -344,14 +346,27 @@ def turned_away() -> bytes:
     return head.encode("ascii") + body
 
 
+def claim_address(sock: socket.socket) -> None:
+    """Sous Windows, interdit de partager l'adresse. La constante n'existe que là."""
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if exclusive is not None:
+        sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+
+
 class BoundedHTTPServer(ThreadingHTTPServer):
     """Un fil par connexion, `CONNECTIONS_MAX` au plus ; le refus ne bloque jamais `accept`."""
 
     request_queue_size = CONNECTIONS_MAX  # une rafale se refuse, elle ne se perd pas en SYN
+    # `HTTPServer` l'active, et `SO_REUSEADDR` laisserait sous Windows lier un port tenu.
+    allow_reuse_address = False
 
     def __init__(self, *args, **kwargs) -> None:
         self._slots = threading.BoundedSemaphore(CONNECTIONS_MAX)
         super().__init__(*args, **kwargs)
+
+    def server_bind(self) -> None:
+        claim_address(self.socket)
+        super().server_bind()
 
     def process_request(self, request, client_address) -> None:
         if not self._slots.acquire(blocking=False):
