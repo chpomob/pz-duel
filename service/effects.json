@@ -1,7 +1,7 @@
 {
   "atoms": {
     "zombie_kill": {"source": "server"},
-    "damage_taken": {"source": "server", "hook_proof": "OnWeaponHitCharacter"},
+    "damage_taken": {"source": "server", "hook_proof": "OnPlayerGetDamage"},
     "build": {"source": "server"},
     "vehicle_repair": {"source": "server"},
     "explosion": {"source": "server"}

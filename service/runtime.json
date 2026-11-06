@@ -11,6 +11,7 @@
   "ack_timeout_s": 15,
   "cmd_result_timeout_s": 60,
   "probe_timeout_s": 30,
+  "probe_retry_s": 5,
   "beat_timeout_s": 30,
   "hook_window_s": 120,
   "countdown_s": 3,

@@ -36,6 +36,7 @@ from .rules import (
     load_effects,
     load_runtime,
     load_table,
+    narrow_table,
     rules_hash,
 )
 from .servers import (
@@ -74,6 +75,7 @@ from .verdict import (
     UNKNOWN,
     combined_spawn,
     fallback,
+    probe_may_retry,
     publish_capabilities,
     verdict,
 )
@@ -342,6 +344,8 @@ class _Probe(NamedTuple):
     deadline_ms: int
     status: str = UNKNOWN
     cause: str = ""
+    # Posé par un refus passager : l'essai suivant part à cet instant, dans le même délai.
+    retry_ms: int | None = None
 
 
 class _Refusal(NamedTuple):
@@ -397,6 +401,8 @@ class RealMatch:
     ) -> None:
         self.config = config
         self.table = table
+        # La table jouée : `table` reste scellée, le retrait d'un atome ne touche que celle-ci.
+        self._played_table: Mapping[str, Any] = table
         self.rules_hash = rules_hash(table)
         self.runtime = runtime
         self.effects = effects
@@ -580,7 +586,7 @@ class RealMatch:
         """
         self._journal.write("state", {"phase": "running", "t0_ms": now_ms}, None, FIRST_MT)
         duration_s = self.config["duration_s"]
-        self._core = MatchCore(self.table, self.runtime, self.effects, now_ms, duration_s)
+        self._core = MatchCore(self._played_table, self.runtime, self.effects, now_ms, duration_s)
         self._core.reserve_seq(self._last_cmd_seq)
 
         def change(state: MatchState) -> None:
@@ -1005,6 +1011,10 @@ class RealMatch:
         elif status != APPLIED:
             reason = self.redactor.redact(str(result.get("reason", "")))
             cause = f"résultat {status} {reason}".rstrip()
+            if probe_may_retry(result):
+                retry_ms = now_ms + self.runtime["probe_retry_s"] * MS_PER_S
+                self._probes[side] = probe._replace(cause=cause, retry_ms=retry_ms)
+                return
         elif spawned < MIN_SPAWNED:
             cause = f"{spawned} zombie créé"
         else:
@@ -1034,9 +1044,13 @@ class RealMatch:
         return None
 
     def _send_probes(self, now_ms: int) -> None:
-        """Une sonde par camp à sa première connexion, hors du cœur : `mt` nul, `seq` réservé."""
+        """Une sonde par camp à sa première connexion, hors du cœur : `mt` nul, `seq` réservé.
+
+        Un essai suivant garde l'échéance du premier : `probe_timeout_s` borne toute la sonde.
+        """
         for side, player in self.players.items():
-            if player is None or side in self._probes:
+            probe = self._probes.get(side)
+            if player is None or not (probe is None or self._retry_due(probe, now_ms)):
                 continue
             self._last_cmd_seq += 1
             seq = self._last_cmd_seq
@@ -1049,8 +1063,15 @@ class RealMatch:
             # Non journalisée, elle ne part pas : l'échéance rend la sonde en échec.
             if self._write_safely(COMMAND, {COMMAND: command, "latency_ms": None}, side, None):
                 self._channels[side].write(command)
-            deadline_ms = now_ms + self.runtime["probe_timeout_s"] * MS_PER_S
-            self._probes[side] = _Probe(seq, deadline_ms)
+            if probe is None:
+                deadline_ms = now_ms + self.runtime["probe_timeout_s"] * MS_PER_S
+                self._probes[side] = _Probe(seq, deadline_ms)
+            else:
+                self._probes[side] = probe._replace(seq=seq, retry_ms=None)
+
+    @staticmethod
+    def _retry_due(probe: _Probe, now_ms: int) -> bool:
+        return probe.retry_ms is not None and probe.retry_ms <= now_ms < probe.deadline_ms
 
     def _probes_resolved(self) -> bool:
         return all(side in self._probes and self._probes[side].status == OK for side in SIDES)
@@ -1058,7 +1079,8 @@ class RealMatch:
     def _failed_probes(self, now_ms: int) -> _Refusal | None:
         for side, probe in self._probes.items():
             if probe.status == UNKNOWN and now_ms >= probe.deadline_ms:
-                cause = f"aucun résultat après {self.runtime['probe_timeout_s']} s"
+                last = probe.cause or "aucun résultat"
+                cause = f"{last} après {self.runtime['probe_timeout_s']} s"
                 self._probes[side] = probe._replace(status=KO, cause=cause)
         failed = [
             f"camp {side}, fonction {PROBE_FUNCTION} : {probe.cause}"
@@ -1072,13 +1094,18 @@ class RealMatch:
         return _Refusal(STEP_LOBBY, message)
 
     def _close_window(self) -> _Refusal | None:
-        """Fige la décision, puis revalide la table sur les seuls atomes actifs."""
+        """Fige la décision, puis joue la table sans ce qui dépend d'un atome retiré.
+
+        Seule une table privée de tout atome est refusée. Un atome absent de `caps` sans
+        être retiré reste un écart de contrat : la revalidation le refuse.
+        """
         self.window.close()
         for withdrawal in self.window.withdrawn:
             self._write_safely(ATOM_WITHDRAWN, withdrawal, None, None)
+        narrowed = narrow_table(self.table, [item["atom"] for item in self.window.withdrawn])
         try:
-            load_table(
-                self.table,
+            self._played_table = load_table(
+                narrowed,
                 self.effects,
                 self.runtime["limits"],
                 file_stem=self.table["id"],
@@ -1089,11 +1116,19 @@ class RealMatch:
                 f"atome {item['atom']} retiré, hook {item['hook']} non vu sur "
                 + ", ".join(item["sides"])
                 for item in self.window.withdrawn
-                if item["atom"] in self.table["atoms"]
+                if item["atom"] in self.table["atoms"] and not narrowed["atoms"]
             ]
             cause = " ; ".join(causes or [self.redactor.redact(str(exc))])
             return _Refusal(STEP_CONTRACT, f"contrat refusé : {cause}")
+        self._log_disabled_rules()
         return None
+
+    def _log_disabled_rules(self) -> None:
+        kept = {rule["id"] for rule in self._played_table["rules"]}
+        disabled = [rule["id"] for rule in self.table["rules"] if rule["id"] not in kept]
+        if disabled:
+            message = f"règles désactivées par le retrait d'un atome : {', '.join(disabled)}"
+            self._on_state(lambda state: state.log(message, "warn"))
 
     def _rules_refusal(self) -> _Refusal | None:
         """Recontrôle le hash sur le fichier du preset, tel qu'il est à cet instant."""

@@ -11,7 +11,7 @@ import pytest
 
 from service import engine, rules
 from service.protocol import parse_event
-from service.rules import TableError, When, load_table, parse_when, rules_hash
+from service.rules import TableError, When, load_table, narrow_table, parse_when, rules_hash
 
 PRESETS_DIR = Path(rules.__file__).resolve().parent / "presets"
 SHIPPED = ("demo", "duel_rapide", "hardcore", "pression")
@@ -397,6 +397,34 @@ def test_active_atoms_restrict_catalog(catalog, limits):
     load_table(table(), catalog, limits, active_atoms=["zombie_kill", "damage_taken"])
     with pytest.raises(TableError, match="damage_taken.*retiré"):
         load_table(table(), catalog, limits, active_atoms=["zombie_kill"])
+
+
+def test_narrow_table_removes_what_depends_on_the_atom(catalog, limits):
+    raw = table()
+    sealed = rules_hash(raw)
+    raw_atoms = list(raw["atoms"])
+
+    narrowed = narrow_table(raw, ["damage_taken"])
+
+    assert narrowed["atoms"] == ["zombie_kill"]
+    assert [rule["id"] for rule in narrowed["rules"]] == [
+        rule["id"] for rule in raw["rules"] if "damage_taken" not in rule["when"]
+    ]
+    assert "damage_taken" not in narrowed["score"]["points"]
+    assert "combo" not in narrowed["modifiers"]
+    load_table(narrowed, catalog, limits, active_atoms=["zombie_kill"])
+    assert raw["atoms"] == raw_atoms and rules_hash(raw) == sealed
+
+
+def test_narrow_table_ignores_an_atom_the_table_never_had():
+    raw = table()
+    assert narrow_table(raw, ["explosion"]) == raw
+
+
+def test_narrowed_table_needs_one_atom(catalog, limits):
+    narrowed = narrow_table(table(), ["zombie_kill", "damage_taken"])
+    with pytest.raises(TableError, match="atoms"):
+        load_table(narrowed, catalog, limits, active_atoms=[])
 
 
 def test_rules_hash_is_canonical():

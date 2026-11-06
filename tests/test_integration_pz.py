@@ -404,8 +404,6 @@ def live_checklist_gaps(
     if DAMAGE_ATOM in published | journaled:
         if DAMAGE_ATOM in active:
             gaps.append(f"retrait contradictoire : {DAMAGE_ATOM} retiré et actif")
-        if DAMAGE_ATOM in start["preset"]["atoms"]:
-            gaps.append(f"{DAMAGE_ATOM} retiré alors que la table le contient")
     elif DAMAGE_ATOM not in active:
         gaps.append(f"{DAMAGE_ATOM} ni actif ni retiré")
     elif not any(event["kind"] == DAMAGE_ATOM for event in events):
@@ -516,12 +514,11 @@ def test_live_checklist_fails_on_withdrawal_contradiction():
     )
 
 
-def test_live_checklist_refuses_withdrawal_of_table_atom():
+def test_live_checklist_accepts_withdrawal_of_table_atom():
+    """Un atome retiré n'empêche plus le match : sa blessure n'est alors pas exigée."""
     records, state = live_traces(withdrawn=True)
     records[0]["data"]["preset"]["atoms"] = [KILL_ATOM, DAMAGE_ATOM]
-    assert live_checklist_gaps(records, state) == [
-        f"{DAMAGE_ATOM} retiré alors que la table le contient"
-    ]
+    assert live_checklist_gaps(records, state) == []
 
 
 def test_live_checklist_requires_a_decision_on_the_atom():

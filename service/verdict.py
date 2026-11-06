@@ -32,6 +32,8 @@ ZOMBIE_KILL = "zombie_kill"
 CAPS = "caps"
 HOOK_SEEN = "hook_seen"
 PROBE_KIND = "probe_spawn"
+REFUSED = "refused"
+NO_SQUARE = "no_square"
 APPLIED = "applied"
 MIN_SPAWNED = 1
 RUNTIME_FIELDS = ("attribution_min_kills", "probe_timeout_s")
@@ -119,12 +121,20 @@ def attribution(records: Sequence[Record], min_kills: int) -> dict[str, Any]:
     }
 
 
-def _probes(records: Iterable[Record]) -> dict[str, Record]:
-    """Première `probe_spawn` de chaque camp : une seule part, à sa première connexion."""
-    probes: dict[str, Record] = {}
+def probe_may_retry(result: Mapping[str, Any]) -> bool:
+    """Dit si un `cmd_result` de sonde décrit un état passager, et non un spawn impossible.
+
+    Un joueur endormi, ou des cases pas encore chargées, ne disent rien de la fonction.
+    """
+    return result["status"] == REFUSED or result.get("reason") == NO_SQUARE
+
+
+def _probes(records: Iterable[Record]) -> dict[str, list[Record]]:
+    """Essais de `probe_spawn` de chaque camp, le premier ouvrant le délai."""
+    probes: dict[str, list[Record]] = {}
     for record in records:
         if record["type"] == COMMAND and record["data"]["command"]["kind"] == PROBE_KIND:
-            probes.setdefault(record["side"], record)
+            probes.setdefault(record["side"], []).append(record)
     return probes
 
 
@@ -139,16 +149,21 @@ def _result_of(records: Iterable[Record], side: str, seq: int) -> Record | None:
 
 
 def _probe_status(
-    records: Sequence[Record], probe: Record, timeout_ms: int, now_ms: int
+    records: Sequence[Record], attempts: Sequence[Record], timeout_ms: int, now_ms: int
 ) -> str:
-    side, deadline_ms = probe["side"], probe["ts_ms"] + timeout_ms
-    result = _result_of(records, side, probe["data"]["command"]["seq"])
-    if result is None:
-        return KO if now_ms >= deadline_ms else UNKNOWN
-    if result["ts_ms"] > deadline_ms:
-        return KO
-    data = result["data"]["data"]
-    return OK if data["status"] == APPLIED and data.get("spawned", 0) >= MIN_SPAWNED else KO
+    side, deadline_ms = attempts[0]["side"], attempts[0]["ts_ms"] + timeout_ms
+    for attempt in attempts:
+        result = _result_of(records, side, attempt["data"]["command"]["seq"])
+        if result is None:
+            continue
+        if result["ts_ms"] > deadline_ms:
+            return KO
+        data = result["data"]["data"]
+        if data["status"] == APPLIED and data.get("spawned", 0) >= MIN_SPAWNED:
+            return OK
+        if not probe_may_retry(data):
+            return KO
+    return KO if now_ms >= deadline_ms else UNKNOWN
 
 
 def spawn_status(
@@ -156,9 +171,10 @@ def spawn_status(
 ) -> dict[str, str]:
     """Statut de la sonde de spawn par camp.
 
-    La sonde part à la connexion du joueur : le délai court depuis sa ligne `command`.
-    `now_ms` vaut par défaut le `ts_ms` de la dernière ligne. Un résultat arrivé après
-    le délai ne rattrape pas la sonde, que le lancement a alors déjà refusée.
+    La sonde part à la connexion du joueur : le délai court depuis sa première ligne
+    `command`, et un état passager n'est `ko` qu'à son terme. `now_ms` vaut par défaut le
+    `ts_ms` de la dernière ligne. Un résultat arrivé après le délai ne rattrape pas la
+    sonde, que le lancement a alors déjà refusée.
     """
     if now_ms is None:
         now_ms = records[-1]["ts_ms"] if records else 0

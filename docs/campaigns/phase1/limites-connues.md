@@ -1,5 +1,19 @@
 # Limites connues de la phase 1
 
+## Preuve de `damage_taken`
+
+Constaté dans les classes de 42.21, jamais en session réelle.
+
+- `OnWeaponHitCharacter` ne suit qu'un coup d'arme de joueur : aucune morsure ne le tire.
+- `OnBeingHitByZombie` est déclaré par `LuaEventManager`, mais aucune classe du jar ni aucun Lua du jeu ne le déclenche. Le mod l'enregistre sans en attendre de preuve.
+- `OnPlayerGetDamage` porte donc `hook_proof`. Une morsure n'y paraît qu'à travers le saignement (`BLEEDING`, depuis `BodyPart.DamageUpdate`). `Bite.process` applique bien la blessure sur le serveur, et rien dans `BodyDamage.Update` ne l'en exclut.
+
+### Non prouvé
+
+- **Que `BodyDamage.Update` tourne sur le serveur pour un joueur connecté.** S'il n'y tourne pas, `damage_taken` est retiré à chaque match : le duel reste jouable, sans ses règles de blessure. Le repli serait alors un écart de santé lu dans `step()`.
+- Une morsure qui ne saigne pas ne compte pas.
+- Pendant un saignement, une seconde morsure ne donne pas de nouvel atome : il faut 5 s sans perte de sang.
+
 ## Connexion du client sans Steam
 
 Les serveurs tournent avec `-Dzomboid.steam=0`. `Ouvrir PZ` lance donc `projectzomboid.sh -nosteam +connect <adresse> +password …`, sans relais par Steam : Steam rendrait la main sans rien dire du client.

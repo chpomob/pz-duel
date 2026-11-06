@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MIN_KILLS = 100
 PROBE_TIMEOUT_S = 30
 T0_MS = 1_793_830_000_000
-HOOK = "OnWeaponHitCharacter"
+HOOK = "OnPlayerGetDamage"
 CAPS = {
     "build": "42.21.0",
     "mod": "0.1.0",
@@ -237,7 +237,9 @@ def test_spawn_status():
         ("applied", {"spawned": 1}, PROBE_TIMEOUT_S, "ok"),
         ("applied", {"spawned": 0}, 0, "ko"),
         ("applied", {}, 0, "ko"),
-        ("refused", {"reason": "sleeping"}, 0, "ko"),
+        ("refused", {"reason": "sleeping"}, 0, "unknown"),
+        ("failed", {"reason": "no_square"}, 0, "unknown"),
+        ("failed", {"reason": "no_spawn", "spawned": 0}, 0, "ko"),
         ("failed", {"spawned": 1}, 0, "ko"),
         ("applied", {"spawned": 1}, PROBE_TIMEOUT_S + 1, "ko"),
     ],
@@ -248,6 +250,22 @@ def test_spawn_result(status, fields, delay_s, expected):
     log.after(delay_s)
     log.result("A", 1, status, **fields)
     assert spawn_status(log.records, PROBE_TIMEOUT_S)["A"] == expected
+
+
+def test_spawn_retry_counts_from_the_first_attempt():
+    log = Log()
+    log.probe("A", 1)
+    log.result("A", 1, "refused", reason="asleep")
+    log.after(5)
+    log.probe("A", 2)
+    log.result("A", 2, "failed", reason="no_square")
+    assert spawn_status(log.records, PROBE_TIMEOUT_S)["A"] == "unknown"
+    assert spawn_status(log.records, PROBE_TIMEOUT_S, T0_MS + 30_000)["A"] == "ko"
+
+    log.after(5)
+    log.probe("A", 3)
+    log.result("A", 3, spawned=1)
+    assert spawn_status(log.records, PROBE_TIMEOUT_S, T0_MS + 30_000)["A"] == "ok"
 
 
 def test_spawn_ignores_results_of_other_commands():

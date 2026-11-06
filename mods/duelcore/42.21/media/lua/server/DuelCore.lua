@@ -8,6 +8,13 @@
 --   OnZombieDead(zombie)                         serveur
 --   OnHitZombie(zombie, wielder, part, weapon)   serveur
 --   OnWeaponHitCharacter(wielder, target, weapon, damage)
+--                                                coup d'arme d'un joueur, jamais une morsure :
+--                                                sonde seulement
+--   OnPlayerGetDamage(character, type, damage)   BodyDamage.Update, sans garde serveur : une
+--                                                morsure s'y lit par BLEEDING, à chaque
+--                                                mise à jour tant que la plaie saigne
+--   OnBeingHitByZombie                           déclaré par LuaEventManager, tiré par aucune
+--                                                classe ni aucun Lua du jeu : ne prouve rien
 --   OnThrowableExplode(trap, square)             l'auteur vient de trap:getAttacker()
 --   OnProcessAction("build", player, args)       serveur, porte l'auteur
 --   OnCharacterDeath(character)                  serveur
@@ -52,6 +59,12 @@ local MAX_CMD_SEQ = 2147483647
 -- jeu l'a recyclé. Un kill tardif, par le feu, part sans auteur plutôt que sous un faux.
 local ATTACKER_TTL_MS = 10000
 local ATTACKER_PURGE_MS = 30000
+-- Une plaie saigne à chaque mise à jour : elle reste un seul atome tant qu'elle ne se tait pas
+-- pendant ce délai. Sans quoi une morsure inonderait `out` et viderait les budgets.
+local WOUND_QUIET_MS = 5000
+-- Les types d'`OnPlayerGetDamage` qui disent une blessure. La faim, la soif, la maladie ou
+-- une chute usent aussi la santé, sans que personne n'ait frappé.
+local WOUND_TYPES = { BLEEDING = true, WEAPONHIT = true }
 
 -- État de session. `session` reste nil tant que le plancher est inconnu : sans lui,
 -- aucune commande n'est traitée et rien n'est émis, faute de `boot`.
@@ -72,6 +85,7 @@ local rainStopAt = nil
 local hooks = {}
 local seenHooks = {}
 local lastAttacker = {}
+local lastWound = {}
 local recentDead = {}
 local deadPlayers = {}
 local repairClasses = 0
@@ -432,15 +446,38 @@ local function onZombieDead(zombie)
     emit("zombie_kill", positionData(zombie, data), sideOf(author))
 end
 
--- Le coup d'un joueur sur un zombie tire aussi ce hook, sans rien dire de `damage_taken` :
--- la preuve est le premier atome émis, pas la première réception.
-local function onWeaponHitCharacter(wielder, target, weapon, damage)
-    if not isPlayer(target) then return end
-    emit("damage_taken", positionData(target, authoredBy(target, {
-        w = weapon and weapon:getFullType() or NULL,
-        damage = damage or NULL,
-    })), side)
-    noteHook("OnWeaponHitCharacter")
+local function attackerName(attacker)
+    if isPlayer(attacker) then return attacker:getUsername() end
+    if attacker and instanceof(attacker, "IsoZombie") then return "zombie" end
+    return NULL
+end
+
+-- La preuve est une blessure reçue, pas une réception quelconque du hook.
+local function reportWound(hook, player, attacker, damage)
+    local name = player:getUsername()
+    local now = getTimestampMs()
+    local quiet = not lastWound[name] or now - lastWound[name] >= WOUND_QUIET_MS
+    lastWound[name] = now
+    if quiet then
+        emit("damage_taken", positionData(player, authoredBy(player, {
+            hp = player:getBodyDamage():getOverallBodyHealth(),
+            attacker = attackerName(attacker),
+            damage = damage or NULL,
+        })), side)
+    end
+    noteHook(hook)
+end
+
+local function onPlayerGetDamage(character, damageType, damage)
+    if isPlayer(character) and WOUND_TYPES[damageType] then
+        reportWound("OnPlayerGetDamage", character, character:getAttackedBy(), damage)
+    end
+end
+
+-- Jamais tiré en 42.21, donc sans signature constatée : sans cible, le joueur du serveur.
+local function onBeingHitByZombie(attacker, target)
+    local player = isPlayer(target) and target or onlinePlayers()[1]
+    if player then reportWound("OnBeingHitByZombie", player, attacker, nil) end
 end
 
 local function onProcessAction(action, character)
@@ -536,7 +573,9 @@ end
 
 register("OnZombieDead", onZombieDead)
 register("OnHitZombie", onHitZombie)
-register("OnWeaponHitCharacter", onWeaponHitCharacter, true)
+register("OnPlayerGetDamage", onPlayerGetDamage, true)
+register("OnBeingHitByZombie", onBeingHitByZombie, true)
+register("OnWeaponHitCharacter", nil)
 register("OnProcessAction", onProcessAction)
 register("OnThrowableExplode", onThrowableExplode)
 register("OnCharacterDeath", onCharacterDeath)
@@ -718,7 +757,7 @@ local function emitCaps()
         if available then atoms[#atoms + 1] = atom end
     end
     addAtom("zombie_kill", hooks.OnZombieDead)
-    addAtom("damage_taken", hooks.OnWeaponHitCharacter)
+    addAtom("damage_taken", hooks.OnPlayerGetDamage)
     addAtom("build", hooks.OnProcessAction)
     addAtom("vehicle_repair", repairClasses > 0)
     addAtom("explosion", hooks.OnThrowableExplode)

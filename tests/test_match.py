@@ -101,8 +101,48 @@ def failed(lobby: Lobby, side: str, seq: int) -> None:
     lobby.mods[side].cmd_result(seq, "failed", reason="exception")
 
 
-def refused(lobby: Lobby, side: str, seq: int) -> None:
-    lobby.mods[side].cmd_result(seq, "refused", reason="asleep")
+def answer_probes(lobby: Lobby, side: str, seq: int, status: str, reason: str) -> None:
+    """Répond de même à chaque essai, jusqu'au terme du délai."""
+    elapsed_s = 0
+    while True:
+        lobby.mods[side].cmd_result(seq, status, reason=reason)
+        wait_retry_planned(lobby, side, seq)
+        elapsed_s += lobby.rig.runtime["probe_retry_s"]
+        lobby.at(elapsed_s)
+        if elapsed_s >= PROBE_TIMEOUT_S:
+            return
+        seq = next_probe(lobby, side, seq)
+
+
+def wait_retry_planned(lobby: Lobby, side: str, seq: int) -> None:
+    """Attend que le moteur ait lu le refus de l'essai `seq` : l'horloge peut alors avancer."""
+
+    def planned() -> bool:
+        probe = lobby.engine._match._probes.get(side)
+        return probe is not None and probe.seq == seq and probe.retry_ms is not None
+
+    lobby.rig.until(lambda _: planned())
+
+
+def still_refused(lobby: Lobby, side: str, seq: int) -> None:
+    """Tous les essais du délai sont refusés : seul l'échec persistant conclut."""
+    answer_probes(lobby, side, seq, "refused", "asleep")
+
+
+def still_no_square(lobby: Lobby, side: str, seq: int) -> None:
+    answer_probes(lobby, side, seq, "failed", "no_square")
+
+
+def next_probe(lobby: Lobby, side: str, seq: int) -> int:
+    """Attend l'essai suivant de la sonde, et rend son `seq`."""
+    path = lobby.mods[side].in_path
+
+    def latest() -> int:
+        lines = path.read_bytes().splitlines()
+        return json.loads(lines[-1])["seq"] if lines else seq
+
+    lobby.rig.until(lambda _: latest() > seq)
+    return latest()
 
 
 def nothing_spawned(lobby: Lobby, side: str, seq: int) -> None:
@@ -117,7 +157,9 @@ def no_result(lobby: Lobby, side: str, seq: int) -> None:
     lobby.at(PROBE_TIMEOUT_S)
 
 
-@pytest.mark.parametrize("scenario", [failed, refused, nothing_spawned, no_result])
+@pytest.mark.parametrize(
+    "scenario", [failed, still_refused, still_no_square, nothing_spawned, no_result]
+)
 @pytest.mark.parametrize("side", SIDES)
 def test_spawn_probe_failure_is_signalled(engine_rig, scenario, side):
     assert engine_rig.runtime["probe_timeout_s"] == PROBE_TIMEOUT_S
@@ -135,6 +177,51 @@ def test_spawn_probe_failure_is_signalled(engine_rig, scenario, side):
     assert stopped_for_good(engine_rig)
     assert lobby.step("lobby")["state"] == "error"
     assert spawn_status(engine_rig.journal(lobby.match_id), PROBE_TIMEOUT_S)[side] == "ko"
+
+
+@pytest.mark.parametrize(
+    "status, reason", [("refused", "no_player"), ("refused", "asleep"), ("failed", "no_square")]
+)
+def test_transient_probe_refusal_is_retried(engine_rig, status, reason):
+    """Deux refus passagers, puis un spawn : le lancement continue, sur les mêmes 30 s."""
+    retry_s = engine_rig.runtime["probe_retry_s"]
+    lobby = Lobby(engine_rig, PRESET)
+    lobby.mods["B"].cmd_result(lobby.join("B"), "applied", spawned=1)
+
+    seq = lobby.join("A")
+    for attempt in (1, 2):
+        lobby.mods["A"].cmd_result(seq, status, reason=reason)
+        wait_retry_planned(lobby, "A", seq)
+        lobby.settle()
+        assert lobby.state()["phase"] == "lobby"
+        assert lobby.state()["capabilities"]["spawn"]["A"] == "unknown"
+        # L'intervalle borne les essais : rien ne repart avant son terme.
+        assert json.loads(lobby.mods["A"].in_path.read_bytes().splitlines()[-1])["seq"] == seq
+        lobby.at(attempt * retry_s)
+        seq = next_probe(lobby, "A", seq)
+    lobby.mods["A"].cmd_result(seq, "applied", spawned=1)
+
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    assert state["capabilities"]["spawn"]["A"] == "ok"
+    assert state["capabilities"]["fallback"] is None
+    assert spawn_status(engine_rig.journal(lobby.match_id), PROBE_TIMEOUT_S)["A"] == "ok"
+
+
+def test_retried_probe_keeps_the_first_deadline(engine_rig):
+    """Un essai sans réponse n'ouvre pas un nouveau délai : l'échéance reste celle du premier."""
+    lobby = Lobby(engine_rig, PRESET)
+    seq = lobby.join("A")
+    lobby.mods["A"].cmd_result(seq, "refused", reason="asleep")
+    wait_retry_planned(lobby, "A", seq)
+    lobby.at(engine_rig.runtime["probe_retry_s"])
+    next_probe(lobby, "A", seq)
+
+    lobby.at(PROBE_TIMEOUT_S)
+    state = engine_rig.wait("error")
+
+    assert "refused asleep après 30 s" in state["error"]
+    assert state["capabilities"]["spawn"]["A"] == "ko"
 
 
 def test_probe_sent_once_at_first_connection(engine_rig):
@@ -279,6 +366,89 @@ def test_refused_player_cannot_decide_the_match(engine_rig):
     duel.played(duel.mods["B"].emit("player_death", {}))
     assert duel.finish()["result"]["winner"] == "A"
     assert duel.replays()
+
+
+def withdrawn_duel(rig, preset: str) -> Duel:
+    """Mène `preset` au match sans preuve de `damage_taken` : l'atome y est retiré."""
+    duel = Duel(rig, preset)
+    window_s = rig.runtime["hook_window_s"]
+    duel.join_and_resolve()
+    duel.wait_detail(f"temps restant : {window_s} s")
+    duel.at(window_s)
+    state = rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    # La fenêtre dépasse `disconnect_grace_s` : sans `beat`, les deux camps sembleraient partis.
+    for side in SIDES:
+        duel.beat(side)
+    duel.t0_s = window_s + rig.runtime["countdown_s"]
+    duel.at_match(0)
+    state = rig.wait("running", "error")
+    assert state["phase"] == "running", state["error"]
+    return duel
+
+
+def test_withdrawn_atom_disables_what_depends_on_it(engine_rig):
+    """`damage_taken` retiré : `hurt_supply` se tait, les kills continuent, le rejeu suit."""
+    duel = withdrawn_duel(engine_rig, "duel_rapide")
+    assert duel.state()["capabilities"]["withdrawn"] == ["damage_taken"]
+    assert any("hurt_supply" in line["msg"] for line in duel.state()["logs"])
+
+    duel.at_match(1)
+    duel.played(duel.mods["A"].emit("damage_taken", {"hp": 90}))
+    duel.kills("A", 1)
+    engine_rig.until(lambda _: duel.records("command")[-1]["data"]["command"]["kind"] == "spawn_pop")
+
+    kinds = [r["data"]["command"]["kind"] for r in duel.records("command")]
+    assert "supply_drop" not in kinds
+    assert not [r for r in duel.records("rule_fired") if r["data"]["rule"] == "hurt_supply"]
+    assert duel.replays()
+
+
+def test_withdrawal_mutes_absence_and_combo(engine_rig):
+    """`pression` : sans `damage_taken`, ni `not atom(...)` toujours vrai, ni combo sans fin."""
+    duel = withdrawn_duel(engine_rig, "pression")
+    played = duel.engine._match._played_table
+
+    assert {"untouched_minute", "hurt_supply"}.isdisjoint(r["id"] for r in played["rules"])
+    assert "combo" not in played["modifiers"]
+    assert "score_gap" in played["modifiers"]
+    # La table scellée ne bouge pas : le hash recontrôlé reste celui du fichier.
+    assert "damage_taken" in duel.engine._match.table["atoms"]
+
+
+def test_table_without_any_atom_left_is_refused(engine_rig, presets):
+    """Seul cas de refus : plus aucun atome, l'erreur nomme l'atome, le hook et les camps."""
+    path = presets / "duel_rapide.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["atoms"] = ["damage_taken"]
+    raw["rules"] = [rule for rule in raw["rules"] if rule["id"] == "hurt_supply"]
+    raw["score"]["points"] = {"damage_taken": 1}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    lobby = Lobby(engine_rig, "duel_rapide")
+    lobby.join_and_resolve()
+    lobby.wait_detail("temps restant : 120 s")
+
+    lobby.at(engine_rig.runtime["hook_window_s"])
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "error"
+    for name in ("damage_taken", "OnPlayerGetDamage", "A, B"):
+        assert name in state["error"]
+    assert stopped_for_good(engine_rig)
+    assert state["capabilities"]["fallback"] is None
+
+
+def test_atoms_left_without_any_rule_still_play(engine_rig, presets):
+    """Un atome survivant suffit, même sans règle ni point : seule l'absence d'atome refuse."""
+    path = presets / "duel_rapide.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["rules"] = [rule for rule in raw["rules"] if rule["id"] == "hurt_supply"]
+    raw["score"]["points"] = {"damage_taken": 1}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    duel = withdrawn_duel(engine_rig, "duel_rapide")
+
+    assert duel.engine._match._played_table["rules"] == []
 
 
 def test_no_countdown_without_both_players(engine_rig):

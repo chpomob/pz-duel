@@ -27,7 +27,7 @@ SANDBOX = "SandboxVars = {\n    DayLength = 4,\n    StartYear = 3,\n    StartMon
 )
 SIDES = ("A", "B")
 ATOM = "damage_taken"
-HOOK = "OnWeaponHitCharacter"
+HOOK = "OnPlayerGetDamage"
 WITH_ATOM = "duel_rapide"
 WITHOUT_ATOM = "demo"
 PLAYERS = {"A": "durand", "B": "dupont"}
@@ -172,7 +172,7 @@ class FrozenClock:
 class Lobby:
     """Vrai `Engine` réel mené au lobby sur les doubles, à un instant fourni par le test."""
 
-    def __init__(self, rig, preset: str) -> None:
+    def __init__(self, rig, preset: str | None) -> None:
         self.rig = rig
         self.clock = FrozenClock()
         self.engine = rig.build()
@@ -190,9 +190,8 @@ class Lobby:
         self.mods = {side: FakeMod(rig.zomboid / "Lua", side) for side in SIDES}
         for side, mod in self.mods.items():
             (rig.caps_dir / side).write_bytes(mod.line("caps", data))
-        ok, message = self.engine.action(
-            "start", {"preset": preset, "password": PLAYER_PASSWORD}
-        )
+        chosen = {"preset": preset} if preset else {}
+        ok, message = self.engine.action("start", {**chosen, "password": PLAYER_PASSWORD})
         assert ok, message
         state = rig.wait("lobby", "error")
         assert state["phase"] == "lobby", state["error"]
@@ -266,7 +265,7 @@ def state_entered_at(lobby: Lobby, phase: str) -> int:
     return next(r["ts_ms"] for r in lobby.records("state") if r["data"].get("phase") == phase)
 
 
-def refused_at_window_end(lobby: Lobby) -> None:
+def withdrawn_at_window_end(lobby: Lobby) -> None:
     lobby.mods["A"].hook_seen()
     lobby.join_and_resolve()
     lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 120 s")
@@ -276,17 +275,15 @@ def refused_at_window_end(lobby: Lobby) -> None:
     assert lobby.state()["phase"] == "lobby"
 
     lobby.at(120)
-    state = lobby.rig.wait("error")
-    for name in (ATOM, HOOK, "sur B"):
-        assert name in state["error"]
-    assert stopped_for_good(lobby.rig)
-    assert state["servers"] == {"A": "down", "B": "down"}
-    assert ATOM in state["capabilities"]["withdrawn"]
+    state = lobby.rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    assert state_entered_at(lobby, "countdown") == (L_S + 120) * MS
+    assert state["capabilities"]["withdrawn"] == [ATOM]
     assert ATOM not in state["capabilities"]["active_atoms"]
-    # Ce refus ne conclut rien sur l'architecture.
+    assert "zombie_kill" in state["capabilities"]["active_atoms"]
+    # Ce retrait ne conclut rien sur l'architecture.
     assert state["capabilities"]["fallback"] is None
-    assert lobby.step("contract")["state"] == "error"
-    assert "countdown" not in lobby.phases()
+    assert lobby.step("contract")["state"] == "ok"
     (withdrawn,) = lobby.records("atom_withdrawn")
     assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
     assert withdrawn["ts_ms"] == (L_S + 120) * MS
@@ -306,10 +303,7 @@ def late_hook_read_with_the_deadline_pass(lobby: Lobby) -> None:
     lobby.clock.on_next_read = miss_the_deadline
     state = lobby.rig.wait("countdown", "error")
 
-    assert state["phase"] == "error"
-    for name in (ATOM, HOOK, "sur B"):
-        assert name in state["error"]
-    assert "countdown" not in lobby.phases()
+    assert state["phase"] == "countdown", state["error"]
     assert ATOM in state["capabilities"]["withdrawn"]
     (withdrawn,) = lobby.records("atom_withdrawn")
     assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
@@ -361,7 +355,7 @@ def seen_on_both_sides(lobby: Lobby) -> None:
 @pytest.mark.parametrize(
     "preset, scenario",
     [
-        (WITH_ATOM, refused_at_window_end),
+        (WITH_ATOM, withdrawn_at_window_end),
         (WITH_ATOM, late_hook_read_with_the_deadline_pass),
         (WITHOUT_ATOM, published_without_the_atom),
         (WITH_ATOM, seen_on_both_sides),
@@ -371,6 +365,20 @@ def test_unseen_hook_withdraws_atom(engine_rig, preset, scenario):
     assert engine_rig.runtime["hook_window_s"] == 120
 
     scenario(Lobby(engine_rig, preset))
+
+
+def test_default_preset_launches_without_the_proof(engine_rig):
+    """Sans preset choisi, `duel_rapide` atteint le décompte même si aucune blessure n'arrive."""
+    lobby = Lobby(engine_rig, None)
+    assert lobby.state()["config"]["preset"] == WITH_ATOM
+    lobby.join_and_resolve()
+    lobby.wait_detail(f"hook {HOOK} attendu sur A, B ; temps restant : 120 s")
+
+    lobby.at(engine_rig.runtime["hook_window_s"])
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state["capabilities"]["withdrawn"] == [ATOM]
 
 
 def test_hook_window_outlives_contract_step(engine_rig):

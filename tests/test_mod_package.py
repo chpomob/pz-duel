@@ -115,27 +115,26 @@ def test_command_reader_guards() -> None:
     assert guard < advance < enqueue
 
 
-def test_hook_proof_is_a_hit_on_the_player() -> None:
-    """`hook_seen` d'`OnWeaponHitCharacter` suit le premier `damage_taken`, jamais un coup sur zombie."""
+def test_hook_proof_is_a_wound_on_the_player() -> None:
+    """`hook_seen` d'une blessure suit son `damage_taken`, jamais une réception quelconque."""
     code = lua_code()
-    assert re.search(r'register\("OnWeaponHitCharacter", onWeaponHitCharacter, true\)', code)
-    assert len(re.findall(r'^register\(.*, true\)$', code, re.MULTILINE)) == 1
+    assert re.search(r'register\("OnPlayerGetDamage", onPlayerGetDamage, true\)', code)
+    assert re.search(r'register\("OnBeingHitByZombie", onBeingHitByZombie, true\)', code)
+    assert len(re.findall(r'^register\(.*, true\)$', code, re.MULTILINE)) == 2
 
     wrapper = function_body("register")
     assert re.search(r"if not selfProved then noteHook\(name\) end", wrapper)
     assert wrapper.index("noteHook(name)") < wrapper.index("handler(...)")
 
-    handler = function_body("onWeaponHitCharacter")
-    guard = handler.index("if not isPlayer(target) then return end")
-    atom = handler.index('emit("damage_taken"')
-    proof = handler.index('noteHook("OnWeaponHitCharacter")')
-    assert guard < atom < proof
+    assert "isPlayer(character) and WOUND_TYPES[damageType]" in function_body("onPlayerGetDamage")
+    handler = function_body("reportWound")
+    assert handler.index('emit("damage_taken"') < handler.index("noteHook(hook)")
 
 
 def test_caps_publish_registration_not_proof() -> None:
     caps = function_body("emitCaps")
     assert "hooks = hooks" in caps
-    assert 'addAtom("damage_taken", hooks.OnWeaponHitCharacter)' in caps
+    assert 'addAtom("damage_taken", hooks.OnPlayerGetDamage)' in caps
     assert "seenHooks" not in caps
     assert "seenHooks" not in function_body("register")
 

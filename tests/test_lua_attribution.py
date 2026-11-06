@@ -24,6 +24,7 @@ START_MS = 1_000_000
 TTL_MS = 10_000
 PURGE_MS = 30_000
 FLUSH_MS = 1_000
+WOUND_QUIET_MS = 5_000
 
 
 class Hook:
@@ -45,6 +46,7 @@ class Player:
     def __init__(self, name: str) -> None:
         self.name = name
         self.dead = False
+        self.attacked_by: Any = None
 
     def getUsername(self) -> str:
         return self.name
@@ -60,6 +62,9 @@ class Player:
 
     def getPrimaryHandItem(self) -> None:
         return None
+
+    def getAttackedBy(self) -> Any:
+        return self.attacked_by
 
 
 class Zombie:
@@ -131,7 +136,8 @@ class Game:
         self.commands = b""
         self.online: list[Player] = []
         self.player = self.connect("hote")
-        body = Stub(getOverallBodyHealth=lambda: 100)
+        self.hp = 100
+        body = Stub(getOverallBodyHealth=lambda: self.hp)
         self.player.getBodyDamage = lambda: body
         self.player.getZombieKills = lambda: 0
         Lua(
@@ -144,7 +150,9 @@ class Game:
                 "getOnlinePlayers": lambda: Online(self.online),
                 "getServerName": lambda: "duelA",
                 "getTimestampMs": lambda: self.now,
-                "instanceof": lambda value, name: name == "IsoPlayer" and isinstance(value, Player),
+                "instanceof": lambda value, name: isinstance(
+                    value, {"IsoPlayer": Player, "IsoZombie": Zombie}[name]
+                ),
                 "isServer": lambda: True,
             }
         ).run(MOD.read_text(encoding="utf-8"))
@@ -176,6 +184,9 @@ class Game:
     def dies(self, zombie: Zombie) -> None:
         self.hooks.get("OnZombieDead").fire(zombie)
 
+    def bleeds(self, damage: float = 0.5, kind: str = "BLEEDING") -> None:
+        self.hooks.get("OnPlayerGetDamage").fire(self.player, kind, damage)
+
     def flush(self) -> None:
         self.after(FLUSH_MS)
         self.tick()
@@ -202,6 +213,7 @@ def test_mod_constants_keep_the_window_under_the_purge():
     assert f"local ATTACKER_TTL_MS = {TTL_MS}\n" in source
     assert f"local ATTACKER_PURGE_MS = {PURGE_MS}\n" in source
     assert f"local FLUSH_MS = {FLUSH_MS}\n" in source
+    assert f"local WOUND_QUIET_MS = {WOUND_QUIET_MS}\n" in source
 
 
 def test_recent_hit_names_the_author(game):
@@ -279,12 +291,79 @@ def test_game_author_needs_no_recorded_hit(game):
 def test_camp_atoms_name_their_player(game):
     """Le service refuse un atome de camp sans `player` : chacun doit le porter."""
     game.hooks.get("OnProcessAction").fire("build", game.player)
-    game.hooks.get("OnWeaponHitCharacter").fire(None, game.player, None, 3)
+    game.bleeds()
     game.hooks.get("OnThrowableExplode").fire(Stub(getAttacker=lambda: game.player), None)
 
     for kind in ("build", "damage_taken", "explosion"):
         [line] = game.lines(kind)
         assert (line["side"], line["data"]["player"]) == (SIDE, "hote"), kind
+
+
+def test_zombie_bite_gives_the_atom_then_the_proof(game):
+    """Morsure : `Bite.process` pose l'attaquant, puis la plaie saigne côté serveur."""
+    game.player.attacked_by = Zombie()
+    game.hp = 87
+    game.bleeds(0.25)
+
+    [hurt] = game.lines("damage_taken")
+    assert (hurt["side"], hurt["data"]["player"]) == (SIDE, "hote")
+    assert hurt["data"]["hp"] == 87
+    assert hurt["data"]["attacker"] == "zombie"
+    assert hurt["data"]["damage"] == 0.25
+    [proof] = game.lines("hook_seen")
+    assert proof["data"]["hook"] == load_effects()["atoms"]["damage_taken"]["hook_proof"]
+    assert hurt["seq"] < proof["seq"]
+
+
+def test_being_hit_hook_reports_the_wound_if_the_game_ever_fires_it(game):
+    game.hooks.get("OnBeingHitByZombie").fire(Zombie())
+
+    [hurt] = game.lines("damage_taken")
+    assert hurt["data"]["attacker"] == "zombie"
+    assert [line["data"]["hook"] for line in game.lines("hook_seen")] == ["OnBeingHitByZombie"]
+
+
+def test_unknown_attacker_stays_unknown(game):
+    game.bleeds()
+
+    [hurt] = game.lines("damage_taken")
+    assert hurt["data"]["attacker"] is None
+
+
+def test_a_bleeding_wound_is_one_atom_until_it_goes_quiet(game):
+    """Le saignement tire à chaque mise à jour : ni `out` ni les budgets n'en paient le prix."""
+    for _ in range(4):
+        game.bleeds()
+        game.after(WOUND_QUIET_MS - 1)
+    assert len(game.lines("damage_taken")) == 1
+    assert len(game.lines("hook_seen")) == 1
+
+    game.after(WOUND_QUIET_MS)
+    game.bleeds()
+    assert len(game.lines("damage_taken")) == 2
+    assert len(game.lines("hook_seen")) == 1
+
+
+@pytest.mark.parametrize("kind", ["HUNGRY", "THIRST", "SICK", "INFECTION", "FALLDOWN"])
+def test_wear_is_no_wound_and_proves_nothing(game, kind):
+    game.bleeds(kind=kind)
+
+    assert game.lines("damage_taken") == []
+    assert game.lines("hook_seen") == []
+
+
+def test_damage_on_a_zombie_is_no_wound(game):
+    game.hooks.get("OnPlayerGetDamage").fire(Zombie(), "WEAPONHIT", 3)
+
+    assert game.lines("damage_taken") == []
+    assert game.lines("hook_seen") == []
+
+
+def test_weapon_hit_hook_no_longer_gives_the_atom(game):
+    """Ce hook ne suit qu'un coup d'arme de joueur : il ne prouve plus `damage_taken`."""
+    game.hooks.get("OnWeaponHitCharacter").fire(None, game.player, None, 3)
+
+    assert game.lines("damage_taken") == []
 
 
 def test_due_command_leaves_the_middle_of_pending_and_answers_once(game):

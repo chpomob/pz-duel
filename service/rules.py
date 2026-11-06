@@ -219,17 +219,40 @@ def load_table(
     """Valide `raw` et en rend une copie, de même contenu donc de même `rules_hash`.
 
     `file_stem`, obligatoire pour un fichier livré, impose `id`. `active_atoms` restreint
-    le catalogue aux atomes retenus à la clôture de la fenêtre de contrat.
+    le catalogue aux atomes retenus à la clôture de la fenêtre de contrat : la table, déjà
+    passée par `narrow_table`, peut alors n'avoir plus ni règle ni point, jamais plus d'atome.
     """
     where = "section table"
     _check_keys(raw, where, "", TABLE_KEYS)
     _check_header(raw, where, file_stem)
     atoms = _check_atoms(raw["atoms"], catalog, active_atoms)
     _check_budget(raw["budget"], limits)
-    _check_score(raw["score"], atoms)
+    narrowed = active_atoms is not None
+    _check_score(raw["score"], atoms, narrowed)
     _check_modifiers(raw["modifiers"], atoms, catalog, limits)
-    _check_rules(raw["rules"], atoms, catalog, limits)
+    _check_rules(raw["rules"], atoms, catalog, limits, narrowed)
     return copy.deepcopy(raw)
+
+
+def narrow_table(table: Mapping[str, Any], withdrawn: Collection[str]) -> dict:
+    """Rend la table jouée sans les atomes retirés, ni rien de ce qui en dépend.
+
+    Une règle qui en cite un disparaît, absence comprise : `not atom(x)` serait toujours
+    vrai sur un atome que plus rien ne compte. Le combo disparaît de même, sans quoi il ne
+    retomberait plus. `table`, dont le hash est scellé, reste intacte.
+    """
+    gone = set(withdrawn)
+    narrowed = copy.deepcopy(dict(table))
+    narrowed["atoms"] = [atom for atom in table["atoms"] if atom not in gone]
+    narrowed["rules"] = [
+        rule for rule in narrowed["rules"] if not gone & set(parse_when(rule["when"]).atoms)
+    ]
+    points = narrowed["score"]["points"]
+    narrowed["score"]["points"] = {k: v for k, v in points.items() if k not in gone}
+    combo = narrowed["modifiers"].get("combo")
+    if combo is not None and gone & {combo["on"], combo["reset_on"]}:
+        del narrowed["modifiers"]["combo"]
+    return narrowed
 
 
 def _fail(where: str, field: str, reason: str) -> NoReturn:
@@ -356,11 +379,11 @@ def _check_budget(budget: Any, limits: Mapping[str, Any]) -> None:
     _check_int(budget["per_effect_cooldown_s"], where, "per_effect_cooldown_s", 0)
 
 
-def _check_score(score: Any, atoms: set[str]) -> None:
+def _check_score(score: Any, atoms: set[str], narrowed: bool = False) -> None:
     where = "section score"
     _check_keys(score, where, "", ("points",))
     points = score["points"]
-    if not isinstance(points, dict) or not points:
+    if not isinstance(points, dict) or not (points or narrowed):
         _fail(where, "points", f"objet non vide attendu, reçu {points!r}")
     for atom, value in points.items():
         field = f"points.{atom}"
@@ -394,9 +417,14 @@ def _check_modifiers(
 
 
 def _check_rules(
-    rules: Any, atoms: set[str], catalog: Mapping[str, Any], limits: Mapping[str, Any]
+    rules: Any,
+    atoms: set[str],
+    catalog: Mapping[str, Any],
+    limits: Mapping[str, Any],
+    narrowed: bool = False,
 ) -> None:
-    _check_list(rules, "section rules", "rules")
+    if not (narrowed and rules == []):
+        _check_list(rules, "section rules", "rules")
     seen: set[str] = set()
     for index, rule in enumerate(rules):
         named = isinstance(rule, dict) and isinstance(rule.get("id"), str)

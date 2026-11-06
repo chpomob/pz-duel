@@ -85,7 +85,7 @@ class FakeMod:
             "build": "42.21.0",
             "mod": "0.1.0",
             "protocol": PROTOCOL_VERSION,
-            "hooks": {"OnZombieDead": True, "OnWeaponHitCharacter": True},
+            "hooks": {"OnZombieDead": True, "OnPlayerGetDamage": True},
             "functions": {"addZombiesInOutfit": True},
             "atoms": ["zombie_kill"],
             "effects": ["spawn_pop"],
@@ -103,7 +103,7 @@ class FakeMod:
             self.player = players[0]
         return self.emit("beat", {"age": age, "players": list(players), "hp": hp, "kills": kills})
 
-    def hook_seen(self, hook: str = "OnWeaponHitCharacter") -> bytes:
+    def hook_seen(self, hook: str = "OnPlayerGetDamage") -> bytes:
         return self.emit("hook_seen", {"hook": hook})
 
     def cmd_result(

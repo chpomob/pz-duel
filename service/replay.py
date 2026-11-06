@@ -1,7 +1,7 @@
 """Rejeu d'un journal et télémétrie : `python -m service.replay [--summary] <journal>`.
 
-Le rejeu relit `match_start`, construit un `MatchCore` neuf à partir de ce seul
-enregistrement et lui repasse les intrants du journal, chacun à son `mt` : l'horloge
+Le rejeu relit `match_start`, en retire les atomes de `atom_withdrawn`, construit un
+`MatchCore` neuf sur cette table et lui repasse les intrants du journal, chacun à son `mt` : l'horloge
 reste celle du cœur, et l'instant courant est le tick journalisé. Ce module ne lit ni
 l'horloge système, ni `service/runtime.json`, ni `service/effects.json`.
 
@@ -22,7 +22,7 @@ from typing import Any
 
 from .journal import JournalError, read_journal
 from .protocol import ProtocolError, parse_event
-from .rules import MS_PER_S, SIDES, MatchCore
+from .rules import MS_PER_S, SIDES, MatchCore, narrow_table
 
 EXIT_SAME = 0
 EXIT_DIFFERENT = 1
@@ -31,6 +31,7 @@ MATCH_END = "match_end"
 COMMAND = "command"
 LATE_EVENT = "late_event"
 EFFECT_DROPPED = "effect_dropped"
+ATOM_WITHDRAWN = "atom_withdrawn"
 PROBE_KIND = "probe_spawn"
 EVENT_TYPES = ("event", "cmd_result")
 START_FIELDS = ("runtime", "effects", "preset", "duration_s")
@@ -134,7 +135,9 @@ def replay_records(records: Sequence[Record]) -> list[Record]:
     t0_ms = _t0_ms(records)
     try:
         tick_ms = start["runtime"]["tick_ms"]
-        core = MatchCore(start["preset"], start["runtime"], catalog, t0_ms, start["duration_s"])
+        withdrawn = [r["data"]["atom"] for r in records if r["type"] == ATOM_WITHDRAWN]
+        table = narrow_table(start["preset"], withdrawn)
+        core = MatchCore(table, start["runtime"], catalog, t0_ms, start["duration_s"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ReplayError(f"`{MATCH_START}` inutilisable, champ invalide : {exc}") from exc
 
