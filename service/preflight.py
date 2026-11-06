@@ -1,8 +1,9 @@
 """Préflight du mode réel et installation du mod `duelcore`.
 
 `run_preflight` ne lance rien et n'écrit rien : il mesure, et rend les valeurs relevées
-avec un message français par défaut constaté. `install_mod` est le seul chemin qui écrit
-dans `~/Zomboid/mods/`, et seulement dans `duelcore/`.
+avec un message français par défaut constaté, et pour chacun l'action que l'UI propose.
+`install_mod` est le seul chemin qui écrit dans `~/Zomboid/mods/`, et seulement dans
+`duelcore/`.
 
 D-B : chaque branche Windows s'exécute sous Linux par un `platform` injecté. Les chemins
 sondés restent des `Path` de l'hôte : ils désignent de vrais fichiers, pas un texte de
@@ -77,6 +78,10 @@ INSTALL_HINT = "lancez `python3 -m service.main --install-mod`"
 INSTALL_HINT_FROZEN = "use the Install mod button"
 FOLDER_HINT_FROZEN = "choose the game folder in the app"
 EXECUTABLE_HINT_FROZEN = "allow it to run as a program in its file properties"
+# Ce que l'UI propose pour un défaut : aucune de ces actions ne passe par un terminal.
+INSTALL_MOD = "install_mod"
+CHOOSE_FOLDER = "choose_folder"
+RETRY = "retry"
 
 
 class _MemoryStatus(ctypes.Structure):
@@ -105,12 +110,24 @@ class PzDetection:
 
 
 @dataclass(frozen=True)
+class Defect:
+    """`kind` nomme le contrôle, `action` vaut `INSTALL_MOD`, `CHOOSE_FOLDER` ou `RETRY`."""
+
+    kind: str
+    message: str
+    action: str
+
+
+@dataclass(frozen=True)
 class PreflightResult:
-    """`failures` porte un message par défaut ; `detail` rend les valeurs mesurées."""
+    """`failures` porte un message par défaut, `defects` les mêmes avec leur action ;
+    `detail` rend les valeurs mesurées.
+    """
 
     failures: tuple[str, ...]
     values: dict[str, Any]
     detail: str
+    defects: tuple[Defect, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -475,7 +492,6 @@ def run_preflight(
         unreadable = f"RAM non mesurée : MemAvailable illisible dans {meminfo}"
 
     detection = detect_pz(pz_dir, env, home, platform=platform, steam_locator=steam_locator)
-    failures = [] if detection.path else [detection.message]
     free_ports, port_failures = check_ports(runtime["ports"], platform=platform)
     available_mb, ram_failures = _check_ram(
         ram_reader or default_reader, unreadable, runtime["min_free_ram_mb"]
@@ -483,7 +499,19 @@ def run_preflight(
     fingerprint, mod_failures = _check_mod(zomboid_dir, Path(mod_src), runtime["mod_version_dir"])
     ini_readable, ini_failures = _check_ini(zomboid_dir / "Server", runtime["ports"])
     table_id, table_failures = _check_table(table, effects, runtime["limits"])
-    failures += port_failures + ram_failures + mod_failures + ini_failures + table_failures
+    defects = tuple(
+        Defect(kind, message, action)
+        for kind, action, messages in (
+            ("pz", CHOOSE_FOLDER, [] if detection.path else [detection.message]),
+            ("port", RETRY, port_failures),
+            ("ram", RETRY, ram_failures),
+            ("mod", INSTALL_MOD, mod_failures),
+            ("ini", RETRY, ini_failures),
+            ("table", RETRY, table_failures),
+        )
+        for message in messages
+    )
+    failures = [defect.message for defect in defects]
 
     values = {
         "pz_dir": str(detection.path) if detection.path else None,
@@ -494,7 +522,7 @@ def run_preflight(
         "ini_readable": ini_readable,
         "table_id": table_id,
     }
-    return PreflightResult(tuple(failures), values, _detail(values, failures))
+    return PreflightResult(tuple(failures), values, _detail(values, failures), defects)
 
 
 def install_mod(src: Path, zomboid_dir: Path) -> Path:

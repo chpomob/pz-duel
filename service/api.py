@@ -291,6 +291,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/presets":
             self._json(200, {"presets": self.engine.presets()})
             return
+        if path == "/api/setup":
+            self._json(200, self.engine.setup_state())
+            return
         if path in ("/", ""):
             self._static("index.html")
             return
@@ -300,7 +303,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self._path()
         if path is None:
             return
-        if path != "/api/action":
+        route = self.POST_ROUTES.get(path)
+        if route is None:
             self._json(404, {"error": "not found"})
             return
         # Rien ne se lit pour un inconnu. Fermer sur des octets non lus couperait la réponse :
@@ -308,28 +312,58 @@ class Handler(BaseHTTPRequestHandler):
         if self._refused():
             self._hang_up()
             return
+        payload = self._payload()
+        if payload is not None:
+            route(self, payload)
+
+    def _payload(self) -> dict | None:
+        """Rend l'objet JSON reçu, ses identifiants contrôlés ; sinon répond et rend `None`."""
         raw = self._body()
         if raw is None:
-            return
+            return None
         if self.headers.get_content_type() != JSON_TYPE:
             self._json(415, {"ok": False, "error": f"Content-Type attendu : {JSON_TYPE}"})
-            return
+            return None
         try:
             payload = json.loads(raw)
         except (ValueError, RecursionError):
             self._json(400, {"ok": False, "error": "JSON invalide"})
-            return
+            return None
         if not isinstance(payload, dict):
             self._json(400, {"ok": False, "error": "objet JSON attendu"})
-            return
+            return None
         field = self._bad_identifier(payload)
         if field is not None:
             error = f"{field} refusé : lettres, chiffres, _ ou -, {IDENTIFIER_MAX} au plus"
             self._json(400, {"ok": False, "error": error})
-            return
+            return None
+        return payload
+
+    def _post_action(self, payload: dict) -> None:
         action = payload.get("action", "")
         ok, msg = self.engine.action(action, payload)
         self._json(200 if ok else 409, {"ok": ok, "message": msg, "state": self.engine.snapshot()})
+
+    def _setup_answer(self, ok: bool, message: str) -> None:
+        self._json(200 if ok else 409, {"ok": ok, "message": message})
+
+    def _post_install_mod(self, payload: dict) -> None:
+        self._setup_answer(*self.engine.install_mod())
+
+    def _post_pz_dir(self, payload: dict) -> None:
+        folder = payload.get("folder")
+        # Vide, ce serait le dossier courant du service.
+        if not isinstance(folder, str) or not folder:
+            self._fail(400, "folder refused: a non-empty text is expected")
+            return
+        self._setup_answer(*self.engine.set_pz_dir(folder))
+
+    # Toute route passe par la même chaîne : `_refused`, lecture bornée, `Content-Type`.
+    POST_ROUTES = {
+        "/api/action": _post_action,
+        "/api/setup/install-mod": _post_install_mod,
+        "/api/setup/pz-dir": _post_pz_dir,
+    }
 
 
 def turned_away() -> bytes:

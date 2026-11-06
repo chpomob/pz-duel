@@ -69,6 +69,18 @@ class RecordingEngine:
         self.actions.append(action)
         return True, "ok"
 
+    def setup_state(self) -> dict:
+        self.actions.append("setup_state")
+        return {"ok": True}
+
+    def install_mod(self) -> tuple[bool, str]:
+        self.actions.append("install_mod")
+        return True, "ok"
+
+    def set_pz_dir(self, folder: str) -> tuple[bool, str]:
+        self.actions.append(folder)
+        return True, "ok"
+
 
 @pytest.fixture
 def api():
@@ -225,7 +237,7 @@ def test_bad_payload_keeps_the_connection_and_answers_json(payload):
 
 SURROGATE = "\ud800"
 # Un champ tenu hors de `IDENTIFIER_FIELDS` doit être classé ici, en connaissance de cause.
-NOT_IDENTIFIERS = {"pseudo", "password", "duration_s", "day_length"}
+NOT_IDENTIFIERS = {"pseudo", "password", "duration_s", "day_length", "folder"}
 SERVICE = Path(__file__).resolve().parent.parent / "service"
 PAYLOAD_KEY = re.compile(r"""(?:payload\.get\(|payload\[|_text_option\(payload, )"(\w+)\"""")
 BAD_IDENTIFIERS = (
@@ -318,7 +330,7 @@ def test_every_field_read_from_the_payload_is_classified():
     """Le champ ajouté demain doit choisir son camp : sinon il échapperait à la frontière."""
     source = "".join(path.read_text(encoding="utf-8") for path in SERVICE.glob("*.py"))
     found = set(PAYLOAD_KEY.findall(source))
-    assert {"action", "preset", "pseudo"} <= found, "le balayage ne voit plus le code"
+    assert {"action", "preset", "pseudo", "folder"} <= found, "le balayage ne voit plus le code"
     assert found <= set(IDENTIFIER_FIELDS) | NOT_IDENTIFIERS
 
 
@@ -560,6 +572,156 @@ def test_foreign_request_is_refused_before_any_body_read(api, body_reads, header
     assert error in json.loads(body)["error"]
     assert body_reads == []
     assert engine.actions == []
+
+
+# Le balayage part de la table : une route ajoutée y passe sans qu'on pense à la citer ici.
+POST_PATHS = tuple(Handler.POST_ROUTES)
+SETUP_BODY = json.dumps({"folder": "/jeu"}).encode()
+
+
+def test_setup_routes_are_in_the_table_and_outside_the_actions():
+    assert {"/api/action", "/api/setup/install-mod", "/api/setup/pz-dir"} <= set(POST_PATHS)
+    assert not {"install_mod", "pz_dir", "setup"} & ACTIONS
+
+
+def post(port: int, path: str, body: bytes = SETUP_BODY, **headers: str) -> tuple[int, dict]:
+    base = {"Host": f"127.0.0.1:{port}", "Content-Type": JSON_TYPE}
+    merged = base | {name.replace("_", "-"): value for name, value in headers.items()}
+    status, answer = send(port, path, merged, body)
+    return status, json.loads(answer)
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+@pytest.mark.parametrize("origin", FOREIGN_ORIGINS)
+def test_every_post_route_refuses_a_foreign_origin(api, path, origin):
+    engine, port = api
+    status, answer = post(port, path, Origin=origin.format(port=port))
+    assert status == 403
+    assert "Origin" in answer["error"]
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+@pytest.mark.parametrize("host", FOREIGN_HOSTS)
+def test_every_post_route_refuses_a_foreign_host(api, path, host):
+    engine, port = api
+    status, answer = post(port, path, Host=host.format(port=port))
+    assert status == 403
+    assert "Host" in answer["error"]
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("origin", FOREIGN_ORIGINS)
+def test_setup_state_refuses_a_foreign_origin_before_measuring(api, origin):
+    engine, port = api
+    status, _ = send(
+        port,
+        "/api/setup",
+        {"Host": f"127.0.0.1:{port}", "Origin": origin.format(port=port)},
+    )
+    assert status == 403
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("host", FOREIGN_HOSTS)
+def test_setup_state_refuses_a_foreign_host_before_measuring(api, host):
+    engine, port = api
+    status, _ = send(port, "/api/setup", {"Host": host.format(port=port)})
+    assert status == 403
+    assert engine.actions == []
+
+
+def test_setup_state_answers_on_the_local_interface(api):
+    engine, port = api
+    status, body = send(port, "/api/setup", {"Host": f"127.0.0.1:{port}"})
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
+    assert engine.actions == ["setup_state"]
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+@pytest.mark.parametrize("content_type", FOREIGN_TYPES)
+def test_every_post_route_requires_json_content_type(api, path, content_type):
+    engine, port = api
+    headers = {"Host": f"127.0.0.1:{port}"}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    status, _ = send(port, path, headers, SETUP_BODY)
+    assert status == 415
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+@pytest.mark.parametrize("body", [b"[1]", b"\xff", b""], ids=["array", "bad-utf8", "empty"])
+def test_every_post_route_refuses_a_body_that_is_no_object(api, path, body):
+    engine, port = api
+    status, answer = post(port, path, body)
+    assert status == 400
+    assert answer["ok"] is False
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+def test_every_post_route_checks_the_identifiers(api, path):
+    engine, port = api
+    body = json.dumps({"action": "<script>", "folder": "/jeu"}).encode()
+    status, answer = post(port, path, body)
+    assert status == 400
+    assert "<script>" not in answer["error"]
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+def test_every_post_route_bounds_its_read(api, body_reads, path):
+    engine, port = api
+    head = f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+    request = f"{head}Content-Type: {JSON_TYPE}\r\nContent-Length: {BODY_MAX + 1}\r\n\r\n"
+    status, answer = raw_exchange(port, request.encode("ascii"))
+    assert status == 413
+    assert answer["ok"] is False
+    assert body_reads == []
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("path", POST_PATHS)
+@pytest.mark.parametrize(
+    ("header", "error"),
+    [("Host: evil.example", "Host"), ("Origin: http://evil.example", "Origin")],
+    ids=["host", "origin"],
+)
+def test_every_post_route_refuses_before_any_body_read(api, body_reads, path, header, error):
+    engine, port = api
+    host = "" if header.startswith("Host") else f"Host: 127.0.0.1:{port}\r\n"
+    request = (
+        f"POST {path} HTTP/1.1\r\n{host}{header}\r\n"
+        f"Content-Type: {JSON_TYPE}\r\nContent-Length: 10\r\n\r\n{{}}"
+    )
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(request.encode("ascii"))
+        answer = conn.makefile("rb").read()
+    code, _, body = split_answer(answer)
+    assert code == 403
+    assert error in json.loads(body)["error"]
+    assert body_reads == []
+    assert engine.actions == []
+
+
+def test_unknown_setup_route_is_not_found_and_reads_nothing(api, body_reads):
+    engine, port = api
+    status, _ = post(port, "/api/setup/other")
+    assert status == 404
+    assert body_reads == []
+    assert engine.actions == []
+
+
+def test_folder_keeps_its_text_up_to_the_engine(api):
+    engine, port = api
+    folder = "C:\\Program Files (x86)\\Steam é"
+    status, answer = post(
+        port, "/api/setup/pz-dir", json.dumps({"folder": folder}).encode()
+    )
+    assert status == 200 and answer["ok"] is True
+    assert engine.actions == [folder]
 
 
 def explode(*_):

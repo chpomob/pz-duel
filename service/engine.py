@@ -22,6 +22,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -29,7 +30,16 @@ from typing import Any, NamedTuple
 from . import paths
 from .journal import Journal, read_journal
 from .platforms import Platform, current
-from .preflight import detect_pz, run_preflight
+from .preflight import (
+    ABSENT,
+    MOD_SRC,
+    PRESENT,
+    PreflightResult,
+    detect_pz,
+    install_mod,
+    mod_fingerprint,
+    run_preflight,
+)
 from .proofs import PROOFS_NAME, HookProofs
 from .protocol import PROTOCOL_VERSION, SIDES
 from .rules import (
@@ -89,6 +99,7 @@ PRESETS_DIR = str(paths.resource_root() / "service" / "presets")
 MATCHES_DIR = paths.matches_dir()
 
 ACTIONS = {"start", "cancel", "rematch", "simulate_join", "open_game"}
+DEFAULT_PRESET = "duel_rapide"
 MODE_MOCK = "mock"
 MODE_REAL = "real"
 MODES = (MODE_MOCK, MODE_REAL)
@@ -1601,6 +1612,11 @@ class Engine:
             else server_factory
         )
         self.lock = threading.RLock()
+        # Tenu par toute mesure et toute écriture du premier lancement, sans `self.lock` : deux
+        # préflights simultanés se verraient l'un l'autre comme un port occupé, et celui d'un
+        # `start` attend ici qu'une installation ait fini, comme `shutdown`.
+        self._setup_lock = threading.Lock()
+        self._setup_result: PreflightResult | None = None
         self.state = MatchState(mode=mode)
         self.state.reset_steps()
         self._stop = threading.Event()
@@ -1629,6 +1645,96 @@ class Engine:
 
     def presets(self) -> list[dict]:
         return self._presets
+
+    # -- premier lancement -------------------------------------------------
+    # Hors de `ACTIONS` : ce ne sont pas des actions de match (H6). Le dossier choisi ne survit
+    # pas au service, la spécification ne le demande pas.
+    def setup_state(self) -> dict:
+        """Mesure sans rien écrire. Hors d'`idle`, rend la dernière mesure sans lier de port.
+
+        Une UI qui sonde pendant un duel lierait sinon les ports du serveur. En mock, rien ne
+        se mesure, et `ok` reste vrai pour garder le parcours simulé.
+        """
+        if not self.real:
+            return self._setup_view(None)
+        with self._setup_lock:
+            if self._setup_refusal() is None:
+                self._measure(self._default_table())
+            with self.lock:
+                return self._setup_view(self._setup_result)
+
+    def install_mod(self) -> tuple[bool, str]:
+        with self._setup_lock:
+            if refusal := self._setup_refusal():
+                return False, refusal
+            try:
+                install_mod(MOD_SRC, self.zomboid_dir)
+            except OSError as exc:
+                return False, f"Could not install the mod: {exc.strerror or exc}"
+            with self.lock:
+                self.state.log("mod installed")
+            return True, "Mod installed"
+
+    def set_pz_dir(self, folder: str) -> tuple[bool, str]:
+        """Retient le dossier détecté, absolu : il ne dépend plus du dossier courant."""
+        with self._setup_lock:
+            if refusal := self._setup_refusal():
+                return False, refusal
+            detection = detect_pz(folder, os.environ, Path.home(), platform=self._platform)
+            if detection.path is None:
+                return False, detection.message
+            with self.lock:
+                self.pz_dir = str(detection.path)
+                self.state.log(f"game folder set: {detection.path}")
+            return True, f"Game folder set: {detection.path}"
+
+    def _setup_refusal(self) -> str | None:
+        with self.lock:
+            if not self.real:
+                return "Not available in simulated mode"
+            if self._closing:
+                return "The service is stopping"
+            if self.state.phase != "idle":
+                return f"Not available during phase {self.state.phase}"
+        return None
+
+    def _default_table(self) -> Any:
+        """Sans table livrée, `{}` fait constater le défaut par le préflight."""
+        try:
+            return self.preset(DEFAULT_PRESET)
+        except ActionRefused:
+            return {}
+
+    def _measure(self, table: Any) -> PreflightResult:
+        """Appelé `_setup_lock` tenu, `self.lock` libre : un disque lent ne fige pas l'état."""
+        with self.lock:
+            pz_dir = self.pz_dir
+        result = run_preflight(
+            table,
+            runtime=self.runtime,
+            effects=self.effects,
+            pz_dir=pz_dir,
+            zomboid_dir=self.zomboid_dir,
+            platform=self._platform,
+        )
+        with self.lock:
+            self._setup_result = result
+        return result
+
+    def _setup_view(self, result: PreflightResult | None) -> dict:
+        try:
+            expected = mod_fingerprint(MOD_SRC)
+        except OSError:
+            expected = None
+        values = {} if result is None else result.values
+        return {
+            "ok": not self.real if result is None else result.ok,
+            "measured": result is not None,
+            "pz": None if result is None else PRESENT if values["pz_dir"] else ABSENT,
+            "defects": [] if result is None else [asdict(defect) for defect in result.defects],
+            "values": values,
+            "expected_mod_fingerprint": expected,
+        }
 
     def preset(self, preset_id: str) -> dict:
         for p in self._presets:
@@ -1715,6 +1821,10 @@ class Engine:
         if thread is not None:
             # L'état final et la fermeture du journal sont écrits par ce fil.
             thread.join()
+        # `_closing` refuse les suivantes ; celle en cours tourne sur un fil démon de l'API, que
+        # la sortie du service couperait entre les deux renommages d'`install_mod`.
+        with self._setup_lock:
+            pass
         return stopped and not self._stop_incomplete
 
     def _open_game(self) -> tuple[bool, str]:
@@ -1786,7 +1896,7 @@ class Engine:
         Tout le `payload` se valide ici, avant le premier effet : un refus laisse l'état, les
         mondes et les sauvegardes tels quels.
         """
-        preset_id = payload.get("preset", "duel_rapide")
+        preset_id = payload.get("preset", DEFAULT_PRESET)
         if not isinstance(preset_id, str):
             raise ActionRefused("preset refusé : identifiant texte attendu")
         preset = self.preset(preset_id)
@@ -1850,14 +1960,8 @@ class Engine:
             self.state.set_step("preflight", "running")
             self.state.log("préflight : installation, ports, mémoire, mod, réglages, table")
             table = self.preset(self.state.config["preset"])
-        result = run_preflight(
-            table,
-            runtime=self.runtime,
-            effects=self.effects,
-            pz_dir=self.pz_dir,
-            zomboid_dir=self.zomboid_dir,
-            platform=self._platform,
-        )
+        with self._setup_lock:
+            result = self._measure(table)
         if self._aborted():
             return
         with self.lock:
