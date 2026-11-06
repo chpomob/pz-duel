@@ -1515,7 +1515,8 @@ def test_rematch(engine_rig, presets):
     assert duel.state()["capabilities"]["active_atoms"] is not None
     duel.at_match(1)
     duel.kills("A", 1)
-    assert duel.state()["score"] == {"A": 1, "B": 0}
+    # Le journal précède la publication du score : `kills` ne garantit que le premier.
+    rig.until(lambda s: s["score"] == {"A": 1, "B": 0})
     duel.at_match(first["config"]["duration_s"])
     state = duel.finish()
     assert state["config"]["code"] == first["config"]["code"]

@@ -433,7 +433,7 @@ def _number_argument(value: Any, function: str) -> int | float:
 def _rounding(name: str, rounded: Callable[[float], int]) -> Callable[..., int | float]:
     """L'arrondi de C : l'infini et NaN se rendent tels quels, là où Python lève."""
 
-    def function(value: Any = None) -> int | float:
+    def function(value: Any = None, *_: Any) -> int | float:
         number = _number_argument(value, name)
         if isinstance(number, int) or not math.isfinite(number) or abs(number) >= 2**53:
             return number

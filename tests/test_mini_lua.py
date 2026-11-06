@@ -157,6 +157,21 @@ def test_rounding_keeps_nan(function):
     assert math.isnan(value)
 
 
+@pytest.mark.parametrize(
+    ("function", "expected"), [("floor", 2), ("ceil", 3)], ids=["floor", "ceil"]
+)
+@pytest.mark.parametrize("extra", ["0", "nil", '"x"', "{}, 1"])
+def test_rounding_ignores_extra_arguments(function, expected, extra):
+    assert lua(f"return pcall(math.{function}, 2.7, {extra})") == [True, expected]
+
+
+@pytest.mark.parametrize("function", ["floor", "ceil"])
+def test_rounding_without_argument_fails_like_lua(function):
+    ok, message = lua(f"return pcall(math.{function})")
+    assert ok is False
+    assert "number expected" in message
+
+
 @pytest.mark.parametrize("function", ["floor", "ceil", "sqrt", "sin", "cos", "rad"])
 @pytest.mark.parametrize("value", ["nil", "true", '"abc"', "{}"])
 def test_math_refuses_what_is_no_number_as_a_lua_error(function, value):

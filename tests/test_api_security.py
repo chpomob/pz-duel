@@ -11,7 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from service.api import IDENTIFIER_FIELDS, IDENTIFIER_MAX, Handler, is_identifier, make_server
+from service.api import (
+    BODY_MAX,
+    IDENTIFIER_FIELDS,
+    IDENTIFIER_MAX,
+    Handler,
+    is_identifier,
+    make_server,
+)
 from service.engine import ACTIONS, Engine, load_presets
 
 SECRET = "mot-de-passe-joueur"
@@ -355,17 +362,157 @@ def test_free_text_with_a_surrogate_keeps_the_connection(field):
     assert state_status == 200
 
 
-@pytest.mark.parametrize("length", ["abc", "-1", "1.5"])
-def test_bad_content_length_gets_a_json_refusal(api, length):
+def framed(port: int, *framing: str, body: bytes = b"") -> bytes:
+    """Une action dont le cadrage est écrit à la main, en latin-1 comme le lit le service."""
+    lines = [
+        "POST /api/action HTTP/1.1",
+        f"Host: 127.0.0.1:{port}",
+        f"Content-Type: {JSON_TYPE}",
+        *framing,
+    ]
+    return "\r\n".join([*lines, "", ""]).encode("latin-1") + body
+
+
+# Chaque ligne décrit un cadrage que le service refuse sans lire : aucun octet n'est envoyé.
+HOSTILE_FRAMINGS = {
+    "py-ssize-t": (413, ["Content-Length: 9223372036854775808"]),
+    "digits-beyond-int-limit": (413, [f"Content-Length: {'9' * 5000}"]),
+    "just-over-the-cap": (413, [f"Content-Length: {BODY_MAX + 1}"]),
+    "negative": (400, ["Content-Length: -1"]),
+    "huge-negative": (400, ["Content-Length: -9223372036854775809"]),
+    "text": (400, ["Content-Length: abc"]),
+    "decimal": (400, ["Content-Length: 1.5"]),
+    "plus-sign": (400, ["Content-Length: +5"]),
+    "underscore": (400, ["Content-Length: 1_0"]),
+    "superscript": (400, ["Content-Length: ²"]),
+    "two-values": (400, ["Content-Length: 5, 5"]),
+    "zero": (400, ["Content-Length: 0"]),
+    "zeros": (400, ["Content-Length: 000"]),
+    "absent": (400, []),
+    "repeated": (400, ["Content-Length: 2", "Content-Length: 3"]),
+    "chunked": (400, ["Transfer-Encoding: chunked"]),
+    "chunked-and-length": (400, ["Transfer-Encoding: chunked", "Content-Length: 2"]),
+}
+
+
+class ReadSpy:
+    """Double de `rfile` : les en-têtes passent, chaque `read` du corps est noté."""
+
+    def __init__(self, stream, reads: list) -> None:
+        self.stream = stream
+        self.reads = reads
+
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+    def read(self, *args):
+        self.reads.append(args)
+        return self.stream.read(*args)
+
+
+@pytest.fixture
+def body_reads(monkeypatch):
+    reads: list = []
+    setup = Handler.setup
+
+    def spied_setup(self):
+        setup(self)
+        self.rfile = ReadSpy(self.rfile, reads)
+
+    monkeypatch.setattr(Handler, "setup", spied_setup)
+    return reads
+
+
+@pytest.mark.parametrize(
+    ("expected", "framing"), HOSTILE_FRAMINGS.values(), ids=HOSTILE_FRAMINGS.keys()
+)
+def test_hostile_framing_is_refused_before_any_read(api, body_reads, expected, framing):
     engine, port = api
-    request = (
-        f"POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
-        f"Content-Type: {JSON_TYPE}\r\nContent-Length: {length}\r\n\r\n"
-    )
-    status, answer = raw_exchange(port, request.encode())
-    assert status == 400
+    status, answer = raw_exchange(port, framed(port, *framing))
+    assert status == expected
     assert answer["ok"] is False and answer["error"]
+    assert body_reads == []
     assert engine.actions == []
+
+
+def test_read_spy_sees_a_valid_body(api, body_reads):
+    """Témoin : sans lui, une liste vide ne prouverait rien."""
+    engine, port = api
+    status, _ = raw_exchange(
+        port, framed(port, f"Content-Length: {len(ACTION_BODY)}", body=ACTION_BODY)
+    )
+    assert status == 200
+    assert body_reads == [(len(ACTION_BODY),)]
+    assert engine.actions == ["start"]
+
+
+def test_body_at_the_cap_is_read(api):
+    engine, port = api
+    body = json.dumps({"action": "start", "pseudo": ""}).encode()
+    body = body[:-1] + b" " * (BODY_MAX - len(body)) + b"}"
+    assert len(body) == BODY_MAX
+    status, answer = action(port, body)
+    assert status == 200 and answer["ok"] is True
+    assert engine.actions == ["start"]
+
+
+def test_body_shorter_than_announced_is_refused(api):
+    """Le client ferme son sens d'envoi : `{}` seul serait un JSON valide pour le moteur."""
+    engine, port = api
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(framed(port, "Content-Length: 10", body=b"{}"))
+        conn.shutdown(socket.SHUT_WR)
+        answer = conn.makefile("rb").read()
+    head, _, body = answer.partition(b"\r\n\r\n")
+    assert int(head.split()[1]) == 400
+    assert json.loads(body)["ok"] is False
+    assert engine.actions == []
+
+
+def explode(*_):
+    raise RuntimeError(SECRET)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("snapshot", "/api/state"), ("presets", "/api/presets"), ("action", "/api/action")],
+)
+def test_unexpected_failure_gets_a_json_answer_without_trace(api, method, path):
+    engine, port = api
+    setattr(engine, method, explode)
+    headers = {"Host": f"127.0.0.1:{port}", "Content-Type": JSON_TYPE}
+    status, body = send(port, path, headers, ACTION_BODY if method == "action" else None)
+    assert status == 500
+    assert json.loads(body) == {"ok": False, "error": "erreur interne"}
+    assert SECRET.encode() not in body and b"Traceback" not in body
+
+
+def test_answer_that_cannot_be_serialized_gets_a_json_answer(api):
+    engine, port = api
+    engine.snapshot = lambda: {"objet": object()}
+    status, body = get_state(port)
+    assert status == 500
+    assert json.loads(body)["ok"] is False
+
+
+class Departed(Sink):
+    """Le client est parti : toute réponse lève."""
+
+    answered = False
+
+    def _fail(self, code: int, error: str) -> None:
+        raise ConnectionResetError
+
+
+def test_barrier_survives_a_departed_client():
+    Handler._last_word(Departed())
+
+
+def test_barrier_never_answers_twice():
+    sink = Sink()
+    sink.answered = True
+    sink._fail = lambda *_: pytest.fail("seconde réponse")
+    Handler._last_word(sink)
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
