@@ -14,7 +14,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-UI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui")
+from . import paths
+
+UI_DIR = str(paths.resource_root() / "ui")
 
 TYPES = {
     ".html": "text/html; charset=utf-8",

@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from . import paths
 from .journal import Journal, read_journal
 from .preflight import detect_pz, run_preflight
 from .proofs import PROOFS_NAME, HookProofs
@@ -82,8 +83,8 @@ from .verdict import (
     verdict,
 )
 
-PRESETS_DIR = os.path.join(os.path.dirname(__file__), "presets")
-MATCHES_DIR = Path(__file__).resolve().parent.parent / "matches"
+PRESETS_DIR = str(paths.resource_root() / "service" / "presets")
+MATCHES_DIR = paths.matches_dir()
 
 ACTIONS = {"start", "cancel", "rematch", "simulate_join", "open_game"}
 MODE_MOCK = "mock"

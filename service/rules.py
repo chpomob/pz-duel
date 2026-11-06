@@ -23,13 +23,13 @@ from collections.abc import Callable, Collection, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from functools import partial
-from pathlib import Path
 from typing import Any, NoReturn
 
+from . import paths
 from .protocol import PROTOCOL_VERSION
 
-RUNTIME_PATH = Path(__file__).resolve().parent / "runtime.json"
-EFFECTS_PATH = Path(__file__).resolve().parent / "effects.json"
+RUNTIME_PATH = paths.resource_root() / "service" / "runtime.json"
+EFFECTS_PATH = paths.resource_root() / "service" / "effects.json"
 
 ALLOWED_MODS = ["duelcore"]
 ALLOWED_SOURCE = "server"

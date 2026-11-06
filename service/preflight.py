@@ -18,10 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import paths
 from .rules import TableError, load_effects, load_runtime, load_table
 
 MOD_ID = "duelcore"
-MOD_SRC = Path(__file__).resolve().parent.parent / "mods" / MOD_ID
+MOD_SRC = paths.resource_root() / "mods" / MOD_ID
 MEMINFO_PATH = Path("/proc/meminfo")
 ENV_VAR = "PZ_INSTALL_DIR"
 SCRIPT = "start-server.sh"
