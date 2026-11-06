@@ -2,7 +2,8 @@
 
 Il produit des lignes du contrat sur demande. Il ne prouve rien du vrai Lua. Les
 paramètres `src`, `side`, `boot` et `seq` de `emit` servent à forger des lignes
-fausses ; sans eux, le double se comporte comme un mod conforme.
+fausses ; sans eux, le double se comporte comme un mod conforme : un atome de camp
+porte `player`, le premier nom de son dernier heartbeat, sauf `data` qui le fixe.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any
 from service.protocol import PROTOCOL_VERSION, dump_line, parse_session
 
 OWN_SIDE = object()
+SERVER_KINDS = ("beat", "caps", "cmd_result", "hook_seen")
 
 
 class FakeMod:
@@ -22,6 +24,7 @@ class FakeMod:
         self.boot = boot
         self.seq = 0
         self.t_ms = t_ms
+        self.player: str | None = None
         self.out_path = lua_dir / f"duel_{side}_out.txt"
         self.in_path = lua_dir / f"duel_{side}_in.txt"
         self.ack_path = lua_dir / f"duel_{side}_ack.txt"
@@ -56,6 +59,8 @@ class FakeMod:
     ) -> bytes:
         """Construit la ligne suivante sans l'écrire ; `seq` avance comme à l'émission."""
         self.seq = self.seq + 1 if seq is None else seq
+        if self.player is not None and kind not in SERVER_KINDS and side is not None:
+            data = {"player": self.player, **data}
         return dump_line(
             {
                 "v": PROTOCOL_VERSION,
@@ -94,6 +99,8 @@ class FakeMod:
         hp: float | None = None,
         kills: int | None = None,
     ) -> bytes:
+        if players:
+            self.player = players[0]
         return self.emit("beat", {"age": age, "players": list(players), "hp": hp, "kills": kills})
 
     def hook_seen(self, hook: str = "OnWeaponHitCharacter") -> bytes:

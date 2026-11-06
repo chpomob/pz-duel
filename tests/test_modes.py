@@ -59,13 +59,16 @@ class FastClock:
 
 
 class Launcher:
-    def __init__(self, found: bool = True) -> None:
-        self.found = found
-        self.calls: list[list[str]] = []
+    """Faux lanceur du client : il note l'appel, et échoue sur `failure`."""
 
-    def __call__(self, args) -> bool:
-        self.calls.append(list(args))
-        return self.found
+    def __init__(self, failure: str | None = None) -> None:
+        self.failure = failure
+        self.calls: list[tuple[Path, list[str]]] = []
+
+    def __call__(self, script, args) -> None:
+        self.calls.append((script, list(args)))
+        if self.failure is not None:
+            raise engine_module.ClientLaunchError(self.failure)
 
 
 def forbidden_factory(*args, **kwargs):
@@ -353,47 +356,6 @@ def test_no_valid_preset_is_a_refusal(tmp_path, monkeypatch, runtime):
     assert engine.action("start") == (False, "aucun preset valide")
 
 
-def test_open_game_real(zomboid_home, tmp_path, monkeypatch, runtime):
-    launcher = Launcher()
-    engine = real_engine(zomboid_home, runtime, steam_launcher=launcher)
-
-    assert engine.action("open_game")[0] is False
-    assert launcher.calls == []
-
-    assert engine.action("start", {"preset": "demo", "password": "marqueur-joueur"})[0]
-    settle(engine)
-    ok, _ = engine.action("open_game")
-    host_password = engine.snapshot()["config"]["host_password"]
-
-    # Sans script de client, Steam ne sert que de relais : le client reste en `-nosteam`.
-    assert ok is True
-    [args] = launcher.calls
-    port = runtime["ports"]["A"]["game"]
-    assert port == 17261
-    assert args == [
-        "-applaunch",
-        str(runtime["steam_app_id"]),
-        "-nosteam",
-        "+connect",
-        f"127.0.0.1:{port}",
-        "+password",
-        host_password,
-    ]
-    assert not any(host_password in e["msg"] for e in engine.snapshot()["logs"])
-
-    # Sans Steam : le lanceur double, puis le vrai lanceur sur un PATH sans `steam`.
-    launcher.found = False
-    ok, message = engine.action("open_game")
-    assert ok is False
-    assert "client PZ introuvable" in message
-
-    monkeypatch.setenv("PATH", str(tmp_path))
-    no_steam = real_engine(zomboid_home, runtime)
-    assert no_steam.action("start", {"preset": "demo"})[0]
-    settle(no_steam)
-    assert no_steam.action("open_game")[0] is False
-
-
 def client_install(root: Path) -> tuple[Path, Path]:
     """Rend le dossier à passer en `pz_dir` et le script du client, à l'endroit du jeu."""
     game = root / "ProjectZomboid" / "projectzomboid"
@@ -406,57 +368,124 @@ def client_install(root: Path) -> tuple[Path, Path]:
     return game.parent, client_script
 
 
+HOST_CONFIG = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
+
+
+def client_engine(zomboid_home, runtime, pz_dir: Path, launcher) -> Engine:
+    engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir, client_launcher=launcher)
+    engine.state.config = dict(HOST_CONFIG)
+    return engine
+
+
+def test_open_game_needs_a_prepared_duel(zomboid_home, tmp_path, runtime):
+    pz_dir, _ = client_install(tmp_path)
+    launcher = Launcher()
+    engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir, client_launcher=launcher)
+
+    assert engine.action("open_game")[0] is False
+    assert launcher.calls == []
+
+
 def test_open_game_is_direct_and_leaves_steam_mode(zomboid_home, tmp_path, runtime):
     """Les serveurs tournent en `zomboid.steam=0` : un client en mode Steam n'y entrerait pas."""
     pz_dir, script = client_install(tmp_path)
-    direct: list[tuple[Path, list[str]]] = []
-    steam = Launcher()
+    launcher = Launcher()
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
 
-    def client_launcher(path, args):
-        direct.append((path, list(args)))
-        return True
+    ok, message = engine.action("open_game")
 
-    engine = real_engine(
-        zomboid_home,
-        runtime,
-        pz_dir=pz_dir,
-        client_launcher=client_launcher,
-        steam_launcher=steam,
-    )
-    engine.state.config = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
-
-    assert engine.action("open_game")[0] is True
-    assert direct == [
+    assert ok is True
+    assert "vérifiez en jeu la connexion" in message, "le lancement ne prouve pas la connexion"
+    assert launcher.calls == [
         (script.resolve(), ["-nosteam", "+connect", "127.0.0.1:17261", "+password", "marqueur-hote"])
     ]
-    assert steam.calls == []
+    assert not any("marqueur-hote" in entry["msg"] for entry in engine.snapshot()["logs"])
 
 
-def test_open_game_uses_steam_only_when_direct_launch_fails(zomboid_home, tmp_path, runtime):
+def test_open_game_without_the_client_fails_explicitly(zomboid_home, tmp_path, runtime):
+    """Binaire absent : aucun lancement, ni de relais qui se dirait réussi sans rien constater."""
+    pz_dir, script = client_install(tmp_path)
+    script.unlink()
+    launcher = Launcher()
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+
+    ok, message = engine.action("open_game")
+
+    assert ok is False
+    assert launcher.calls == []
+    assert "client PZ introuvable (projectzomboid.sh absent)" in message
+    assert "à la main avec -nosteam, puis rejoignez 127.0.0.1:17261" in message
+    assert "marqueur-hote" not in message
+    assert engine.snapshot()["logs"][-1]["level"] == "warn"
+
+
+def test_open_game_reports_a_refused_launch(zomboid_home, tmp_path, runtime):
     pz_dir, _ = client_install(tmp_path)
-    steam = Launcher()
-    engine = real_engine(
-        zomboid_home,
-        runtime,
-        pz_dir=pz_dir,
-        client_launcher=lambda path, args: False,
-        steam_launcher=steam,
-    )
-    engine.state.config = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
+    launcher = Launcher("options refusées")
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+
+    ok, message = engine.action("open_game")
+
+    assert ok is False
+    assert len(launcher.calls) == 1
+    assert message.startswith("options refusées : lancez PZ à la main")
+
+
+def test_open_game_keeps_the_engine_free_while_launching(zomboid_home, tmp_path, runtime):
+    """Le lanceur attend le démarrage : ni `/api/state` ni le match n'attendent avec lui."""
+    pz_dir, _ = client_install(tmp_path)
+    free: list[bool] = []
+
+    def probe():
+        acquired = engine.lock.acquire(timeout=WAIT_S)
+        free.append(acquired)
+        if acquired:
+            engine.lock.release()
+
+    def launcher(script, args):
+        other = threading.Thread(target=probe)
+        other.start()
+        other.join()
+
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
 
     assert engine.action("open_game")[0] is True
-    [args] = steam.calls
-    assert "-nosteam" in args
+    assert free == [True]
 
 
-def test_default_client_launcher_runs_the_script(tmp_path, monkeypatch):
-    started = []
-    monkeypatch.setattr(
-        engine_module.subprocess, "Popen", lambda command, **kwargs: started.append(command)
-    )
+def write_script(path: Path, body: str) -> Path:
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
 
-    assert engine_module.launch_client(tmp_path / "pz.sh", ["-nosteam"]) is True
-    assert started == [[str(tmp_path / "pz.sh"), "-nosteam"]]
+
+def test_default_client_launcher_accepts_a_client_that_stays_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", 0.05)
+    marker = tmp_path / "args"
+    script = write_script(tmp_path / "pz.sh", f'echo "$@" > {marker}\nexec sleep 1')
+
+    assert engine_module.launch_client(script, ["-nosteam", "+connect"]) is None
+    deadline = time.monotonic() + WAIT_S
+    while not (marker.exists() and marker.read_text(encoding="utf-8")):
+        assert time.monotonic() < deadline
+    assert marker.read_text(encoding="utf-8") == "-nosteam +connect\n"
+
+
+@pytest.mark.parametrize("code", [0, 3], ids=["exit-0-du-vrai-script", "refus"])
+def test_default_client_launcher_refuses_an_early_exit(tmp_path, monkeypatch, code):
+    """`projectzomboid.sh` finit par `exit 0` même quand le client n'a pas tenu."""
+    monkeypatch.setattr(engine_module, "CLIENT_START_GRACE_S", WAIT_S)
+    script = write_script(tmp_path / "pz.sh", f"exit {code}")
+
+    with pytest.raises(engine_module.ClientLaunchError, match=f"pz.sh s'est arrêté aussitôt \\(code {code}\\)"):
+        engine_module.launch_client(script, ["+password", "marqueur-hote"])
+
+
+def test_default_client_launcher_names_a_missing_binary(tmp_path):
+    with pytest.raises(engine_module.ClientLaunchError, match="pz.sh ne démarre pas") as caught:
+        engine_module.launch_client(tmp_path / "pz.sh", ["+password", "marqueur-hote"])
+
+    assert "marqueur-hote" not in str(caught.value)
 
 
 def test_default_passwords_are_distinct_and_unrelated_to_the_code(zomboid_home, runtime):
@@ -468,20 +497,6 @@ def test_default_passwords_are_distinct_and_unrelated_to_the_code(zomboid_home, 
     assert config["password"] != config["host_password"]
     assert config["code"] not in (config["password"], config["host_password"])
     assert min(len(config["password"]), len(config["host_password"])) >= 16
-
-
-def test_default_launcher_goes_through_steam(tmp_path, monkeypatch):
-    steam = tmp_path / "steam"
-    steam.write_text("#!/bin/sh\n", encoding="utf-8")
-    steam.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    started: list[list[str]] = []
-    monkeypatch.setattr(
-        engine_module.subprocess, "Popen", lambda argv, **kwargs: started.append(argv)
-    )
-
-    assert engine_module.launch_steam(["+connect", "127.0.0.1:1"]) is True
-    assert started == [[str(steam), "+connect", "127.0.0.1:1"]]
 
 
 def call(url: str, data: dict | None = None) -> tuple[int, dict]:
@@ -497,7 +512,7 @@ def call(url: str, data: dict | None = None) -> tuple[int, dict]:
 @pytest.mark.parametrize("mode", ["mock", "real"])
 def test_api_backward_compatible(mode, zomboid_home, runtime):
     if mode == "real":
-        engine = real_engine(zomboid_home, runtime, steam_launcher=Launcher())
+        engine = real_engine(zomboid_home, runtime, client_launcher=Launcher())
     else:
         engine = Engine(mode, runtime=runtime, clock=FastClock())
     server = make_server(engine)

@@ -10,7 +10,7 @@ large rejetterait des lignes réelles. Les bornes ci-dessous sont celles du cont
 
 Les champs inconnus sont préservés jusqu'au journal : ils y doivent au moins rester
 sérialisables et relisibles. `_check_bounds` borne donc toute la ligne, sans regarder
-ce que ses champs signifient.
+ce que ses champs signifient : ce qu'il accepte, `dump_line` sait l'écrire.
 """
 
 from __future__ import annotations
@@ -53,23 +53,42 @@ def _reject_constant(name: str) -> None:
     raise ValueError(f"constante non JSON : {name}")
 
 
+def _check_encodable(text: str) -> None:
+    """`\\ud800` se décode en caractère isolé, que seul l'encodage UTF-8 refuse ensuite."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _bad("tout texte", "encodable en UTF-8") from None
+
+
 def _check_bounds(value: Any, depth: int = 0) -> None:
     """Refuse, à toute profondeur, ce que le journal ne saurait écrire puis relire.
 
-    `1e999` se décode en infini sans passer par `parse_constant`, et `dump_line` le
-    refuserait une fois la ligne acceptée. Une comparaison ne déborde pas, même sur un
-    entier géant, et elle est fausse pour NaN.
+    Seules passent les formes que `dump_line` écrit : un objet déjà décodé peut porter
+    n'importe quel type. `1e999` se décode en infini sans passer par `parse_constant`.
+    Une comparaison ne déborde pas, même sur un entier géant, et elle est fausse pour NaN.
     """
     if depth > MAX_DEPTH:
         raise _bad("la ligne", f"imbriquée sur au plus {MAX_DEPTH} niveaux")
-    if isinstance(value, Mapping):
+    if isinstance(value, dict):
+        for key in value:
+            if not isinstance(key, str):
+                raise _bad("toute clé", "une chaîne")
+            _check_encodable(key)
         children: Iterable[Any] = value.values()
     elif isinstance(value, (list, tuple)):
         children = value
-    else:
-        if type(value) in (int, float) and not abs(value) <= MAX_NUMBER:
+    elif isinstance(value, str):
+        _check_encodable(value)
+        return
+    elif value is None or isinstance(value, bool):
+        return
+    elif isinstance(value, (int, float)):
+        if not abs(value) <= MAX_NUMBER:
             raise _bad("tout nombre", f"fini et borné par {MAX_NUMBER} en valeur absolue")
         return
+    else:
+        raise _bad("tout champ", "sérialisable en JSON")
     for child in children:
         _check_bounds(child, depth + 1)
 

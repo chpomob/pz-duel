@@ -144,13 +144,14 @@ def test_last_attacker_is_purged() -> None:
     """Un zombie touché qui ne meurt jamais ne reste pas dans la table."""
     dead = function_body("onZombieDead")
     assert "lastAttacker[zombie] = nil" in dead
-    assert "hit.wielder" in dead
+    assert "freshAuthor(hit, zombie" in dead
 
     hit = function_body("onHitZombie")
     assert re.search(r"at = getTimestampMs\(\)", hit)
 
     purge = function_body("purgeAttackers")
     assert re.search(r"now - hit\.at < ATTACKER_TTL_MS", purge)
+    assert "hit.at >= ATTACKER_TTL_MS" in function_body("freshAuthor")
     assert re.search(r"lastAttacker = kept", purge)
 
     step = function_body("step")

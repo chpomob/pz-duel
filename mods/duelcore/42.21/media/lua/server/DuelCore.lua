@@ -48,8 +48,9 @@ local DUEL_MARK = "duelOrigin"
 
 -- Au-delà, un `seq` ne vient pas du compteur du service : l'accepter bloquerait les suivants.
 local MAX_CMD_SEQ = 2147483647
--- Un coup sans mort oublié passé ce délai : le zombie a disparu, ou le jeu l'a recyclé.
-local ATTACKER_TTL_MS = 120000
+-- Au-delà, un coup ne désigne plus l'auteur d'une mort : le zombie a pu disparaître, ou le
+-- jeu l'a recyclé. Un kill tardif, par le feu, part sans auteur plutôt que sous un faux.
+local ATTACKER_TTL_MS = 10000
 local ATTACKER_PURGE_MS = 30000
 
 -- État de session. `session` reste nil tant que le plancher est inconnu : sans lui,
@@ -361,6 +362,12 @@ local function positionData(character, data)
     return data
 end
 
+-- Le service ne compte un atome que s'il vient de l'identité du camp : le nom part avec lui.
+local function authoredBy(character, data)
+    if isPlayer(character) then data.player = character:getUsername() end
+    return data
+end
+
 -- Sans preuve de réception, un hook reste `false` côté service, même enregistré.
 local function noteHook(name)
     if not seenHooks[name] and emit("hook_seen", { hook = name }, side) then
@@ -370,7 +377,11 @@ end
 
 local function onHitZombie(zombie, wielder)
     if isPlayer(wielder) then
-        lastAttacker[zombie] = { wielder = wielder, at = getTimestampMs() }
+        lastAttacker[zombie] = {
+            wielder = wielder,
+            at = getTimestampMs(),
+            target = zombie:getOnlineID(),
+        }
     end
 end
 
@@ -383,43 +394,63 @@ local function purgeAttackers(now)
     lastAttacker = kept
 end
 
+local function isOnline(player)
+    local players = onlinePlayers()
+    for i = 1, #players do
+        if players[i] == player then return true end
+    end
+    return false
+end
+
+-- Le jeu recycle ses objets : un coup ne vaut que récent, sur le même zombie, et d'un joueur
+-- encore en jeu. `target` écarte un recyclage dans la fenêtre, si l'identifiant a changé.
+local function freshAuthor(hit, zombie, now)
+    if not hit or now - hit.at >= ATTACKER_TTL_MS then return nil end
+    if hit.target ~= zombie:getOnlineID() then return nil end
+    local wielder = hit.wielder
+    if not isPlayer(wielder) or wielder:isDead() or not isOnline(wielder) then return nil end
+    return wielder
+end
+
 local function onZombieDead(zombie)
+    local hit = lastAttacker[zombie]
+    lastAttacker[zombie] = nil
+
     -- Le jeu peut tirer ce hook deux fois pour un zombie qui brûle.
     if recentDead[zombie] then return end
     recentDead[zombie] = true
 
     local author = zombie:getAttackedBy()
-    local hit = lastAttacker[zombie]
-    lastAttacker[zombie] = nil
-    if not isPlayer(author) then author = hit and hit.wielder end
+    if not isPlayer(author) then author = freshAuthor(hit, zombie, getTimestampMs()) end
 
     -- Le jeu recycle ses zombies sans vider leur modData : la marque ne survit pas au mort.
     local modData = zombie:getModData()
     local origin = modData[DUEL_MARK] and "duel" or "world"
     modData[DUEL_MARK] = nil
 
-    emit("zombie_kill", positionData(zombie, { w = weaponOf(author), origin = origin }), sideOf(author))
+    local data = authoredBy(author, { w = weaponOf(author), origin = origin })
+    emit("zombie_kill", positionData(zombie, data), sideOf(author))
 end
 
 -- Le coup d'un joueur sur un zombie tire aussi ce hook, sans rien dire de `damage_taken` :
 -- la preuve est le premier atome émis, pas la première réception.
 local function onWeaponHitCharacter(wielder, target, weapon, damage)
     if not isPlayer(target) then return end
-    emit("damage_taken", positionData(target, {
+    emit("damage_taken", positionData(target, authoredBy(target, {
         w = weapon and weapon:getFullType() or NULL,
         damage = damage or NULL,
-    }), side)
+    })), side)
     noteHook("OnWeaponHitCharacter")
 end
 
 local function onProcessAction(action, character)
     if action ~= "build" then return end
-    emit("build", positionData(character, {}), sideOf(character))
+    emit("build", positionData(character, authoredBy(character, {})), sideOf(character))
 end
 
 local function onThrowableExplode(trap, square)
     local author = trap and trap:getAttacker() or nil
-    local data = {}
+    local data = authoredBy(author, {})
     if square then
         data.x = square:getX()
         data.y = square:getY()
@@ -463,7 +494,8 @@ local function reportRepair(action, before)
     local repaired = part:getCondition() > before.condition
     local installed = not before.installed and part:getInventoryItem() ~= nil
     if repaired or installed then
-        emit("vehicle_repair", positionData(action.character, {}), sideOf(action.character))
+        local character = action.character
+        emit("vehicle_repair", positionData(character, authoredBy(character, {})), sideOf(character))
     end
 end
 

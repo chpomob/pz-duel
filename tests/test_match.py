@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import threading
@@ -31,7 +32,7 @@ from test_snapshots import (  # noqa: F401
 )
 from service import engine as engine_module
 from service.journal import JOURNAL_NAME, JournalError
-from service.protocol import parse_session
+from service.protocol import dump_line, parse_session
 from service.replay import main as replay_main
 from service.servers import read_ini
 from service.state import MatchState
@@ -220,6 +221,64 @@ def test_side_follows_the_connection_identity(engine_rig):
     lobby.mods["A"].beat(players=(host,))
     engine_rig.until(lambda s: s["players"] == PLAYERS)
     assert len(lobby.records("player_refused")) == 2
+
+
+def test_unauthenticated_camp_brings_no_event(engine_rig):
+    """Personne n'a de nom lié sur B : rien de ce camp n'entre, seul le serveur y parle."""
+    lobby = Lobby(engine_rig, PRESET)
+    lobby.mods["B"].emit("player_death", {"player": "intrus"})
+    lobby.mods["B"].emit("zombie_kill", {"player": "intrus", **KILL})
+    lobby.mods["B"].emit("zombie_kill", KILL, side=None)
+    lobby.mods["B"].hook_seen()
+
+    engine_rig.until(lambda _: len(lobby.records("event_refused")) == 3)
+    engine_rig.until(
+        lambda _: any(r["data"]["kind"] == "hook_seen" for r in lobby.records("event"))
+    )
+
+    refused = lobby.records("event_refused")
+    assert [(r["side"], r["data"]["kind"], r["data"]["player"]) for r in refused] == [
+        ("B", "player_death", "intrus"),
+        ("B", "zombie_kill", "intrus"),
+        ("B", "zombie_kill", None),
+    ]
+    entered = {r["data"]["kind"] for r in lobby.records("event") if r["data"]["src"] == "B"}
+    assert entered == {"caps", "hook_seen"}
+
+
+def test_refused_player_cannot_decide_the_match(engine_rig):
+    """Sa mort, et ses kills, s'arrêtent à la liaison d'identité : le match continue."""
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.mods["B"].emit("player_death", {"player": "intrus"})
+    duel.mods["B"].emit("zombie_kill", {"player": "intrus", **KILL})
+    duel.mods["B"].emit("damage_taken", {"player": PLAYERS["A"]})
+    # Le double signe ses atomes : celui-ci s'écrit à la main, à la suite de sa séquence.
+    mod = duel.mods["B"]
+    mod.seq += 1
+    envelope = {"v": 1, "boot": mod.boot, "seq": mod.seq, "t_ms": mod.t_ms, "src": "B", "side": "B"}
+    mod.write_raw(dump_line({**envelope, "kind": "player_death", "data": {}}))
+    duel.read("B")
+    engine_rig.until(lambda _: len(duel.records("event_refused")) == 4)
+
+    state = duel.reach(10)
+
+    assert state["phase"] == "running"
+    assert state["result"] is None
+    assert state["score"] == {"A": 0, "B": 0}
+    assert [r["data"]["kind"] for r in duel.records("event_refused")] == [
+        "player_death",
+        "zombie_kill",
+        "damage_taken",
+        "player_death",
+    ]
+    assert not any(r["data"]["kind"] == "player_death" for r in duel.records("event"))
+
+    # Le camp reste décidable par sa propre identité.
+    duel.played(duel.mods["B"].emit("player_death", {}))
+    assert duel.finish()["result"]["winner"] == "A"
+    assert duel.replays()
 
 
 def test_no_countdown_without_both_players(engine_rig):
@@ -788,6 +847,93 @@ def test_decided_result_survives_a_journal_failure(engine_rig):
     assert duel.records("match_end") == []
     warned = [log["msg"] for log in state["logs"] if log["level"] == "warn"]
     assert any("fin de match absente du journal" in msg for msg in warned)
+
+
+def failing_journal(duel: Duel, failed: str, error: Exception) -> list[str]:
+    """Fait échouer toute écriture du type `failed` ; rend les types qu'il a vu passer."""
+    journal = duel.engine._match._journal
+    write = journal.write
+    attempts: list[str] = []
+
+    def broken(type_, *args):
+        attempts.append(type_)
+        if type_ == failed:
+            raise error
+        return write(type_, *args)
+
+    journal.write = broken
+    return attempts
+
+
+ENCODING_FAILURE = UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+
+
+@pytest.mark.parametrize(
+    "failed",
+    ["bad_line", "event", "rule_fired", "effect_dropped", "match_end"],
+)
+@pytest.mark.parametrize(
+    "error", [OSError("disque plein"), ENCODING_FAILURE, TypeError("type")], ids=["disque", "encodage", "type"]
+)
+def test_write_failure_at_any_step_keeps_the_result(engine_rig, failed, error):
+    """Mort et kill au même tick : le lot est jeté, et chaque écriture du chemin peut lâcher."""
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    attempts = failing_journal(duel, failed, error)
+    duel.mods["B"].write_raw(b"pas du json\n")
+    duel.mods["A"].emit("zombie_kill", KILL)
+    duel.mods["B"].emit("player_death", {})
+    duel.at_match(1 + duel.step_s)
+
+    state = duel.finish()
+
+    assert failed in attempts, "la panne n'a pas été exercée"
+    assert state["result"]["outcome"] == "death"
+    assert state["result"]["winner"] == "A"
+    assert state["score"] == {"A": 1, "B": 0}
+    logs = [log["msg"] for log in state["logs"]]
+    assert any("match terminé — A 1 / B 0" in msg for msg in logs)
+    warned = [log["msg"] for log in state["logs"] if log["level"] == "warn"]
+    assert any("journal incomplet" in msg for msg in warned)
+    if failed == "match_end":
+        assert duel.records("match_end") == []
+    else:
+        ending = duel.match_end()["data"]
+        assert ending["result"]["winner"] == "A"
+        assert ending["score"] == {"A": 1, "B": 0}
+        assert ending["attribution"]
+
+
+def test_lost_command_does_not_stop_the_match(engine_rig):
+    """Une commande qui ne peut pas partir ne prive pas le lot de son `match_end`."""
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+
+    def disk_full(command):
+        raise OSError("disque plein")
+
+    for channel in duel.engine._match._channels.values():
+        channel.write = disk_full
+    duel.kills("A", 1)
+    engine_rig.until(lambda _: duel.records("command"))
+
+    duel.at_match(duel.te_s + duel.step_s)
+    duel.mods["B"].emit("player_death", {})
+    duel.at_match(duel.te_s + duel.step_s)
+
+    assert duel.finish()["result"]["winner"] == "A"
+    assert duel.match_end()["data"]["score"] == {"A": 1, "B": 0}
+
+
+def test_journal_refuses_nothing_on_the_match_path_unguarded():
+    """Seules `match_start` et `t0_ms` s'écrivent sans filet : avant elles, rien n'est fixé."""
+    source = inspect.getsource(engine_module)
+    assert source.count("self._journal.write(") == 3
+    assert 'self._journal.write(\n            "match_start"' in source
+    assert 'self._journal.write("state", {"phase": "running"' in source
+    assert "self._journal.write(type_, data, side, mt)" in source
 
 
 def test_refused_start_touches_no_world(engine_rig):

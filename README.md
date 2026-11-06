@@ -27,9 +27,9 @@ python3 -m service.main --mode real --pz-dir /chemin/vers/ProjectZomboid
 - `--install-mod` ne touche qu'à `~/Zomboid/mods/duelcore/`. À relancer après chaque modification du mod : le préflight compare l'empreinte installée à celle du dépôt et refuse tout écart.
 - Le jeu se cherche dans `--pz-dir`, sinon `PZ_INSTALL_DIR`, sinon les chemins Steam connus. Un choix explicite invalide échoue sans repli sur Steam. Le chemin désigne `ProjectZomboid/` ou `ProjectZomboid/projectzomboid/`.
 - Il faut 6 ports libres (jeu 17261 et 17271, UDP 17262 et 17272, RCON 27015 et 27016) et `min_free_ram_mb` de mémoire disponible : chaque serveur prend 2 Go. L'invité doit pouvoir joindre l'hôte sur le port de jeu de B.
-- Les serveurs tournent sans Steam (`start-server.sh` fixe `-Dzomboid.steam=0`), donc le client aussi. Dans le lobby, `Ouvrir PZ` lance `projectzomboid.sh -nosteam +connect 127.0.0.1:17261 +password …` ; si ce script manque, Steam lance le jeu avec les mêmes arguments. Le jeu demande ensuite le nom d'utilisateur. Le mot de passe est visible dans `ps` tant que le client tourne.
+- Les serveurs tournent sans Steam (`start-server.sh` fixe `-Dzomboid.steam=0`), donc le client aussi. Dans le lobby, `Ouvrir PZ` lance `projectzomboid.sh -nosteam +connect 127.0.0.1:17261 +password …` . Si le script manque, ou si le client s'arrête dans les 2 s, le bouton rend un échec qui dit la cause et la commande à faire à la main : il n'y a pas de relais par Steam. Un succès dit que le client tourne, pas qu'il est connecté (voir [les limites connues](docs/campaigns/phase1/limites-connues.md)). Le jeu demande ensuite le nom d'utilisateur. Le mot de passe est visible dans `ps` tant que le client tourne.
 - Chaque camp a son mot de passe : celui de A est tiré au hasard et affiché à l'hôte seul, celui de B part dans l'invitation avec l'adresse et le port de B. Sans mot de passe choisi, celui de B est aussi tiré au hasard. L'invité lance son client avec `-nosteam`.
-- Le premier nom d'utilisateur vu sur un serveur devient l'identité de ce camp pour tout le match. Un autre nom n'y compte pas comme présent, et un nom ne sert qu'un camp : les deux joueurs doivent donc prendre des noms différents.
+- Le premier nom d'utilisateur vu sur un serveur devient l'identité de ce camp pour tout le match. Un autre nom n'y compte pas comme présent, et un nom ne sert qu'un camp : les deux joueurs doivent donc prendre des noms différents. Tant que le camp n'a pas d'identité, ou si l'atome porte un autre nom, l'événement est refusé et journalisé en `event_refused` : il ne compte pas, et une mort refusée ne décide pas le match.
 
 **Ce que le mode réel écrit dans `~/Zomboid` :**
 
@@ -103,7 +103,7 @@ Relevé le 2026-11-05, build 42.21.0, sans joueur. `pytest -m pz_integration` : 
 | Hooks | Enregistrement confirmé sur les 10 hooks et `OnTick`. **Signatures non prouvées** : aucun `hook_seen` n'a tiré sans joueur ; seule la boucle `OnTick` est vue à l'œuvre |
 | Parcours `--mode real` | Lobby atteint en 21 s, invitation sur le port de B, `Annuler` en 10 s, `SIGTERM` propre |
 
-Reste non prouvé, faute de joueur : AC19, H2, les signatures de hooks, le spawn serveur en multi (`addZombiesInOutfit` n'est constaté que présent, `probe_spawn` finit `refused` sans joueur), l'attribution des kills, et la connexion d'un client `-nosteam` à un serveur lancé par `start-server.sh`, qui tourne avec `-Dzomboid.steam=0`.
+Reste non prouvé, faute de joueur : AC19, H2, les signatures de hooks, le spawn serveur en multi (`addZombiesInOutfit` n'est constaté que présent, `probe_spawn` finit `refused` sans joueur), l'attribution des kills, et la connexion d'un client `-nosteam` à un serveur lancé par `start-server.sh`, qui tourne avec `-Dzomboid.steam=0`. Le détail du lancement du client est dans [les limites connues](docs/campaigns/phase1/limites-connues.md).
 
 ## Structure
 

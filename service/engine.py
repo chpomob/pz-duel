@@ -14,7 +14,6 @@ import math
 import os
 import queue
 import random
-import shutil
 import socket
 import string
 import subprocess
@@ -86,17 +85,21 @@ ACTIONS = {"start", "cancel", "rematch", "simulate_join", "open_game"}
 MODE_MOCK = "mock"
 MODE_REAL = "real"
 MODES = (MODE_MOCK, MODE_REAL)
-STEAM_BINARY = "steam"
 # Lanceur du client, posé à côté du dossier que `detect_pz` rend.
 CLIENT_SCRIPT = "projectzomboid.sh"
 # `start-server.sh` fixe `-Dzomboid.steam=0` : le client doit quitter le mode Steam lui aussi.
 NO_STEAM_FLAG = "-nosteam"
+# Un client qui tient ce délai a démarré : un refus d'options sort bien avant.
+CLIENT_START_GRACE_S = 2
 # L'hôte joue sur la machine du serveur A.
 HOST_SIDE = "A"
 CLIENT_HOST = "127.0.0.1"
 # L'invité joue sur le serveur B.
 GUEST_SIDE = "B"
 PLAYER_REFUSED = "player_refused"
+EVENT_REFUSED = "event_refused"
+# Faits du serveur, sans auteur : ils arrivent avant toute connexion.
+SERVER_KINDS = (BEAT, CAPS, CMD_RESULT, HOOK_SEEN)
 LUA_DIR = "Lua"
 SERVER_DIR = "Server"
 FIRST_BOOT = 1
@@ -147,30 +150,31 @@ def load_presets(
     return out
 
 
-def _spawn(command: Sequence[str]) -> bool:
-    """Lance `command`, détachée du service. Rend faux si elle ne peut pas partir."""
+class ClientLaunchError(Exception):
+    """Client non lancé : le message dit la cause, sans jamais citer les arguments."""
+
+
+def launch_client(script: Path, args: Sequence[str]) -> None:
+    """Lance le client par son script, détaché du service, et le regarde démarrer.
+
+    Le script garde le client au premier plan et finit toujours par `exit 0` : le code ne
+    prouve rien, seul compte qu'il tourne encore au bout de `CLIENT_START_GRACE_S`.
+    """
     try:
-        subprocess.Popen(
-            command,
+        process = subprocess.Popen(
+            [str(script), *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-    except OSError:
-        return False
-    return True
-
-
-def launch_client(script: Path, args: Sequence[str]) -> bool:
-    """Lance le client par son script, sans passer par Steam."""
-    return _spawn([str(script), *args])
-
-
-def launch_steam(args: Sequence[str]) -> bool:
-    """Lance Steam avec `args`, détaché du service. Rend faux si Steam est introuvable."""
-    steam = shutil.which(STEAM_BINARY)
-    return steam is not None and _spawn([steam, *args])
+    except OSError as exc:
+        raise ClientLaunchError(f"{script.name} ne démarre pas ({exc.strerror})") from exc
+    try:
+        code = process.wait(CLIENT_START_GRACE_S)
+    except subprocess.TimeoutExpired:
+        return
+    raise ClientLaunchError(f"{script.name} s'est arrêté aussitôt (code {code}), options refusées ?")
 
 
 def local_ip() -> str:
@@ -412,6 +416,7 @@ class RealMatch:
         # Nom de connexion lié à chaque camp, pour tout le match, relances comprises.
         self._identities: dict[str, str] = {}
         self._refused_players: set[tuple[str, str]] = set()
+        self._lost_lines = 0
         self._probes: dict[str, _Probe] = {}
         self._last_cmd_seq = FIRST_CMD_FLOOR
         self._countdown_end_ms: int | None = None
@@ -795,17 +800,31 @@ class RealMatch:
         self._last_age[side] = age
 
     def _write_records(self, records: Sequence[Mapping[str, Any]]) -> None:
-        """Journalise dans l'ordre du cœur ; une commande part une fois journalisée."""
+        """Journalise dans l'ordre du cœur ; une commande part une fois journalisée.
+
+        `match_end` ferme le lot : aucune panne d'une ligne précédente ne doit l'en priver.
+        """
         for record in records:
             if record["type"] == MATCH_END:
                 self._conclude(record)
                 continue
-            data = record["data"]
-            self._journal.write(record["type"], data, record["side"], record["mt"])
-            if record["type"] == COMMAND:
-                self._channels[record["side"]].write(data[COMMAND])
-                self._unresolved[record["side"]].add(data[COMMAND]["seq"])
-                self._threats.append(record["mt"])
+            written = self._write_safely(
+                record["type"], record["data"], record["side"], record["mt"]
+            )
+            if written and record["type"] == COMMAND:
+                self._send(record)
+
+    def _send(self, record: Mapping[str, Any]) -> None:
+        """Écrit une commande dans `in` ; perdue, le cœur la rend par son `cmd_timeout`."""
+        side, command = record["side"], record["data"][COMMAND]
+        # Avant l'écriture : une panne après le `write` laisse une ligne que le mod a pu lire.
+        self._unresolved[side].add(command["seq"])
+        try:
+            self._channels[side].write(command)
+        except (OSError, ValueError) as exc:
+            LOGGER.error("commande %s : %s", command["seq"], self.redactor.redact_exception(exc))
+            return
+        self._threats.append(record["mt"])
 
     def _conclude(self, record: Mapping[str, Any]) -> None:
         """Écrit `match_end` avec le verdict relu sur le journal, qui contient tout le match.
@@ -844,6 +863,8 @@ class RealMatch:
         }
         if not self._write_safely(MATCH_END, data, record["side"], record["mt"]):
             notes.append("fin de match absente du journal : écriture impossible")
+        if self._lost_lines:
+            notes.append(f"journal incomplet : {self._lost_lines} lignes perdues")
         self.result = result
         score = record["data"]["score"]
 
@@ -899,13 +920,38 @@ class RealMatch:
     def _record_anomalies(self, anomalies: Sequence[Anomaly]) -> None:
         for anomaly in anomalies:
             data = _redacted(self.redactor, anomaly.data)
-            self._journal.write(anomaly.type, data, anomaly.side, self._line_mt())
+            self._write_safely(anomaly.type, data, anomaly.side, self._line_mt())
+
+    def _admitted(self, side: str, event: Mapping[str, Any]) -> bool:
+        """Dit si l'événement vient de l'identité du camp, seule à pouvoir peser sur le match.
+
+        `SERVER_KINDS` décrivent le serveur et n'ont pas d'auteur. Le reste exige un camp
+        authentifié. Un atome sans camp n'a pas d'auteur non plus : le cœur le journalise
+        sans le compter. Un atome de camp sans `player` est refusé, faute de preuve.
+        """
+        if event["kind"] in SERVER_KINDS:
+            return True
+        bound = self._identities.get(side)
+        if bound is None:
+            return False
+        return event["side"] is None or event["data"].get("player") == bound
 
     def _take_event(self, side: str, event: Mapping[str, Any], now_ms: int) -> None:
         """Avant le match, l'événement se journalise ici ; ensuite, le cœur l'écrit à son tick."""
         kind, data = event["kind"], event["data"]
+        if not self._admitted(side, event):
+            refused = {
+                "kind": kind,
+                "boot": event["boot"],
+                "seq": event["seq"],
+                "player": data.get("player"),
+            }
+            self._record_anomalies([Anomaly(EVENT_REFUSED, side, refused)])
+            return
         if self._core is None:
-            self._journal.write(CMD_RESULT if kind == CMD_RESULT else EVENT, event, event["side"])
+            self._write_safely(
+                CMD_RESULT if kind == CMD_RESULT else EVENT, event, event["side"], None
+            )
         else:
             self._core.submit_event(event)
         if kind == CAPS:
@@ -1000,8 +1046,9 @@ class RealMatch:
                 "kind": PROBE_KIND,
                 **self.runtime["probe_spawn"],
             }
-            self._journal.write(COMMAND, {COMMAND: command, "latency_ms": None}, side)
-            self._channels[side].write(command)
+            # Non journalisée, elle ne part pas : l'échéance rend la sonde en échec.
+            if self._write_safely(COMMAND, {COMMAND: command, "latency_ms": None}, side, None):
+                self._channels[side].write(command)
             deadline_ms = now_ms + self.runtime["probe_timeout_s"] * MS_PER_S
             self._probes[side] = _Probe(seq, deadline_ms)
 
@@ -1028,7 +1075,7 @@ class RealMatch:
         """Fige la décision, puis revalide la table sur les seuls atomes actifs."""
         self.window.close()
         for withdrawal in self.window.withdrawn:
-            self._journal.write(ATOM_WITHDRAWN, withdrawal)
+            self._write_safely(ATOM_WITHDRAWN, withdrawal, None, None)
         try:
             load_table(
                 self.table,
@@ -1173,10 +1220,14 @@ class RealMatch:
     def _write_safely(
         self, type_: str, data: Mapping[str, Any], side: str | None, mt: float | None
     ) -> bool:
-        """Journalise une ligne qu'une panne du journal ne doit pas interrompre."""
+        """Journalise une ligne qu'une panne du journal ne doit pas interrompre.
+
+        Disque, encodage ou type : la perte se compte et `_conclude` la rapporte.
+        """
         try:
             self._journal.write(type_, data, side, mt)
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
+            self._lost_lines += 1
             LOGGER.error("journal : %s", self.redactor.redact_exception(exc))
             return False
         return True
@@ -1213,8 +1264,7 @@ class Engine:
         effects: Mapping[str, Any] | None = None,
         clock: Callable[[], float] | None = None,
         matches_dir: str | os.PathLike[str] | None = None,
-        client_launcher: Callable[[Path, Sequence[str]], bool] | None = None,
-        steam_launcher: Callable[[Sequence[str]], bool] | None = None,
+        client_launcher: Callable[[Path, Sequence[str]], None] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
     ) -> None:
         if mode not in MODES:
@@ -1227,7 +1277,6 @@ class Engine:
         self.matches_dir = MATCHES_DIR if matches_dir is None else Path(matches_dir)
         self._clock = time.time if clock is None else clock
         self._client_launcher = launch_client if client_launcher is None else client_launcher
-        self._steam_launcher = launch_steam if steam_launcher is None else steam_launcher
         self._server_factory = ServerProcess if server_factory is None else server_factory
         self.lock = threading.RLock()
         self.state = MatchState(mode=mode)
@@ -1274,6 +1323,8 @@ class Engine:
         payload = payload or {}
         if not isinstance(name, str) or name not in ACTIONS:
             return False, f"action inconnue: {name}"
+        if name == "open_game" and self.real:
+            return self._open_game_real()
         with self.lock:
             phase = self.state.phase
             if self._closing and name in ("start", "rematch"):
@@ -1320,8 +1371,6 @@ class Engine:
                 self.state.event("adversaire connecté", "B")
                 return True, "invité connecté"
             if name == "open_game":
-                if self.real:
-                    return self._open_game_real()
                 self.state.log("lancement du client PZ demandé (simulé)")
                 return True, "client PZ lancé (simulé)"
         return False, "action non traitée"
@@ -1350,31 +1399,32 @@ class Engine:
         return stopped and not self._stop_incomplete
 
     def _open_game_real(self) -> tuple[bool, str]:
-        """Connecte le client de l'hôte au serveur A. La commande n'est jamais journalisée.
+        """Lance le client de l'hôte vers le serveur A. La commande n'est jamais journalisée.
 
-        Les serveurs tournent sans Steam, le client aussi : son script d'abord, et Steam
-        seulement s'il manque, avec le même `-nosteam`.
+        Les serveurs tournent sans Steam, le client aussi, et par son seul script : Steam ne
+        rendrait aucun constat du lancement. Un succès dit que le client tourne, pas qu'il
+        est connecté. Le verrou reste libre pendant que `launch_client` regarde le démarrage.
         """
-        password = self.state.config.get("host_password")
+        with self.lock:
+            password = self.state.config.get("host_password")
+            address = self.state.config.get("host_address")
         if not password:
             return False, "aucun duel préparé : démarrez un duel avant d'ouvrir le jeu"
-        args = [
-            NO_STEAM_FLAG,
-            "+connect",
-            self.state.config["host_address"],
-            "+password",
-            password,
-        ]
+        args = [NO_STEAM_FLAG, "+connect", address, "+password", password]
         script = self._client_script()
-        if script is not None and self._client_launcher(script, args):
-            message = "client PZ lancé sans Steam"
-        elif self._steam_launcher(["-applaunch", str(self.runtime["steam_app_id"]), *args]):
-            message = f"client PZ lancé par Steam avec {NO_STEAM_FLAG}"
-        else:
-            message = f"client PZ introuvable : lancez PZ à la main avec {NO_STEAM_FLAG}"
-            self.state.log(message, "warn")
+        try:
+            if script is None:
+                raise ClientLaunchError(f"client PZ introuvable ({CLIENT_SCRIPT} absent)")
+            self._client_launcher(script, args)
+        except ClientLaunchError as exc:
+            manual = f"lancez PZ à la main avec {NO_STEAM_FLAG}, puis rejoignez {address}"
+            message = f"{exc} : {manual}"
+            with self.lock:
+                self.state.log(message, "warn")
             return False, message
-        self.state.log(message)
+        message = f"client PZ lancé sans Steam : vérifiez en jeu la connexion à {address}"
+        with self.lock:
+            self.state.log(message)
         return True, message
 
     def _client_script(self) -> Path | None:
