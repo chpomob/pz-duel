@@ -1,0 +1,29 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A1",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:608 transmet désormais les morts antérieures au cœur ; service/rules.py:849 les trie chronologiquement, sans exclusion avant t0 (service/rules.py:878), donc la plus ancienne décide, y compris face à une mort après t0. Toutefois service/engine.py:612 passe en running avant jugement : si l'attente du tampon reste ouverte, service/engine.py:659 continue les ticks tandis que service/rules.py:846 retient les morts. tests/test_match.py:2019 couvre explicitement cette période en running sans résultat après une mort juste avant t0. L'exigence de jugement au passage en running reste ouverte."
+    },
+    {
+      "id": "A2",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:272 ferme la fenêtre dès que le lobby est prêt ; service/engine.py:1102 utilise le couple build/empreinte pour mémoriser la détection, et DuelCore.lua:493 fournit le relevé de santé sans blessure préalable. Mais service/engine.py:1279 retire toujours des règles de _played_table après un échec mémorisé, alors que rules_hash reste celui de table (service/engine.py:398) et que _rules_refusal vérifie seulement le preset original (service/engine.py:1308). tests/test_match.py:2232 prévoit ce retrait au match suivant : la table jouée peut donc encore différer de celle annoncée dans rules_hash."
+    },
+    {
+      "id": "A3",
+      "status": "RESOLVED",
+      "evidence": "mods/duelcore/42.21/media/lua/server/DuelCore.lua:74 énumère les morts et les atomes de score à vider immédiatement ; emit appelle flushOut à la ligne 330. service/engine.py:620 attend conclusion_settle_ms puis reprend un repère de fin et relit les sorties avant jugement ; service/rules.py:814 retient les morts et le tick du minuteur pendant cette attente. docs/campaigns/phase1/limites-connues.md:26 indique 1,5 s pour un tampon de 1 s. tests/test_match.py:2072 et :2090 couvrent les deux scénarios d'origine."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "service/engine.py",
+    "service/rules.py",
+    "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+    "README.md",
+    "tests/test_match.py",
+    "docs/campaigns/phase1/limites-connues.md"
+  ]
+}

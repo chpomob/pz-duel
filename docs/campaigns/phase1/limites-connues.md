@@ -74,6 +74,10 @@ et le contrat — mais chacun a un effet observable, décrit tel quel.
   ligne tronquée comme une commande invalide.
 - **L'URI d'invitation est construite sans encodage** : un mot de passe ou un nom contenant un
   caractère réservé casse le lien.
+- **Le jugement attend un intervalle de vidage** (`conclusion_settle_ms`) avant de conclure. Pendant
+  cette fenêtre bornée, le match tourne encore sans résultat alors qu'une mort est déjà journalisée.
+  C'est volontaire : c'est ce qui garantit que la mort la plus ancienne décide même si elle est
+  encore dans le tampon du mod (cf. constat A3 de la revue de clôture).
 
 Ces six points sont des correctifs courts ; ils sont différés parce qu'aucun ne touche la chaîne
 prouvée (mod chargé, `caps`, contrat, arrêt RCON), et parce que les corriger sans le premier duel
