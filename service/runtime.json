@@ -13,7 +13,7 @@
   "probe_timeout_s": 30,
   "probe_retry_s": 5,
   "beat_timeout_s": 30,
-  "hook_window_s": 120,
+  "conclusion_settle_ms": 1500,
   "countdown_s": 3,
   "tick_ms": 250,
   "rate_window_s": 60,

@@ -230,6 +230,12 @@ function stepsList() {
   </ul>`;
 }
 
+// La table jouée diffère de l'annonce dans un seul cas : un atome retiré sur échec constaté.
+function disabledRules() {
+  const rules = (S.capabilities && S.capabilities.disabled_rules) || [];
+  return rules.length ? `<p class="hint">Règles retirées de ce match : ${esc(rules.join(', '))}</p>` : '';
+}
+
 function renderLive() {
   const phase = S.phase;
   let body = '';
@@ -245,11 +251,12 @@ function renderLive() {
         </div>
         <div class="row"><span class="k">Menaces / min</span><span class="v">${S.threats_per_min}</span></div>
         <div class="row"><span class="k">Dérive d'horloge</span><span class="v">${S.clock.drift_s ?? '—'} s</span></div>
+        ${disabledRules()}
         <div class="actions">${phase === 'running' ? '<button class="danger" data-action="cancel">Arrêter le match</button>' : ''}</div>
       </section>`;
     if (phase === 'countdown') {
       body = `<section class="card"><div class="countdown">${S.clock.countdown ?? 3}</div>
-        <p class="hint" style="text-align:center">le duel commence</p></section>`;
+        <p class="hint" style="text-align:center">le duel commence</p>${disabledRules()}</section>`;
     }
     if (S.events.length) {
       body += `<section class="card"><h2>Fil du match</h2>

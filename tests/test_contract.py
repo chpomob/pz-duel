@@ -205,11 +205,14 @@ class Lobby:
     l'écriture. Un effet se lit par `wait_for`, et une absence d'effet après `sync_pump`.
     """
 
-    def __init__(self, rig, preset: str | None) -> None:
+    def __init__(self, rig, preset: str | None, failed_sides: tuple[str, ...] = ()) -> None:
         self.rig = rig
         self.clock = FrozenClock()
         self.wall = SteppedWall(self.clock)
         self.engine = rig.build()
+        if failed_sides:
+            # Échec déjà constaté sur ce couple : `test_proof_survives_to_the_next_match` l'établit.
+            self.engine._proofs.failed_sides = lambda pair, hook: list(failed_sides)
         self.engine._clock = self.wall
         self.engine._monotonic = self.clock
         catalog = self.engine.effects
@@ -334,20 +337,49 @@ def state_entered_at(lobby: Lobby, phase: str) -> int:
     return next(r["ts_ms"] for r in lobby.records("state") if r["data"].get("phase") == phase)
 
 
-def withdrawn_at_window_end(lobby: Lobby) -> None:
+def test_lobby_does_not_wait_for_a_wound(engine_rig):
+    """Sans preuve ni échec connus : décompte à `L`, table entière, aucun atome retiré."""
+    lobby = Lobby(engine_rig, None)
+    assert lobby.state()["config"]["preset"] == WITH_ATOM
+    lobby.join_and_resolve()
+
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state_entered_at(lobby, "countdown") == L_S * MS
+    assert ATOM in state["capabilities"]["active_atoms"]
+    assert state["capabilities"]["withdrawn"] == []
+    assert state["capabilities"]["disabled_rules"] == []
+    assert lobby.records("atom_withdrawn") == []
+    assert lobby.engine._match._played_table == lobby.engine._match.table
+
+
+def test_hook_seen_on_one_side_withdraws_nothing(engine_rig):
+    """Un hook muet sur un camp n'est pas un échec : le relevé de santé reste le signal."""
+    lobby = Lobby(engine_rig, WITH_ATOM)
     lobby.mods["A"].hook_seen()
     lobby.join_and_resolve()
-    lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 120 s")
 
-    lobby.at(119)
-    lobby.wait_detail("temps restant : 1 s")
-    assert lobby.state()["phase"] == "lobby"
+    state = engine_rig.wait("countdown", "error")
 
-    lobby.at(120)
-    state = lobby.rig.wait("countdown", "error")
     assert state["phase"] == "countdown", state["error"]
-    assert state_entered_at(lobby, "countdown") == (L_S + 120) * MS
+    assert state["capabilities"]["withdrawn"] == []
+    assert state["capabilities"]["A"]["hooks"][HOOK]["seen"]
+    assert not state["capabilities"]["B"]["hooks"][HOOK]["seen"]
+
+
+def test_known_failure_withdraws_at_l_and_is_announced(engine_rig):
+    """Un échec constaté retire l'atome à `L`, sans attente, et le lobby l'annonce avant."""
+    lobby = Lobby(engine_rig, WITH_ATOM, failed_sides=("B",))
+    lobby.wait_detail(f"{ATOM} sera retiré")
+
+    lobby.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state_entered_at(lobby, "countdown") == L_S * MS
     assert state["capabilities"]["withdrawn"] == [ATOM]
+    assert state["capabilities"]["disabled_rules"] == ["hurt_supply"]
     assert ATOM not in state["capabilities"]["active_atoms"]
     assert "zombie_kill" in state["capabilities"]["active_atoms"]
     # Ce retrait ne conclut rien sur l'architecture.
@@ -355,45 +387,31 @@ def withdrawn_at_window_end(lobby: Lobby) -> None:
     assert lobby.step("contract")["state"] == "ok"
     (withdrawn,) = lobby.records("atom_withdrawn")
     assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
-    assert withdrawn["ts_ms"] == (L_S + 120) * MS
+    assert withdrawn["ts_ms"] == L_S * MS
     assert withdrawn["mt"] is None
 
 
-def late_hook_read_with_the_deadline_pass(lobby: Lobby) -> None:
-    lobby.mods["A"].hook_seen()
+def test_signal_seen_in_the_lobby_clears_a_known_failure(engine_rig):
+    lobby = Lobby(engine_rig, WITH_ATOM, failed_sides=("B",))
+    lobby.wait_detail(f"{ATOM} sera retiré")
+
+    lobby.mods["B"].hook_seen()
     lobby.join_and_resolve()
-    lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 120 s")
-
-    def miss_the_deadline() -> None:
-        # Sur le fil du moteur, juste avant `pump` : la passe qui constate l'échéance lit le hook.
-        # Pas `at` : ce fil ne peut pas attendre ses propres passes.
-        lobby.clock.now = L_S + 120.001
-        lobby.mods["B"].hook_seen()
-
-    lobby.clock.on_next_read = miss_the_deadline
-    state = lobby.rig.wait("countdown", "error")
+    state = engine_rig.wait("countdown", "error")
 
     assert state["phase"] == "countdown", state["error"]
-    assert ATOM in state["capabilities"]["withdrawn"]
-    (withdrawn,) = lobby.records("atom_withdrawn")
-    assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
-    # Le hook tardif reste publié comme vu, sans compter dans la décision.
-    assert state["capabilities"]["B"]["hooks"][HOOK]["seen"]
+    assert state["capabilities"]["withdrawn"] == []
 
 
-def published_without_the_atom(lobby: Lobby) -> None:
-    lobby.mods["A"].hook_seen()
+def test_table_without_the_atom_publishes_the_same_withdrawal(engine_rig):
+    lobby = Lobby(engine_rig, WITHOUT_ATOM, failed_sides=("B",))
     lobby.join_and_resolve()
 
-    state = lobby.rig.wait("countdown", "error")
+    state = engine_rig.wait("countdown", "error")
 
     assert state["phase"] == "countdown", state["error"]
-    assert state_entered_at(lobby, "countdown") == L_S * MS
     assert state["capabilities"]["withdrawn"] == [ATOM]
     assert ATOM not in state["capabilities"]["active_atoms"]
-    assert "zombie_kill" in state["capabilities"]["active_atoms"]
-    (withdrawn,) = lobby.records("atom_withdrawn")
-    assert withdrawn["data"] == {"atom": ATOM, "hook": HOOK, "sides": ["B"]}
 
     # Un `hook_seen` tardif ne réactive rien, même publié comme vu.
     lobby.mods["B"].hook_seen()
@@ -402,60 +420,10 @@ def published_without_the_atom(lobby: Lobby) -> None:
     assert ATOM not in lobby.state()["capabilities"]["active_atoms"]
 
 
-def seen_on_both_sides(lobby: Lobby) -> None:
-    lobby.join_and_resolve()
-    lobby.wait_detail(f"hook {HOOK} attendu sur A, B ; temps restant : 120 s")
-
-    lobby.at(5)
-    lobby.wait_detail("temps restant : 115 s")
-    lobby.mods["A"].hook_seen()
-    lobby.wait_detail(f"hook {HOOK} attendu sur B ; temps restant : 115 s")
-    assert lobby.state()["phase"] == "lobby"
-    lobby.mods["B"].hook_seen()
-
-    state = lobby.rig.wait("countdown", "error")
-
-    assert state["phase"] == "countdown", state["error"]
-    assert state_entered_at(lobby, "countdown") == (L_S + 5) * MS
-    assert ATOM in state["capabilities"]["active_atoms"]
-    assert state["capabilities"]["withdrawn"] == []
-    assert lobby.records("atom_withdrawn") == []
-
-
-@pytest.mark.parametrize(
-    "preset, scenario",
-    [
-        (WITH_ATOM, withdrawn_at_window_end),
-        (WITH_ATOM, late_hook_read_with_the_deadline_pass),
-        (WITHOUT_ATOM, published_without_the_atom),
-        (WITH_ATOM, seen_on_both_sides),
-    ],
-)
-def test_unseen_hook_withdraws_atom(engine_rig, preset, scenario):
-    assert engine_rig.runtime["hook_window_s"] == 120
-
-    scenario(Lobby(engine_rig, preset))
-
-
-def test_default_preset_launches_without_the_proof(engine_rig):
-    """Sans preset choisi, `duel_rapide` atteint le décompte même si aucune blessure n'arrive."""
-    lobby = Lobby(engine_rig, None)
-    assert lobby.state()["config"]["preset"] == WITH_ATOM
-    lobby.join_and_resolve()
-    lobby.wait_detail(f"hook {HOOK} attendu sur A, B ; temps restant : 120 s")
-
-    lobby.at(engine_rig.runtime["hook_window_s"])
-    state = engine_rig.wait("countdown", "error")
-
-    assert state["phase"] == "countdown", state["error"]
-    assert state["capabilities"]["withdrawn"] == [ATOM]
-
-
-def test_hook_window_outlives_contract_step(engine_rig):
+def test_decision_outlives_contract_step_and_restart(engine_rig):
     lobby = Lobby(engine_rig, WITH_ATOM)
 
     assert lobby.step("contract")["state"] == "ok"
-    lobby.wait_detail(f"hook {HOOK} attendu sur A, B")
     lobby.at(300)
     lobby.settle()
     assert lobby.state()["phase"] == "lobby"
@@ -463,8 +431,6 @@ def test_hook_window_outlives_contract_step(engine_rig):
     assert lobby.state()["capabilities"]["active_atoms"] is None
 
     lobby.at(0)
-    for mod in lobby.mods.values():
-        mod.hook_seen()
     lobby.join_and_resolve()
     state = engine_rig.wait("countdown", "error")
     assert state["phase"] == "countdown", state["error"]
@@ -484,92 +450,72 @@ def test_hook_window_outlives_contract_step(engine_rig):
     engine_rig.until(lambda s: not s["capabilities"]["A"]["hooks"][HOOK]["registered"])
     assert lobby.state()["capabilities"]["active_atoms"] == active
     assert lobby.records("atom_withdrawn") == []
-    # Chaque `at` laisse une passe juger l'instant : l'écart entre `beat` reste sous la grâce.
-    for now_s in (90, 180, engine_rig.runtime["hook_window_s"] * 2):
-        lobby.at(now_s)
-        for side in SIDES:
-            lobby.mods[side].beat(players=(PLAYERS[side],))
-    # En match, le cœur n'écrit qu'à un tick suivant : c'est `at` qui passe l'échéance.
-    lobby.at(engine_rig.runtime["hook_window_s"] * 2 + 1)
-    assert lobby.state()["capabilities"]["active_atoms"] == active
-    assert lobby.records("atom_withdrawn") == []
 
 
-def window(table_atoms: list[str]) -> ContractWindow:
-    opened = ContractWindow({"atoms": table_atoms}, load_effects(), 120)
+def window(table_atoms: list[str] = ("zombie_kill", ATOM)) -> ContractWindow:
+    opened = ContractWindow(load_effects())
     for side in SIDES:
-        opened.on_caps(side, {"atoms": ["zombie_kill", ATOM]})
+        opened.on_caps(side, {"atoms": list(table_atoms)})
     return opened
 
 
 def test_window_never_closes_before_l():
-    opened = window(["zombie_kill", ATOM])
+    opened = window()
     for side in SIDES:
-        opened.on_hook_seen(side, HOOK, 0)
+        opened.on_hook_seen(side, HOOK)
 
-    assert not opened.due(0)
+    assert not opened.due
 
-    opened.reach_lobby_ready(10)
-    assert opened.due(10)
+    opened.reach_lobby_ready()
+    assert opened.due
 
 
-def test_registered_hook_without_proof_withdraws_atom():
-    """`caps` publie l'enregistrement : seul un `hook_seen` du hook requis le prouve."""
-    opened = ContractWindow({"atoms": [ATOM]}, load_effects(), 120)
-    for side in SIDES:
-        opened.on_caps(side, {"atoms": [ATOM], "hooks": {HOOK: True}})
-        opened.on_hook_seen(side, "OnHitZombie", 0)
-    opened.on_hook_seen("A", HOOK, 0)
-    opened.reach_lobby_ready(0)
+def test_window_closes_at_l_without_any_proof():
+    opened = window()
+    opened.reach_lobby_ready()
 
-    assert not opened.due(119_999)
-    assert opened.due(120_000)
-    opened.close()
+    assert opened.due
+    opened.close({})
+    assert opened.withdrawn == []
+    assert opened.active_atoms == ["damage_taken", "zombie_kill"]
+    assert not opened.due
+
+
+def test_only_a_known_failure_withdraws():
+    opened = window()
+    opened.close({HOOK: ["B"]})
+
     assert opened.withdrawn == [{"atom": ATOM, "hook": HOOK, "sides": ["B"]}]
-    assert opened.active_atoms == []
+    assert opened.active_atoms == ["zombie_kill"]
 
 
 def test_window_opens_at_first_caps():
-    opened = ContractWindow({"atoms": [ATOM]}, load_effects(), 120)
+    opened = ContractWindow(load_effects())
 
-    opened.on_hook_seen("A", HOOK, 0)
+    opened.on_hook_seen("A", HOOK)
     assert opened.seen["A"] == set()
 
     opened.on_caps("B", {"atoms": [ATOM]})
-    opened.on_hook_seen("A", HOOK, 0)
+    opened.on_hook_seen("A", HOOK)
     assert opened.seen["A"] == {HOOK}
 
 
-def test_window_keeps_first_l():
-    opened = window([ATOM])
-    opened.reach_lobby_ready(1000)
-    opened.reach_lobby_ready(5000)
-
-    assert not opened.due(120_999)
-    assert opened.due(121_000)
-
-
 def test_atom_missing_from_one_caps_is_not_active():
-    opened = window(["zombie_kill"])
+    opened = window()
     opened.on_caps("B", {"atoms": ["zombie_kill"]})
-    opened.on_hook_seen("A", HOOK, 0)
-    opened.on_hook_seen("B", HOOK, 0)
 
-    opened.close()
+    opened.close({})
 
     assert opened.active_atoms == ["zombie_kill"]
     assert opened.withdrawn == []
 
 
-def test_hook_after_deadline_is_published_but_proves_nothing():
-    opened = window([ATOM])
-    opened.reach_lobby_ready(1000)
-    opened.on_hook_seen("A", HOOK, 121_000)
-    opened.on_hook_seen("B", HOOK, 121_001)
+def test_a_wound_or_a_hook_detects_the_side():
+    opened = window()
+    assert not opened.detected("A", HOOK)
 
-    assert opened.seen["B"] == {HOOK}
-    assert opened.due(121_001)
-    opened.close()
+    opened.on_wound("A", ATOM)
+    opened.on_hook_seen("B", HOOK)
 
-    assert opened.withdrawn == [{"atom": ATOM, "hook": HOOK, "sides": ["B"]}]
-    assert ATOM not in opened.active_atoms
+    assert opened.detected("A", HOOK)
+    assert opened.detected("B", HOOK)

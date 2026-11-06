@@ -876,9 +876,21 @@ class MatchCore:
         return self._tick > 0 and te_ms <= self._now_ms - self._tick_ms
 
     def _is_fatal(self, event: Mapping[str, Any]) -> bool:
-        """Dit si l'événement est une mort qui clôt le match : celle d'un camp, depuis `t0`."""
+        """Dit si l'événement est une mort qui clôt le match : celle d'un camp, jusqu'au terme.
+
+        Une mort d'avant `t0` en est une : le match ne se joue pas avec un participant mort.
+        """
         is_death = event["kind"] == PLAYER_DEATH and event["side"] is not None
-        return is_death and event["t_ms"] >= self._t0_ms
+        return is_death and self._in_time(event["t_ms"] - self._t0_ms)
+
+    def _in_time(self, te_ms: int) -> bool:
+        """Dit si `te_ms` compte : au tick du minuteur, la lecture voit plus loin que le terme.
+
+        Seul ce tick compare `te` au terme : avant lui, `te` peut le passer sur un saut de
+        l'heure murale, et ce fait reste du match.
+        """
+        end_ms = self.duration_s * MS_PER_S
+        return te_ms <= end_ms or self._now_ms < end_ms
 
     def _process_event(self, event: Mapping[str, Any]) -> None:
         kind, side = event["kind"], event["side"]
@@ -894,8 +906,8 @@ class MatchCore:
             self._record("late_event", data, side)
         if kind == CMD_RESULT:
             self._settle(event["src"], event["data"]["seq"])
-        elif side is not None:
-            if self._is_fatal(event) and self._ending is None:
+        elif side is not None and self._ending is None and self._in_time(te_ms):
+            if self._is_fatal(event):
                 self._ending = self._death_result(side)
             for fired in self._evaluators[side].feed(event, te_ms):
                 self._apply_rule(fired)

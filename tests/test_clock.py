@@ -284,7 +284,7 @@ def test_short_of_end_keeps_what_does_not_conclude_moving():
     core.submit_event(event(0, seq=3))
     records = core.advance_short_of_end(at(0))
 
-    assert [r["data"]["seq"] for r in of_type(records, "event")] == [2, 3]
+    assert [r["data"]["seq"] for r in of_type(records, "event")] == [3]
     assert core.scores["A"] == 1
 
 

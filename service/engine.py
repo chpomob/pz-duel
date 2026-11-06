@@ -27,9 +27,11 @@ from typing import Any, NamedTuple
 
 from .journal import Journal, read_journal
 from .preflight import detect_pz, run_preflight
+from .proofs import PROOFS_NAME, HookProofs
 from .protocol import PROTOCOL_VERSION, SIDES
 from .rules import (
     MS_PER_S,
+    PLAYER_DEATH,
     RESTARTING,
     MatchCore,
     TableError,
@@ -110,6 +112,8 @@ STOP_INCOMPLETE = "arrêt incomplet : des processus de serveur subsistent"
 # La fonction de jeu que `probe_spawn` met à l'épreuve dans `DuelCore.lua`.
 PROBE_FUNCTION = "addZombiesInOutfit"
 ATOM_WITHDRAWN = "atom_withdrawn"
+EARLY_DEATH = "early_death"
+OUTCOME_DEATH = "death"
 STEP_CONTRACT = "contract"
 STEP_LOBBY = "lobby"
 STATUS_SUSPECT = "suspect"
@@ -235,31 +239,25 @@ def _redacted(redactor: Redactor, value: Any) -> Any:
 
 
 class ContractWindow:
-    """Fenêtre de contrat : ce que les camps ont prouvé, jusqu'à une décision figée.
+    """Fenêtre de contrat : ce que les camps ont montré, jusqu'à une décision figée.
 
-    Ouverte au premier `caps`. `reach_lobby_ready` fixe `L`. `close` décide une fois pour
-    tout le match : `caps` et `hook_seen` tardifs restent publiés, sans rien réactiver.
-    `seen` est ce qui se publie, `_proven` ce qui décide : un `hook_seen` lu après
-    `L` + `hook_window_s` entre dans le premier seulement, même si `close` n'a pas encore eu
-    lieu, car `pump` lit `out` avant de juger l'échéance.
+    Ouverte au premier `caps`, elle se ferme à `L`, que `reach_lobby_ready` fixe : aucune
+    blessure n'est attendue, car `damage_taken` vient du relevé de santé du mod, et son hook ne
+    fait que le confirmer. `close` décide une fois pour tout le match, sur l'échec déjà constaté
+    pour ce build et ce mod : `caps` et `hook_seen` tardifs restent publiés, sans rien réactiver.
+    `seen` est ce qui se publie, `detected` dit si le camp a vu la blessure par un signal ou l'autre.
     """
 
-    def __init__(
-        self, table: Mapping[str, Any], catalog: Mapping[str, Any], hook_window_s: float
-    ) -> None:
-        self._proofs = {
+    def __init__(self, catalog: Mapping[str, Any]) -> None:
+        self.proofs = {
             atom: spec["hook_proof"]
             for atom, spec in catalog["atoms"].items()
             if "hook_proof" in spec
         }
-        self._required = sorted(
-            {self._proofs[atom] for atom in table["atoms"] if atom in self._proofs}
-        )
-        self._window_s = hook_window_s
         self.caps: dict[str, Mapping[str, Any]] = {}
         self.seen: dict[str, set[str]] = {side: set() for side in SIDES}
-        self._proven: dict[str, set[str]] = {side: set() for side in SIDES}
-        self.ready_ms: int | None = None
+        self._wounded: dict[str, set[str]] = {side: set() for side in SIDES}
+        self.ready = False
         self.active_atoms: list[str] | None = None
         self.withdrawn: list[dict[str, Any]] = []
 
@@ -267,62 +265,46 @@ class ContractWindow:
     def closed(self) -> bool:
         return self.active_atoms is not None
 
+    @property
+    def due(self) -> bool:
+        return self.ready and not self.closed
+
     def on_caps(self, side: str, data: Mapping[str, Any]) -> None:
         self.caps[side] = data
 
-    def on_hook_seen(self, side: str, hook: str, now_ms: int) -> None:
-        if not self.caps:
-            return
-        self.seen[side].add(hook)
-        if self.ready_ms is None or now_ms <= self._deadline_ms():
-            self._proven[side].add(hook)
+    def on_hook_seen(self, side: str, hook: str) -> None:
+        if self.caps:
+            self.seen[side].add(hook)
 
-    def reach_lobby_ready(self, now_ms: int) -> None:
-        if self.ready_ms is None:
-            self.ready_ms = now_ms
+    def on_wound(self, side: str, atom: str) -> None:
+        self._wounded[side].add(self.proofs[atom])
 
-    def _missing(self, hook: str) -> list[str]:
-        return [side for side in SIDES if hook not in self._proven[side]]
+    def detected(self, side: str, hook: str) -> bool:
+        return hook in self.seen[side] or hook in self._wounded[side]
 
-    def _deadline_ms(self) -> int:
-        return self.ready_ms + self._window_s * MS_PER_S
+    def reach_lobby_ready(self) -> None:
+        self.ready = True
 
-    def due(self, now_ms: int) -> bool:
-        """La clôture suit toujours `L` : un hook vu avant n'en dispense pas."""
-        if self.closed or self.ready_ms is None:
-            return False
-        if not any(self._missing(hook) for hook in self._required):
-            return True
-        return now_ms >= self._deadline_ms()
-
-    def close(self) -> None:
-        """Retient les atomes communs aux deux `caps`, moins ceux dont le hook n'est pas prouvé."""
+    def close(self, failed: Mapping[str, Sequence[str]]) -> None:
+        """Retient les atomes communs aux deux `caps`, moins ceux dont `failed` nomme le hook."""
         common = set.intersection(*(set(self.caps[side]["atoms"]) for side in SIDES))
-        for atom in sorted(common & self._proofs.keys()):
-            hook = self._proofs[atom]
-            if missing := self._missing(hook):
-                self.withdrawn.append({"atom": atom, "hook": hook, "sides": missing})
+        for atom in sorted(common & self.proofs.keys()):
+            hook = self.proofs[atom]
+            if hook in failed:
+                self.withdrawn.append({"atom": atom, "hook": hook, "sides": list(failed[hook])})
         self.active_atoms = sorted(common - {item["atom"] for item in self.withdrawn})
 
-    def detail(self, now_ms: int) -> str:
-        """Détail de l'étape `contract` (D17), vide tant qu'aucun hook n'est attendu."""
+    def detail(self, failed: Mapping[str, Sequence[str]]) -> str:
+        """Détail de l'étape `contract` (D17) : dès le lobby, il annonce la table qui sera jouée."""
         if self.closed:
             summary = f"atomes actifs : {', '.join(self.active_atoms)}"
             retired = [item["atom"] for item in self.withdrawn]
             return f"{summary} ; retirés : {', '.join(retired)}" if retired else summary
-        waited = [
-            f"hook {hook} attendu sur {', '.join(self._missing(hook))}"
-            for hook in self._required
-            if self._missing(hook)
-        ]
-        if not waited:
-            return ""
-        if self.ready_ms is None:
-            limit = f"{self._window_s} s à compter de l'arrivée des deux joueurs"
-        else:
-            left_s = math.ceil((self._deadline_ms() - now_ms) / MS_PER_S)
-            limit = f"temps restant : {left_s} s"
-        return f"{' ; '.join(waited)} ; {limit}"
+        return " ; ".join(
+            f"{atom} sera retiré : blessure jamais détectée sur ce build et ce mod"
+            for atom, hook in sorted(self.proofs.items())
+            if hook in failed
+        )
 
 
 def _feed_line(record: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -403,6 +385,8 @@ class RealMatch:
         server_factory: Callable[..., ServerProcess],
         on_status: Callable[[str, str, str], None],
         on_state: Callable[[Callable[[MatchState], None]], None],
+        proofs: HookProofs,
+        mod_print: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
@@ -426,7 +410,13 @@ class RealMatch:
         self._stop = stop
         self._on_status = on_status
         self._on_state = on_state
-        self.window = ContractWindow(table, effects, runtime["hook_window_s"])
+        self.window = ContractWindow(effects)
+        self._proofs = proofs
+        self._mod_print = mod_print
+        # Échecs constatés pour ce build et ce mod, relus une fois les `caps` connus.
+        self._failed_hooks: dict[str, list[str]] | None = None
+        self._proven_hooks: set[str] = set()
+        self._disabled_rules: list[str] = []
         self.players: dict[str, str | None] = dict.fromkeys(SIDES)
         # Nom de connexion lié à chaque camp, pour tout le match, relances comprises.
         self._identities: dict[str, str] = {}
@@ -436,6 +426,8 @@ class RealMatch:
         self._last_cmd_seq = FIRST_CMD_FLOOR
         self._countdown_end_ms: int | None = None
         self._core: MatchCore | None = None
+        # Morts lues avant `running` : le cœur, qui n'existait pas, les reçoit à sa naissance.
+        self._early_deaths: list[Mapping[str, Any]] = []
         self.result: Mapping[str, Any] | None = None
         self._attribution: str | None = None
         # Instants de réception : `t_ms` date les événements, jamais l'absence (D13).
@@ -455,6 +447,8 @@ class RealMatch:
         # Camps en relance ou perdus : ni sortie, ni silence, ni absence n'y sont jugés.
         self._unavailable: set[str] = set()
         self._exits_held: set[str] = set()
+        # Fin de l'attente du tampon du mod, posée quand une conclusion devient due.
+        self._settle_end_ms: int | None = None
         self._conclusion_aimed = False
         self._relaunched: queue.SimpleQueue[tuple[str, str | None]] = queue.SimpleQueue()
         self._relaunch_lock = threading.Lock()
@@ -572,7 +566,7 @@ class RealMatch:
 
         Une passe lit un budget borné de `out`. Tant qu'il reste du retard, rien ne se juge sur
         ce relevé partiel : les passes suivantes finissent la lecture, puis tranchent. Une fin
-        de match se juge en plus sur un repère pris une fois qu'elle est due.
+        de match se juge en plus sur un repère pris une fois le tampon du mod retombé.
         """
         exited = self._exited_sides()
         if exited and self._core is None:
@@ -583,7 +577,7 @@ class RealMatch:
             self._readers[side].aim_at_end()
         self._poll_out(now_ms)
         if self._core is not None:
-            self._aim_past_conclusion(now_ms)
+            self._settle_conclusion(now_ms)
             self._pump_match(now_ms, exited)
             return None
         self._poll_acks()
@@ -603,6 +597,7 @@ class RealMatch:
 
         Il se lit ici, et non au lancement : un saut survenu au lobby ne décale pas `te`.
         Le `state` s'écrit sans le filet de `_record_state` : sans `t0_ms`, rien ne se rejoue.
+        Une mort déjà lue passe au cœur : le match s'ouvre pour la juger, et rien d'autre.
         """
         t0_ms = int(self._clock() * MS_PER_S)
         self._t0_shift_ms = t0_ms - now_ms
@@ -610,6 +605,8 @@ class RealMatch:
         duration_s = self.config["duration_s"]
         self._core = MatchCore(self._played_table, self.runtime, self.effects, t0_ms, duration_s)
         self._core.reserve_seq(self._last_cmd_seq)
+        for event in self._early_deaths:
+            self._core.submit_event(event)
 
         def change(state: MatchState) -> None:
             state.phase = "running"
@@ -620,32 +617,46 @@ class RealMatch:
 
         self._on_state(change)
 
-    def _aim_past_conclusion(self, now_ms: int) -> None:
-        """Relit `out` jusqu'à sa fin dès qu'une conclusion est due, une seule fois par match.
+    def _settle_conclusion(self, now_ms: int) -> None:
+        """Laisse retomber le tampon du mod, puis relit `out` à sa fin, une seule fois par fin due.
 
-        Le repère d'une lecture en retard peut précéder ce qui la décide : un kill ou une mort
-        écrits après lui resteraient non lus au tick final. Un second repère, lui, laisserait un
-        écrivain retenir la fin : celui-ci est pris après l'échéance et ne bouge plus.
+        Le mod vide `out` par lots, sans accord entre A et B : un fait plus ancien que la
+        conclusion peut n'être pas encore écrit. Le repère se prend donc une fois l'attente
+        finie. Un repère de plus laisserait un écrivain retenir la fin : celui-ci ne bouge plus,
+        sauf si la fin s'efface (`_judged_tick`) : la suivante aura sa propre attente.
         """
-        if self._conclusion_aimed or not self._core.conclusion_due(now_ms + self._t0_shift_ms):
+        if self._conclusion_aimed:
+            return
+        if self._settle_end_ms is None:
+            if not self._core.conclusion_due(now_ms + self._t0_shift_ms):
+                return
+            self._begin_settle(now_ms)
+        if now_ms < self._settle_end_ms:
             return
         self._conclusion_aimed = True
         for reader in self._readers.values():
             reader.aim_at_end()
         self._poll_out(now_ms)
 
+    def _begin_settle(self, now_ms: int) -> None:
+        if self._settle_end_ms is None:
+            self._settle_end_ms = now_ms + self.runtime["conclusion_settle_ms"]
+
+    def _settling(self) -> bool:
+        return self._settle_end_ms is not None and not self._conclusion_aimed
+
     def _pump_match(self, now_ms: int, exited: Sequence[str]) -> None:
         """Juge l'instant, avance le cœur, puis écrit ce qu'il rend : le tick reste son ordre.
 
         `out` est déjà lu : une fin soumise ici passe après les événements de son tick.
-        En retard de lecture, sorties et fins attendent, et une sortie reste relevée à la passe
-        suivante. Les ticks ordinaires continuent : ils vident la file du cœur à chaque tour,
+        En retard de lecture, ou le temps que le tampon du mod retombe, sorties et fins attendent,
+        et une sortie reste relevée à la passe suivante. Les ticks ordinaires continuent : ils vident la file du cœur à chaque tour,
         et ce qui arrive après son tick s'y journalise en `late_event`. Rien ne part vers un
         serveur sorti : seul le bilan de ses commandes attend la fin de sa lecture.
         """
         self._take_relaunches(now_ms)
         core_ms = now_ms + self._t0_shift_ms
-        if self._reading_behind():
+        if self._reading_behind() or self._settling():
             self._hold_commands_to(exited)
             records = self._core.advance_short_of_end(core_ms)
         else:
@@ -663,8 +674,16 @@ class RealMatch:
         self._watch_beats(now_ms)
         end = self._drift_end() or self._absence_end(now_ms)
         if end is not None:
+            if not self._conclusion_aimed:
+                self._begin_settle(now_ms)
+                return self._core.advance_short_of_end(core_ms)
             self._core.submit_end(end)
-        return self._core.advance(core_ms)
+        records = self._core.advance(core_ms)
+        if end is None and not self._core.conclusion_due(core_ms):
+            # Le joueur absent est revenu pendant l'attente : la fin attendue n'existe plus.
+            self._settle_end_ms = None
+            self._conclusion_aimed = False
+        return records
 
     def _hold_commands_to(self, exited: Sequence[str]) -> None:
         """Passe en relance, pour le cœur et le journal, les camps sortis pas encore relevés."""
@@ -920,6 +939,7 @@ class RealMatch:
         attribution `unknown`, ni une panne du journal ne font perdre le résultat.
         """
         result = dict(record["data"]["result"])
+        self._judge_detection(result)
         notes = []
         try:
             report = verdict(read_journal(self._journal.path).records)
@@ -1042,22 +1062,84 @@ class RealMatch:
             }
             self._record_anomalies([Anomaly(EVENT_REFUSED, side, refused)])
             return
-        if self._core is None:
+        if self._core is not None:
+            self._core.submit_event(event)
+        elif kind == PLAYER_DEATH and event["side"] is not None:
+            self._take_early_death(event, now_ms)
+        else:
             self._write_safely(
                 CMD_RESULT if kind == CMD_RESULT else EVENT, event, event["side"], None
             )
-        else:
-            self._core.submit_event(event)
         if kind == CAPS:
             self.window.on_caps(side, data)
         elif kind == HOOK_SEEN:
-            self.window.on_hook_seen(side, data["hook"], now_ms)
+            self.window.on_hook_seen(side, data["hook"])
+            if data["hook"] in self.window.proofs.values():
+                self._prove(data["hook"])
+        elif kind in self.window.proofs and event["side"] is not None:
+            self.window.on_wound(event["side"], kind)
+            self._prove(self.window.proofs[kind])
         elif kind == BEAT and event["boot"] == self._channels[side].boot:
             # Le `java` d'un `boot` révolu peut survivre à son script : il n'atteste plus rien.
             self._take_beat(side, data, now_ms)
         elif kind == CMD_RESULT:
             self._unresolved[side].discard(data["seq"])
             self._take_probe_result(side, data, now_ms)
+
+    def _take_early_death(self, event: Mapping[str, Any], now_ms: int) -> None:
+        """Retient une mort d'avant `running` : l'`event` s'écrira au tick qui la juge.
+
+        Sa trace part dès la lecture : un `cancel` du décompte ne doit pas l'effacer. L'attente
+        du tampon part d'ici, et le premier tick décide si elle est finie à `t0`.
+        """
+        self._early_deaths.append(event)
+        self._begin_settle(now_ms)
+        data = {"boot": event["boot"], "seq": event["seq"], "t_ms": event["t_ms"]}
+        self._write_safely(EARLY_DEATH, data, event["side"], None)
+        message = f"camp {event['side']} mort avant le début du match"
+        self._on_state(lambda state: state.log(message, "warn"))
+
+    def _proof_pair(self) -> str | None:
+        """Rend la clé de `HookProofs`, nulle sans `caps`. `verify` tient les deux camps égaux."""
+        caps = next(iter(self.window.caps.values()), None)
+        if caps is None:
+            return None
+        return f"{caps['build']}|{self._mod_print or caps['mod']}"
+
+    def _prove(self, hook: str) -> None:
+        """Un signal a tiré : le couple est prouvé, et un échec passé tombe, une fois par match."""
+        pair = self._proof_pair()
+        if pair is None or hook in self._proven_hooks:
+            return
+        self._proven_hooks.add(hook)
+        self._proofs.prove(pair, hook)
+        if self._failed_hooks is not None:
+            self._failed_hooks.pop(hook, None)
+
+    def _known_failures(self) -> Mapping[str, Sequence[str]]:
+        """Rend les échecs de ce couple, lus une fois : `pump` passe quatre fois par seconde."""
+        if self._failed_hooks is not None:
+            return self._failed_hooks
+        pair = self._proof_pair()
+        if pair is None or len(self.window.caps) < len(SIDES):
+            return {}
+        sides = {hook: self._proofs.failed_sides(pair, hook) for hook in self.window.proofs.values()}
+        self._failed_hooks = {
+            hook: found
+            for hook, found in sides.items()
+            if found and hook not in self._proven_hooks
+        }
+        return self._failed_hooks
+
+    def _judge_detection(self, result: Mapping[str, Any]) -> None:
+        """Seule preuve d'échec : un mort que ni le relevé de santé ni le hook n'ont vu blesser."""
+        if result["outcome"] != OUTCOME_DEATH:
+            return
+        dead = next(side for side in SIDES if side != result["winner"])
+        pair = self._proof_pair()
+        for atom, hook in self.window.proofs.items():
+            if atom in self.window.active_atoms and not self.window.detected(dead, hook):
+                self._proofs.fail(pair, hook, dead)
 
     def _take_beat(self, side: str, data: Mapping[str, Any], now_ms: int) -> None:
         self.players[side] = self._identify(side, data["players"])
@@ -1127,8 +1209,8 @@ class RealMatch:
             return refusal
         both_here = all(self.players.values())
         if both_here and self._probes_resolved():
-            self.window.reach_lobby_ready(now_ms)
-        if self.window.due(now_ms) and (refusal := self._close_window()):
+            self.window.reach_lobby_ready()
+        if self.window.due and (refusal := self._close_window()):
             return refusal
         if self.window.closed and both_here:
             return self._enter_countdown(now_ms)
@@ -1187,10 +1269,11 @@ class RealMatch:
     def _close_window(self) -> _Refusal | None:
         """Fige la décision, puis joue la table sans ce qui dépend d'un atome retiré.
 
+        Sans échec constaté, la table jouée est la table scellée, celle que l'UI annonce.
         Seule une table privée de tout atome est refusée. Un atome absent de `caps` sans
         être retiré reste un écart de contrat : la revalidation le refuse.
         """
-        self.window.close()
+        self.window.close(self._known_failures())
         for withdrawal in self.window.withdrawn:
             self._write_safely(ATOM_WITHDRAWN, withdrawal, None, None)
         narrowed = narrow_table(self.table, [item["atom"] for item in self.window.withdrawn])
@@ -1204,7 +1287,7 @@ class RealMatch:
             )
         except TableError as exc:
             causes = [
-                f"atome {item['atom']} retiré, hook {item['hook']} non vu sur "
+                f"atome {item['atom']} retiré, hook {item['hook']} en échec sur "
                 + ", ".join(item["sides"])
                 for item in self.window.withdrawn
                 if item["atom"] in self.table["atoms"] and not narrowed["atoms"]
@@ -1217,6 +1300,7 @@ class RealMatch:
     def _log_disabled_rules(self) -> None:
         kept = {rule["id"] for rule in self._played_table["rules"]}
         disabled = [rule["id"] for rule in self.table["rules"] if rule["id"] not in kept]
+        self._disabled_rules = disabled
         if disabled:
             message = f"règles désactivées par le retrait d'un atome : {', '.join(disabled)}"
             self._on_state(lambda state: state.log(message, "warn"))
@@ -1276,6 +1360,7 @@ class RealMatch:
             **published,
             "active_atoms": window.active_atoms,
             "withdrawn": [item["atom"] for item in window.withdrawn],
+            "disabled_rules": self._disabled_rules,
             "attribution": self._attribution,
             "spawn": spawn,
             # L'attribution ne se mesure qu'en fin de match : rien à en conclure avant.
@@ -1285,7 +1370,7 @@ class RealMatch:
     def _publish(self, now_ms: int) -> None:
         capabilities = self._capabilities()
         players = dict(self.players)
-        detail = self.window.detail(now_ms)
+        detail = self.window.detail(self._known_failures())
 
         def change(state: MatchState) -> None:
             state.capabilities = capabilities
@@ -1402,6 +1487,7 @@ class Engine:
         self.runtime = load_runtime() if runtime is None else runtime
         self.effects = load_effects() if effects is None else effects
         self.matches_dir = MATCHES_DIR if matches_dir is None else Path(matches_dir)
+        self._proofs = HookProofs(self.matches_dir / PROOFS_NAME, LOGGER.warning)
         self._clock = time.time if clock is None else clock
         self._monotonic = time.monotonic if monotonic is None else monotonic
         self._client_launcher = launch_client if client_launcher is None else client_launcher
@@ -1671,7 +1757,7 @@ class Engine:
         if not result.ok:
             self._fail("préflight en échec : " + " ; ".join(result.failures))
             return
-        match = self._open_match(table, result.values["pz_dir"])
+        match = self._open_match(table, result.values["pz_dir"], result.values["mod_fingerprint"])
         if match is None:
             self._cancel_state()
             return
@@ -1684,7 +1770,9 @@ class Engine:
             failure = f"lancement impossible : {match.redactor.redact_exception(exc)}"
         self._finish_match(match, failure)
 
-    def _open_match(self, table: Mapping[str, Any], pz_dir: str) -> RealMatch | None:
+    def _open_match(
+        self, table: Mapping[str, Any], pz_dir: str, mod_print: str | None
+    ) -> RealMatch | None:
         """Crée le match sous le verrou : `cancel` voit soit `_match`, soit `_stop` ici relu."""
         with self.lock:
             if self._stop.is_set():
@@ -1702,6 +1790,8 @@ class Engine:
                 matches_dir=self.matches_dir,
                 clock=self._clock,
                 monotonic=self._monotonic,
+                proofs=self._proofs,
+                mod_print=mod_print,
                 stop=self._stop,
                 server_factory=self._server_factory,
                 on_status=self._on_server_status,

@@ -12,7 +12,8 @@
 --                                                sonde seulement
 --   OnPlayerGetDamage(character, type, damage)   BodyDamage.Update, sans garde serveur : une
 --                                                morsure s'y lit par BLEEDING, à chaque
---                                                mise à jour tant que la plaie saigne
+--                                                mise à jour tant que la plaie saigne. Il
+--                                                confirme `checkHealth`, qui le précède
 --   OnBeingHitByZombie                           déclaré par LuaEventManager, tiré par aucune
 --                                                classe ni aucun Lua du jeu : ne prouve rien
 --   OnThrowableExplode(trap, square)             l'auteur vient de trap:getAttacker()
@@ -65,6 +66,19 @@ local WOUND_QUIET_MS = 5000
 -- Les types d'`OnPlayerGetDamage` qui disent une blessure. La faim, la soif, la maladie ou
 -- une chute usent aussi la santé, sans que personne n'ait frappé.
 local WOUND_TYPES = { BLEEDING = true, WEAPONHIT = true }
+-- Chute de santé (échelle de 0 à 100) entre deux relevés (`READ_MS`) qui vaut blessure : le signal
+-- que le serveur lit lui-même. L'usure de la faim ou de la soif reste en dessous.
+local HEALTH_DROP_MIN = 1
+-- Ce qui peut décider d'une fin de match, par la mort ou par le score : ces lignes n'attendent
+-- pas `FLUSH_MS`. Le service conclut sur `out`, et les phases de vidage de A et B sont libres.
+local FLUSH_AT_ONCE = {
+    player_death = true,
+    zombie_kill = true,
+    damage_taken = true,
+    build = true,
+    vehicle_repair = true,
+    explosion = true,
+}
 
 -- État de session. `session` reste nil tant que le plancher est inconnu : sans lui,
 -- aucune commande n'est traitée et rien n'est émis, faute de `boot`.
@@ -87,6 +101,7 @@ local hooks = {}
 local seenHooks = {}
 local lastAttacker = {}
 local lastWound = {}
+local lastHealth = {}
 local recentDead = {}
 local deadPlayers = {}
 local repairClasses = 0
@@ -292,6 +307,15 @@ end
 
 -- Émission ------------------------------------------------------------------------
 
+local function flushOut()
+    if #outLines == 0 then return end
+    local writer = getFileWriter(OUT_FILE, true, true)
+    if not writer then return end
+    writer:write(table.concat(outLines))
+    writer:close()
+    outLines = {}
+end
+
 local function emit(kind, data, author)
     if not session then return false end
     outSeq = outSeq + 1
@@ -303,16 +327,8 @@ local function emit(kind, data, author)
         .. ",\"side\":" .. encodeValue(author)
         .. ",\"kind\":" .. encodeString(kind)
         .. ",\"data\":" .. encodeValue(data) .. "}\n"
+    if FLUSH_AT_ONCE[kind] then flushOut() end
     return true
-end
-
-local function flushOut()
-    if #outLines == 0 then return end
-    local writer = getFileWriter(OUT_FILE, true, true)
-    if not writer then return end
-    writer:write(table.concat(outLines))
-    writer:close()
-    outLines = {}
 end
 
 local function writeAck()
@@ -453,7 +469,9 @@ local function attackerName(attacker)
     return NULL
 end
 
--- La preuve est une blessure reçue, pas une réception quelconque du hook.
+-- La preuve est une blessure reçue, pas une réception quelconque du hook. `hook` nul : la
+-- blessure vient du relevé de santé, qui ne prouve aucun hook. Les deux sources partagent
+-- `lastWound` : une plaie vue des deux côtés reste un seul atome, et le hook la confirme.
 local function reportWound(hook, player, attacker, damage)
     local name = player:getUsername()
     local now = getTimestampMs()
@@ -464,9 +482,22 @@ local function reportWound(hook, player, attacker, damage)
             hp = player:getBodyDamage():getOverallBodyHealth(),
             attacker = attackerName(attacker),
             damage = damage or NULL,
+            source = hook and "hook" or "health",
         })), side)
     end
-    noteHook(hook)
+    if hook then noteHook(hook) end
+end
+
+-- Le signal premier de `damage_taken` : il ne dépend d'aucun hook. Le premier relevé d'un joueur
+-- pose son repère, et une santé qui remonte, soin ou nouveau personnage, n'est pas une blessure.
+local function checkHealth(player)
+    local name = player:getUsername()
+    local health = player:getBodyDamage():getOverallBodyHealth()
+    local before = lastHealth[name]
+    lastHealth[name] = health
+    if before and before - health >= HEALTH_DROP_MIN then
+        reportWound(nil, player, player:getAttackedBy(), before - health)
+    end
 end
 
 local function onPlayerGetDamage(character, damageType, damage)
@@ -500,6 +531,8 @@ local function reportDeath(player)
     local name = player:getUsername()
     if deadPlayers[name] then return end
     deadPlayers[name] = true
+    -- Une mort entre deux relevés reste une blessure : la perte de santé part avant elle.
+    checkHealth(player)
     emit("player_death", positionData(player, { player = name }), side)
 end
 
@@ -516,6 +549,7 @@ local function checkDeaths()
             reportDeath(player)
         else
             deadPlayers[player:getUsername()] = nil
+            checkHealth(player)
         end
     end
 end
@@ -758,7 +792,8 @@ local function emitCaps()
         if available then atoms[#atoms + 1] = atom end
     end
     addAtom("zombie_kill", hooks.OnZombieDead)
-    addAtom("damage_taken", hooks.OnPlayerGetDamage)
+    -- `checkHealth` tourne dans `OnTick` : l'atome ne dépend pas de `OnPlayerGetDamage`.
+    addAtom("damage_taken", hooks.OnTick)
     addAtom("build", hooks.OnProcessAction)
     addAtom("vehicle_repair", repairClasses > 0)
     addAtom("explosion", hooks.OnThrowableExplode)

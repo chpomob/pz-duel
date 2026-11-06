@@ -134,7 +134,8 @@ def test_hook_proof_is_a_wound_on_the_player() -> None:
 def test_caps_publish_registration_not_proof() -> None:
     caps = function_body("emitCaps")
     assert "hooks = hooks" in caps
-    assert 'addAtom("damage_taken", hooks.OnPlayerGetDamage)' in caps
+    # Le relevé de santé tourne dans `OnTick` : l'atome ne dépend pas d'un hook à prouver.
+    assert 'addAtom("damage_taken", hooks.OnTick)' in caps
     assert "seenHooks" not in caps
     assert "seenHooks" not in function_body("register")
 

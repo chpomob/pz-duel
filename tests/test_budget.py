@@ -677,7 +677,7 @@ def test_sudden_death():
     assert end_of(script)["data"]["result"]["winner"] == "A"
 
 
-def test_death_outside_match_is_ignored():
+def test_death_before_t0_decides_and_anonymous_death_does_not():
     script = Script(make_core(KILL_SPAWN))
     script.core.submit_event(
         parse_event(
@@ -695,9 +695,11 @@ def test_death_outside_match_is_ignored():
         )
     )
     script.to(1)
-    # D14 : journalisée, sans effet sur le résultat.
+    # Le match ne se joue pas avec un participant déjà mort : l'autre camp gagne au tick 0.
     assert [r["data"]["kind"] for r in script.of_type("event")] == ["player_death"]
-    assert script.core.result is None
+    assert end_of(script)["mt"] == 0
+    assert end_of(script)["data"]["result"]["outcome"] == "death"
+    assert end_of(script)["data"]["result"]["winner"] == "B"
 
     script = Script(make_core(KILL_SPAWN))
     script.core.submit_event(
@@ -717,6 +719,46 @@ def test_death_outside_match_is_ignored():
     )
     script.to(1)
     assert script.core.result is None
+
+
+def test_what_is_dated_after_the_timer_decides_nothing():
+    """La lecture finale voit plus loin que le terme : un fait d'après ne change pas le score."""
+    script = Script(make_core(KILL_SPAWN, duration_s=10))
+    script.send(9.9)
+    script.to(9.75)
+    script.core.submit_event(
+        parse_event(
+            {
+                "v": 1,
+                "boot": 1,
+                "seq": 90,
+                "t_ms": T0_MS + 10_500,
+                "src": "B",
+                "side": "B",
+                "kind": "zombie_kill",
+                "data": {"origin": "world"},
+            },
+            CATALOG,
+        )
+    )
+    script.core.submit_event(
+        parse_event(
+            {
+                "v": 1,
+                "boot": 1,
+                "seq": 91,
+                "t_ms": T0_MS + 10_600,
+                "src": "A",
+                "side": "A",
+                "kind": "player_death",
+                "data": {},
+            },
+            CATALOG,
+        )
+    )
+    script.core.advance(T0_MS + 10_000)
+    assert script.core.result["outcome"] == "win"
+    assert script.core.result["winner"] == "A"
 
 
 def test_end_is_idempotent():

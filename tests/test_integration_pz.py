@@ -33,6 +33,7 @@ from service.preflight import (
     install_mod,
     run_preflight,
 )
+from service.proofs import PROOFS_NAME, HookProofs
 from service.protocol import (
     PROTOCOL_VERSION,
     SIDES,
@@ -131,6 +132,7 @@ def real_match(pz_dir, tmp_path, match_secrets) -> Iterator[RealMatch]:
         zomboid_dir=zomboid_dir,
         pz_dir=pz_dir,
         matches_dir=tmp_path / "matches",
+        proofs=HookProofs(tmp_path / PROOFS_NAME, print),
         clock=time.time,
         stop=threading.Event(),
         server_factory=ServerProcess,

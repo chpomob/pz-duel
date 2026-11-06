@@ -36,6 +36,7 @@ from test_snapshots import (  # noqa: F401
 from service import engine as engine_module
 from service.api import make_server
 from service.journal import JOURNAL_NAME, JournalError
+from service.proofs import PROOFS_NAME
 from service.protocol import dump_line, parse_session
 from service.replay import main as replay_main
 from service.servers import read_ini
@@ -50,6 +51,7 @@ LONG_MATCH_S = 300
 RESTART_MATCH_S = 900
 # Une seule ligne, jetée d'un bloc : elle retarde ce qui la suit sans remplir le journal.
 OVER_POLL_LINE = b"x" * POLL_MAX + b"\n"
+SETTLE_PASSES = 3
 
 
 @pytest.fixture
@@ -410,27 +412,15 @@ def test_refused_player_cannot_decide_the_match(engine_rig):
     assert not any(r["data"]["kind"] == "player_death" for r in duel.records("event"))
 
     # Le camp reste décidable par sa propre identité.
-    duel.played(duel.mods["B"].emit("player_death", {}))
+    duel.mods["B"].emit("player_death", {})
     assert duel.finish()["result"]["winner"] == "A"
     assert duel.replays()
 
 
 def withdrawn_duel(rig, preset: str) -> Duel:
-    """Mène `preset` au match sans preuve de `damage_taken` : l'atome y est retiré."""
-    duel = Duel(rig, preset)
-    window_s = rig.runtime["hook_window_s"]
-    duel.join_and_resolve()
-    duel.wait_detail(f"temps restant : {window_s} s")
-    duel.at(window_s)
-    state = rig.wait("countdown", "error")
-    assert state["phase"] == "countdown", state["error"]
-    # La fenêtre dépasse `disconnect_grace_s` : sans `beat`, les deux camps sembleraient partis.
-    for side in SIDES:
-        duel.beat(side)
-    duel.t0_s = window_s + rig.runtime["countdown_s"]
-    duel.at_match(0)
-    state = rig.wait("running", "error")
-    assert state["phase"] == "running", state["error"]
+    """Mène `preset` au match sur un échec constaté de `damage_taken` : l'atome y est retiré."""
+    duel = Duel(rig, preset, failed_sides=("A", "B"))
+    duel.start_match()
     return duel
 
 
@@ -471,11 +461,8 @@ def test_table_without_any_atom_left_is_refused(engine_rig, presets):
     raw["rules"] = [rule for rule in raw["rules"] if rule["id"] == "hurt_supply"]
     raw["score"]["points"] = {"damage_taken": 1}
     path.write_text(json.dumps(raw), encoding="utf-8")
-    lobby = Lobby(engine_rig, "duel_rapide")
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("A", "B"))
     lobby.join_and_resolve()
-    lobby.wait_detail("temps restant : 120 s")
-
-    lobby.at(engine_rig.runtime["hook_window_s"])
     state = engine_rig.wait("countdown", "error")
 
     assert state["phase"] == "error"
@@ -561,8 +548,8 @@ def edit_preset(folder, **changes) -> None:
 class Duel(Lobby):
     """Match réel à un instant fourni par le test, `te` étant compté depuis `t0_ms`."""
 
-    def __init__(self, rig, preset: str = PRESET) -> None:
-        super().__init__(rig, preset)
+    def __init__(self, rig, preset: str = PRESET, failed_sides: tuple[str, ...] = ()) -> None:
+        super().__init__(rig, preset, failed_sides)
         self.t0_s = 0.0
         self.te_s = 0.0
         # Deux ticks : l'arrondi de l'horloge flottante peut en manger un.
@@ -618,7 +605,15 @@ class Duel(Lobby):
             line = self.mods[side].emit("zombie_kill", KILL)
         self.played(line)
 
+    def settle_out(self) -> None:
+        """Passe l'attente du tampon du mod : une passe la pose, une suivante la clôt."""
+        wait_s = self.rig.runtime["conclusion_settle_ms"] / MS + self.step_s
+        for _ in range(SETTLE_PASSES):
+            if self.state()["phase"] == "running":
+                self.at_match(self.te_s + wait_s)
+
     def finish(self) -> dict:
+        self.settle_out()
         state = self.rig.wait("over", "error")
         assert state["phase"] == "over", state["error"]
         assert state["servers"] == {"A": "down", "B": "down"}
@@ -770,7 +765,7 @@ def timer_draw(duel: Duel) -> None:
 
 def sudden_death(duel: Duel) -> None:
     duel.at_match(100)
-    duel.played(duel.mods["A"].emit("player_death", {}))
+    duel.mods["A"].emit("player_death", {})
 
 
 @pytest.mark.parametrize(
@@ -1150,9 +1145,11 @@ def test_write_failure_at_any_step_keeps_the_result(engine_rig, failed, error):
     duel.at_match(1)
     attempts = failing_journal(duel, failed, error)
     duel.mods["B"].write_raw(b"pas du json\n")
-    duel.mods["A"].emit("zombie_kill", KILL)
+    death_ms = duel.mods["B"].t_ms
     duel.mods["B"].emit("player_death", {})
     duel.at_match(1 + duel.step_s)
+    # Lu pendant l'attente du tampon, le kill rejoint la mort au tick qui conclut.
+    duel.mods["A"].emit("zombie_kill", KILL, t_ms=death_ms - 1)
 
     state = duel.finish()
 
@@ -1990,6 +1987,279 @@ def test_earlier_death_after_a_stale_goal_beats_a_later_one(engine_rig, monkeypa
     assert duel.replays()
 
 
+def to_countdown(rig) -> Duel:
+    duel = Duel(rig)
+    duel.t0_s = rig.runtime["countdown_s"]
+    duel.join_and_resolve()
+    state = rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    for mod in duel.mods.values():
+        mod.t_ms = round(L_S * MS)
+    return duel
+
+
+def test_death_during_the_countdown_is_judged_at_the_first_tick(engine_rig):
+    """Le mod ne la redira pas : le camp vivant gagne à `t0`, le match ne court pas."""
+    duel = to_countdown(engine_rig)
+    line = duel.mods["A"].emit("player_death", {})
+    duel.read("A")
+
+    duel.at_match(0)
+    state = duel.finish()
+
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "B")
+    assert duel.match_end()["mt"] == 0
+    (early,) = duel.records("early_death")
+    assert (early["side"], early["mt"]) == ("A", None)
+    # Un seul `event` : celui du tick qui juge, que le rejeu retrouve.
+    assert [r["mt"] for r in duel.records("event") if r["data"] == json.loads(line)] == [0]
+    assert duel.replays()
+
+
+def test_death_just_before_t0_is_judged_once_the_buffer_has_settled(engine_rig):
+    duel = to_countdown(engine_rig)
+    duel.at(engine_rig.runtime["countdown_s"] - 0.25)
+    duel.mods["B"].emit("player_death", {}, t_ms=round((L_S + 2.75) * MS))
+    duel.read("B")
+
+    duel.at_match(0)
+    engine_rig.wait("running", "over")
+    duel.at_match(engine_rig.runtime["conclusion_settle_ms"] / MS)
+    state = engine_rig.wait("over", "error")
+
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "A")
+    assert duel.match_end()["mt"] < 5
+    assert duel.replays()
+
+
+def test_death_dated_before_t0_but_read_after_it_decides(engine_rig):
+    """Le tampon du mod peut passer `t0` : ce qui compte est la date du fait."""
+    duel = to_countdown(engine_rig)
+    duel.at_match(0)
+    engine_rig.wait("running")
+    duel.mods["A"].emit("player_death", {}, t_ms=round((L_S + 2.5) * MS))
+
+    state = duel.finish()
+
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "B")
+    assert duel.replays()
+
+
+def test_oldest_of_two_deaths_before_t0_decides(engine_rig):
+    duel = to_countdown(engine_rig)
+    duel.mods["A"].emit("player_death", {}, t_ms=round((L_S + 1) * MS))
+    duel.mods["B"].emit("player_death", {}, t_ms=round((L_S + 0.5) * MS))
+    duel.read("A")
+    duel.read("B")
+
+    duel.at_match(0)
+    state = duel.finish()
+
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "A")
+
+
+def test_death_in_the_lobby_is_not_lost_by_a_cancel(engine_rig):
+    """Sa trace part à la lecture : un duel annulé au décompte la garde au journal."""
+    duel = to_countdown(engine_rig)
+    duel.mods["A"].emit("player_death", {})
+    duel.wait_for(lambda _: duel.records("early_death"), expected="`early_death` au journal")
+
+    assert duel.engine.action("cancel")[0]
+    engine_rig.wait("idle")
+    assert len(duel.records("early_death")) == 1
+
+
+def test_oldest_death_written_second_decides(engine_rig):
+    """La mort de A, 400 ms plus récente, arrive d'abord : c'est celle de B qui compte."""
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(1)
+    death_ms = duel.mods["A"].t_ms
+
+    duel.mods["A"].emit("player_death", {}, t_ms=death_ms + 400)
+    duel.at_match(1 + duel.step_s)
+    duel.read("A")
+    assert duel.state()["result"] is None
+    duel.mods["B"].emit("player_death", {}, t_ms=death_ms)
+
+    state = duel.finish()
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "A")
+    assert duel.replays()
+
+
+def test_kill_dated_before_the_timer_but_flushed_after_it_counts(engine_rig, presets):
+    edit_preset(presets, duration_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(CLOCK_MATCH_S - duel.step_s)
+    deadline_ms = round((L_S + duel.t0_s + CLOCK_MATCH_S) * MS)
+
+    duel.at_match(CLOCK_MATCH_S)
+    duel.sync_pump()
+    assert duel.state()["phase"] == "running"
+    duel.mods["A"].emit("zombie_kill", KILL, t_ms=deadline_ms - 200)
+
+    state = duel.finish()
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("win", "A")
+    assert duel.match_end()["mt"] == CLOCK_MATCH_S
+    assert duel.replays()
+
+
+def test_kill_dated_after_the_timer_does_not_count(engine_rig, presets):
+    """L'attente laisse lire plus loin que le terme : elle n'allonge pas le match."""
+    edit_preset(presets, duration_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(CLOCK_MATCH_S - duel.step_s)
+    deadline_ms = round((L_S + duel.t0_s + CLOCK_MATCH_S) * MS)
+
+    duel.at_match(CLOCK_MATCH_S)
+    duel.sync_pump()
+    duel.mods["A"].emit("zombie_kill", KILL, t_ms=deadline_ms + 200)
+
+    state = duel.finish()
+    assert state["result"]["outcome"] == "draw"
+    assert duel.replays()
+
+
+def test_forfeit_waits_for_the_buffer_too(engine_rig, presets):
+    """Une mort encore dans le tampon passe avant la fin que le service allait prononcer."""
+    edit_preset(presets, duration_s=LONG_MATCH_S, disconnect_grace_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(50)
+    for side in SIDES:
+        duel.beat(side)
+    duel.at_match(95)
+    duel.beat("B")
+    duel.at_match(112)
+    duel.sync_pump()
+    assert duel.state()["result"] is None
+    duel.mods["B"].emit("player_death", {})
+
+    state = duel.finish()
+    assert state["result"]["outcome"] == "death"
+
+
+def test_return_during_the_wait_leaves_the_next_conclusion_its_own(engine_rig, presets):
+    """L'absent revient pendant l'attente : la mort d'après attend encore le tampon du mod."""
+    edit_preset(presets, duration_s=LONG_MATCH_S, disconnect_grace_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(50)
+    for side in SIDES:
+        duel.beat(side)
+    duel.at_match(95)
+    duel.beat("B")
+    duel.at_match(112)
+    duel.sync_pump()
+    duel.beat("A")
+    duel.beat("B")
+
+    duel.at_match(112 + engine_rig.runtime["conclusion_settle_ms"] / MS + duel.step_s)
+    duel.sync_pump()
+    duel.sync_pump()
+    assert duel.state()["result"] is None
+
+    death_ms = duel.mods["A"].t_ms
+    duel.mods["A"].emit("player_death", {}, t_ms=death_ms)
+    duel.read("A")
+    duel.at_match(duel.te_s + duel.step_s)
+    duel.sync_pump()
+    assert duel.state()["result"] is None
+    duel.mods["B"].emit("player_death", {}, t_ms=death_ms - 400)
+
+    state = duel.finish()
+    assert (state["result"]["outcome"], state["result"]["winner"]) == ("death", "A")
+    assert duel.replays()
+
+
+def test_hurt_supply_plays_without_any_wound_before_the_match(engine_rig):
+    """Le preset par défaut, sans blessure ni `hook_seen` : la table annoncée est celle jouée."""
+    duel = Duel(engine_rig, "duel_rapide")
+    duel.start_match()
+    match = duel.engine._match
+    assert match._played_table == match.table
+    assert duel.state()["capabilities"]["withdrawn"] == []
+
+    duel.at_match(1)
+    duel.played(duel.mods["A"].emit("damage_taken", {"hp": 88, "source": "health"}))
+    engine_rig.until(lambda _: duel.records("command"))
+
+    assert [r["data"]["rule"] for r in duel.records("rule_fired")] == ["hurt_supply"]
+    assert duel.records("command")[-1]["data"]["command"]["kind"] == "supply_drop"
+    assert [r for r in duel.records("event") if r["data"]["kind"] == "hook_seen"] == []
+
+
+def proofs_file(rig) -> dict:
+    return json.loads((rig.matches / PROOFS_NAME).read_text(encoding="utf-8"))
+
+
+def rematch(duel: Duel) -> None:
+    """Ramène `duel` au lobby d'une revanche, à l'instant courant du banc."""
+    for mod in duel.mods.values():
+        mod.restart(1)
+        mod.seq = 1
+    ok, message = duel.engine.action("rematch")
+    assert ok, message
+    state = duel.rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+    duel.match_id = state["match_id"]
+
+
+def test_proof_survives_to_the_next_match(engine_rig):
+    """Une blessure vue une fois vaut pour le couple : la revanche n'attend ni ne retire rien."""
+    duel = Duel(engine_rig, "duel_rapide")
+    duel.start_match()
+    duel.at_match(1)
+    duel.mods["A"].emit("damage_taken", {"hp": 88})
+    duel.mods["A"].emit("player_death", {})
+    duel.finish()
+    (hooks,) = proofs_file(engine_rig).values()
+    assert hooks == {"OnPlayerGetDamage": {"status": "proven"}}
+
+    rematch(duel)
+    now_s = duel.t0_s + duel.te_s
+    duel.at(now_s)
+    duel.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state_entered_at(duel, "countdown") == (L_S + now_s) * MS
+    assert state["capabilities"]["withdrawn"] == []
+
+
+def test_death_no_signal_saw_withdraws_from_the_next_match_only(engine_rig):
+    """Seule preuve d'échec : un mort sans blessure vue. Le match suivant s'en souvient."""
+    duel = Duel(engine_rig, "duel_rapide")
+    duel.start_match()
+    assert duel.state()["capabilities"]["withdrawn"] == []
+    duel.at_match(1)
+    duel.mods["B"].emit("player_death", {})
+    duel.finish()
+    (hooks,) = proofs_file(engine_rig).values()
+    assert hooks == {"OnPlayerGetDamage": {"status": "failed", "sides": ["B"]}}
+
+    rematch(duel)
+    duel.at(duel.t0_s + duel.te_s)
+    duel.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state["capabilities"]["withdrawn"] == ["damage_taken"]
+    assert state["capabilities"]["disabled_rules"] == ["hurt_supply"]
+
+
+def test_other_endings_prove_no_failure(engine_rig, presets):
+    edit_preset(presets, duration_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(CLOCK_MATCH_S)
+
+    assert duel.finish()["result"]["outcome"] == "draw"
+    assert not (engine_rig.matches / PROOFS_NAME).exists()
+
+
 def test_no_command_to_an_exited_server_during_a_read_backlog(engine_rig, monkeypatch):
     """Tant que la lecture du serveur sorti finit, rien ne part vers lui : son budget reste."""
     monkeypatch.setattr("service.transport.DRAIN_PASSES", 1)
@@ -2185,7 +2455,7 @@ def test_rematch(engine_rig, presets):
     assert duel.engine._match.window is not first_window
     assert state["capabilities"].get("active_atoms") is None
     duel.match_id = state["match_id"]
-    duel.start_match(lobby_s=duel.t0_s + first["config"]["duration_s"])
+    duel.start_match(lobby_s=duel.t0_s + duel.te_s)
     assert duel.state()["capabilities"]["active_atoms"] is not None
     duel.at_match(1)
     duel.kills("A", 1)

@@ -24,6 +24,7 @@ START_MS = 1_000_000
 TTL_MS = 10_000
 PURGE_MS = 30_000
 FLUSH_MS = 1_000
+READ_MS = 1_000
 WOUND_QUIET_MS = 5_000
 BEAT_MS = 10_000
 # Plus que `disconnect_grace_s` : un mod muet pendant le recul coûterait le match.
@@ -41,8 +42,10 @@ class Hook:
 
 
 class Hooks(Table):
-    def get(self, key: Any) -> Hook:
-        return self.items.setdefault(key, Hook())
+    missing: tuple[str, ...] = ()
+
+    def get(self, key: Any) -> Hook | None:
+        return None if key in self.missing else self.items.setdefault(key, Hook())
 
 
 class Player:
@@ -132,9 +135,10 @@ class Stub:
 class Game:
     """Le serveur A, réduit à ce que le mod lui demande."""
 
-    def __init__(self) -> None:
+    def __init__(self, missing_events: tuple[str, ...] = ()) -> None:
         self.now = START_MS
         self.hooks = Hooks()
+        self.hooks.missing = missing_events
         self.out: list[str] = []
         self.commands = b""
         self.online: list[Player] = []
@@ -316,6 +320,106 @@ def test_zombie_bite_gives_the_atom_then_the_proof(game):
     [proof] = game.lines("hook_seen")
     assert proof["data"]["hook"] == load_effects()["atoms"]["damage_taken"]["hook_proof"]
     assert hurt["seq"] < proof["seq"]
+
+
+def read_health(game: Game, hp: float) -> None:
+    """Pose la santé et laisse passer le relevé de `step`."""
+    game.hp = hp
+    game.after(READ_MS)
+    game.tick()
+
+
+def written(game: Game) -> list[str]:
+    """Rend les `kind` déjà dans `out`, sans provoquer de vidage."""
+    return [json.loads(line)["kind"] for line in "".join(game.out).splitlines()]
+
+
+def test_health_drop_gives_the_atom_without_any_hook(game):
+    """Le signal premier : le serveur lit la santé lui-même, sans que le hook ait tiré."""
+    read_health(game, 100)
+    game.player.attacked_by = Zombie()
+    read_health(game, 88)
+
+    [hurt] = game.lines("damage_taken")
+    assert (hurt["side"], hurt["data"]["player"]) == (SIDE, "hote")
+    assert hurt["data"]["source"] == "health"
+    assert (hurt["data"]["hp"], hurt["data"]["damage"]) == (88, 12)
+    assert hurt["data"]["attacker"] == "zombie"
+    assert game.lines("hook_seen") == []
+
+
+def test_first_reading_and_rising_health_are_no_wound(game):
+    read_health(game, 40)
+    read_health(game, 90)
+
+    assert game.lines("damage_taken") == []
+
+
+def test_slow_wear_stays_under_the_threshold(game):
+    read_health(game, 100)
+    for hp in (99.5, 99, 98.5):
+        read_health(game, hp)
+
+    assert game.lines("damage_taken") == []
+
+
+def test_hook_confirms_the_wound_the_health_already_gave(game):
+    """Vue des deux côtés, une plaie reste un atome, et le hook se prouve quand même."""
+    read_health(game, 100)
+    read_health(game, 88)
+    game.bleeds()
+
+    assert len(game.lines("damage_taken")) == 1
+    [proof] = game.lines("hook_seen")
+    assert proof["data"]["hook"] == load_effects()["atoms"]["damage_taken"]["hook_proof"]
+
+
+def test_caps_keep_the_atom_when_the_hook_is_not_registered():
+    game = Game(missing_events=("OnPlayerGetDamage",))
+
+    [caps] = game.lines("caps")
+    assert caps["data"]["hooks"]["OnPlayerGetDamage"] is False
+    assert "damage_taken" in caps["data"]["atoms"]
+
+
+def test_death_is_in_out_before_the_flush_interval(game):
+    game.tick()
+    game.player.dead = True
+    game.hooks.get("OnCharacterDeath").fire(game.player)
+
+    assert "player_death" in written(game)
+
+
+def test_a_kill_is_in_out_before_the_flush_interval(game):
+    zombie = Zombie()
+    game.hit(zombie)
+    game.dies(zombie)
+
+    assert "zombie_kill" in written(game)
+
+
+def test_flushed_lines_keep_their_order_behind_what_was_buffered(game):
+    game.hooks.get("OnWeaponHitCharacter").fire()
+    game.hooks.get("OnCharacterDeath").fire(game.player)
+
+    assert written(game).index("hook_seen") < written(game).index("player_death")
+
+
+def test_what_cannot_conclude_still_waits_for_the_flush(game):
+    game.hooks.get("OnWeaponHitCharacter").fire()
+
+    assert "hook_seen" not in written(game)
+    assert game.lines("hook_seen")
+
+
+def test_death_between_two_readings_reports_the_loss_first(game):
+    read_health(game, 100)
+    game.hp = 0
+    game.player.dead = True
+    game.hooks.get("OnCharacterDeath").fire(game.player)
+
+    kinds = written(game)
+    assert kinds.index("damage_taken") < kinds.index("player_death")
 
 
 def test_being_hit_hook_reports_the_wound_if_the_game_ever_fires_it(game):
