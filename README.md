@@ -1,148 +1,151 @@
 # PZ Duel
 
-> ⚠️ **Prototype de concept — aucun duel réel n'a encore été joué.** Les serveurs, le mod et le
-> contrat sont prouvés sur le vrai jeu ; tout ce qui demande un joueur reste à constater.
+*English — [version française](README.fr.md)*
 
-Deux parties solo de Project Zomboid, reliées par un arbitre local : les joueurs ne se croisent
-jamais, mais **chaque action de l'un devient une pression dans le monde de l'autre**. Un zombie tué
-chez A fait apparaître deux zombies chez B. Un craft réussi chez B envoie une horde chez A.
+> ⚠️ **Concept prototype — not a single real duel has been played yet.** The servers, the mod and
+> the contract are proven against the real game; everything that needs a player is still unverified.
 
-L'idée est celle d'un duel à la Tetris, transposée à la survie : le monde de chacun est un terrain
-de jeu séparé, et la seule chose qui circule est la conséquence de ce qu'on y fait.
+Two separate Project Zomboid solo games, linked by a local referee: the players never meet, but
+**every action on one side becomes pressure in the other player's world**. One zombie killed on A
+spawns two zombies on B. A successful craft on B sends a horde to A.
 
-## Comment ça marche
+Think of it as a Tetris-style duel transposed to survival: each world is its own board, and the only
+thing that travels is the consequence of what you do on yours.
+
+## How it works
 
 ```
         ┌──────────────┐                      ┌──────────────┐
-        │  Serveur PZ  │  out (JSONL)         │  Serveur PZ  │
+        │   PZ server  │  out (JSONL)         │   PZ server  │
         │      A       │ ─────────┐   ┌────── │      B       │
-        │  monde A     │          │   │       │  monde B     │
+        │  world A     │          │   │       │  world B     │
         └──────────────┘          ▼   ▼       └──────────────┘
                               ┌──────────────┐
-                              │   Arbitre    │  table de relations
-                              │   (Python)   │  horloge, score, journal
+                              │   Referee    │  relation table
+                              │   (Python)   │  clock, score, journal
                               └──────────────┘
 ```
 
-- Le mod `duelcore` tourne sur chaque serveur, capture ce qui s'y passe et **publie** des atomes
+- The `duelcore` mod runs on each server, captures what happens there and **publishes** atoms
   (`zombie_kill`, `damage_taken`, `craft`, `player_death`…).
-- L'arbitre lit ces atomes, applique une **table de relations** configurable, et écrit des commandes
-  dans le monde adverse (`spawn_pop`, `hurt_supply`, `weather_rain`…).
-- Aucune connexion entre les deux joueurs, aucun monde miroir : deux sauvegardes séparées, donc du
-  loot et des véhicules différents. L'équité est dans les règles et les conditions de départ, pas
-  dans l'identité des mondes.
+- The referee reads those atoms, applies a configurable **relation table**, and writes commands into
+  the opposing world (`spawn_pop`, `hurt_supply`, `weather_rain`…).
+- No connection between the two players, no mirrored world: two separate saves, hence different loot
+  and vehicles. Fairness lives in the rules and the starting conditions, not in identical worlds.
 
-## Démarrage rapide (sans Project Zomboid)
+## Quick start (no Project Zomboid needed)
 
-Le mode `mock` rejoue tout le parcours — préflight, serveurs, contrat, décompte, score — sans lancer
-un seul processus.
+`mock` mode replays the whole flow — preflight, servers, contract, countdown, score — without
+launching a single process.
 
 ```bash
 git clone https://github.com/chpomob/pz-duel.git && cd pz-duel
-python3 -m service.main            # ouvre http://127.0.0.1:8765/
+python3 -m service.main            # opens http://127.0.0.1:8765/
 ```
 
-Python **≥ 3.12**, aucune dépendance : le service est en bibliothèque standard uniquement.
+Python **≥ 3.12**, no dependencies: the service is standard library only.
 
-Parcours : `Configurer un duel` → preset **Démo 90 s** → `Lancer le duel` → dans le lobby,
-`Simuler l'adversaire`. Tout ce qui est simulé est annoncé comme tel.
+Flow: `Configure a duel` → preset **Démo 90 s** → `Launch the duel` → in the lobby,
+`Simulate the opponent`. Anything simulated is labelled as such.
 
-## Mode réel
+## Real mode
 
-Il faut Project Zomboid **42.21** (le lanceur serveur est livré avec le jeu), 6 ports libres
-(jeu 17261/17271, UDP 17262/17272, RCON 27015/27016) et environ 6 Go de RAM disponible — chaque
-serveur en prend 2.
+Requires Project Zomboid **42.21** (the headless server launcher ships with the game), six free
+ports (game 17261/17271, UDP 17262/17272, RCON 27015/27016) and about 6 GB of free RAM — each
+server takes 2.
 
 ```bash
-python3 -m service.main --install-mod     # copie mods/duelcore dans ~/Zomboid/mods/
-python3 -m service.main --mode real       # détection Steam automatique
-python3 -m service.main --mode real --pz-dir /chemin/vers/ProjectZomboid
+python3 -m service.main --install-mod     # copies mods/duelcore into ~/Zomboid/mods/
+python3 -m service.main --mode real       # automatic Steam detection
+python3 -m service.main --mode real --pz-dir /path/to/ProjectZomboid
 ```
 
-- `--install-mod` ne touche qu'à `~/Zomboid/mods/duelcore/`. À relancer après chaque modification du
-  mod : le préflight compare l'empreinte installée à celle du dépôt et refuse tout écart.
-- Les serveurs tournent **sans Steam** (`-Dzomboid.steam=0`), le client aussi : le lobby peut lancer
-  `projectzomboid.sh -nosteam +connect … +password …`. Si le script manque ou si le client s'arrête
-  dans les deux secondes, le bouton rend un échec qui nomme la cause et la commande à passer à la main.
-- Chaque camp a son mot de passe ; celui de l'hôte n'apparaît qu'au lobby, celui de l'invité part dans
-  l'invitation (QR ou lien).
-- **Machine mono-utilisateur uniquement** : l'API locale n'a pas de jeton, tout processus local peut
-  lire `/api/state` et piloter le duel. Les mots de passe figurent aussi dans `ps`.
+- `--install-mod` only touches `~/Zomboid/mods/duelcore/`. Re-run it after every mod change: the
+  preflight compares the installed fingerprint with the repository one and refuses any mismatch.
+- The servers run **without Steam** (`-Dzomboid.steam=0`), and so does the client: the lobby can
+  launch `projectzomboid.sh -nosteam +connect … +password …`. If the script is missing, or the client
+  exits within two seconds, the button returns a failure naming the cause and the command to run by
+  hand.
+- Each side has its own password; the host's appears only in the lobby, the guest's travels in the
+  invitation (QR code or link).
+- **Single-user machine only**: the local API has no token, so any local process can read
+  `/api/state` and drive the duel. Passwords also show up in `ps`.
 
-Ce que le mode réel écrit dans `~/Zomboid` : `Server/duelA.ini` et `duelB.ini` (en `0600`, car
-`RCONPassword` y est en clair), `duel-snapshots/`, `Saves/Multiplayer/duelA|duelB` (restaurés à
-chaque lancement), et les fichiers de transport `Lua/duel_A_*.txt`, `duel_B_*.txt`. Les journaux et
-sorties expurgés vont dans `matches/<match_id>/`.
+What real mode writes into `~/Zomboid`: `Server/duelA.ini` and `duelB.ini` (`0600`, since
+`RCONPassword` sits there in clear text), `duel-snapshots/`, `Saves/Multiplayer/duelA|duelB`
+(restored on every launch), and the transport files `Lua/duel_A_*.txt`, `duel_B_*.txt`. Redacted
+logs and server output go to `matches/<match_id>/`.
 
-## Rythme de synchronisation
+## Synchronisation cadence
 
-Valeurs du code (`service/runtime.json`, `mods/duelcore/…/DuelCore.lua`), pas du document de conception.
+Values from the code (`service/runtime.json`, `mods/duelcore/…/DuelCore.lua`), not from the design
+document.
 
-| Étape | Cadence |
+| Step | Cadence |
 |---|---|
-| Mod → fichier `out` | tampon **1 s**, vidé **immédiatement** sur un fait concluant (mort, score) |
-| Arbitre lit `out` | toutes les **250 ms** |
-| Tick du cœur de match | **250 ms** |
-| Mod lit `in` | toutes les **1 s** |
-| `ack` / `beat` de présence | **5 s** / **10 s** (timeout 30 s) |
-| Effets | servis à chaque tick, FIFO par camp, tranches de 30 unités, plafonds `cap_per_min` (max 120/min) |
-| Conclusion | **+1,5 s** après la dernière lecture (voir les limites) |
-| Dérive tolérée | 60 s, écart d'âge du monde × DayLength × 2,5 |
+| Mod → `out` file | **1 s** buffer, flushed **immediately** on a concluding fact (death, score) |
+| Referee reads `out` | every **250 ms** |
+| Match core tick | **250 ms** |
+| Mod reads `in` | every **1 s** |
+| Presence `ack` / `beat` | **5 s** / **10 s** (30 s timeout) |
+| Effects | served on every tick, FIFO per side, 30-unit slices, `cap_per_min` caps (max 120/min) |
+| Conclusion | **+1.5 s** after the last read (see known limits) |
+| Tolerated drift | 60 s, world-age gap × DayLength × 2.5 |
 
-Latence typique d'un événement, du kill en jeu à la commande écrite chez l'adversaire : **~2,3 s**
-(1 s de vidage + 250 ms de lecture + 1 s de lecture du mod), hors attente de plafond.
+Typical event latency, from a kill in game to the command written on the other side: **~2.3 s**
+(1 s flush + 250 ms read + 1 s mod read), excluding any cap wait.
 
-## Ce qui est prouvé, et ce qui ne l'est pas
+## What is proven, and what is not
 
-Prouvé, sur cette installation (build 42.21.0), par `pytest -m pz_integration` :
+Proven on this machine (build 42.21.0) by `pytest -m pz_integration`:
 
-- deux serveurs réels démarrent, le mod `duelcore` se charge, `caps` est publié et le contrat est
-  vérifié intégralement (`verify(caps) == []`) ;
-- arrêt par **RCON**, ports libérés, fichiers `.ini` en `0600`, **aucun secret** dans les fichiers de
-  match, aucun processus résiduel ;
-- le lecteur de commandes lit une ligne au plus une fois, y compris ligne coupée ou `\n` manquant ;
-- 1 214 tests hors jeu couvrent le protocole, la table de relations, le score, le journal, le rejeu,
-  l'API locale et l'UI (suite verte sur Python 3.12 et 3.14).
+- two real servers boot, the `duelcore` mod loads, `caps` is published and the contract is fully
+  verified (`verify(caps) == []`);
+- shutdown through **RCON**, ports released, `.ini` files in `0600`, **no secret** in any match file,
+  no leftover process;
+- the command reader reads a line at most once, including a cut line or a missing `\n`;
+- 1,214 tests outside the game cover the protocol, the relation table, scoring, the journal, replay,
+  the local API and the UI (suite green on Python 3.12 and 3.14).
 
-**Jamais exercé**, et c'est le cœur du produit :
+**Never exercised**, and this is the heart of the product:
 
-- un duel **avec deux joueurs** : attribution des kills en multi (`OnZombieDead` + `getAttackedBy`),
-  visibilité côté client d'un spawn lancé par le serveur, craft via `OnProcessAction` ;
-- la connexion d'un client `-nosteam` à un serveur lancé par `start-server.sh` ;
-- que la santé d'un joueur bouge côté serveur, condition de l'atome `damage_taken` ;
-- ce que devient un joueur mort dans le vrai jeu (reste en ligne, respawn, déconnexion).
+- a duel **with two players**: kill attribution in multiplayer (`OnZombieDead` + `getAttackedBy`),
+  client-side visibility of a server-initiated spawn, crafting through `OnProcessAction`;
+- a `-nosteam` client connecting to a server launched by `start-server.sh`;
+- whether a player's health actually changes server-side, the condition for the `damage_taken` atom;
+- what a dead player becomes in the real game (stays online, respawns, disconnects).
 
-La procédure de 15 minutes qui tranche ces points est décrite dans [`README`](#procédure-de-verdict-en-jeu)
-plus bas ; tant qu'elle n'a pas été déroulée, ces cases restent ouvertes, et les documents le disent.
+The 15-minute procedure that settles these points is described [below](#in-game-verdict-procedure);
+until it has been run, those boxes stay open — and the documents say so.
 
 ## Tests
 
 ```bash
-python3 -m pytest -q                          # sans le jeu (1 214 tests, ~60 s)
-python3.12 -m pytest -q                       # plancher de version déclaré
-python3 -m pytest -m pz_integration           # vrais serveurs, ~2 min 30
+python3 -m pytest -q                          # without the game (1,214 tests, ~60 s)
+python3.12 -m pytest -q                       # declared version floor
+python3 -m pytest -m pz_integration           # real servers, ~2 min 30
 ```
 
-`-m pz_integration` **écrit dans le vrai `~/Zomboid`** (mod, réglages, snapshots, restauration des
-mondes). Ne le lancez pas pendant un duel : le préflight refuserait les ports.
+`-m pz_integration` **writes into the real `~/Zomboid`** (mod, settings, snapshots, world restore).
+Do not run it during a duel: the preflight would refuse the ports.
 
-## Procédure de verdict en jeu
+## In-game verdict procedure
 
-C'est la seule preuve des points ci-dessus. Elle demande deux personnes, l'hôte sur A et l'invité
-sur B, et le preset **Duel rapide** (`zombie_kill`, `damage_taken`, `spawn_pop` à 30-60 cases).
+This is the only proof for the points above. It needs two people, the host on A and the guest on B,
+and the **Duel rapide** preset (`zombie_kill`, `damage_taken`, `spawn_pop` at 30-60 tiles).
 
-1. Lancer en `--mode real`, durée courte, connecter les deux joueurs. Noter si l'invité entre avec le
-   mod copié, et si un invité sans le mod est refusé.
-2. Le décompte part quand les deux joueurs sont là et que les sondes de spawn ont répondu. Un zombie
-   apparaît à 30-60 cases de chacun : première cible, et déjà un constat de spawn.
-3. Sur A, tuer un zombie. B doit recevoir un `spawn_pop` : **c'est le joueur B qui vérifie qu'il voit
-   les zombies apparaître**, le journal ne prouve que ce que l'API rend.
-4. Se faire blesser par un zombie après 5 s sans saigner : l'événement `damage_taken` doit sortir avec
-   `hp`, `attacker` et `source`. Noter ce que porte `source` et si un `hook_seen` d'`OnPlayerGetDamage`
-   suit.
-5. S'endormir ou monter en voiture pendant que l'autre tue : la commande reçue doit finir `refused`
-   (`asleep`, `in_vehicle`).
-6. Laisser le match aller à son terme, puis contrôler les traces :
+1. Launch in `--mode real`, short duration, connect both players. Note whether the guest joins with
+   the mod copied over, and whether a guest without the mod is refused.
+2. The countdown starts once both players are in and the spawn probes have answered. One zombie
+   appears 30-60 tiles from each player: a first target, and already a spawn observation.
+3. On A, kill a zombie. B must receive a `spawn_pop`: **it is player B who checks that the zombies
+   appear on screen**; the journal only proves what the API returns.
+4. Get hurt by a zombie after 5 s without bleeding: the `damage_taken` event must appear with `hp`,
+   `attacker` and `source`. Note what `source` carries, and whether an `OnPlayerGetDamage` `hook_seen`
+   follows.
+5. Fall asleep or get into a vehicle while the other player kills: the command received meanwhile
+   must end `refused` (`asleep`, `in_vehicle`).
+6. Let the match run to its end, then check the traces:
 
 ```bash
 curl -s http://127.0.0.1:8765/api/state > state.json
@@ -150,46 +153,46 @@ PZ_LIVE_JOURNAL=matches/<match_id>/journal.jsonl PZ_LIVE_STATE=state.json \
   python3 -m pytest -m pz_integration tests/test_integration_pz.py::test_live_journal_checklist
 ```
 
-Un `skip` n'est pas une preuve : le point reste ouvert tant que la procédure n'a pas été déroulée.
+A `skip` is not proof: the point stays open until the procedure has been run.
 
-## Relire un match
+## Replaying a match
 
 ```bash
-python3 -m service.replay matches/<match_id>/journal.jsonl            # 0 si le rejeu redonne les mêmes décisions
-python3 -m service.replay --summary matches/<match_id>/journal.jsonl  # télémétrie par camp
-python3 -m service.verdict matches/<match_id>/journal.jsonl           # attribution, spawn, hooks vus
+python3 -m service.replay matches/<match_id>/journal.jsonl            # 0 if the replay yields the same decisions
+python3 -m service.replay --summary matches/<match_id>/journal.jsonl  # per-side telemetry
+python3 -m service.verdict matches/<match_id>/journal.jsonl           # attribution, spawn, hooks seen
 ```
 
-Le journal est en JSONL, horodaté, séquencé et idempotent : le rejeu instancie le même cœur de match,
-donc rejouer un journal prouve le moteur.
+The journal is JSONL, timestamped, sequenced and idempotent: replay instantiates the same match core,
+so replaying a journal proves the engine.
 
-## Structure
+## Layout
 
 ```
-service/          arbitre : préflight, serveurs, RCON, protocole, transport fichier,
-                  table de relations, cœur de match, journal, rejeu, verdict, API locale
-mods/duelcore/    mod serveur (Lua) : capture les faits, publie ses capacités, applique les commandes
-ui/               interface locale (HTML/CSS/JS, aucune dépendance hors QR vendorisé)
-tests/            1 214 tests ; doubles de serveur, de mod et interpréteur Lua réduit
-docs/campaigns/   spec (77 critères), plan (24 étapes), 4 revues de branche, 15 étapes de correction
-01-…09-…          conception : faisabilité, architecture, mécanismes, spec MVP, UI
+service/          referee: preflight, servers, RCON, protocol, file transport,
+                  relation table, match core, journal, replay, verdict, local API
+mods/duelcore/    server-side mod (Lua): captures facts, publishes capabilities, applies commands
+ui/               local interface (HTML/CSS/JS, no dependency beyond a vendored QR encoder)
+tests/            1,214 tests; server, mod and a reduced Lua interpreter as doubles
+docs/campaigns/   spec (77 criteria), plan (24 steps), 4 branch reviews, 15 fix steps
+01-…09-…          design notes (French): feasibility, architecture, mechanisms, MVP spec, UI
 ```
 
-## Limites connues
+## Known limits
 
-Le détail daté est dans [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md).
-Les plus importantes :
+The dated detail lives in [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md)
+(French). The important ones:
 
-- **La détection des dégâts repose sur un relevé de santé côté serveur** dont on n'a pas constaté
-  qu'il tourne pour un joueur connecté. Si non, l'atome est retiré et la règle de blessure disparaît
-  — le lobby l'annonce, le journal le porte.
-- **La conclusion attend 1,5 s** : le match tourne encore un instant avec une mort déjà journalisée.
-  C'est volontaire, pour laisser passer une mort plus ancienne encore dans le tampon du mod.
-- **Pas de relance automatique d'un serveur figé**, pas de récupération des serveurs orphelins si
-  l'arbitre meurt brutalement, pas de jeton sur l'API locale.
-- **Pas d'anti-triche** : le joueur possède ses fichiers. Le classement n'a de sens qu'entre amis.
+- **Damage detection relies on a server-side health reading** that has not been observed working for a
+  connected player. If it does not, the atom is withdrawn and the wound rule disappears — the lobby
+  announces it, the journal records it.
+- **The conclusion waits 1.5 s**: the match keeps running for a moment with a death already journaled.
+  Deliberate, so an older death still sitting in the mod's buffer can win.
+- **No automatic restart of a hung server**, no recovery of orphaned servers if the referee dies
+  abruptly, no token on the local API.
+- **No anti-cheat**: the player owns their files. A leaderboard only means anything among friends.
 
 ## Licence
 
-WTFPL v2 — voir [`LICENSE`](LICENSE). Les crédits des mods et auteurs dont ce projet s'inspire sont
-dans [`CREDITS.md`](CREDITS.md), à lire avant toute reprise de code.
+WTFPL v2 — see [`LICENSE`](LICENSE). Credits for the mods and authors this project draws on are in
+[`CREDITS.md`](CREDITS.md), to be read before reusing any code.
