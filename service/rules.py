@@ -239,10 +239,14 @@ def narrow_table(table: Mapping[str, Any], withdrawn: Collection[str]) -> dict:
 
     Une règle qui en cite un disparaît, absence comprise : `not atom(x)` serait toujours
     vrai sur un atome que plus rien ne compte. Le combo disparaît de même, sans quoi il ne
-    retomberait plus. `table`, dont le hash est scellé, reste intacte.
+    retomberait plus. `summary`, texte libre sans lien aux règles, décrirait ce qui ne se joue
+    plus : une ligne dit le retrait à sa place. `table` reste intacte, et un atome qu'elle
+    n'a jamais eu ne change rien, donc rien au hash de la table rendue.
     """
     gone = set(withdrawn)
     narrowed = copy.deepcopy(dict(table))
+    if removed := sorted(gone & set(table["atoms"])):
+        narrowed["summary"] = [f"Table réduite, sans {', '.join(removed)}"]
     narrowed["atoms"] = [atom for atom in table["atoms"] if atom not in gone]
     narrowed["rules"] = [
         rule for rule in narrowed["rules"] if not gone & set(parse_when(rule["when"]).atoms)

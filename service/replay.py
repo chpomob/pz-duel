@@ -1,6 +1,7 @@
 """Rejeu d'un journal et télémétrie : `python -m service.replay [--summary] <journal>`.
 
-Le rejeu relit `match_start`, en retire les atomes de `atom_withdrawn`, construit un
+Le rejeu relit `match_start`, en retire les atomes de `atom_withdrawn`, contrôle le hash de
+`table_sealed` sur la table obtenue, construit un
 `MatchCore` neuf sur cette table et lui repasse les intrants du journal, chacun à son `mt` : l'horloge
 reste celle du cœur, et l'instant courant est le tick journalisé. Ce module ne lit ni
 l'horloge système, ni `service/runtime.json`, ni `service/effects.json`.
@@ -22,7 +23,7 @@ from typing import Any
 
 from .journal import JournalError, read_journal
 from .protocol import ProtocolError, parse_event
-from .rules import MS_PER_S, SIDES, MatchCore, narrow_table
+from .rules import MS_PER_S, SIDES, MatchCore, narrow_table, rules_hash
 
 EXIT_SAME = 0
 EXIT_DIFFERENT = 1
@@ -32,6 +33,7 @@ COMMAND = "command"
 LATE_EVENT = "late_event"
 EFFECT_DROPPED = "effect_dropped"
 ATOM_WITHDRAWN = "atom_withdrawn"
+TABLE_SEALED = "table_sealed"
 PROBE_KIND = "probe_spawn"
 EVENT_TYPES = ("event", "cmd_result")
 START_FIELDS = ("runtime", "effects", "preset", "duration_s")
@@ -83,6 +85,27 @@ def _t0_ms(records: Sequence[Record]) -> int:
     raise ReplayError("champ `t0_ms` manquant : aucun `state` ne le porte")
 
 
+def _check_seal(records: Sequence[Record], table: Mapping[str, Any]) -> None:
+    """Le hash annoncé doit être celui de la table rebâtie ; un journal d'avant F15 n'en a pas."""
+    for record in records:
+        if record["type"] == TABLE_SEALED and record["data"].get("rules_hash") != rules_hash(table):
+            sealed = record["data"].get("rules_hash")
+            raise ReplayError(
+                f"`{TABLE_SEALED}` à n={record['n']} : hash {sealed}, table rejouée {rules_hash(table)}"
+            )
+
+
+def _sealed_table(records: Sequence[Record], start: Mapping[str, Any]) -> dict:
+    """Rebâtit la table jouée et la contrôle au sceau, ticks écrits ou non."""
+    try:
+        withdrawn = [r["data"]["atom"] for r in records if r["type"] == ATOM_WITHDRAWN]
+        table = narrow_table(start["preset"], withdrawn)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReplayError(f"`{MATCH_START}` inutilisable, champ invalide : {exc}") from exc
+    _check_seal(records, table)
+    return table
+
+
 def _tick_of(record: Record, tick_ms: int) -> int:
     """Rend l'index de tick de `mt`, compté en valeur exacte et non en flottant."""
     mt = record["mt"]
@@ -121,22 +144,22 @@ def _feed(core: MatchCore, record: Record, catalog: Mapping[str, Any]) -> None:
 def replay_records(records: Sequence[Record]) -> list[Record]:
     """Rejoue `records` et rend tout ce que le cœur a produit, dans l'ordre d'écriture.
 
-    `ReplayError` signale un journal qu'aucun moteur ne peut rejouer. Le parcours s'arrête
-    au plus grand `mt` lu : celui de `match_end` dans un journal complet, car une ligne
-    postérieure prend le dernier tick clos.
+    `ReplayError` signale un journal qu'aucun moteur ne peut rejouer. Le sceau se contrôle
+    d'abord : un journal arrêté avant le premier tick n'a rien à rejouer, mais sa table
+    reste vérifiable. Le parcours s'arrête au plus grand `mt` lu : celui de `match_end` dans
+    un journal complet, car une ligne postérieure prend le dernier tick clos.
     """
     _check_lines(records)
     records = sorted(records, key=lambda record: record["n"])
     start = _start_of(records)
     catalog = start["effects"]
+    table = _sealed_table(records, start)
     timed = [record for record in records if record["mt"] is not None]
     if not timed:
         return []
     t0_ms = _t0_ms(records)
     try:
         tick_ms = start["runtime"]["tick_ms"]
-        withdrawn = [r["data"]["atom"] for r in records if r["type"] == ATOM_WITHDRAWN]
-        table = narrow_table(start["preset"], withdrawn)
         core = MatchCore(table, start["runtime"], catalog, t0_ms, start["duration_s"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ReplayError(f"`{MATCH_START}` inutilisable, champ invalide : {exc}") from exc

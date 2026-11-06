@@ -82,3 +82,14 @@ et le contrat — mais chacun a un effet observable, décrit tel quel.
 Ces six points sont des correctifs courts ; ils sont différés parce qu'aucun ne touche la chaîne
 prouvée (mod chargé, `caps`, contrat, arrêt RCON), et parce que les corriger sans le premier duel
 réel reviendrait à régler des cas dont on ignore la fréquence.
+
+## Table annoncée et table jouée
+
+Une seule table fait foi : celle que le cœur joue, dont `rules_hash` dérive. Deux écarts d'annonce restent, faute de savoir plus tôt.
+
+- **L'aperçu de `Nouveau duel` montre le preset, pas la table jouée.** Le couple (build, mod) n'est
+  connu qu'aux `caps` : avant, rien ne dit si un atome sera retiré. L'écran le dit, et le lobby
+  annonce ensuite la table jouée. Une table réduite perd aussi son `summary`, texte libre sans lien
+  aux règles : le lobby liste les identifiants de règles, pas leur description.
+- **Le `rules_hash` publié au lobby reste provisoire jusqu'à `L`** : un signal reçu au lobby peut
+  lever l'échec, et le hash change alors avec la table. `table_sealed` est le seul hash définitif.

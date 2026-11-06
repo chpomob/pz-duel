@@ -39,6 +39,7 @@ from service.journal import JOURNAL_NAME, JournalError
 from service.proofs import PROOFS_NAME
 from service.protocol import dump_line, parse_session
 from service.replay import main as replay_main
+from service.rules import narrow_table, rules_hash
 from service.servers import read_ini
 from service.state import PHASE_LABELS, MatchState
 from service.transport import DRAIN_PASSES, POLL_MAX
@@ -2248,6 +2249,247 @@ def test_death_no_signal_saw_withdraws_from_the_next_match_only(engine_rig):
     assert state["phase"] == "countdown", state["error"]
     assert state["capabilities"]["withdrawn"] == ["damage_taken"]
     assert state["capabilities"]["disabled_rules"] == ["hurt_supply"]
+    assert state["config"]["rules_hash"] == reduced_hash("duel_rapide")
+    assert state["config"]["rules_hash"] != preset_hash("duel_rapide")
+
+
+def preset_table(name: str) -> dict:
+    path = Path(engine_module.PRESETS_DIR) / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def preset_hash(name: str) -> str:
+    return rules_hash(preset_table(name))
+
+
+def reduced_hash(name: str) -> str:
+    return rules_hash(narrow_table(preset_table(name), ["damage_taken"]))
+
+
+def test_withdrawal_moves_hash_announcement_and_journal_together(engine_rig):
+    """Régression A2 : dès le lobby, le hash est celui de la table réduite, jusqu'au sceau."""
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
+    announced = lobby.state()
+
+    assert announced["config"]["rules_hash"] == reduced_hash("duel_rapide")
+    assert announced["config"]["rules_hash"] != preset_hash("duel_rapide")
+    assert announced["capabilities"]["table"] == {
+        "atoms": ["zombie_kill"],
+        "rules": ["kill_baseline", "kill_streak"],
+    }
+    assert announced["capabilities"]["disabled_rules"] == ["hurt_supply"]
+
+    lobby.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state["config"]["rules_hash"] == announced["config"]["rules_hash"]
+    assert state["capabilities"]["table"] == announced["capabilities"]["table"]
+    (start,) = lobby.records("match_start")
+    assert start["data"]["preset_hash"] == preset_hash("duel_rapide")
+    assert "rules_hash" not in start["data"]
+    (seal,) = lobby.records("table_sealed")
+    assert seal["data"] == {
+        "rules_hash": reduced_hash("duel_rapide"),
+        "preset_hash": preset_hash("duel_rapide"),
+        **announced["capabilities"]["table"],
+        "withdrawn": ["damage_taken"],
+        "disabled_rules": ["hurt_supply"],
+    }
+    (withdrawn,) = lobby.records("atom_withdrawn")
+    assert withdrawn["n"] < seal["n"]
+    assert withdrawn["data"]["hook"] == "OnPlayerGetDamage"
+    logs = [line["msg"] for line in state["logs"]]
+    assert any("damage_taken" in line and "jamais détectée" in line for line in logs)
+    assert any(seal["data"]["rules_hash"] in line for line in logs)
+
+
+def test_signal_in_the_lobby_gives_the_preset_hash_back(engine_rig):
+    """L'échec levé avant la clôture rend tout : la table, l'annonce et le hash."""
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
+    assert lobby.state()["config"]["rules_hash"] == reduced_hash("duel_rapide")
+
+    lobby.mods["B"].hook_seen()
+    lobby.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state["config"]["rules_hash"] == preset_hash("duel_rapide")
+    assert "hurt_supply" in state["capabilities"]["table"]["rules"]
+    assert state["capabilities"]["disabled_rules"] == []
+    (seal,) = lobby.records("table_sealed")
+    assert seal["data"]["rules_hash"] == preset_hash("duel_rapide")
+    assert lobby.records("atom_withdrawn") == []
+
+
+def test_same_state_gives_the_same_hash_on_the_next_match(engine_rig):
+    duel = withdrawn_duel(engine_rig, "duel_rapide")
+    first = duel.state()["config"]["rules_hash"]
+    duel.at_match(1)
+    duel.mods["B"].emit("player_death", {})
+    duel.finish()
+
+    rematch(duel)
+    assert duel.state()["config"]["rules_hash"] == first
+    duel.at(duel.t0_s + duel.te_s)
+    duel.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+
+    assert state["phase"] == "countdown", state["error"]
+    assert state["config"]["rules_hash"] == first
+    (seal,) = duel.records("table_sealed")
+    assert seal["data"]["rules_hash"] == first
+
+
+@pytest.mark.parametrize(
+    ("preset", "failed_sides"),
+    [
+        ("duel_rapide", ()),
+        ("duel_rapide", ("B",)),
+        ("pression", ()),
+        ("pression", ("A", "B")),
+    ],
+)
+def test_table_hash_and_applied_effects_agree(engine_rig, preset, failed_sides):
+    """Cohérence croisée : ce que le cœur joue, ce que dit le hash, ce qui part vers les mods."""
+    duel = Duel(engine_rig, preset, failed_sides=failed_sides)
+    duel.start_match()
+    played = duel.engine._match._played_table
+
+    duel.at_match(1)
+    duel.played(duel.mods["A"].emit("damage_taken", {"hp": 90}))
+    duel.kills("A", 1)
+    engine_rig.until(lambda _: "spawn_pop" in sent_kinds(duel))
+    duel.mods["B"].emit("player_death", {})
+    state = duel.finish()
+
+    (start,) = duel.records("match_start")
+    gone = [record["data"]["atom"] for record in duel.records("atom_withdrawn")]
+    rebuilt = narrow_table(start["data"]["preset"], gone)
+    (seal,) = duel.records("table_sealed")
+    announced = state["capabilities"]["table"]
+
+    # Table ↔ hash, par les quatre chemins qui le disent.
+    assert rules_hash(played) == rules_hash(rebuilt)
+    assert rules_hash(played) == seal["data"]["rules_hash"]
+    assert rules_hash(played) == state["config"]["rules_hash"]
+    assert (rules_hash(played) == preset_hash(preset)) == (not failed_sides)
+    # Table ↔ annonce : ni règle en plus, ni règle en moins.
+    assert announced["rules"] == [rule["id"] for rule in played["rules"]]
+    assert announced["atoms"] == played["atoms"]
+    assert announced == {"atoms": seal["data"]["atoms"], "rules": seal["data"]["rules"]}
+    assert set(announced["rules"]).isdisjoint(state["capabilities"]["disabled_rules"])
+
+    # Effets ↔ table : la règle de la blessure joue si, et seulement si, elle est annoncée.
+    fired = {record["data"]["rule"] for record in duel.records("rule_fired")}
+    assert fired <= set(announced["rules"])
+    assert ("hurt_supply" in fired) == ("hurt_supply" in announced["rules"])
+    allowed = {effect["kind"] for rule in played["rules"] for effect in rule["effects"]}
+    assert set(sent_kinds(duel)) <= allowed
+    assert duel.replays()
+
+
+def sent_kinds(duel: Duel) -> list[str]:
+    """Les effets envoyés aux mods : la sonde de spawn, hors cœur, n'en est pas un."""
+    commands = [record["data"]["command"] for record in duel.records("command")]
+    return [command["kind"] for command in commands if command["kind"] != "probe_spawn"]
+
+
+def test_replay_refuses_a_seal_that_is_not_the_replayed_table(engine_rig):
+    duel = withdrawn_duel(engine_rig, "duel_rapide")
+    duel.at_match(1)
+    duel.mods["B"].emit("player_death", {})
+    sealed = duel.finish()["config"]["rules_hash"]
+    assert duel.replays()
+
+    path = engine_rig.matches / duel.match_id / JOURNAL_NAME
+    text = path.read_text(encoding="utf-8")
+    assert text.count(sealed) == 1
+    path.write_text(text.replace(sealed, "0" * len(sealed)), encoding="utf-8")
+
+    assert not duel.replays()
+
+
+def test_replay_checks_the_seal_of_a_match_cancelled_during_countdown(engine_rig):
+    """Annulé avant le premier tick : la table scellée, réduite ici, se contrôle quand même."""
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
+    lobby.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    match_id = state["match_id"]
+    assert lobby.engine.action("cancel")[0]
+    engine_rig.wait("idle")
+
+    path = engine_rig.matches / match_id / JOURNAL_NAME
+    assert all(record["mt"] is None for record in engine_rig.journal(match_id))
+    assert replay_main([str(path)]) == 0
+
+    sealed = reduced_hash("duel_rapide")
+    text = path.read_text(encoding="utf-8")
+    assert text.count(sealed) == 1
+    path.write_text(text.replace(sealed, "0" * len(sealed)), encoding="utf-8")
+
+    assert replay_main([str(path)]) == 1
+
+
+def test_played_table_that_is_not_the_reduced_preset_is_refused(engine_rig):
+    """Recontrôle : une règle jouée hors du preset réduit, ou l'inverse, ne passe pas."""
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
+    lobby.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    match = lobby.engine._match
+    assert match._rules_refusal() is None
+
+    match._played_table = match.table
+    refusal = match._rules_refusal()
+
+    assert refusal is not None
+    assert reduced_hash("duel_rapide") in refusal.message
+
+
+def test_preset_modified_under_a_withdrawal_is_still_refused(engine_rig, presets):
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
+    sealed = preset_hash("duel_rapide")
+    path = presets / "duel_rapide.json"
+    path.write_bytes(path.read_bytes().replace(b'"n": 2', b'"n": 3'))
+
+    lobby.join_and_resolve()
+    state = engine_rig.wait("error", "countdown")
+
+    assert state["phase"] == "error"
+    assert sealed in state["error"]
+    assert stopped_for_good(engine_rig)
+
+
+@pytest.mark.parametrize("lost", ["atom_withdrawn", "table_sealed"])
+def test_table_the_journal_cannot_carry_is_not_played(engine_rig, lost):
+    """Sans ces lignes, le rejeu rebâtirait une autre table : mieux vaut ne pas jouer."""
+    lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
+    journal = lobby.engine._match._journal
+    write = journal.write
+
+    def failing(type_, *args, **kwargs):
+        if type_ == lost:
+            raise OSError("disque plein")
+        return write(type_, *args, **kwargs)
+
+    journal.write = failing
+    lobby.join_and_resolve()
+    state = engine_rig.wait("error", "countdown")
+
+    assert state["phase"] == "error"
+    assert "non journalisée" in state["error"]
+    assert stopped_for_good(engine_rig)
+
+
+def test_ui_shows_the_table_the_service_publishes():
+    """L'UI lit la table publiée, à toutes les phases où elle a un sens, sans la recalculer."""
+    script = (Path(engine_module.__file__).parent.parent / "ui" / "app.js").read_text("utf-8")
+
+    assert "S.capabilities.table" in script
+    assert "S.config.rules_hash" in script
+    assert script.count("${playedTable()}") == 4
 
 
 def test_other_endings_prove_no_failure(engine_rig, presets):

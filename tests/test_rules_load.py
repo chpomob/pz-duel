@@ -416,6 +416,14 @@ def test_narrow_table_removes_what_depends_on_the_atom(catalog, limits):
     assert raw["atoms"] == raw_atoms and rules_hash(raw) == sealed
 
 
+def test_narrowed_summary_no_longer_describes_the_rules_it_lost(catalog, limits):
+    """`summary` entre dans le hash : il ne peut pas y annoncer ce qui ne se joue plus."""
+    narrowed = narrow_table(read_preset("duel_rapide"), ["damage_taken"])
+
+    assert narrowed["summary"] == ["Table réduite, sans damage_taken"]
+    load_table(narrowed, catalog, limits, active_atoms=["zombie_kill"])
+
+
 def test_narrow_table_ignores_an_atom_the_table_never_had():
     raw = table()
     assert narrow_table(raw, ["explosion"]) == raw

@@ -112,6 +112,8 @@ STOP_INCOMPLETE = "arrêt incomplet : des processus de serveur subsistent"
 # La fonction de jeu que `probe_spawn` met à l'épreuve dans `DuelCore.lua`.
 PROBE_FUNCTION = "addZombiesInOutfit"
 ATOM_WITHDRAWN = "atom_withdrawn"
+TABLE_SEALED = "table_sealed"
+WITHDRAWAL_REASON = "blessure jamais détectée sur ce build et ce mod"
 EARLY_DEATH = "early_death"
 OUTCOME_DEATH = "death"
 STEP_CONTRACT = "contract"
@@ -285,14 +287,21 @@ class ContractWindow:
     def reach_lobby_ready(self) -> None:
         self.ready = True
 
+    def _common_atoms(self) -> set[str]:
+        return set.intersection(*(set(self.caps[side]["atoms"]) for side in SIDES))
+
+    def withdrawals(self, failed: Mapping[str, Sequence[str]]) -> list[dict[str, Any]]:
+        """Rend ce que `failed` retire : le lobby l'annonce, `close` le fige."""
+        return [
+            {"atom": atom, "hook": self.proofs[atom], "sides": list(failed[self.proofs[atom]])}
+            for atom in sorted(self._common_atoms() & self.proofs.keys())
+            if self.proofs[atom] in failed
+        ]
+
     def close(self, failed: Mapping[str, Sequence[str]]) -> None:
         """Retient les atomes communs aux deux `caps`, moins ceux dont `failed` nomme le hook."""
-        common = set.intersection(*(set(self.caps[side]["atoms"]) for side in SIDES))
-        for atom in sorted(common & self.proofs.keys()):
-            hook = self.proofs[atom]
-            if hook in failed:
-                self.withdrawn.append({"atom": atom, "hook": hook, "sides": list(failed[hook])})
-        self.active_atoms = sorted(common - {item["atom"] for item in self.withdrawn})
+        self.withdrawn = self.withdrawals(failed)
+        self.active_atoms = sorted(self._common_atoms() - {item["atom"] for item in self.withdrawn})
 
     def detail(self, failed: Mapping[str, Sequence[str]]) -> str:
         """Détail de l'étape `contract` (D17) : dès le lobby, il annonce la table qui sera jouée."""
@@ -301,7 +310,7 @@ class ContractWindow:
             retired = [item["atom"] for item in self.withdrawn]
             return f"{summary} ; retirés : {', '.join(retired)}" if retired else summary
         return " ; ".join(
-            f"{atom} sera retiré : blessure jamais détectée sur ce build et ce mod"
+            f"{atom} sera retiré : {WITHDRAWAL_REASON}"
             for atom, hook in sorted(self.proofs.items())
             if hook in failed
         )
@@ -391,9 +400,10 @@ class RealMatch:
     ) -> None:
         self.config = config
         self.table = table
-        # La table jouée : `table` reste scellée, le retrait d'un atome ne touche que celle-ci.
+        self.preset_hash = rules_hash(table)
+        # Seule source de vérité : le cœur la joue, `rules_hash` en dérive, l'UI la publie.
+        # Le lobby la suit au fil des échecs connus ; `_close_window` la fige avant le décompte.
         self._played_table: Mapping[str, Any] = table
-        self.rules_hash = rules_hash(table)
         self.runtime = runtime
         self.effects = effects
         self.zomboid_dir = zomboid_dir
@@ -476,6 +486,11 @@ class RealMatch:
         self._shutdown_lock = threading.Lock()
         self._stopped: bool | None = None
 
+    @property
+    def rules_hash(self) -> str:
+        """Le hash de la table jouée : il ne se stocke pas, donc ne peut pas s'en écarter."""
+        return rules_hash(self._played_table)
+
     def prepare(self) -> None:
         """Amène les mondes à leur origine, rejoue la préparation, ouvre le journal.
 
@@ -490,7 +505,8 @@ class RealMatch:
             {
                 "match_id": self.match_id,
                 "preset": self.table,
-                "rules_hash": self.rules_hash,
+                # La table jouée n'est connue qu'à `table_sealed` : il faut les `caps` pour la dire.
+                "preset_hash": self.preset_hash,
                 "ports": self.runtime["ports"],
                 "protocol": PROTOCOL_VERSION,
                 "runtime": self.runtime,
@@ -1267,16 +1283,19 @@ class RealMatch:
         return _Refusal(STEP_LOBBY, message)
 
     def _close_window(self) -> _Refusal | None:
-        """Fige la décision, puis joue la table sans ce qui dépend d'un atome retiré.
+        """Fige la décision et scelle la table sans ce qui dépend d'un atome retiré.
 
-        Sans échec constaté, la table jouée est la table scellée, celle que l'UI annonce.
-        Seule une table privée de tout atome est refusée. Un atome absent de `caps` sans
-        être retiré reste un écart de contrat : la revalidation le refuse.
+        Sans échec constaté, la table jouée est le preset. Seule une table privée de tout atome
+        est refusée. Un atome absent de `caps` sans être retiré reste un écart de contrat : la
+        revalidation le refuse. Une table que le journal ne porte pas ne se joue pas : le rejeu
+        ne la retrouverait pas.
         """
         self.window.close(self._known_failures())
-        for withdrawal in self.window.withdrawn:
+        written = [
             self._write_safely(ATOM_WITHDRAWN, withdrawal, None, None)
-        narrowed = narrow_table(self.table, [item["atom"] for item in self.window.withdrawn])
+            for withdrawal in self.window.withdrawn
+        ]
+        narrowed = narrow_table(self.table, self._withdrawn_atoms())
         try:
             self._played_table = load_table(
                 narrowed,
@@ -1294,29 +1313,73 @@ class RealMatch:
             ]
             cause = " ; ".join(causes or [self.redactor.redact(str(exc))])
             return _Refusal(STEP_CONTRACT, f"contrat refusé : {cause}")
-        self._log_disabled_rules()
+        self._disabled_rules = self._rules_gone()
+        written.append(self._write_safely(TABLE_SEALED, self._seal(), None, None))
+        if not all(written):
+            message = f"contrat refusé : table {self.rules_hash} non journalisée"
+            return _Refusal(STEP_CONTRACT, message)
+        self._log_withdrawals()
         return None
 
-    def _log_disabled_rules(self) -> None:
+    def _withdrawn_atoms(self) -> list[str]:
+        return [item["atom"] for item in self.window.withdrawn]
+
+    def _rules_gone(self) -> list[str]:
         kept = {rule["id"] for rule in self._played_table["rules"]}
-        disabled = [rule["id"] for rule in self.table["rules"] if rule["id"] not in kept]
-        self._disabled_rules = disabled
-        if disabled:
-            message = f"règles désactivées par le retrait d'un atome : {', '.join(disabled)}"
-            self._on_state(lambda state: state.log(message, "warn"))
+        return [rule["id"] for rule in self.table["rules"] if rule["id"] not in kept]
+
+    def _announced_table(self) -> dict[str, list[str]]:
+        table = self._played_table
+        return {"atoms": list(table["atoms"]), "rules": [rule["id"] for rule in table["rules"]]}
+
+    def _seal(self) -> dict[str, Any]:
+        return {
+            "rules_hash": self.rules_hash,
+            "preset_hash": self.preset_hash,
+            **self._announced_table(),
+            "withdrawn": self._withdrawn_atoms(),
+            "disabled_rules": self._disabled_rules,
+        }
+
+    def _log_withdrawals(self) -> None:
+        lines = [
+            f"atome {item['atom']} retiré : {WITHDRAWAL_REASON} "
+            f"(hook {item['hook']}, camps {', '.join(item['sides'])})"
+            for item in self.window.withdrawn
+        ]
+        if self._disabled_rules:
+            rules = ", ".join(self._disabled_rules)
+            lines.append(f"règles désactivées par le retrait d'un atome : {rules}")
+        if lines:
+            lines.append(f"table jouée : hash {self.rules_hash}")
+
+        def change(state: MatchState) -> None:
+            for line in lines:
+                state.log(line, "warn")
+
+        self._on_state(change)
 
     def _rules_refusal(self) -> _Refusal | None:
-        """Recontrôle le hash sur le fichier du preset, tel qu'il est à cet instant."""
+        """Recontrôle le fichier du preset, tel qu'il est à cet instant, et ce qui en dérive.
+
+        Le preset doit être celui du lancement, et la table jouée ce qu'il donne une fois
+        retirés les atomes journalisés : ni règle en plus, ni règle en moins.
+        """
         path = os.path.join(PRESETS_DIR, f"{self.table['id']}.json")
         try:
             with open(path, encoding="utf-8") as fh:
-                found = rules_hash(json.load(fh))
+                raw = json.load(fh)
+            found = rules_hash(raw)
         except (OSError, ValueError) as exc:
             cause = self.redactor.redact_exception(exc)
-            message = f"preset illisible, hash {self.rules_hash} non recontrôlé : {cause}"
+            message = f"preset illisible, hash {self.preset_hash} non recontrôlé : {cause}"
             return _Refusal(STEP_LOBBY, message)
-        if found != self.rules_hash:
-            message = f"preset modifié : hash {found}, scellé {self.rules_hash}"
+        if found != self.preset_hash:
+            message = f"preset modifié : hash {found}, scellé {self.preset_hash}"
+            return _Refusal(STEP_LOBBY, message)
+        derived = rules_hash(narrow_table(raw, self._withdrawn_atoms()))
+        if derived != self.rules_hash:
+            message = f"table jouée {self.rules_hash} différente du preset réduit {derived}"
             return _Refusal(STEP_LOBBY, message)
         return None
 
@@ -1361,19 +1424,34 @@ class RealMatch:
             "active_atoms": window.active_atoms,
             "withdrawn": [item["atom"] for item in window.withdrawn],
             "disabled_rules": self._disabled_rules,
+            "table": self._announced_table(),
             "attribution": self._attribution,
             "spawn": spawn,
             # L'attribution ne se mesure qu'en fin de match : rien à en conclure avant.
             "fallback": fallback(combined_spawn(spawn), self._attribution or INSUFFICIENT),
         }
 
+    def _follow_failures(self) -> None:
+        """Avant la clôture, la table suit les échecs connus : un signal au lobby peut en lever un."""
+        if not self.window.closed:
+            withdrawals = self.window.withdrawals(self._known_failures())
+            self._played_table = narrow_table(self.table, [item["atom"] for item in withdrawals])
+            self._disabled_rules = self._rules_gone()
+
+    def announce_table(self) -> None:
+        """Publie la table avant d'ouvrir le lobby : aucun relevé n'y voit celle du preset."""
+        self._publish(self._now_ms())
+
     def _publish(self, now_ms: int) -> None:
+        self._follow_failures()
         capabilities = self._capabilities()
         players = dict(self.players)
         detail = self.window.detail(self._known_failures())
+        announced = self.rules_hash
 
         def change(state: MatchState) -> None:
             state.capabilities = capabilities
+            state.config["rules_hash"] = announced
             state.players = players
             state.set_step(STEP_CONTRACT, "ok", detail)
 
@@ -1854,6 +1932,7 @@ class Engine:
                 "code": self.state.config["code"],
             }
             self.state.log("lobby ouvert, invitation prête")
+        match.announce_table()
         match.enter_phase("lobby")
 
     def _finish_match(self, match: RealMatch, failure: str | None) -> None:

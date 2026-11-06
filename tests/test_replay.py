@@ -651,6 +651,20 @@ def test_lobby_only_journal_has_nothing_to_replay(tmp_path, capsys):
     assert code == 0, output
 
 
+@pytest.mark.parametrize("honest", [True, False])
+def test_seal_is_checked_even_without_a_single_tick(tmp_path, capsys, honest):
+    """Journal annulé au décompte : rien à rejouer, mais la table scellée se contrôle."""
+    records = [r for r in records_of(fixture("replay_clock")) if r["mt"] is None]
+    sealed = rules_hash(records[0]["data"]["preset"]) if honest else "0" * 64
+    n = records[-1]["n"] + 1
+    records.append({"n": n, "type": "table_sealed", "mt": None, "data": {"rules_hash": sealed}})
+
+    code, output = run(capsys, write_records(tmp_path / "countdown.jsonl", records))
+
+    assert code == (0 if honest else 1), output
+    assert honest or f"`table_sealed` à n={n}" in output
+
+
 def test_command_line(tmp_path):
     def cli(*argv):
         command = [sys.executable, "-m", "service.replay", *map(str, argv)]

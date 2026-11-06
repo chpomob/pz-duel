@@ -194,7 +194,7 @@ function renderConfig() {
         <span class="hint"> (lecture seule)</span></span></div>
 
       <h2 style="margin-top:18px">Règles — ${esc(p.label)}</h2>
-      <p class="sub">Aperçu. L'invité verra exactement ceci avant d'accepter.</p>
+      <p class="sub">Aperçu du preset. Le lobby annonce la table jouée, réduite si un atome est retiré.</p>
       <ul class="feed">
         ${(p.summary || []).map((line) => `<li>• ${esc(line)}</li>`).join('')}
       </ul>
@@ -230,10 +230,14 @@ function stepsList() {
   </ul>`;
 }
 
-// La table jouée diffère de l'annonce dans un seul cas : un atome retiré sur échec constaté.
-function disabledRules() {
-  const rules = (S.capabilities && S.capabilities.disabled_rules) || [];
-  return rules.length ? `<p class="hint">Règles retirées de ce match : ${esc(rules.join(', '))}</p>` : '';
+// La table que le service joue : ni le preset, ni un calcul de l'UI. Le hash vient de la même table.
+function playedTable() {
+  const table = S.capabilities && S.capabilities.table;
+  if (!table) return '';
+  const rules = S.capabilities.disabled_rules || [];
+  return `<p class="hint">Table jouée : atomes ${esc(table.atoms.join(', '))} ; règles ${esc(table.rules.join(', ') || 'aucune')}</p>
+    ${rules.length ? `<p class="hint">Règles retirées de ce match : ${esc(rules.join(', '))}</p>` : ''}
+    <p class="hint">Hash des règles : ${esc(S.config.rules_hash || '')}</p>`;
 }
 
 function renderLive() {
@@ -251,12 +255,12 @@ function renderLive() {
         </div>
         <div class="row"><span class="k">Menaces / min</span><span class="v">${S.threats_per_min}</span></div>
         <div class="row"><span class="k">Dérive d'horloge</span><span class="v">${S.clock.drift_s ?? '—'} s</span></div>
-        ${disabledRules()}
+        ${playedTable()}
         <div class="actions">${phase === 'running' ? '<button class="danger" data-action="cancel">Arrêter le match</button>' : ''}</div>
       </section>`;
     if (phase === 'countdown') {
       body = `<section class="card"><div class="countdown">${S.clock.countdown ?? 3}</div>
-        <p class="hint" style="text-align:center">le duel commence</p>${disabledRules()}</section>`;
+        <p class="hint" style="text-align:center">le duel commence</p>${playedTable()}</section>`;
     }
     if (S.events.length) {
       body += `<section class="card"><h2>Fil du match</h2>
@@ -286,6 +290,7 @@ function renderLive() {
             <p class="hint" style="margin-top:10px">Adversaire : ${S.players.B ? esc(S.players.B) : 'en attente…'}</p>
           </div>
         </div>
+        ${playedTable()}
       </section>`;
     shell(`<section class="card"><h2>Lancement</h2>${stepsList()}</section>` + body +
       `<section class="card"><div class="actions"><button class="danger" data-action="cancel">Annuler le duel</button></div></section>`);
@@ -316,6 +321,7 @@ function renderOver() {
         <div class="vs">${esc(verdict)}</div>
         <div class="side"><div class="n">${b}</div><div class="who">${esc(S.players.B || 'B')}</div></div>
       </div>
+      ${playedTable()}
       <div class="actions">
         <button class="primary" data-action="rematch">Revanche</button>
         <button class="ghost" data-action="config">Nouveau duel</button>

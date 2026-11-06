@@ -701,7 +701,7 @@ def test_match_start_comes_first_without_secret(engine_rig):
     assert first["type"] == "match_start"
     assert set(START_FIELDS) <= set(first["data"])
     assert first["data"]["match_id"] == state["match_id"]
-    assert first["data"]["rules_hash"] == state["config"]["rules_hash"]
+    assert first["data"]["preset_hash"] == state["config"]["rules_hash"]
     assert first["data"]["day_length"] == state["config"]["day_length"]
     assert first["data"]["runtime"] == rig.runtime
     assert {"phase": "contract"} in [record["data"] for record in others]
