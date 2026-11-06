@@ -1,0 +1,36 @@
+{
+  "verdict": "APPROVE",
+  "findings": [
+    {
+      "id": "F1",
+      "status": "RESOLVED",
+      "evidence": "AC7 distingue désormais server_name(side), les ports et délais du runtime et le secret tiré par Engine._open_match(), conformément à service/servers.py et service/engine.py."
+    },
+    {
+      "id": "F2",
+      "status": "RESOLVED",
+      "evidence": "AC38 limite la conservation à rematch sans changement d'adresse ; AC59 couvre le changement de Password par start, conforme à Engine._begin() et RealMatch._prepare_launch(), et AC60–AC61 rendent cette limite explicite dans l'UI et la documentation."
+    },
+    {
+      "id": "F3",
+      "status": "RESOLVED",
+      "evidence": "La section « Portée de targets » distingue fichiers modifiés, ressources conservées et collections mesurées ; targets inclut les quatre fichiers de tests existants visés par AC62 et déclare service/platforms.py et tests/test_platform_windows.py comme nouveaux fichiers à créer."
+    },
+    {
+      "id": "F4",
+      "status": "RESOLVED",
+      "evidence": "H1 conditionne maintenant l'enregistrement du .bat à une adresse utilisable et reprend explicitement l'exception de R7 et AC44."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "docs/campaigns/phase2/spec.md",
+    "docs/campaigns/phase2/BRIEF.md",
+    "service/servers.py",
+    "service/engine.py",
+    "tests/test_snapshots.py",
+    "tests/test_contract.py",
+    "tests/test_modes.py",
+    "tests/test_campaign_gate.py"
+  ]
+}

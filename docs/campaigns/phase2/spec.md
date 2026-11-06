@@ -32,7 +32,7 @@ targets:
   - file: service/share.py
     description: "Nouveau : écouteur réseau de l'invitation, limité au téléchargement du .bat pendant le lobby"
   - file: ui/app.js
-    description: "Écran de premier lancement, bouton Quit, invitation par lien, QR et enregistrement du .bat, champ d'adresse publique, portée de l'invitation et ports à ouvrir"
+    description: "Écran de premier lancement, bouton Quit, invitation par lien, QR et enregistrement du .bat, champ d'adresse publique, portée de l'invitation et ports à ouvrir, avertissement sur les lanceurs périmés par un duel neuf"
   - file: ui/index.html
     description: "Points d'ancrage des écrans ajoutés"
   - file: ui/style.css
@@ -46,7 +46,7 @@ targets:
   - file: packaging/smoke_test.py
     description: "Nouveau : test de fumée du binaire produit, stdlib seule, lancé par la CI"
   - file: .github/workflows/tests.yml
-    description: "Ajout de la suite sur windows-latest et du test de fumée du binaire sur chaque pull request"
+    description: "Ajout de la suite sur windows-latest et du test de fumée du binaire sur chaque pull request ; historique complet au checkout (`fetch-depth: 0`) pour la comparaison d'AC53"
   - file: .github/workflows/release.yml
     description: "Nouveau : sur tag v*, construction sur windows-latest, test de fumée, puis pièce jointe à la release GitHub"
   - file: tests/doubles/fake_server.py
@@ -59,8 +59,16 @@ targets:
     description: "Paramétrage des doubles d'installation par plateforme"
   - file: tests/test_api_security.py
     description: "Classement des nouveaux champs de payload, balayage des nouvelles routes et de l'écouteur de partage"
+  - file: tests/test_snapshots.py
+    description: "`os.killpg`, `signal.SIGKILL` et scripts `#!/bin/sh` paramétrés par plateforme ; équivalent Windows ou skip nommant le test qui le remplace (AC62)"
+  - file: tests/test_contract.py
+    description: "`crash()` paramétré par plateforme, sans `os.killpg` ni `signal.SIGKILL` sous Windows (AC62)"
+  - file: tests/test_modes.py
+    description: "Doubles du client et du serveur (`#!/bin/sh` exécutés par `launch_client`) paramétrés par plateforme (AC62)"
+  - file: tests/test_campaign_gate.py
+    description: "Faux interpréteur `#!/bin/sh` paramétré par plateforme (AC62)"
   - file: tests/test_platform_windows.py
-    description: "Nouveau : branches Windows exécutées sous Linux par injection de plateforme (R1, R2, R3)"
+    description: "Nouveau : branches Windows exécutées sous Linux par injection de plateforme (R1, R2, R3) ; mesure des collections d'AC6 et d'AC53 et des raisons de skip d'AC62"
   - file: tests/test_frozen.py
     description: "Nouveau : résolution des ressources et des données en mode figé simulé, démarrage sans console (R4)"
   - file: tests/test_setup_flow.py
@@ -68,11 +76,11 @@ targets:
   - file: tests/test_guest_launcher.py
     description: "Nouveau : contenu du .bat sous Linux, exécution réelle sous Windows uniquement (R6)"
   - file: tests/test_share.py
-    description: "Nouveau : écouteur de partage et adresse d'invitation (R7)"
+    description: "Nouveau : écouteur de partage, adresse d'invitation et validité des lanceurs après revanche ou `start` (R7)"
   - file: tests/test_ci_workflows.py
     description: "Nouveau : lecture statique des workflows et du fichier de build (R8)"
   - file: README.md
-    description: "Section de démarrage pour joueurs Windows : téléchargement, SmartScreen, pare-feu, redirection de port, invité"
+    description: "Section de démarrage pour joueurs Windows : téléchargement, SmartScreen, pare-feu, redirection de port, invité, lanceurs périmés par un duel neuf"
   - file: README.fr.md
     description: "Même section en français"
   - file: docs/campaigns/phase2/limites-connues.md
@@ -129,8 +137,9 @@ qui casseraient Windows ou le binaire sans bruit :
   supposerait un programme déjà installé chez l'invité, ce que le `.bat` sert justement à éviter. Le
   lien devient donc une URL HTTP servie par l'hôte. C'est le premier écouteur hors boucle locale du
   projet : R7 le limite strictement, et `make_server` reste sur `127.0.0.1`. L'enregistrement du `.bat`
-  depuis l'UI, à envoyer par messagerie, reste toujours possible : c'est la voie normale pour un invité
-  hors du réseau local.
+  depuis l'UI, à envoyer par messagerie, reste possible dès qu'une adresse utilisable existe : c'est la
+  voie normale pour un invité hors du réseau local. Seule exception, couverte par R7 : sans adresse
+  utilisable, le service ne produit ni lien ni `.bat` et demande la saisie.
 - **H2 — L'invité est sous Windows.** Le `.bat` est la décision de l'opérateur. Un invité Linux suit
   la procédure manuelle actuelle. Un hôte Linux produit le même `.bat` qu'un hôte Windows.
 - **H3 — Sources et binaire divergent sur trois points seulement** : le mode par défaut, le dossier de
@@ -157,6 +166,22 @@ qui casseraient Windows ou le binaire sans bruit :
 Aucune exigence ne contredit une assertion existante sous Linux : la section de liste d'échecs
 autorisés est donc absente. `tests/test_api_security.py` demande de classer tout nouveau champ de
 payload : c'est une extension prévue par ce test, pas un assouplissement.
+
+### Portée de `targets`
+
+`targets` liste les fichiers que la phase modifie ou crée, et eux seuls. Deux absences sont voulues :
+
+- **Fichiers qui ne doivent pas changer.** `service/protocol.py`, `service/journal.py`,
+  `service/presets/`, `service/effects.json`, `mods/duelcore/`, `tests/fixtures/` et
+  `tests/test_stdlib_only.py` sont lus ou cités par AC17, AC18, AC31, AC32, AC48 et AC55. Ces critères
+  exigent qu'ils restent identiques : les ajouter à `targets` les contredirait.
+- **Collections mesurées sur l'arbre.** « Tous les modules de `service/` » (AC6) et « chaque fonction
+  de test » (AC53) sont constatés à l'exécution, pas listés. `tests/test_platform_windows.py` mesure
+  AC6 et AC53, `tests/test_stdlib_only.py` parcourt `service/` pour AC48. Les modules de ces
+  collections absents de `targets`, dont `service/rcon.py`, `service/snapshots.py`, `service/state.py`,
+  `service/replay.py` et `service/verdict.py`, ne sont pas à modifier : aucune dépendance POSIX n'y a
+  été relevée. `tests/test_integration_pz.py` lit `/proc`, mais seulement dans les tests marqués
+  `pz_integration`, qui ne tournent pas en CI : il n'est pas à modifier non plus.
 
 ## Requirements
 
@@ -219,7 +244,9 @@ comportement.
   pour une adresse détectée, avec la consigne de saisir l'adresse publique pour un invité distant ; non
   vérifiée pour une adresse saisie, avec les ports que l'hôte doit rendre accessibles (ports UDP de jeu
   du serveur B pour jouer, port TCP de partage pour le lien). Si l'écouteur ne peut pas démarrer, le
-  lobby reste ouvert et l'enregistrement du `.bat` reste offert. `pzduel://` disparaît de l'UI.
+  lobby reste ouvert et l'enregistrement du `.bat` reste offert. `pzduel://` disparaît de l'UI. Un
+  `.bat` déjà envoyé reste valide pour une revanche, qui réutilise la configuration et donc le mot de
+  passe ; un `start` neuf peut tirer un autre mot de passe et le périme alors, ce que l'UI signale.
 - R8: **Vérification et livraison.** Chaque pull request exécute la suite sur `windows-latest` en plus de
   Linux, construit le binaire et exécute son test de fumée. Un tag `v*` construit sur `windows-latest`,
   refait le test de fumée et, seulement s'il passe, attache le `.exe` et son empreinte SHA-256 à la
@@ -227,7 +254,8 @@ comportement.
   dans `service/` ne l'importe, et `service/` reste stdlib, en syntaxe Python 3.11.
 - R9: **Documentation.** `README.md` et `README.fr.md` expliquent le parcours du joueur et de l'invité :
   téléchargement, avertissement SmartScreen sur le `.exe` et sur le `.bat`, invite du pare-feu Windows,
-  ports à rediriger pour un invité distant, sensibilité du `.bat`. `limites-connues` sépare ce que la CI
+  ports à rediriger pour un invité distant, sensibilité du `.bat`, péremption des lanceurs déjà envoyés
+  par un duel neuf. `limites-connues` sépare ce que la CI
   prouve de ce qui n'est pas prouvé sur le vrai jeu Windows.
 - R10: **Non-régression.** Sous Linux, depuis les sources, le comportement et la suite restent ceux de la
   phase 1. Aucun test n'est supprimé : les tests liés à `chmod 0600`, à SIGTERM ou aux chemins POSIX sont
@@ -243,11 +271,11 @@ comportement.
 - AC3 (R1): Avec `--pz-dir` ou `PZ_INSTALL_DIR` invalide et une installation valide au dossier Steam par défaut, la détection rend `absent` et ne rend pas le dossier Steam ; `--pz-dir` valide l'emporte sur `PZ_INSTALL_DIR` valide.
 - AC4 (R1): Avec une mesure de RAM injectée et un seuil de 6144 Mo, 6143 Mo produit exactement 1 défaut de RAM, 6144 Mo n'en produit aucun, et une mesure en échec produit 1 défaut avec `mem_available_mb` à `None`. Sur `windows-latest`, la mesure réelle est un entier strictement positif.
 - AC5 (R1): Sur `windows-latest`, un port TCP tenu par une socket à l'écoute, avec ou sans `SO_REUSEADDR` chez son détenteur, et un port UDP lié produisent chacun 1 défaut qui nomme le port et son protocole, tandis qu'un port libre n'en produit aucun. Une erreur système 10013 injectée donne un défaut « inutilisable ».
-- AC6 (R1): Un test lancé sous Linux importe tous les modules de `service/` dans un sous-processus et vérifie que `winreg`, `msvcrt` et `_winapi` sont absents de `sys.modules`.
+- AC6 (R1): Un test de `tests/test_platform_windows.py` lancé sous Linux énumère à l'exécution les modules de `service/`, les importe tous dans un sous-processus et vérifie que `winreg`, `msvcrt` et `_winapi` sont absents de `sys.modules`.
 
 ### Processus (R2)
 
-- AC7 (R2): Sous Linux, plateforme Windows injectée, la commande serveur commence par `<dossier>\StartServer64.bat` et porte `-servername`, `-port`, `-udpport` et `-adminpassword` avec les valeurs de `runtime.json` ; la commande client est `ProjectZomboid64.exe` du même dossier, suivie de `-nosteam +connect <adresse> +password <valeur>`, soit 5 arguments.
+- AC7 (R2): Sous Linux, plateforme Windows injectée, avec un `runtime.json` de test aux ports et délais modifiés et `gen_secret` injecté, la commande serveur commence par `<dossier>\StartServer64.bat` et porte `-servername`, `-port`, `-udpport` et `-adminpassword`, soit 8 arguments, avec les valeurs qu'utilise le moteur : `server_name(side)` pour `-servername`, les ports `game` et `udp` du camp dans ce `runtime.json` pour `-port` et `-udpport`, le secret admin tiré par `Engine._open_match()` pour ce match pour `-adminpassword`. Les délais ne sont pas des arguments : `stop_timeout_s` et `kill_grace_s` appliqués à ce serveur sont ceux de ce `runtime.json`. Après un lancement réussi, ce secret ne figure ni dans un message rendu, ni dans l'état, ni dans le log du service. La commande client est `ProjectZomboid64.exe` du même dossier, suivie de `-nosteam +connect <adresse> +password <valeur>`, soit 5 arguments.
 - AC8 (R2): Sur `windows-latest`, avec un double dans un dossier nommé `Program Files (x86)\Project Zomboid`, le serveur démarre, reçoit ses arguments à l'identique (comparaison sur le fichier d'arguments du double) et atteint l'état prêt par ses marqueurs de sortie.
 - AC9 (R2): Sur `windows-latest`, un double dont le script finit par `PAUSE` et dont l'enfant ignore la demande d'arrêt est arrêté au palier `sigkill` : `stop_stage` vaut `sigkill`, `running` vaut faux et 0 processus de son arbre ne subsiste à l'échéance `kill_grace_s`.
 - AC10 (R2): Sur `windows-latest`, un service lancé avec un double en cours d'exécution puis tué de force (`taskkill /F` sur le service seul) ne laisse aucun processus du double au bout de 5 s ; la même mesure vaut pour la fermeture de sa console.
@@ -294,7 +322,7 @@ comportement.
 ### Invitation (R7)
 
 - AC37 (R7): Le lien exposé par `invite` et le texte du QR sont identiques, commencent par `http://`, et le `GET` de ce lien rend les mêmes octets que l'enregistrement depuis l'UI. `pzduel://` n'apparaît plus dans `ui/`.
-- AC38 (R7): Le jeton compte au moins 128 bits (32 caractères hexadécimaux ou équivalent) et 2 lobbys successifs, revanche comprise, ont des jetons différents, tandis qu'un `.bat` du lobby précédent garde une adresse et un mot de passe valides.
+- AC38 (R7): Le jeton compte au moins 128 bits (32 caractères hexadécimaux ou équivalent) et 2 lobbys successifs, revanche comprise, ont des jetons différents. Cas vérifié ici : la revanche, sans nouvelle adresse saisie. Après `rematch`, le `+connect` et le `+password` du `.bat` du lobby précédent égalent ceux du `.bat` du nouveau lobby, et ce mot de passe est le `Password` écrit dans le `.ini` du serveur B. Le cas du `start` est celui d'AC59.
 - AC39 (R7): Sur l'écouteur de partage, `/`, `/api/state`, `/api/action`, un jeton faux, un jeton juste avec un autre chemin et toute méthode autre que `GET` répondent 404 ou 405, sans corps contenant le jeton, le mot de passe ou une ressource de l'UI. Le port de l'API reste lié à `127.0.0.1`.
 - AC40 (R7): L'écouteur refuse la connexion dans les 2 s qui suivent la sortie du lobby, et le port de partage n'est pas lié avant l'ouverture du lobby. Le nombre de connexions simultanées reste plafonné comme sur l'API (32).
 - AC41 (R7): Après un téléchargement réussi et un refus, ni les logs du service, ni l'état journalisé, ni les fichiers de match ne contiennent le jeton.
@@ -303,6 +331,8 @@ comportement.
 - AC44 (R7): Avec `local_ip` rendant `127.0.0.1`, `0.0.0.0` ou `169.254.1.1` (3 cas) et sans adresse saisie, aucun lien ni `.bat` n'est produit, le lobby reste ouvert et l'UI demande l'adresse ; après saisie, les deux le sont.
 - AC57 (R7): Avec `local_ip` rendant `192.168.1.20` et sans adresse saisie, le lien et le `.bat` portent cette adresse et `invite` annonce en anglais une portée limitée au réseau local. Avec `82.64.1.2` saisie, `invite` annonce une adresse non vérifiée et nomme les ports `17271` et `17272` en UDP et le port de partage de `runtime.json` en TCP. Les 2 valeurs de ports viennent de `runtime.json` : un `runtime.json` de test aux ports modifiés change le message.
 - AC58 (R7): Une adresse saisie sans machine derrière elle (`192.0.2.1`) produit le lien et le `.bat` sans attente, et 0 connexion n'est tentée vers cette adresse ni vers un tiers pour la valider (sockets espionnées pendant la saisie et la génération).
+- AC59 (R7): Cas vérifié ici : le `start` neuf, qu'AC38 ne couvre pas. Après un lobby réel, un `start` sans mot de passe saisi, `gen_player_password` injecté rendant 2 valeurs distinctes, écrit dans le `.ini` du serveur B un `Password` différent du `+password` du `.bat` précédent : ce `.bat` est périmé. Un `start` qui saisit le mot de passe du lobby précédent garde ce `Password`.
+- AC60 (R7): Dans un lobby réel, `invite` annonce en anglais qu'un `.bat` déjà envoyé reste valide pour une revanche et qu'un nouveau duel peut le périmer, et `ui/app.js` affiche ce texte dans l'écran d'invitation. Hors lobby réel, `invite` ne porte pas cette annonce.
 
 ### Vérification et livraison (R8)
 
@@ -316,13 +346,15 @@ comportement.
 
 - AC50 (R9): `README.md` et `README.fr.md` contiennent chacun une section de démarrage qui nomme SmartScreen, le pare-feu Windows, les ports 17271 et 17272 en UDP, le port de partage et l'interdiction de diffuser le `.bat`, et aucune commande de terminal dans le parcours du joueur.
 - AC51 (R9): `limites-connues.md` et sa version française listent comme non prouvés sur le vrai jeu au moins : la transmission par `StartServer64.bat` de ses 8 arguments, sa valeur de `-Dzomboid.steam` face à un client `-nosteam`, son comportement de fin de script, la connexion effective d'un invité, et la joignabilité depuis Internet d'une adresse saisie, que le service ne teste pas. Chaque preuve citée renvoie à un test ou à une exécution de CI.
+- AC61 (R9): `README.md` et `README.fr.md` disent chacun, dans la section de démarrage, qu'une revanche garde valides les `.bat` déjà envoyés et qu'un nouveau duel peut les périmer, auquel cas il faut renvoyer le `.bat`.
 
 ### Non-régression (R10)
 
 - AC52 (R10): Sous Linux, depuis les sources, `pytest` rend 0 échec et exactement 5 skips, avec au moins 1219 tests collectés.
-- AC53 (R10): Chaque fonction de test présente à `1d854d0` existe encore, même paramétrée (comparaison des noms par `pytest --collect-only`, identifiants de paramètres retirés), et aucune assertion existante n'est retirée ou affaiblie sous Linux.
+- AC53 (R10): Chaque fonction de test présente à `1d854d0` existe encore, même paramétrée (comparaison des noms par `pytest --collect-only`, identifiants de paramètres retirés, faite à l'exécution par `tests/test_platform_windows.py`, qui échoue si ce commit est inaccessible), et aucune assertion existante n'est retirée ou affaiblie sous Linux.
 - AC54 (R10): Sur `windows-latest`, `pytest` rend 0 échec, et chaque skip propre à Windows donne pour raison le nom du test Windows équivalent, qui s'exécute dans le même job.
 - AC55 (R10): Le diff de la phase ne modifie ni `service/protocol.py`, ni `service/rules.py` hors de la résolution de ses deux fichiers de données, ni `service/journal.py`, ni `service/presets/`, ni `mods/duelcore/`.
+- AC62 (R10): Sur `windows-latest`, chaque test de `tests/test_snapshots.py`, `tests/test_contract.py`, `tests/test_modes.py` et `tests/test_campaign_gate.py` qui passe sous Linux par `os.killpg`, `signal.SIGKILL` ou un script `#!/bin/sh` s'exécute par un équivalent Windows (arrêt de l'arbre par `service/platforms.py`, double en `.bat`), ou bien est en `skip` avec pour raison le nom du test Windows qui le remplace. Ces 4 fichiers rendent 0 échec dans ce job, et `tests/test_platform_windows.py` vérifie que chaque nom cité par une telle raison désigne un test existant. Sous Linux, ces tests s'exécutent sans `skip` et gardent `os.killpg`.
 
 ## Caller enumeration
 
@@ -345,7 +377,10 @@ de la fonction. Tout nouveau paramètre doit garder un défaut qui reproduit le 
 | tests/test_preflight.py | `detect_pz`, `run_preflight`, `install_mod`, `SCRIPT`, `free_port` | Appels inchangés : défauts Linux |
 | tests/test_integration_pz.py | `detect_pz`, `run_preflight`, `install_mod`, `SCRIPT` | Inchangé, marqué `pz_integration` |
 | tests/test_servers.py, tests/test_secrets.py | `launch_command` | Appels inchangés ; assertions POSIX paramétrées |
-| tests/test_modes.py | `launch_client`, `install_mod`, `free_port`, `make_server`, `ACTIONS` | Appels inchangés |
+| tests/test_modes.py | `launch_client`, `install_mod`, `free_port`, `make_server`, `ACTIONS` | Appels inchangés ; `client_install` et `write_script` paramétrés par plateforme (AC62) |
 | tests/test_snapshots.py | `install_mod`, `free_port` | Appels inchangés |
+| tests/test_snapshots.py | `os.killpg`, `signal.SIGKILL`, `script.chmod(0o755)` sur les scripts `#!/bin/sh` | Paramétrés par plateforme : équivalent Windows ou skip nommant son remplaçant (AC62) |
+| tests/test_contract.py | `crash` → `os.killpg`, `signal.SIGKILL` | Paramétré par plateforme : équivalent Windows ou skip nommant son remplaçant (AC62) |
+| tests/test_campaign_gate.py | fixture `harness` → `fake_python.chmod(0o755)` sur un script `#!/bin/sh` | Paramétrée par plateforme (AC62) |
 | tests/test_match.py, tests/test_rules_load.py, tests/test_rules.py | `PRESETS_DIR` | Le nom reste exporté par `service/engine.py` |
 | tests/test_api_security.py, tests/test_match.py, tests/test_secrets.py | `make_server` | Signature inchangée |

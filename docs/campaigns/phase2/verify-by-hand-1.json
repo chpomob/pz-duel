@@ -1,0 +1,87 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "R1",
+      "status": "PARTIAL",
+      "evidence": "AC1–AC5 sont réalisables dans preflight.py et platforms.py ; AC6 porte sur tous les modules de service/, mais targets omet notamment service/rcon.py, service/snapshots.py, service/state.py et service/verdict.py."
+    },
+    {
+      "id": "R2",
+      "status": "PARTIAL",
+      "evidence": "AC7 exige les valeurs de runtime.json pour les arguments serveur, alors que launch_command() reçoit un admin_password généré par Engine._open_match() et calcule -servername par server_name()."
+    },
+    {
+      "id": "R3",
+      "status": "PARTIAL",
+      "evidence": "Les adaptations de transport et de remplacement sont exprimables dans les fichiers ciblés ; AC17 nomme toutefois tests/fixtures, service/protocol.py et mods/duelcore, absents de targets."
+    },
+    {
+      "id": "R4",
+      "status": "PARTIAL",
+      "evidence": "La résolution des ressources, les données persistantes et le démarrage sont réalisables dans les fichiers ciblés ; la collection des presets, mods/duelcore et service/effects.json exigés par AC18 ne figurent pas dans targets."
+    },
+    {
+      "id": "R5",
+      "status": "RESOLVED",
+      "evidence": "AC23–AC29 : run_preflight(), install_mod(), Engine.pz_dir, ACTIONS, Engine.shutdown() et Handler._refused() fournissent les points d'adaptation nécessaires ; les fichiers d'implémentation et les tests dédiés sont ciblés."
+    },
+    {
+      "id": "R6",
+      "status": "PARTIAL",
+      "evidence": "Le générateur autonome et ses vérifications Windows sont réalisables dans guest_launcher.py et tests/test_guest_launcher.py ; les assertions d'empreinte AC31–AC32 portent sur la collection MOD_SRC, mods/duelcore/, absente de targets."
+    },
+    {
+      "id": "R7",
+      "status": "PARTIAL",
+      "evidence": "AC38 garantit la validité du mot de passe d'un ancien .bat entre deux lobbys successifs sans limiter cette garantie aux revanches ; Engine._begin() accepte pourtant un nouveau mot de passe à chaque start."
+    },
+    {
+      "id": "R8",
+      "status": "PARTIAL",
+      "evidence": "Les workflows et le test de fumée sont ciblés et vérifiables en CI Windows ; AC48 nomme explicitement tests/test_stdlib_only.py, absent de targets."
+    },
+    {
+      "id": "R9",
+      "status": "RESOLVED",
+      "evidence": "AC50–AC51 : les quatre documents sont ciblés et couvrent SmartScreen, pare-feu, redirection des ports, confidentialité du .bat et limites des preuves sur le jeu Windows, conformément au brief."
+    },
+    {
+      "id": "R10",
+      "status": "PARTIAL",
+      "evidence": "AC53 porte sur toute la collection de tests à 1d854d0, mais targets n'en couvre qu'une partie ; AC55 nomme aussi service/journal.py, service/protocol.py, service/presets/ et mods/duelcore/, absents de targets."
+    }
+  ],
+  "new_findings": [
+    {
+      "severity": "major",
+      "title": "AC7 attribue à runtime.json des valeurs produites ailleurs",
+      "evidence": "AC7 ; service/servers.py, launch_command() et server_name() ; service/engine.py, Engine._open_match(). Les ports viennent du runtime, mais le nom du serveur est calculé et le secret admin est tiré par gen_secret(). Exiger toutes ces valeurs depuis runtime.json contredit leurs sources actuelles et la conservation du comportement Linux."
+    },
+    {
+      "severity": "major",
+      "title": "La garantie de validité des anciens lanceurs dépasse les revanches",
+      "evidence": "AC38 ; service/engine.py, Engine.action() et Engine._begin(). Seule rematch réutilise la configuration précédente ; start peut choisir un autre password, ensuite écrit comme Password du serveur B par RealMatch._prepare_launch(). Un ancien .bat ne peut conserver un mot de passe valide lorsque ce mot de passe est remplacé, tout en conservant le comportement de phase 1 exigé par R10."
+    },
+    {
+      "severity": "major",
+      "title": "Le frontmatter ne couvre pas les fichiers et collections des AC",
+      "evidence": "AC6, AC17, AC18, AC31–AC32, AC48, AC53 et AC55 : targets omet des modules de service/, tests/fixtures, service/effects.json, service/protocol.py, service/journal.py, service/presets/, mods/duelcore/ et tests/test_stdlib_only.py. La collection complète de tests visée par AC53 comprend également des fichiers cités dans Caller enumeration mais non ciblés, notamment tests/test_modes.py et tests/test_integration_pz.py. Même les fichiers devant rester inchangés doivent être tracés selon la règle de revue demandée."
+    },
+    {
+      "severity": "minor",
+      "title": "La disponibilité permanente de l'enregistrement contredit le cas sans adresse",
+      "evidence": "H1 affirme que l'enregistrement du .bat reste toujours possible ; R7 et AC44 interdisent toute production du .bat sans adresse utilisable. Cette promesse absolue est incompatible avec cette exception explicite."
+    }
+  ],
+  "read_files": [
+    "docs/campaigns/phase2/spec.md",
+    "docs/campaigns/phase2/BRIEF.md",
+    "service/preflight.py",
+    "service/servers.py",
+    "service/engine.py",
+    "service/api.py",
+    "service/main.py",
+    "service/transport.py"
+  ]
+}
