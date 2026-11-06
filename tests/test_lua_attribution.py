@@ -25,6 +25,9 @@ TTL_MS = 10_000
 PURGE_MS = 30_000
 FLUSH_MS = 1_000
 WOUND_QUIET_MS = 5_000
+BEAT_MS = 10_000
+# Plus que `disconnect_grace_s` : un mod muet pendant le recul coûterait le match.
+CLOCK_BACK_MS = 200_000
 
 
 class Hook:
@@ -379,3 +382,60 @@ def test_due_command_leaves_the_middle_of_pending_and_answers_once(game):
     results = game.lines("cmd_result")
     assert [line["data"]["seq"] for line in results] == [2, 1]
     assert {line["data"]["reason"] for line in results} == {"unknown_kind"}
+
+
+def beats_over(game: Game, span_ms: int) -> int:
+    """Fait tourner le serveur `span_ms`, seconde par seconde, et compte les heartbeats écrits."""
+    before = "".join(game.out).count('"beat"')
+    for _ in range(span_ms // FLUSH_MS):
+        game.flush()
+    return "".join(game.out).count('"beat"') - before
+
+
+def test_backward_clock_step_keeps_the_beats_flowing(game):
+    assert beats_over(game, 2 * BEAT_MS) >= 1
+
+    game.after(-CLOCK_BACK_MS)
+    game.tick()
+
+    assert beats_over(game, 2 * BEAT_MS) >= 1
+
+
+def test_backward_clock_step_keeps_a_command_warning_delay(game):
+    warn_s = 5
+    game.flush()
+    game.commands = dump_line(
+        {"v": 1, "seq": 1, "kind": "weather_rain", "warn_s": warn_s, "duration_s": 30}
+    )
+    game.flush()
+
+    game.after(-CLOCK_BACK_MS)
+    game.tick()
+    for _ in range(warn_s + 1):
+        game.flush()
+
+    assert [line["data"]["seq"] for line in game.lines("cmd_result")] == [1]
+
+
+def test_backward_clock_step_does_not_stretch_the_attacker_window(game):
+    zombie = Zombie()
+    game.hit(zombie)
+    game.tick()
+    game.after(-CLOCK_BACK_MS)
+    game.tick()
+    game.after(TTL_MS)
+    game.dies(zombie)
+
+    (line,) = game.lines("zombie_kill")
+    assert anonymous(line)
+
+
+def test_backward_clock_step_does_not_mute_the_wounds(game):
+    game.bleeds()
+    game.tick()
+    game.after(-CLOCK_BACK_MS)
+    game.tick()
+    game.after(WOUND_QUIET_MS)
+    game.bleeds()
+
+    assert len(game.lines("damage_taken")) == 2

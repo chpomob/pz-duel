@@ -81,6 +81,7 @@ local nextAck = 0
 local nextBeat = 0
 local nextAttackerPurge = 0
 local rainStopAt = nil
+local lastNow = 0
 
 local hooks = {}
 local seenHooks = {}
@@ -909,9 +910,34 @@ local function openSession(now)
     emitCaps()
 end
 
+-- L'heure murale peut reculer : ce qui est daté d'elle recule d'autant, et chaque délai garde
+-- ce qu'il lui restait. Sinon les heartbeats se tairaient le temps du recul, et le service,
+-- sur son horloge monotone, y verrait une absence.
+local function absorbClockStep(now)
+    local back = lastNow - now
+    lastNow = now
+    if back <= 0 then return end
+    nextFlush = nextFlush - back
+    nextRead = nextRead - back
+    nextAck = nextAck - back
+    nextBeat = nextBeat - back
+    nextAttackerPurge = nextAttackerPurge - back
+    if rainStopAt then rainStopAt = rainStopAt - back end
+    for i = 1, #pending do
+        pending[i].due = pending[i].due - back
+    end
+    for _, hit in pairs(lastAttacker) do
+        hit.at = hit.at - back
+    end
+    for name, at in pairs(lastWound) do
+        lastWound[name] = at - back
+    end
+end
+
 local function step()
     -- getTimestampMs et non EveryOneMinute : le cadencement suit le temps réel.
     local now = getTimestampMs()
+    absorbClockStep(now)
     if now >= nextAttackerPurge then
         nextAttackerPurge = now + ATTACKER_PURGE_MS
         purgeAttackers(now)

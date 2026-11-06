@@ -34,6 +34,8 @@ IDENTIFIER_MAX = 64
 IDENTIFIER = re.compile(rf"[A-Za-z0-9_-]{{1,{IDENTIFIER_MAX}}}")
 # Une action tient en quelques centaines d'octets : ce plafond borne la lecture, rien de plus.
 BODY_MAX = 1 << 20
+# Ce qu'un client obtient pour livrer tout son corps : sur la boucle locale, c'est très large.
+BODY_READ_S = 5.0
 # Ni `int` ni `str.isdigit` : ils admettent `+5`, `1_0` ou `²`, qu'aucun client honnête n'envoie.
 DIGITS = re.compile(r"[0-9]+")
 # Les refus du parseur de `http.server`. Son message cite la requête : il ne sort jamais.
@@ -88,6 +90,11 @@ class Handler(BaseHTTPRequestHandler):
         self.request_version = ""
         self.close_connection = True
         self._fail(code, PROTOCOL_REFUSALS.get(code, PROTOCOL_REFUSED))
+        self._drain()
+
+    def _hang_up(self) -> None:
+        """Clôt une connexion dont le corps n'a pas été lu en entier."""
+        self.close_connection = True
         self._drain()
 
     def _drain(self) -> None:
@@ -193,10 +200,36 @@ class Handler(BaseHTTPRequestHandler):
         length = self._length()
         if length is None:
             return None
-        raw = self.rfile.read(length)
+        try:
+            raw = self._read_body(length)
+        except TimeoutError:
+            self._fail(408, f"corps non reçu en {BODY_READ_S} s")
+            return self._hang_up()
         if len(raw) != length:
             return self._fail(400, "corps tronqué")
         return raw
+
+    def _read_body(self, length: int) -> bytes:
+        """Lit le corps avant l'échéance ; rend moins d'octets si le client ferme.
+
+        L'échéance vaut pour tout le corps : un délai par `recv` se renouvellerait à chaque
+        octet d'un client au goutte-à-goutte.
+        """
+        deadline = time.monotonic() + BODY_READ_S
+        raw = bytearray()
+        try:
+            while len(raw) < length:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(left)
+                chunk = self.rfile.read1(length - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            self.connection.settimeout(self.timeout)
+        return bytes(raw)
 
     def _bad_identifier(self, payload: dict) -> str | None:
         """Nomme le premier champ refusé, sans citer sa valeur : elle peut tout contenir."""
@@ -230,10 +263,13 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/api/action":
             self._json(404, {"error": "not found"})
             return
-        # Un corps de longueur valide se lit même pour un refus : fermer sur des octets non lus
-        # couperait la réponse. Une longueur refusée ne se lit pas : le cadrage ne vaut plus rien.
+        # Rien ne se lit pour un inconnu. Fermer sur des octets non lus couperait la réponse :
+        # `_hang_up` les jette en temps borné.
+        if self._refused():
+            self._hang_up()
+            return
         raw = self._body()
-        if raw is None or self._refused():
+        if raw is None:
             return
         if self.headers.get_content_type() != JSON_TYPE:
             self._json(415, {"ok": False, "error": f"Content-Type attendu : {JSON_TYPE}"})

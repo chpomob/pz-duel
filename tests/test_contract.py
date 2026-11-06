@@ -169,14 +169,27 @@ class FrozenClock:
         return self.now
 
 
+class SteppedWall:
+    """Heure murale du banc : l'instant du test, plus le saut que le test lui impose."""
+
+    def __init__(self, clock: FrozenClock) -> None:
+        self.clock = clock
+        self.step_s = 0.0
+
+    def __call__(self) -> float:
+        return self.clock() + self.step_s
+
+
 class Lobby:
     """Vrai `Engine` réel mené au lobby sur les doubles, à un instant fourni par le test."""
 
     def __init__(self, rig, preset: str | None) -> None:
         self.rig = rig
         self.clock = FrozenClock()
+        self.wall = SteppedWall(self.clock)
         self.engine = rig.build()
-        self.engine._clock = self.clock
+        self.engine._clock = self.wall
+        self.engine._monotonic = self.clock
         catalog = self.engine.effects
         data = {
             "build": BUILD,

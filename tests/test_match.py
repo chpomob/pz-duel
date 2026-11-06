@@ -36,6 +36,7 @@ from service.protocol import dump_line, parse_session
 from service.replay import main as replay_main
 from service.servers import read_ini
 from service.state import MatchState
+from service.transport import POLL_MAX
 from service.verdict import VerdictError, spawn_status, verdict
 
 PRESET = "demo"
@@ -43,6 +44,8 @@ PROBE_TIMEOUT_S = 30
 KILL = {"w": "Base.Axe", "x": 10500, "y": 9900, "origin": "world"}
 LONG_MATCH_S = 300
 RESTART_MATCH_S = 900
+# Une seule ligne, jetée d'un bloc : elle retarde ce qui la suit sans remplir le journal.
+OVER_POLL_LINE = b"x" * POLL_MAX + b"\n"
 
 
 @pytest.fixture
@@ -534,7 +537,7 @@ class Duel(Lobby):
         self.te_s = te_s
         self.at(self.t0_s + te_s)
         for mod in self.mods.values():
-            mod.t_ms = round((L_S + self.t0_s + te_s) * MS)
+            mod.t_ms = round((L_S + self.t0_s + te_s + self.wall.step_s) * MS)
 
     def reach(self, te_s: float) -> dict:
         """Avance à `te_s` et attend la passe qui y a jugé le match."""
@@ -1097,6 +1100,131 @@ def test_lost_command_does_not_stop_the_match(engine_rig):
     assert duel.match_end()["data"]["score"] == {"A": 1, "B": 0}
 
 
+TRANSPORT_FAILURE = OSError("disque en panne")
+
+
+def refuse(*_):
+    raise TRANSPORT_FAILURE
+
+
+def restart_preparation_fails(duel: Duel) -> None:
+    duel.engine._match._channels["A"].prepare_restart = refuse
+    crash(duel, "A")
+
+
+def ack_poll_fails(duel: Duel) -> None:
+    duel.engine._match._channels["B"].poll_ack = refuse
+
+
+def out_read_fails(duel: Duel) -> None:
+    duel.engine._match._readers["A"]._read_from_offset = refuse
+
+
+@pytest.mark.parametrize(
+    ("fail", "step"),
+    [
+        (restart_preparation_fails, "relance impossible"),
+        (ack_poll_fails, "suivi de `ack` du camp B"),
+        (out_read_fails, "lecture de `out` du camp A"),
+    ],
+    ids=["prepare_restart", "poll_ack", "out"],
+)
+def test_transport_failure_in_match_closes_the_journal(engine_rig, fail, step):
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.kills("A", 1)
+    core = duel.engine._match._core
+
+    fail(duel)
+    engine_rig.until(lambda _: core._submitted_end is not None)
+    duel.at_match(duel.te_s + duel.step_s)
+
+    state = duel.finish()
+    assert state["error"] is None
+    assert state["result"]["outcome"] == "invalidated"
+    assert state["result"]["winner"] is None
+    assert state["score"] == {"A": 1, "B": 0}
+    ending = duel.match_end()["data"]
+    assert ending["result"] == state["result"]
+    assert ending["score"] == {"A": 1, "B": 0}
+    for text in (step, "disque en panne"):
+        assert text in ending["result"]["reason"]
+    assert duel.replays()
+
+
+def test_transport_failure_before_the_match_stays_a_launch_failure(engine_rig):
+    """Sans cœur, il n'y a ni score à sauver ni `match_end` à écrire."""
+    lobby = Lobby(engine_rig, PRESET)
+    out_read_fails(lobby)
+
+    state = engine_rig.wait("error")
+
+    assert "disque en panne" in state["error"]
+    assert lobby.records("match_end") == []
+
+
+CLOCK_MATCH_S = 60
+
+
+@pytest.mark.parametrize("step_s", [200, -200], ids=["avance", "recul"])
+def test_wall_clock_step_neither_ends_nor_freezes_the_match(engine_rig, presets, step_s):
+    """200 s dépassent la grâce : sur l'heure murale, l'avance invaliderait, le recul figerait."""
+    edit_preset(presets, duration_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(10)
+    duel.kills("A", 1)
+
+    duel.wall.step_s = step_s
+    state = duel.reach(20)
+
+    assert state["phase"] == "running"
+    assert state["servers"] == {"A": "up", "B": "up"}
+    assert duel.records("match_end") == []
+
+    duel.at_match(CLOCK_MATCH_S + duel.step_s)
+    state = duel.finish()
+    assert state["result"]["winner"] == "A"
+    assert duel.match_end()["mt"] == CLOCK_MATCH_S
+    assert duel.replays()
+
+
+@pytest.mark.parametrize("step_s", [200, -5], ids=["avance", "recul"])
+def test_events_still_count_after_a_wall_clock_step(engine_rig, step_s):
+    """Le `t_ms` du mod suit le saut : l'événement reste compté tant que `te` reste positif."""
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(10)
+    duel.kills("A", 1)
+
+    duel.wall.step_s = step_s
+    duel.reach(20)
+    duel.kills("A", 1)
+
+    assert duel.state()["score"] == {"A": 2, "B": 0}
+
+
+def test_acks_are_timed_on_the_monotonic_clock(engine_rig):
+    lobby = Lobby(engine_rig, PRESET)
+    for channel in lobby.engine._match._channels.values():
+        assert channel._clock is lobby.clock
+
+
+def test_t0_is_read_on_the_wall_when_the_match_starts(engine_rig):
+    """Un saut au lobby ne décale pas `te` : `t0_ms` et le mod voient la même heure murale."""
+    duel = Duel(engine_rig)
+    duel.wall.step_s = 200
+    duel.start_match()
+
+    (running,) = [r for r in duel.records("state") if "t0_ms" in r["data"]]
+    assert running["data"]["t0_ms"] == round((L_S + duel.t0_s + 200) * MS)
+    duel.at_match(5)
+    duel.kills("A", 1)
+    assert duel.state()["score"] == {"A": 1, "B": 0}
+    assert duel.records("late_event") == []
+
+
 def test_journal_refuses_nothing_on_the_match_path_unguarded():
     """Seules `match_start` et `t0_ms` s'écrivent sans filet : avant elles, rien n'est fixé."""
     source = inspect.getsource(engine_module)
@@ -1495,8 +1623,12 @@ def test_no_command_while_restarting(engine_rig, presets):
     assert duel.replays()
 
 
-def test_result_written_before_exit_is_not_lost(engine_rig, presets):
-    """`cmd_result` écrit juste avant la sortie : seule la commande muette est perdue."""
+@pytest.mark.parametrize("backlog", [b"", OVER_POLL_LINE], ids=["a_jour", "retard_de_lecture"])
+def test_result_written_before_exit_is_not_lost(engine_rig, presets, backlog):
+    """`cmd_result` écrit juste avant la sortie : seule la commande muette est perdue.
+
+    Derrière plus de `POLL_MAX` octets en attente, il compte encore : la relance attend tout.
+    """
     duel = Duel(engine_rig)
     duel.start_match()
     duel.at_match(1)
@@ -1521,17 +1653,56 @@ def test_result_written_before_exit_is_not_lost(engine_rig, presets):
         poll_out(now_ms)
         if now_ms >= due_ms:
             match._poll_out = poll_out
+            duel.mods["A"].write_raw(backlog)
             duel.mods["A"].cmd_result(answered, "applied", spawned=2)
             crash(duel, "A")
             engine_rig.until(lambda _: server.exit_code is not None)
 
+    channel = match._channels["A"]
+    prepare_restart = channel.prepare_restart
+    declared = []
+
+    def spied_restart(unresolved):
+        """Le cœur écarterait au tick suivant une perte contredite : le constat se lit ici."""
+        declared.extend(unresolved)
+        return prepare_restart(unresolved)
+
+    channel.prepare_restart = spied_restart
     match._poll_out = exit_right_after_the_read
     duel.at_match(te_s)
     engine_rig.until(lambda s: s["servers"]["A"] == "restarting")
+    assert declared == [unanswered]
     duel.at_match(te_s + duel.step_s)
     engine_rig.until(lambda _: duel.records("lost_on_restart"))
     assert [r["data"]["seq"] for r in duel.records("lost_on_restart")] == [unanswered]
     assert [r["data"]["data"]["seq"] for r in duel.records("cmd_result")][-1] == answered
+
+
+def test_final_tick_counts_a_kill_behind_a_read_backlog(engine_rig, presets):
+    """Le tick final conclut pour de bon : il ne laisse pas un kill au-delà de `POLL_MAX`."""
+    edit_preset(presets, duration_s=CLOCK_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.reach(CLOCK_MATCH_S - duel.step_s)
+
+    match = duel.engine._match
+    poll_out = match._poll_out
+    due_ms = int((L_S + duel.t0_s + CLOCK_MATCH_S) * MS)
+
+    def backlog_before_the_last_read(now_ms: int) -> None:
+        if now_ms >= due_ms:
+            match._poll_out = poll_out
+            duel.mods["A"].write_raw(OVER_POLL_LINE)
+            duel.mods["A"].emit("zombie_kill", KILL)
+        poll_out(now_ms)
+
+    match._poll_out = backlog_before_the_last_read
+    # `at` et non `at_match` : le kill reste daté du dernier tick, avant la fin.
+    duel.mods["A"].t_ms = round((L_S + duel.t0_s + CLOCK_MATCH_S - duel.step_s / 4) * MS)
+    duel.at(duel.t0_s + CLOCK_MATCH_S)
+
+    assert duel.finish()["result"]["winner"] == "A"
+    assert duel.replays()
 
 
 def refuse_launch(duel: Duel, server) -> None:

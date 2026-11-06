@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from service.protocol import parse_ack, parse_command, parse_event
-from service.transport import CommandChannel, OutReader
+from service.rules import load_effects
+from service.transport import POLL_MAX, RECORD_MAX, CommandChannel, OutReader
 from doubles.fake_mod import FakeMod
 
 EFFECTS_PATH = Path(__file__).resolve().parent.parent / "service" / "effects.json"
@@ -37,6 +38,138 @@ def seqs(result):
 
 def types(result):
     return [anomaly.type for anomaly in result.anomalies]
+
+
+def spied_reads(reader) -> list[int]:
+    """Note la taille de chaque lecture de `out`."""
+    sizes: list[int] = []
+    read = reader._read_from_offset
+
+    def spied() -> bytes:
+        chunk = read()
+        sizes.append(len(chunk))
+        return chunk
+
+    reader._read_from_offset = spied
+    return sizes
+
+
+def test_growing_unterminated_tail_stays_bounded_and_is_reported_once(mod, reader):
+    piece = b"x" * (RECORD_MAX // 2)
+    sizes = spied_reads(reader)
+    anomalies = []
+    for _ in range(8):
+        mod.write_raw(piece)
+        anomalies += reader.poll().anomalies
+
+    (anomaly,) = anomalies
+    assert anomaly.type == "bad_line"
+    assert anomaly.data["code"] == "line_too_long"
+    assert str(RECORD_MAX) in anomaly.data["detail"]
+    assert anomaly.data["offset"] == 0
+    # Ce qui est écarté n'est plus relu : chaque passe ne voit que ce qui vient d'arriver.
+    assert max(sizes) <= RECORD_MAX + len(piece)
+    assert sizes[-3:] == [len(piece)] * 3
+    assert reader.offset == mod.out_path.stat().st_size
+
+    mod.write_raw(b"fin de la ligne\n")
+    (line,) = kills(mod, 1)
+    result = reader.poll()
+    assert result.anomalies == []
+    assert result.events == [json.loads(line)]
+
+
+def test_poll_reads_at_most_its_bound(mod, reader):
+    mod.write_raw(b"x" * (3 * POLL_MAX))
+    sizes = spied_reads(reader)
+    results = [reader.poll() for _ in range(4)]
+
+    assert sizes == [POLL_MAX, POLL_MAX, POLL_MAX, 0]
+    assert sum(len(result.anomalies) for result in results) == 1
+
+
+def test_complete_oversized_line_is_reported_without_stopping_the_reading(mod, reader):
+    mod.write_raw(b"x" * (RECORD_MAX + 1) + b"\n")
+    kills(mod, 1)
+    result = reader.poll()
+
+    assert [a.data["code"] for a in result.anomalies] == ["line_too_long"]
+    assert len(result.events) == 1
+
+
+def test_line_at_the_limit_still_reaches_the_contract(mod, reader):
+    mod.write_raw(b"x" * RECORD_MAX + b"\n")
+    (anomaly,) = reader.poll().anomalies
+    assert anomaly.data["code"] == "bad_json"
+
+
+def test_backlog_beyond_the_bound_is_read_over_several_polls(mod, reader, monkeypatch):
+    lines = kills(mod, 20)
+    monkeypatch.setattr("service.transport.POLL_MAX", len(lines[0]) * 3)
+    events, anomalies = [], []
+    while reader.offset < mod.out_path.stat().st_size:
+        result = reader.poll()
+        events += result.events
+        anomalies += result.anomalies
+
+    assert anomalies == []
+    assert [event["seq"] for event in events] == [json.loads(line)["seq"] for line in lines]
+
+
+def drained(reader: OutReader) -> tuple[list, list]:
+    events, anomalies = [], []
+    for result in reader.drain():
+        events += result.events
+        anomalies += result.anomalies
+    return events, anomalies
+
+
+def test_drain_reads_the_whole_backlog_in_bounded_passes(mod, reader):
+    mod.write_raw(b"x" * POLL_MAX + b"\n")
+    (line,) = kills(mod, 1)
+    sizes = spied_reads(reader)
+    events, anomalies = drained(reader)
+
+    assert max(sizes) <= POLL_MAX
+    assert len(sizes) > 1
+    assert [a.data["code"] for a in anomalies] == ["line_too_long"]
+    assert events == [json.loads(line)]
+    assert reader.offset == mod.out_path.stat().st_size
+
+
+def test_drain_stops_at_the_size_it_found(mod, reader, monkeypatch):
+    """Un écrivain plus rapide que le lecteur ne retient pas la passe de `pump`."""
+    lines = kills(mod, 6)
+    monkeypatch.setattr("service.transport.POLL_MAX", len(lines[0]) * 3)
+    seen = []
+    for result in reader.drain():
+        seen += result.events
+        kills(mod, 3)
+
+    assert len(seen) == len(lines)
+
+
+def test_drain_leaves_an_unfinished_line_for_later(mod, reader):
+    (line,) = kills(mod, 1)
+    mod.write_raw(b"debut de ligne")
+    events, anomalies = drained(reader)
+
+    assert anomalies == []
+    assert events == [json.loads(line)]
+    assert reader.offset == len(line)
+
+
+def test_drain_of_a_missing_file_is_empty(tmp_path):
+    assert drained(OutReader(tmp_path / "absent.txt", "A", load_effects())) == ([], [])
+
+
+def test_rewritten_file_ends_the_skipping(mod, reader):
+    mod.write_raw(b"x" * (RECORD_MAX + 1))
+    assert len(reader.poll().anomalies) == 1
+    mod.out_path.write_bytes(b"")
+    assert reader.poll() == ([], [])
+    kills(mod, 1)
+    assert len(reader.poll().events) == 1
 
 
 def test_partial_line_waits_for_newline(mod, reader):

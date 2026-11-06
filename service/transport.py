@@ -2,7 +2,9 @@
 
 `OutReader` suit un fichier `duel_X_out.txt` en mode binaire : l'offset compte des
 octets, jamais des caractères, et ne franchit que des lignes complètes. Une ligne
-n'arrête jamais la lecture : elle devient un événement ou une anomalie.
+n'arrête jamais la lecture : elle devient un événement ou une anomalie. Une passe lit
+`POLL_MAX` octets au plus, et une ligne de plus de `RECORD_MAX` octets ne s'accumule pas.
+`drain` enchaîne ces passes pour qui doit décider sur tout ce qui est déjà écrit.
 
 `CommandChannel` porte le sens service → mod et la garantie « au plus une fois ».
 """
@@ -11,7 +13,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -33,6 +35,11 @@ ACK_AHEAD = "ack_ahead"
 ACK_FOREIGN_BOOT = "ack_foreign_boot"
 ACK_TIMEOUT = "ack_timeout"
 LOST_ON_RESTART = "lost_on_restart"
+LINE_TOO_LONG = "line_too_long"
+# Une ligne du contrat tient en quelques centaines d'octets : ce plafond n'arrête qu'une panne.
+RECORD_MAX = 1 << 16
+# Doit dépasser `RECORD_MAX` : une ligne admise se voit alors entière à la passe qui la commence.
+POLL_MAX = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,9 @@ class OutReader:
     Une ligne passe, dans l'ordre : le contrat (`parse_event`), le camp du fichier,
     puis la déduplication. Seule une ligne acceptée déplace `last`, si bien qu'une
     ligne rejetée ne peut ni masquer ni créer un doublon.
+
+    Une ligne trop longue se signale une fois puis se jette jusqu'à son `\\n`, sans rien
+    garder : `offset` la franchit au fil des passes, et elle n'est jamais relue.
     """
 
     def __init__(self, path: str | os.PathLike[str], side: str, catalog: Mapping[str, Any]) -> None:
@@ -63,28 +73,75 @@ class OutReader:
         self.catalog = catalog
         self.offset = 0
         self.last: tuple[int, int] | None = None
+        self._skipping = False
 
     def poll(self) -> PollResult:
         """Traite les lignes complètes ajoutées ; le reste attend la lecture suivante."""
         result = PollResult([], [])
         chunk = self._read_from_offset()
+        if self._skipping:
+            chunk = self._skip_long_line(chunk)
         complete = chunk[: chunk.rfind(b"\n") + 1]
         for line in complete.split(b"\n")[:-1]:
-            self._take(line, result)
+            if len(line) > RECORD_MAX:
+                self._report_long_line(result)
+            else:
+                self._take(line, result)
             self.offset += len(line) + 1
+        tail = len(chunk) - len(complete)
+        if tail > RECORD_MAX:
+            self._report_long_line(result)
+            self.offset += tail
+            self._skipping = True
         return result
+
+    def drain(self) -> Iterator[PollResult]:
+        """Rend passe par passe ce que `out` contient à l'appel, la mémoire restant bornée.
+
+        Une seule passe laisserait non lu ce qui dépasse `POLL_MAX`. Le repère est la taille
+        à l'appel : un écrivain qui continue ne retient pas le lecteur. Une passe sans progrès
+        clôt aussi la boucle : il ne reste alors qu'une ligne inachevée.
+        """
+        end = self._size()
+        while True:
+            before = self.offset
+            yield self.poll()
+            if self.offset >= end or self.offset == before:
+                return
+
+    def _size(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    def _skip_long_line(self, chunk: bytes) -> bytes:
+        """Jette `chunk` jusqu'au `\\n` de la ligne trop longue et rend ce qui le suit."""
+        end = chunk.find(b"\n")
+        if end < 0:
+            self.offset += len(chunk)
+            return b""
+        self.offset += end + 1
+        self._skipping = False
+        return chunk[end + 1 :]
+
+    def _report_long_line(self, result: PollResult) -> None:
+        detail = f"ligne de plus de {RECORD_MAX} octets écartée"
+        self._report(result, BAD_LINE, offset=self.offset, code=LINE_TOO_LONG, detail=detail)
 
     def _read_from_offset(self) -> bytes:
         try:
             with open(self.path, "rb") as handle:
                 if os.fstat(handle.fileno()).st_size < self.offset:
                     self.offset = 0
+                    self._skipping = False
                 handle.seek(self.offset)
-                return handle.read()
+                return handle.read(POLL_MAX)
         except FileNotFoundError:
             # Un fichier disparu vaut un fichier vide : celui qui le remplacera se lit
             # depuis son début, et la déduplication écarte ce qui serait déjà vu.
             self.offset = 0
+            self._skipping = False
             return b""
 
     def _take(self, line: bytes, result: PollResult) -> None:

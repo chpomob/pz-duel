@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -416,6 +417,10 @@ class ReadSpy:
         self.reads.append(args)
         return self.stream.read(*args)
 
+    def read1(self, *args):
+        self.reads.append(args)
+        return self.stream.read1(*args)
+
 
 @pytest.fixture
 def body_reads(monkeypatch):
@@ -473,6 +478,83 @@ def test_body_shorter_than_announced_is_refused(api):
     head, _, body = answer.partition(b"\r\n\r\n")
     assert int(head.split()[1]) == 400
     assert json.loads(body)["ok"] is False
+    assert engine.actions == []
+
+
+@pytest.fixture
+def released(monkeypatch):
+    """Délais courts ; l'événement rendu dit que le fil a fini la requête."""
+    monkeypatch.setattr("service.api.BODY_READ_S", 0.2)
+    monkeypatch.setattr("service.api.DRAIN_S", 0.05)
+    done = threading.Event()
+    finish = Handler.finish
+
+    def noted(self):
+        finish(self)
+        done.set()
+
+    monkeypatch.setattr(Handler, "finish", noted)
+    return done
+
+
+def assert_timed_out(answer: bytes) -> None:
+    code, _, body = split_answer(answer)
+    assert code == 408
+    assert json.loads(body)["ok"] is False
+
+
+def test_partial_body_gets_a_json_timeout_and_frees_the_handler(api, released):
+    """Le client garde sa connexion ouverte : seule l'échéance du service peut répondre."""
+    engine, port = api
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(framed(port, "Content-Length: 10", body=b"{}"))
+        answer = conn.makefile("rb").read()
+        assert released.wait(5), "le fil reste pris alors que le client est encore là"
+    assert_timed_out(answer)
+    assert engine.actions == []
+
+
+def test_dripped_body_cannot_renew_the_deadline(api, released):
+    """Un octet par intervalle renouvellerait un délai compté par `recv`."""
+    engine, port = api
+    deadline = time.monotonic() + 5
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(framed(port, "Content-Length: 100000"))
+        conn.settimeout(0.02)
+        answer = b""
+        while not answer and time.monotonic() < deadline:
+            conn.sendall(b" ")
+            try:
+                answer = conn.recv(1 << 16)
+            except TimeoutError:
+                continue
+        conn.settimeout(5)
+        answer += conn.makefile("rb").read()
+        assert released.wait(5)
+    assert_timed_out(answer)
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize(
+    ("header", "error"),
+    [("Host: evil.example", "Host"), ("Origin: http://evil.example", "Origin")],
+    ids=["host", "origin"],
+)
+def test_foreign_request_is_refused_before_any_body_read(api, body_reads, header, error):
+    """Corps partiel et connexion ouverte : le refus n'attend ni le corps ni l'échéance."""
+    engine, port = api
+    host = "" if header.startswith("Host") else f"Host: 127.0.0.1:{port}\r\n"
+    request = (
+        f"POST /api/action HTTP/1.1\r\n{host}{header}\r\n"
+        f"Content-Type: {JSON_TYPE}\r\nContent-Length: 10\r\n\r\n{{}}"
+    )
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.sendall(request.encode("ascii"))
+        answer = conn.makefile("rb").read()
+    code, _, body = split_answer(answer)
+    assert code == 403
+    assert error in json.loads(body)["error"]
+    assert body_reads == []
     assert engine.actions == []
 
 

@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -57,7 +57,7 @@ from .servers import (
 )
 from .snapshots import SnapshotError, SnapshotStore, prepare_worlds
 from .state import MatchState
-from .transport import Anomaly, CommandChannel, OutReader
+from .transport import Anomaly, CommandChannel, OutReader, PollResult
 from .verdict import (
     APPLIED,
     BEAT,
@@ -380,6 +380,11 @@ class RealMatch:
 
     Ce que le mod écrit est une sortie de serveur comme une autre : `_poll_out` l'expurge
     à la lecture, avant le journal, le cœur et l'état.
+
+    Deux horloges, sans mélange. `monotonic` cadence tout ce qui se mesure en durée : `now_ms`,
+    les ticks, le décompte, le silence, l'absence et les délais d'`ack`. `clock`, l'heure
+    murale, date le journal et donne `t0_ms`, seul repère commun avec le `t_ms` du mod. Un
+    saut de l'heure murale ne touche ainsi ni le rythme ni les minuteries.
     """
 
     def __init__(
@@ -398,6 +403,7 @@ class RealMatch:
         server_factory: Callable[..., ServerProcess],
         on_status: Callable[[str, str, str], None],
         on_state: Callable[[Callable[[MatchState], None]], None],
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self.table = table
@@ -414,6 +420,9 @@ class RealMatch:
         self.redactor = Redactor(secrets)
         self.poll_s = runtime["tick_ms"] / MS_PER_S
         self._clock = clock
+        self._monotonic = monotonic
+        # Ce qui sépare `now_ms` de l'échelle de `t0_ms`, fixé une fois à l'entrée en `running`.
+        self._t0_shift_ms = 0
         self._stop = stop
         self._on_status = on_status
         self._on_state = on_state
@@ -462,7 +471,7 @@ class RealMatch:
         self._store = SnapshotStore(zomboid_dir, ports=runtime["ports"])
         lua_dir = zomboid_dir / LUA_DIR
         self._lua_dir = lua_dir
-        self._channels = {side: CommandChannel(side, lua_dir, clock=clock) for side in SIDES}
+        self._channels = {side: CommandChannel(side, lua_dir, clock=monotonic) for side in SIDES}
         self._readers = {
             side: OutReader(channel.out_path, side, effects)
             for side, channel in self._channels.items()
@@ -548,7 +557,7 @@ class RealMatch:
         return {side: self.window.caps.get(side) for side in SIDES}
 
     def pump(self, now_ms: int) -> str | None:
-        """Une passe à l'instant `now_ms` ; rend le motif d'un arrêt, `result` dit la fin.
+        """Une passe à l'instant monotone `now_ms` ; rend le motif d'un arrêt, `result` dit la fin.
 
         Seul ce fil écrit sur les canaux. L'absence de heartbeat n'est une panne qu'en
         `running` : un serveur vide ne tique pas (H3). L'entrée en `running` précède la
@@ -580,18 +589,21 @@ class RealMatch:
         return self._core is None and end_ms is not None and now_ms >= end_ms
 
     def _enter_running(self, now_ms: int) -> None:
-        """Ouvre le tick 0 : `t0_ms` est le seul relevé de l'horloge du service dans le match.
+        """Ouvre le tick 0 : `t0_ms` est le seul relevé de l'heure murale qui règle le match.
 
+        Il se lit ici, et non au lancement : un saut survenu au lobby ne décale pas `te`.
         Le `state` s'écrit sans le filet de `_record_state` : sans `t0_ms`, rien ne se rejoue.
         """
-        self._journal.write("state", {"phase": "running", "t0_ms": now_ms}, None, FIRST_MT)
+        t0_ms = int(self._clock() * MS_PER_S)
+        self._t0_shift_ms = t0_ms - now_ms
+        self._journal.write("state", {"phase": "running", "t0_ms": t0_ms}, None, FIRST_MT)
         duration_s = self.config["duration_s"]
-        self._core = MatchCore(self._played_table, self.runtime, self.effects, now_ms, duration_s)
+        self._core = MatchCore(self._played_table, self.runtime, self.effects, t0_ms, duration_s)
         self._core.reserve_seq(self._last_cmd_seq)
 
         def change(state: MatchState) -> None:
             state.phase = "running"
-            state.started_at = now_ms / MS_PER_S
+            state.started_at = t0_ms / MS_PER_S
             state.clock = {"remaining_s": duration_s, "drift_s": None}
             state.log("match lancé")
             state.event("le duel commence")
@@ -610,7 +622,7 @@ class RealMatch:
         end = self._drift_end() or self._absence_end(now_ms)
         if end is not None:
             self._core.submit_end(end)
-        records = self._core.advance(now_ms)
+        records = self._core.advance(now_ms + self._t0_shift_ms)
         self._write_records(records)
         self._poll_acks()
         self._publish(now_ms)
@@ -636,7 +648,13 @@ class RealMatch:
             self._lose_server(side, cause)
             return
         self._restarts[side] += 1
-        lost = self._channels[side].prepare_restart(sorted(self._unresolved[side]))
+        try:
+            lost = self._channels[side].prepare_restart(sorted(self._unresolved[side]))
+        except OSError as exc:
+            # Sans `in` vidé ni session neuve, relancer pourrait rejouer une commande.
+            detail = self.redactor.redact_exception(exc)
+            self._lose_server(side, f"{cause}, relance impossible : {detail}")
+            return
         self._unresolved[side].clear()
         self._suspects.discard(side)
         self.players[side] = None
@@ -661,6 +679,17 @@ class RealMatch:
     def _lose_server(self, side: str, cause: str) -> None:
         self._on_status(side, STATUS_ERROR, self._server_detail(side, cause))
         reason = f"serveur {side} perdu : {cause}"
+        self._core.submit_end({"outcome": OUTCOME_INVALIDATED, "winner": None, "reason": reason})
+
+    def _transport_failed(self, step: str, exc: OSError) -> None:
+        """Clôt un match invalidé sur une panne de fichier : `match_end` ferme le journal.
+
+        Le cœur tient le score : laisser l'erreur remonter le perdrait avec le match. Avant
+        `running`, il n'y a rien à conclure, et l'erreur reste une panne de lancement.
+        """
+        if self._core is None:
+            raise exc
+        reason = f"transport en panne ({step}) : {self.redactor.redact_exception(exc)}"
         self._core.submit_end({"outcome": OUTCOME_INVALIDATED, "winner": None, "reason": reason})
 
     def _server_detail(self, side: str, cause: str) -> str:
@@ -907,7 +936,7 @@ class RealMatch:
         self._on_state(change)
 
     def _now_ms(self) -> int:
-        return int(self._clock() * MS_PER_S)
+        return int(self._monotonic() * MS_PER_S)
 
     def _line_mt(self) -> float | None:
         """`mt` d'une ligne écrite hors d'un tick : le dernier tick clos, nul avant le match."""
@@ -917,11 +946,19 @@ class RealMatch:
         return FIRST_MT if mt is None else mt
 
     def _poll_out(self, now_ms: int) -> None:
+        """Lit tout ce que `out` contient : relance, absence et fin se décident sur ce relevé."""
         for side, reader in self._readers.items():
-            events, anomalies = reader.poll()
-            self._record_anomalies(anomalies)
-            for event in events:
-                self._take_event(side, _redacted(self.redactor, event), now_ms)
+            for events, anomalies in self._read_passes(side, reader):
+                self._record_anomalies(anomalies)
+                for event in events:
+                    self._take_event(side, _redacted(self.redactor, event), now_ms)
+
+    def _read_passes(self, side: str, reader: OutReader) -> Iterator[PollResult]:
+        """Isole les pannes de lecture : celles du journal ne sont pas des pannes de transport."""
+        try:
+            yield from reader.drain()
+        except OSError as exc:
+            self._transport_failed(f"lecture de `out` du camp {side}", exc)
 
     def _record_anomalies(self, anomalies: Sequence[Anomaly]) -> None:
         for anomaly in anomalies:
@@ -1023,8 +1060,11 @@ class RealMatch:
         self._probes[side] = probe._replace(status=KO, cause=cause)
 
     def _poll_acks(self) -> None:
-        for channel in self._channels.values():
-            self._record_anomalies(channel.poll_ack())
+        for side, channel in self._channels.items():
+            try:
+                self._record_anomalies(channel.poll_ack())
+            except OSError as exc:
+                self._transport_failed(f"suivi de `ack` du camp {side}", exc)
             self._record_anomalies(channel.check_ack_timeout(self.runtime["ack_timeout_s"]))
 
     def _advance(self, now_ms: int) -> _Refusal | None:
@@ -1287,7 +1327,7 @@ class RealMatch:
 
 
 class Engine:
-    """Un duel à la fois. `clock` rend l'heure murale en secondes."""
+    """Un duel à la fois. `clock` rend l'heure murale en secondes, `monotonic` cadence le match."""
 
     def __init__(
         self,
@@ -1298,6 +1338,7 @@ class Engine:
         runtime: Mapping[str, Any] | None = None,
         effects: Mapping[str, Any] | None = None,
         clock: Callable[[], float] | None = None,
+        monotonic: Callable[[], float] | None = None,
         matches_dir: str | os.PathLike[str] | None = None,
         client_launcher: Callable[[Path, Sequence[str]], None] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
@@ -1311,6 +1352,7 @@ class Engine:
         self.effects = load_effects() if effects is None else effects
         self.matches_dir = MATCHES_DIR if matches_dir is None else Path(matches_dir)
         self._clock = time.time if clock is None else clock
+        self._monotonic = time.monotonic if monotonic is None else monotonic
         self._client_launcher = launch_client if client_launcher is None else client_launcher
         self._server_factory = ServerProcess if server_factory is None else server_factory
         self.lock = threading.RLock()
@@ -1586,6 +1628,7 @@ class Engine:
                 pz_dir=pz_dir,
                 matches_dir=self.matches_dir,
                 clock=self._clock,
+                monotonic=self._monotonic,
                 stop=self._stop,
                 server_factory=self._server_factory,
                 on_status=self._on_server_status,
@@ -1631,7 +1674,7 @@ class Engine:
             return message
         self._open_lobby(match)
         while not self._stop.wait(match.poll_s):
-            if failure := match.pump(int(self._clock() * MS_PER_S)):
+            if failure := match.pump(int(self._monotonic() * MS_PER_S)):
                 return failure
             if match.result is not None:
                 break
