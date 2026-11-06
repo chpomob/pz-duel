@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip pytest
+      # Les tests du vrai jeu sont en skip hors d'une machine avec Project Zomboid.
+      - run: python -m pytest -q
