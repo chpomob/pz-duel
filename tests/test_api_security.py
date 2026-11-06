@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import threading
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ from service.api import (
     BODY_MAX,
     IDENTIFIER_FIELDS,
     IDENTIFIER_MAX,
+    PROTOCOL_REFUSED,
+    PROTOCOL_REFUSALS,
     Handler,
     is_identifier,
     make_server,
@@ -242,14 +245,18 @@ def serve(engine):
     return server
 
 
-def raw_exchange(port: int, request: bytes) -> tuple[int, dict]:
+def raw_answer(port: int, request: bytes) -> bytes:
     """Passe par le socket : `http.client` refuserait d'émettre ces requêtes."""
     with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
         conn.sendall(request)
         answer = b""
         while chunk := conn.recv(4096):
             answer += chunk
-    head, _, body = answer.partition(b"\r\n\r\n")
+    return answer
+
+
+def raw_exchange(port: int, request: bytes) -> tuple[int, dict]:
+    head, _, body = raw_answer(port, request).partition(b"\r\n\r\n")
     return int(head.split()[1]), json.loads(body)
 
 
@@ -523,3 +530,156 @@ def test_unparsable_target_gets_a_json_refusal(api, method):
     assert status == 400
     assert answer["ok"] is False and answer["error"]
     assert engine.actions == []
+
+
+LINE_MAX = 65536
+LONG_LINE = b"X-Long: " + b"a" * (LINE_MAX + 1) + b"\r\n"
+# Chaque ligne est un refus du parseur de la bibliothèque, avant nos routes.
+PROTOCOL_ABUSES = {
+    "header-line-too-long": (431, b"GET / HTTP/1.1\r\n" + LONG_LINE + b"\r\n"),
+    "too-many-headers": (431, b"GET / HTTP/1.1\r\n" + b"X: y\r\n" * 101 + b"\r\n"),
+    "request-line-too-long": (414, b"GET /" + b"a" * LINE_MAX + b" HTTP/1.1\r\n\r\n"),
+    "unknown-method": (501, b"BREW / HTTP/1.1\r\nHost: x\r\n\r\n"),
+    "method-without-route": (501, b"DELETE /api/action HTTP/1.1\r\nHost: x\r\n\r\n"),
+    "method-with-body": (501, b"PUT / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"),
+    "invalid-version": (400, b"GET / HTTP/x.y\r\n\r\n"),
+    "not-a-version": (400, b"GET / FTP/1.1\r\n\r\n"),
+    "unsupported-version": (505, b"GET / HTTP/2.0\r\n\r\n"),
+    "too-many-words": (400, b"GET / extra HTTP/1.1 more\r\n\r\n"),
+    "single-word": (400, b"GET\r\n"),
+    "two-words-not-get": (400, b"POST /api/action\r\n"),
+    "blank-line": (400, b"\r\n"),
+    "spaces-only": (400, b"   \r\n"),
+    "http-0.9-page": (400, b"GET /\r\n"),
+    "http-0.9-api": (400, b"GET /api/state\r\n"),
+    "http-0.9-latin-1-space": (400, b"GET\xa0/\r\n"),
+    "http-0.9-spelled-out": (400, b"GET /api/state HTTP/0.9\r\nHost: x\r\n\r\n"),
+    "http-0.9-long-header": (431, b"GET / HTTP/0.9\r\n" + LONG_LINE + b"\r\n"),
+}
+abuses = pytest.mark.parametrize(
+    ("status", "raw"), PROTOCOL_ABUSES.values(), ids=PROTOCOL_ABUSES.keys()
+)
+LIBRARY_MARKS = (b"<html", b"<!doctype", b"basehttprequesthandler", b"basehttp/", b"python/")
+
+
+def split_answer(answer: bytes) -> tuple[int, dict[str, str], bytes]:
+    head, _, body = answer.partition(b"\r\n\r\n")
+    status_line, *lines = head.decode("latin-1").split("\r\n")
+    headers = dict(line.lower().split(": ", 1) for line in lines)
+    return int(status_line.split()[1]), headers, body
+
+
+@abuses
+def test_protocol_refusal_is_json_with_a_status_line(api, status, raw):
+    engine, port = api
+    code, headers, body = split_answer(raw_answer(port, raw))
+    assert code == status
+    assert headers["content-type"].startswith(JSON_TYPE)
+    assert int(headers["content-length"]) == len(body)
+    assert json.loads(body) == {"ok": False, "error": PROTOCOL_REFUSALS[status]}
+    assert engine.actions == []
+
+
+@abuses
+def test_protocol_refusal_carries_no_library_signature(api, status, raw):
+    _, port = api
+    answer = raw_answer(port, raw).lower()
+    assert not [mark for mark in LIBRARY_MARKS if mark in answer]
+
+
+@pytest.mark.parametrize("raw", [b"GET /\r\n", b"POST /api/action\r\n", b"GET\xa0/\r\n"])
+def test_two_word_request_never_reaches_the_library_parser(api, monkeypatch, raw):
+    """Seules certaines versions y attendent des en-têtes ; ce garde-fou vaut sur toutes."""
+    _, port = api
+
+    def parser_entered(_handler):
+        raise AssertionError("parseur atteint")
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "parse_request", parser_entered)
+    assert split_answer(raw_answer(port, raw))[0] == 400
+
+
+def test_served_answer_carries_no_library_signature(api):
+    _, port = api
+    request = f"GET /api/presets HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode()
+    code, headers, _ = split_answer(raw_answer(port, request))
+    assert code == 200
+    assert headers["server"] == Handler.server_version.lower()
+
+
+def test_protocol_refusal_never_echoes_the_request(api):
+    _, port = api
+    answer = raw_answer(port, b"<script> / HTTP/1.1\r\n\r\n")
+    assert split_answer(answer)[0] == 501
+    assert b"script" not in answer
+
+
+def test_unmapped_code_still_gets_a_json_refusal():
+    sink = Sink()
+    sink._drain = lambda: None
+    sink._fail = lambda code, error: sink.sent.append((code, error))
+    sink.sent = []
+    Handler.send_error(sink, 418, "cité par le client")
+    assert sink.sent == [(418, PROTOCOL_REFUSED)]
+
+
+def test_http_client_reads_the_refusal_of_a_long_header(api):
+    _, port = api
+    headers = {"Host": f"127.0.0.1:{port}", "X-Long": "a" * (LINE_MAX + 1)}
+    status, body = send(port, "/api/state", headers)
+    assert status == 431
+    assert json.loads(body)["ok"] is False
+
+
+def test_head_gets_the_refusal_headers_without_a_body(api):
+    _, port = api
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("HEAD", "/")
+        response = conn.getresponse()
+        assert response.status == 501
+        assert response.getheader("Content-Type").startswith(JSON_TYPE)
+        assert int(response.getheader("Content-Length")) > 0
+    finally:
+        conn.close()
+    assert raw_answer(port, b"HEAD / HTTP/1.1\r\n\r\n").endswith(b"\r\n\r\n")
+
+
+def test_client_still_writing_finishes_and_reads_the_refusal(api):
+    """Au-delà des tampons du noyau, un refus sans lecture casse l'écriture du client."""
+    _, port = api
+    request = b"GET / HTTP/1.1\r\nX-Long: " + b"a" * (16 * BODY_MAX) + b"\r\n\r\n"
+    code, _, body = split_answer(raw_answer(port, request))
+    assert code == 431
+    assert json.loads(body)["ok"] is False
+
+
+class Flood:
+    """Un client qui émet sans fin : seule l'échéance arrête la lecture."""
+
+    def shutdown(self, how: int) -> None:
+        pass
+
+    def settimeout(self, timeout: float) -> None:
+        pass
+
+    def recv(self, size: int) -> bytes:
+        return b"x"
+
+
+class Gone(Flood):
+    def shutdown(self, how: int) -> None:
+        raise OSError("déconnecté")
+
+
+def test_drain_stops_at_the_deadline(monkeypatch):
+    monkeypatch.setattr("service.api.DRAIN_S", 0.01)
+    sink = Sink()
+    sink.connection = Flood()
+    Handler._drain(sink)
+
+
+def test_drain_survives_a_departed_client():
+    sink = Sink()
+    sink.connection = Gone()
+    Handler._drain(sink)

@@ -7,6 +7,8 @@ import logging
 import mimetypes
 import os
 import re
+import socket
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -34,6 +36,18 @@ IDENTIFIER = re.compile(rf"[A-Za-z0-9_-]{{1,{IDENTIFIER_MAX}}}")
 BODY_MAX = 1 << 20
 # Ni `int` ni `str.isdigit` : ils admettent `+5`, `1_0` ou `²`, qu'aucun client honnête n'envoie.
 DIGITS = re.compile(r"[0-9]+")
+# Les refus du parseur de `http.server`. Son message cite la requête : il ne sort jamais.
+PROTOCOL_REFUSALS = {
+    400: "requête malformée",
+    414: "ligne de requête trop longue",
+    431: "en-têtes trop longs ou trop nombreux",
+    501: "méthode non prise en charge",
+    505: "version HTTP non prise en charge",
+}
+PROTOCOL_REFUSED = "requête refusée"
+# Ce qu'un client encore en train d'émettre obtient pour finir d'écrire puis lire le refus.
+DRAIN_S = 1.0
+DRAIN_CHUNK = 1 << 16
 LOG = logging.getLogger(__name__)
 
 
@@ -49,6 +63,44 @@ class Handler(BaseHTTPRequestHandler):
     # -- utilitaires -----------------------------------------------------
     def log_message(self, fmt, *args):  # silence : l'UI est la source de vérité
         return
+
+    def version_string(self) -> str:
+        return self.server_version  # sans le `Python/x.y` de la bibliothèque
+
+    def parse_request(self) -> bool:
+        """Ferme ce que le parseur laisse passer : la ligne vide, sans réponse, et HTTP/0.9."""
+        # Deux mots, c'est HTTP/0.9 : sans en-têtes à venir, où certaines versions de la
+        # bibliothèque les attendraient sans fin. Le découpage est le sien, en latin-1.
+        if len(str(self.raw_requestline, "iso-8859-1").split()) == 2:
+            self.command = None  # `_send` et le journal lisent ce que le parseur aurait posé
+            self.requestline = ""
+            self.send_error(400)
+            return False
+        if super().parse_request() and self.request_version != "HTTP/0.9":
+            return True
+        if not self.answered:
+            self.send_error(400)
+        return False
+
+    def send_error(self, code, message=None, explain=None) -> None:
+        """Remplace la page HTML du parseur par le refus JSON du service."""
+        # En HTTP/0.9, la bibliothèque tairait le statut et les en-têtes.
+        self.request_version = ""
+        self.close_connection = True
+        self._fail(code, PROTOCOL_REFUSALS.get(code, PROTOCOL_REFUSED))
+        self._drain()
+
+    def _drain(self) -> None:
+        """Fermer sur des octets non lus couperait la réponse : ils se jettent, en temps borné."""
+        deadline = time.monotonic() + DRAIN_S
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            while (left := deadline - time.monotonic()) > 0:
+                self.connection.settimeout(left)
+                if not self.connection.recv(DRAIN_CHUNK):
+                    return
+        except OSError:  # le client est parti, ou il se tait : la réponse est déjà sortie
+            LOG.debug("fin de lecture après refus", exc_info=True)
 
     def handle_one_request(self):
         """Dernière barrière : l'imprévu devient une réponse JSON, sa trace reste au log."""
@@ -73,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.answered = True
         self.end_headers()
+        if self.command == "HEAD":  # le corps est annoncé, jamais envoyé
+            return
         try:
             self.wfile.write(body)
         except BrokenPipeError:
