@@ -16,6 +16,8 @@ même forcée, le noyau ferme ce seul handle et tue l'arbre, sans qu'aucun code 
 D-F : `terminate` met fin au seul processus racine, même bloqué sur `PAUSE`, et laisse
 `kill_grace_s` à `java` ; `kill` met fin au Job. `GenerateConsoleCtrlEvent` n'atteint pas un
 processus lancé avec sa propre console invisible.
+
+`sync_disk` est la seule synchronisation disque du service : `os.sync` n'existe pas sous Windows.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -527,6 +529,46 @@ def replace_file(
                     f"file still in use after {timeout_s} s."
                 ) from exc
         sleep(min(retry_s, remaining_s))
+
+
+def _files_under(target: str | os.PathLike[str]) -> Iterator[str]:
+    """Rend `target` et ce qu'il contient ; `os.walk` ne descend dans aucun lien."""
+    yield os.fspath(target)
+    for folder, _, names in os.walk(target):
+        for name in names:
+            yield os.path.join(folder, name)
+
+
+def _flush_file(path: str) -> None:
+    descriptor = os.open(path, os.O_RDWR)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sync_disk(
+    targets: Iterable[str | os.PathLike[str]], *, platform: Platform | None = None
+) -> None:
+    """Rend `targets`, fichiers ou dossiers, durables avant que l'appelant ne s'y fie.
+
+    Sous POSIX, `os.sync` couvre tout le système, donc `targets`. Windows n'a pas d'équivalent
+    sans droits d'administrateur (`FlushFileBuffers` sur le volume) : chaque fichier de `targets`
+    passe par `os.fsync`, en un appel par fichier. Restent hors de cette garantie, assumés :
+    - les entrées de dossier, car un dossier ne s'ouvre pas ainsi : elles relèvent du journal NTFS ;
+    - un fichier en lecture seule, car `FlushFileBuffers` exige un accès en écriture ;
+    - la cible d'un lien, qui n'appartient pas à `targets`.
+
+    Une autre panne lève `OSError` : un fichier qui n'a pas pu être rendu durable n'est pas tu.
+    """
+    platform = current() if platform is None else platform
+    if platform.name != WINDOWS.name:
+        os.sync()
+        return
+    for target in targets:
+        for path in _files_under(target):
+            if os.path.isfile(path) and not os.path.islink(path) and os.access(path, os.W_OK):
+                _flush_file(path)
 
 
 def _lock(descriptor: int, platform: Platform, module: Any) -> bool:

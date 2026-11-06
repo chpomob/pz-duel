@@ -463,10 +463,12 @@ UNPROVEN_TERMS = {
         "not tested": r"service ne teste pas une adresse saisie",
     },
 }
-# P5, P11, P13, P14 et P15 ont relevé ce que `limites-connues` doit garder.
+# P5, P11, P13, P14 et P15 ont relevé ce que `limites-connues` doit garder. `os.sync` n'y est
+# plus un blocage depuis P18F1 : il reste la raison pour laquelle `sync_disk`, sous Windows, ne
+# synchronise que fichier par fichier. `test_disk_sync.py` suit l'usage de ce nom dans `service/`.
 LIMITS_TERMS = {
     EN: {
-        "os.sync": r"`os\.sync`",
+        "windows disk sync": r"`os\.sync`",
         "powershell": r"constrained language mode",
         "mark of the web": r"Mark of the Web",
         "antivirus": r"Antivirus",
@@ -477,7 +479,7 @@ LIMITS_TERMS = {
         "error phase": r"`error` phase",
     },
     FR: {
-        "os.sync": r"`os\.sync`",
+        "windows disk sync": r"`os\.sync`",
         "powershell": r"mode de langage restreint",
         "mark of the web": r"Mark of the Web",
         "antivirus": r"antivirus",

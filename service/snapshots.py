@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from functools import partial
 from pathlib import Path
 
+from .platforms import Platform, current, sync_disk
 from .preflight import check_ports
 from .rules import load_runtime
 from .servers import ServerPair, ServerProcess, server_name
@@ -92,12 +93,14 @@ class SnapshotStore:
         *,
         ports: Mapping[str, Mapping[str, int]] | None = None,
         copy: Copy = copy_path,
+        platform: Platform | None = None,
     ) -> None:
         self._zomboid_dir = Path(zomboid_dir)
         self._root = self._zomboid_dir / SNAPSHOTS_DIR
         self._marker = self._root / CREATION_MARKER
         self._ports = load_runtime()["ports"] if ports is None else ports
         self._copy = copy
+        self._platform = current() if platform is None else platform
 
     def has(self, side: str) -> bool:
         return self._snapshot(side).is_dir()
@@ -113,7 +116,7 @@ class SnapshotStore:
         """Pose le marqueur, durable avant que le premier serveur n'écrive son monde."""
         self._root.mkdir(parents=True, exist_ok=True)
         self._marker.touch()
-        os.sync()
+        sync_disk([self._marker], platform=self._platform)
 
     def end_creation(self) -> None:
         self._marker.unlink(missing_ok=True)
@@ -206,7 +209,7 @@ class SnapshotStore:
                 fill(stage / STAGED)
                 moves.append((stage / STAGED, target, stage / REPLACED))
             # Sans cela, une coupure pourrait garder le `rename` et perdre les données.
-            os.sync()
+            sync_disk([staged for staged, _, _ in moves], platform=self._platform)
             _switch(moves)
         except SnapshotError:
             # Bascule non défaite : ces dossiers tiennent peut-être le seul ancien monde.
