@@ -58,8 +58,8 @@ CHILD_FLAG = "--fake-child"
 SERVER_ARGS_START = 3
 REPLIES = {"save": "World saved"}
 WINDOWS_HOST = "win32"
-SYNCHRONIZE = 0x00100000
-WAIT_TIMEOUT = 0x102
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
 # Le compilateur du .NET Framework, livré avec Windows et présent sur `windows-latest`.
 CSC = Path("Microsoft.NET") / "Framework64" / "v4.0.30319" / "csc.exe"
 COMPILE_TIMEOUT_S = 120
@@ -229,18 +229,26 @@ def assert_private(path: Path) -> None:
 
 
 def windows_pid_alive(pid: int) -> bool:
-    """Sonde sans effet : sous Windows, `os.kill(pid, 0)` tuerait le processus."""
+    """Sonde sans effet : sous Windows, `os.kill(pid, 0)` tuerait le processus.
+
+    Le code de sortie décide, pas le signal de l'objet processus : celui-ci suit le démontage de
+    la mémoire, quelques millisecondes après que le Job s'est vidé (mesuré à 1,5 ms sur
+    `windows-latest`), alors que plus rien ne tourne et que le code de sortie est déjà posé.
+    """
     import ctypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = ctypes.c_void_p
-    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return False
     try:
-        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        code = ctypes.c_uint32()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return code.value == STILL_ACTIVE
     finally:
         kernel32.CloseHandle(handle)
 
@@ -368,10 +376,13 @@ def spawn_child(life_s: float, depth: int) -> subprocess.Popen:
     """Python, et non `sleep` : le double doit aussi tourner sous Windows.
 
     `stdout` est explicite : sans lui, `close_fds` n'y transmet aucun handle à l'enfant.
+    `stdin` est coupé, car seul le serveur lit `quit` : sous Windows, une lecture en attente sur
+    un tube verrouille son objet fichier, et l'enfant qui hérite de ce tube resterait bloqué
+    dans le démarrage de Python, à l'examen de son entrée standard, sans jamais rien imprimer.
     """
     script = str(Path(__file__).resolve())
     command = [sys.executable, script, CHILD_FLAG, str(life_s), str(depth)]
-    return subprocess.Popen(command, stdout=sys.stdout)
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=sys.stdout)
 
 
 def run_child(life_s: str, depth: str) -> int:

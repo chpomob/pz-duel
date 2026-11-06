@@ -14,7 +14,8 @@ dans le Job, puis il reprend : un enfant précoce ne peut donc pas lui échapper
 même forcée, le noyau ferme ce seul handle et tue l'arbre, sans qu'aucun code du service tourne.
 
 D-F : `terminate` met fin au seul processus racine, même bloqué sur `PAUSE`, et laisse
-`kill_grace_s` à `java` ; `kill` met fin au Job. `GenerateConsoleCtrlEvent` n'atteint pas un
+`kill_grace_s` à `java` ; une racine déjà sortie n'y offre plus de prise, et ce palier est sauté ;
+`kill` met fin au Job. `GenerateConsoleCtrlEvent` n'atteint pas un
 processus lancé avec sa propre console invisible.
 
 `sync_disk` est la seule synchronisation disque du service : `os.sync` n'existe pas sous Windows.
@@ -23,6 +24,7 @@ processus lancé avec sa propre console invisible.
 from __future__ import annotations
 
 import ctypes
+import math
 import ntpath
 import os
 import posixpath
@@ -189,6 +191,9 @@ class ProcessTree(Protocol):
     def alive(self) -> bool:
         """Vrai tant qu'un processus de l'arbre subsiste."""
 
+    def can_terminate(self) -> bool:
+        """Faux si `terminate` n'a plus de prise sur l'arbre : le palier `sigterm` est sauté."""
+
     def terminate(self) -> None:
         """Palier `sigterm` : une demande que l'arbre peut encore honorer lui-même."""
 
@@ -216,6 +221,9 @@ class PosixProcessTree:
             return False
         except PermissionError:
             return True
+        return True
+
+    def can_terminate(self) -> bool:
         return True
 
     def terminate(self) -> None:
@@ -266,6 +274,9 @@ class WindowsProcessTree:
             return True
         self._close()
         return False
+
+    def can_terminate(self) -> bool:
+        return self._process.poll() is None
 
     def terminate(self) -> None:
         try:
@@ -488,6 +499,11 @@ class WindowsKernel:
         self._kernel32.CloseHandle(handle)
 
 
+def replace_attempts(policy: Mapping[str, Any]) -> int:
+    """Le plus d'essais que `replace_file` fait : un au départ, puis un par pas du budget."""
+    return math.ceil(policy["replace_timeout_s"] * MS_PER_S / policy["replace_retry_ms"]) + 1
+
+
 def replace_file(
     src: str | os.PathLike[str],
     dst: str | os.PathLike[str],
@@ -504,6 +520,10 @@ def replace_file(
     `replace_retry_ms`, puis `ReplaceError` nomme le fichier. La dernière attente est tronquée
     à l'échéance, où a lieu un dernier essai. `policy` vaut `load_runtime()` par défaut.
 
+    Deux bornes valent ensemble : le temps et le nombre d'essais, `replace_attempts(policy)`.
+    Une horloge à gros grain, comme celle de Windows, peut rendre une veille plus courte que
+    son pas : le dernier essai attend alors l'échéance au lieu d'en ajouter d'autres.
+
     `src` reste en place sur un échec : le temporaire appartient à l'appelant, qui le retire.
     """
     platform = current() if platform is None else platform
@@ -516,19 +536,26 @@ def replace_file(
         policy = load_runtime()
     timeout_s = policy["replace_timeout_s"]
     retry_s = policy["replace_retry_ms"] / MS_PER_S
+    attempts_left = replace_attempts(policy)
     deadline = clock() + timeout_s
     while True:
         try:
             os.replace(src, dst)
             return
         except PermissionError as exc:
+            attempts_left -= 1
             remaining_s = deadline - clock()
-            if remaining_s <= 0:
+            if remaining_s <= 0 or not attempts_left:
                 raise ReplaceError(
                     f"Could not replace {os.fspath(dst)}: "
                     f"file still in use after {timeout_s} s."
                 ) from exc
-        sleep(min(retry_s, remaining_s))
+        if attempts_left > 1:
+            sleep(min(retry_s, remaining_s))
+            continue
+        while remaining_s > 0:
+            sleep(remaining_s)
+            remaining_s = deadline - clock()
 
 
 def _files_under(target: str | os.PathLike[str]) -> Iterator[str]:

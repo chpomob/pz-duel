@@ -11,6 +11,11 @@ un groupe sous Linux, un Job sous Windows, dont `service/platforms.py` porte les
 Les droits POSIX du `.ini` ne valent que si `platform.posix_modes` : sous Windows, ni
 `fchmod` ni `chmod`, et `ini_failure` reste à `None`. `policy` et `platform` vont à
 `replace_file` : voir `service/platforms.py`.
+
+`stop_stage` n'emploie que les quatre noms du plan, `rcon`, `stdin`, `sigterm` et `sigkill`, sur
+toute plateforme : ils nomment des paliers, pas des appels système. Un palier sans prise sur
+l'arbre est sauté, jamais renommé. Sous Windows, `sigterm` est la fin de la seule racine (D-F) :
+une racine déjà sortie le saute, et `sigkill` suit sans attendre.
 """
 
 from __future__ import annotations
@@ -63,6 +68,9 @@ STOP_RCON = "rcon"
 STOP_STDIN = "stdin"
 STOP_SIGTERM = "sigterm"
 STOP_SIGKILL = "sigkill"
+# Sous Windows, un `connect` local sur un port fermé met deux secondes à échouer : sans cette
+# part, un RCON absent consommerait tout `stop_timeout_s` et `stdin` n'aurait plus aucun délai.
+RCON_STOP_SHARE = 0.5
 
 
 def _read_text(path: Path) -> str:
@@ -364,7 +372,8 @@ class ServerProcess:
 
         Le retour reste borné : un zombie que personne ne ramasse garde `killpg` positif
         même après SIGKILL, et l'appelant ne doit pas rester bloqué pour autant. Les paliers
-        gardent leurs noms sous Windows, où aucun signal n'est envoyé (D-F).
+        gardent leurs noms sous Windows, où aucun signal n'est envoyé (D-F). RCON n'a droit qu'à
+        `RCON_STOP_SHARE` de `stop_timeout_s`, sans allonger l'arrêt : le reste revient à `stdin`.
         """
         self.exited_unexpectedly()
         with self._state_lock:
@@ -381,14 +390,16 @@ class ServerProcess:
     def _stop_group(self) -> bool:
         if not self._group_alive():
             return True
-        deadline = time.monotonic() + self._cfg["stop_timeout_s"]
-        self._ask_quit(deadline)
-        if self._wait_group_gone(deadline):
+        begin = time.monotonic()
+        timeout_s = self._cfg["stop_timeout_s"]
+        self._ask_quit(begin + timeout_s * RCON_STOP_SHARE)
+        if self._wait_group_gone(begin + timeout_s):
             return True
-        self.stop_stage = STOP_SIGTERM
-        self._signal_group(self._tree.terminate)
-        if self._wait_group_gone(time.monotonic() + self._cfg["kill_grace_s"]):
-            return True
+        if self._tree.can_terminate():
+            self.stop_stage = STOP_SIGTERM
+            self._signal_group(self._tree.terminate)
+            if self._wait_group_gone(time.monotonic() + self._cfg["kill_grace_s"]):
+                return True
         self.stop_stage = STOP_SIGKILL
         self._signal_group(self._tree.kill)
         return self._wait_group_gone(time.monotonic() + self._cfg["kill_grace_s"])

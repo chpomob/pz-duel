@@ -34,6 +34,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from conftest import ZOMBOID_SUBDIRS
+from doubles import fake_server
 from doubles.fake_server import (
     PosixKernel,
     WindowsLaunchOnPosix,
@@ -41,6 +42,15 @@ from doubles.fake_server import (
     install_fake_server,
     plan_windows_client,
     windows_pid_alive,
+)
+from test_contract import Lobby
+from test_share import (  # noqa: F401
+    LAN_ADDRESS,
+    LAUNCHER_ROUTE,
+    PRESET,
+    api_port,
+    detect,
+    request,
 )
 from test_snapshots import (  # noqa: F401
     ENGINE_READY,
@@ -74,16 +84,21 @@ from service.platforms import (
     UnsafeArgument,
     WindowsKernel,
     WindowsProcessTree,
+    replace_attempts,
     replace_file,
 )
 from service.proofs import PROOFS_NAME, HookProofs
 from service.protocol import PROTOCOL_VERSION, SIDES, dump_line
 from service.rules import load_effects, load_runtime
+from service.rcon import RconError
 from service.servers import (
+    RCON_STOP_SHARE,
     REDACTED,
     STARTED_MARKER,
     STOP_RCON,
     STOP_SIGKILL,
+    STOP_SIGTERM,
+    STOP_STDIN,
     Redactor,
     ServerProcess,
     launch_command,
@@ -363,6 +378,7 @@ def test_default_platform_replaces_the_file(files):
 # Tenue d'AC14, et délai court pour que le test d'AC15 n'attende pas celui de `runtime.json`.
 HOLD_S = 0.5
 SHORT_POLICY = {"replace_timeout_s": 0.2, "replace_retry_ms": 20}
+CLOCK_GRAIN_MS = 16
 SANDBOX_TEXT = "SandboxVars = {\n    DayLength = 1,\n}\n"
 HOOK = "hook"
 
@@ -527,6 +543,34 @@ def test_lasting_hold_keeps_the_old_content_and_no_temporary(tmp_path, monkeypat
     monkeypatch.undo()
     assert writer.holds(1)
     assert folder_of(writer) == [writer.target.name]
+
+
+class CoarseTime(FakeTime):
+    """Lit l'heure par pas de `CLOCK_GRAIN_MS` : c'est `time.monotonic` sous Windows 3.12."""
+
+    def clock(self) -> float:
+        return self.now_ms // CLOCK_GRAIN_MS * CLOCK_GRAIN_MS / 1000
+
+
+def test_coarse_clock_bounds_the_attempts_and_still_spends_the_budget(files):
+    """La CI réelle a compté 12 essais pour 11 permis : l'horloge retarde sur les veilles."""
+    coarse = CoarseTime()
+    held = HeldTarget(coarse)
+    budget_ms = SHORT_POLICY["replace_timeout_s"] * 1000
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "replace", held)
+        with pytest.raises(ReplaceError):
+            replace_on_windows(files, coarse, SHORT_POLICY)
+
+    assert held.attempts == replace_attempts(SHORT_POLICY)
+    assert coarse.clock() * 1000 >= budget_ms
+
+
+def test_attempt_bound_comes_from_the_budget_and_the_step():
+    for policy in (POLICY, SHORT_POLICY, {"replace_timeout_s": 5, "replace_retry_ms": 100}):
+        steps = policy["replace_timeout_s"] * 1000 / policy["replace_retry_ms"]
+        assert replace_attempts(policy) == math.ceil(steps) + 1
 
 
 # Le chemin POSIX de ces deux écrivains passe par `os.fchmod`, absent sous Windows.
@@ -1537,6 +1581,169 @@ if sys.platform != "win32":
 
 # AC8 à AC11 sur le vrai Windows (D-A) --------------------------------------------------------
 
+# R2 : ce que la CI réelle a montré des arrêts et du double, rejoué sur toute plateforme.
+
+STOP_CFG = {"tick_ms": 1, "stop_timeout_s": 0.2, "kill_grace_s": 0.2, "rcon_timeout_s": 1}
+
+
+class SlowRefusedRcon:
+    """RCON absent à la façon de Windows : le `connect` occupe tout le délai qu'on lui donne."""
+
+    deadlines: list[float] = []
+
+    def __init__(self, port, password, timeout_s, deadline):
+        self.deadlines.append(deadline)
+        self._deadline = deadline
+
+    def __enter__(self):
+        time.sleep(max(0, self._deadline - time.monotonic()))
+        raise RconError("RCON injoignable")
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class QuitOnStdin:
+    """`stdin` d'un serveur qui part dès qu'il lit `quit`."""
+
+    def __init__(self, tree):
+        self._tree = tree
+
+    def write(self, line):
+        self._tree.active = 0
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class ScriptedTree:
+    """Arbre sans processus : `can_terminate` dit si le palier `sigterm` a prise."""
+
+    def __init__(self, can_terminate=True):
+        self.active = 1
+        self.calls = []
+        self._can_terminate = can_terminate
+
+    def alive(self):
+        return bool(self.active)
+
+    def can_terminate(self):
+        return self._can_terminate
+
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def kill(self):
+        self.calls.append("kill")
+        self.active = 0
+
+
+def stopping_server(tmp_path, runtime, monkeypatch, tree, stdin=None) -> ServerProcess:
+    monkeypatch.setattr(SlowRefusedRcon, "deadlines", [])
+    monkeypatch.setattr(servers, "RconClient", SlowRefusedRcon)
+    cfg = {**runtime, **STOP_CFG, "zomboid_dir": tmp_path, "rcon_password": RCON_MARKER}
+    server = ServerProcess("A", cfg, tmp_path, Redactor(()))
+    server._tree = tree
+    server._process = SimpleNamespace(stdin=stdin or io.BytesIO(), poll=lambda: None)
+    return server
+
+
+def test_slow_rcon_failure_leaves_stdin_its_share_of_the_stop_delay(
+    tmp_path, runtime, monkeypatch
+):
+    """Sous Windows, `connect` échoue en deux secondes : `stdin` doit encore avoir son délai."""
+    tree = ScriptedTree()
+    server = stopping_server(tmp_path, runtime, monkeypatch, tree, QuitOnStdin(tree))
+    begin = time.monotonic()
+
+    assert server.stop()
+
+    assert server.stop_stage == STOP_STDIN
+    assert tree.calls == []
+    share_s = STOP_CFG["stop_timeout_s"] * RCON_STOP_SHARE
+    assert SlowRefusedRcon.deadlines[0] - begin <= share_s * TOLERANCE
+
+
+def test_rcon_share_does_not_lengthen_the_stop(tmp_path, runtime, monkeypatch):
+    tree = ScriptedTree()
+    server = stopping_server(tmp_path, runtime, monkeypatch, tree)
+    begin = time.monotonic()
+
+    assert server.stop()
+
+    elapsed = time.monotonic() - begin
+    assert 0 < RCON_STOP_SHARE < 1
+    assert tree.calls == ["terminate", "kill"]
+    planned_s = STOP_CFG["stop_timeout_s"] + STOP_CFG["kill_grace_s"]
+    assert planned_s <= elapsed < planned_s + STOP_CFG["kill_grace_s"]
+    assert server.stop_stage == STOP_SIGKILL
+
+
+def test_stage_without_a_hold_on_the_tree_is_skipped_not_renamed(tmp_path, runtime, monkeypatch):
+    tree = ScriptedTree(can_terminate=False)
+    server = stopping_server(tmp_path, runtime, monkeypatch, tree)
+
+    assert server.stop()
+
+    assert tree.calls == ["kill"]
+    assert server.stop_stage == STOP_SIGKILL
+
+
+def test_stop_vocabulary_is_the_one_of_the_plan():
+    stages = (STOP_RCON, STOP_STDIN, STOP_SIGTERM, STOP_SIGKILL)
+    assert stages == ("rcon", "stdin", "sigterm", "sigkill")
+
+
+@pytest.mark.parametrize(("code", "expected"), [(None, True), (0, False)])
+def test_windows_root_gone_takes_the_hold_of_the_sigterm_stage(code, expected):
+    process = SimpleNamespace(pid=1, poll=lambda: code, kill=lambda: None)
+    kernel = PosixKernel()
+    kernel.open_process = lambda pid: 1
+    kernel.assign = lambda job, root: None
+
+    assert WindowsProcessTree(process, kernel).can_terminate() is expected
+
+
+def test_posix_tree_always_takes_the_sigterm_stage():
+    assert PosixProcessTree(SimpleNamespace(pid=1)).can_terminate()
+
+
+def test_double_child_does_not_share_the_stdin_the_double_reads(monkeypatch):
+    """Sous Windows, l'enfant qui en hérite reste bloqué au démarrage de Python : la CI réelle
+    n'a jamais vu ses descendants, et wine ne reproduit pas ce verrou."""
+    seen = {}
+
+    def spy(command, **options):
+        seen.update(options)
+
+    monkeypatch.setattr(fake_server.subprocess, "Popen", spy)
+
+    fake_server.spawn_child(1, 0)
+
+    assert seen["stdin"] == subprocess.DEVNULL
+
+
+def test_launcher_generation_adds_no_bat_to_the_disk(
+    engine_rig, monkeypatch, tmp_path, api_port  # noqa: F811
+):
+    """Le rig pose déjà ses propres `.bat` sous Windows : seul l'écart compte ici."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_dir))
+    monkeypatch.setenv("LOCALAPPDATA", str(data_dir))
+    detect(monkeypatch, LAN_ADDRESS)
+    lobby = Lobby(engine_rig, PRESET)
+    before = set(tmp_path.rglob("*.bat"))
+
+    status, _, _ = request(api_port(lobby.engine), "GET", LAUNCHER_ROUTE)
+
+    assert status == 200
+    assert set(tmp_path.rglob("*.bat")) == before
+
+
 if sys.platform == "win32":
     REPO_SERVICE = REPO / "tests" / "doubles" / "run_service.py"
     SERVICE_URL_PREFIX = "interface : "
@@ -1552,18 +1759,43 @@ if sys.platform == "win32":
     TREE_PID = re.compile(r"fake (?:script|server|child|grandchild) pid=(\d+)")
     TREE = {"child": True, "child_depth": 1, "announce_pids": True}
     # `AttachConsole` veut un processus sans console : ce script tourne donc à part.
+    # Une vraie fenêtre reçoit `WM_CLOSE`, et sa console envoie `CTRL_CLOSE_EVENT` par un fil posé
+    # sur `CtrlRoutine`. Sur `windows-latest`, la console est une pseudo-console qui ignore
+    # ce message, même pour un Python sans gestionnaire : le script y pose lui-même ce fil.
     CLOSE_CONSOLE = """
 import ctypes, sys
+service_pid = int(sys.argv[1])
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.CreateRemoteThread.restype = ctypes.c_void_p
+kernel32.CreateRemoteThread.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_uint32, ctypes.c_void_p,
+]
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
 kernel32.FreeConsole()
-if not kernel32.AttachConsole(int(sys.argv[1])):
+if not kernel32.AttachConsole(service_pid):
     sys.exit("AttachConsole failed: " + str(ctypes.get_last_error()))
 window = kernel32.GetConsoleWindow()
-if not window or not user32.PostMessageW(window, 0x0010, 0, 0):
+if not window:
     sys.exit("no console window to close")
+name = ctypes.create_unicode_buffer(64)
+user32.GetClassNameW(window, name, len(name))
+if name.value != "PseudoConsoleWindow":
+    if not user32.PostMessageW(window, 0x0010, 0, 0):
+        sys.exit("WM_CLOSE refused: " + str(ctypes.get_last_error()))
+    sys.exit(0)
+routine = ctypes.cast(ctypes.WinDLL("kernelbase").CtrlRoutine, ctypes.c_void_p)
+# PROCESS_CREATE_THREAD, VM_OPERATION, VM_READ, VM_WRITE et QUERY_INFORMATION.
+process = kernel32.OpenProcess(0x043A, False, service_pid)
+if not process:
+    sys.exit("OpenProcess failed: " + str(ctypes.get_last_error()))
+# 2 vaut CTRL_CLOSE_EVENT.
+if not kernel32.CreateRemoteThread(process, None, 0, routine, 2, 0, None):
+    sys.exit("CreateRemoteThread failed: " + str(ctypes.get_last_error()))
 """
 
     def wait_until(condition: Callable[[], bool], timeout_s: float = WAIT_S) -> None:
