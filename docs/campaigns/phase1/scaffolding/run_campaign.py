@@ -231,8 +231,15 @@ def gate(step: dict, before: str) -> tuple[bool, str]:
     summary = (r.stdout.strip().splitlines() or ["(aucune sortie)"])[-1]
     notes.append(f"pytest: {summary}")
     if r.returncode != 0:
+        # Un rouge doit rester diagnosticable : sortie complète et noms des tests en échec
+        # dans un fichier, sinon « 1 failed » ne dit pas lequel ni pourquoi.
+        LOGS.mkdir(parents=True, exist_ok=True)
+        trace = LOGS / f"{step['id']}.gate.log"
+        trace.write_text((r.stdout or "") + "\n" + (r.stderr or ""), encoding="utf-8")
+        failed = [line for line in (r.stdout or "").splitlines() if line.startswith("FAILED")]
+        notes.append("échecs: " + (" | ".join(failed[:5]) if failed else "non nommés"))
         notes.append("SUITE ROUGE")
-        return False, " · ".join(notes)
+        return False, " · ".join(notes) + f" · détail: {trace}"
     # invariants mécaniques de la phase
     stdlib = run([PY, "-m", "pytest", "-q", "tests/test_stdlib_only.py"], timeout=600)
     if stdlib.returncode != 0:

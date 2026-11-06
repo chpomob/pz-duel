@@ -93,7 +93,14 @@ def gate(step: dict, before: str) -> tuple[bool, str]:
     summary = (r.stdout.strip().splitlines() or ["(aucune sortie)"])[-1]
     notes.append(f"pytest: {summary}")
     if r.returncode != 0:
-        return False, " · ".join(notes) + " · SUITE ROUGE"
+        # Un rouge doit rester diagnosticable : la sortie complète et les noms des tests
+        # en échec vont dans un fichier, sinon on ne sait pas ce qui a échoué.
+        LOGS.mkdir(parents=True, exist_ok=True)
+        trace = LOGS / f"{step['id']}.gate.log"
+        trace.write_text((r.stdout or "") + "\n" + (r.stderr or ""), encoding="utf-8")
+        failed = [line for line in (r.stdout or "").splitlines() if line.startswith("FAILED")]
+        notes.append("échecs: " + (" | ".join(failed[:5]) if failed else "non nommés"))
+        return False, " · ".join(notes) + f" · SUITE ROUGE (détail: {trace})"
     return True, " · ".join(notes)
 
 
