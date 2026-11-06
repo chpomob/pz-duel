@@ -78,6 +78,7 @@ def play_leaky_match(duel: Duel, read_state: Callable[[], str]) -> list[str]:
     # Refusée par le protocole, dont le message cite le `kind` : l'anomalie part au journal.
     mod.emit(f"inconnu {RCON_MARKER}", {})
     duel.kills("A", 1)
+    duel.wait_for(lambda s: s["score"]["A"] == 2, expected="second kill au score")
     seen.append(read_state())
     duel.at_match(duel.state()["config"]["duration_s"])
     duel.finish()

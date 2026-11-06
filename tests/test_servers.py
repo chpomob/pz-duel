@@ -1197,6 +1197,7 @@ def test_cancel_in_lobby_stops_servers(engine_rig):
     cancel(engine_rig)
 
     assert stopped_for_good(engine_rig)
+    engine_rig.closed()
     phases = [r["data"]["phase"] for r in engine_rig.journal(state["match_id"]) if "phase" in r["data"]]
     assert phases == ["starting", "contract", "lobby", "stopping", "idle"]
 

@@ -6,6 +6,7 @@ Tout se joue dans `zomboid_home`, sur des ports tirés au hasard : ni les vrais 
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shlex
@@ -89,6 +90,7 @@ BUILD = "42.21.0"
 ENGINE_READY = [f"version={BUILD}", *READY_LINES]
 WAIT_S = 10
 WAIT_POLL_S = 0.01
+OBSERVED_KEYS = ("phase", "score", "clock", "players", "servers", "result", "error")
 PLAYER_PASSWORD = "player-marker"
 
 
@@ -168,14 +170,24 @@ class EngineRig:
     def wait(self, *phases: str) -> dict:
         return self.until(lambda state: state["phase"] in phases)
 
-    def until(self, condition) -> dict:
-        deadline = time.monotonic() + WAIT_S
+    def until(self, condition, timeout_s: float = WAIT_S, expected: str | None = None) -> dict:
+        """Rend l'état dès que `condition` y tient ; au-delà du délai, dit ce qui manquait."""
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             state = self.engine.snapshot()
             if condition(state):
                 return state
             time.sleep(WAIT_POLL_S)
-        raise AssertionError(f"condition jamais atteinte : {self.engine.snapshot()['logs']}")
+        state = self.engine.snapshot()
+        observed = {key: state[key] for key in OBSERVED_KEYS}
+        raise AssertionError(
+            f"attendu en {timeout_s} s : {expected or inspect.getsource(condition).strip()} ; "
+            f"observé : {observed} ; journal d'état : {state['logs']}"
+        )
+
+    def closed(self) -> None:
+        """Attend la fin du fil du moteur : la phase finale se publie avant de se journaliser."""
+        self.until(lambda _: not self.engine._thread.is_alive(), expected="fil du moteur terminé")
 
     def seen(self, side: str) -> list[Path]:
         folder = self.launches / f"duel{side}"

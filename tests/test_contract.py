@@ -6,9 +6,9 @@ import json
 import os
 import signal
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -34,6 +34,8 @@ PLAYERS = {"A": "durand", "B": "dupont"}
 # `L` : le test fige l'horloge du moteur, tout se passe à cet instant sauf s'il l'avance.
 L_S = 1000.0
 MS = 1000
+# Les phases où le fil du moteur enchaîne les passes de `pump`.
+PUMPED_PHASES = ("lobby", "countdown", "running")
 
 
 def caps_data(table: dict) -> dict:
@@ -180,8 +182,28 @@ class SteppedWall:
         return self.clock() + self.step_s
 
 
+class PumpPasses:
+    """Remplace `match.pump` : compte ses passes, sans rien changer à ce qu'elles font."""
+
+    def __init__(self, pump: Callable[[int], str | None]) -> None:
+        self.pump = pump
+        self.begun = 0
+        self.done = 0
+
+    def __call__(self, now_ms: int) -> str | None:
+        self.begun += 1
+        try:
+            return self.pump(now_ms)
+        finally:
+            self.done += 1
+
+
 class Lobby:
-    """Vrai `Engine` réel mené au lobby sur les doubles, à un instant fourni par le test."""
+    """Vrai `Engine` réel mené au lobby sur les doubles, à un instant fourni par le test.
+
+    `pump` tourne dans son fil : rien de ce que le test écrit n'est traité au retour de
+    l'écriture. Un effet se lit par `wait_for`, et une absence d'effet après `sync_pump`.
+    """
 
     def __init__(self, rig, preset: str | None) -> None:
         self.rig = rig
@@ -222,14 +244,46 @@ class Lobby:
     def step(self, step_id: str) -> dict:
         return next(item for item in self.state()["steps"] if item["id"] == step_id)
 
+    def wait_for(
+        self,
+        predicate: Callable[[dict], Any],
+        timeout_s: float = WAIT_S,
+        expected: str | None = None,
+    ) -> dict:
+        """Rend l'état du moteur dès que `predicate` y tient, ou échoue en disant ce qu'il voit."""
+        return self.rig.until(predicate, timeout_s, expected)
+
+    def sync_pump(self) -> None:
+        """Attend deux passes entières : tout ce qui précède l'appel est traité et publié.
+
+        La première a pu lire l'horloge avant l'appel ; la seconde l'a lue après. Hors des
+        phases où `pump` tourne, il n'y a plus de passe à attendre.
+        """
+        match = self.engine._match
+        if match is None:
+            return
+        if not isinstance(match.pump, PumpPasses):
+            match.pump = PumpPasses(match.pump)
+        passes = match.pump
+        target = passes.begun + 2
+        self.wait_for(
+            lambda s: passes.done >= target or s["phase"] not in PUMPED_PHASES,
+            expected=f"{target} passes de `pump` finies",
+        )
+
     def at(self, seconds_after_l: float) -> None:
+        """Avance l'horloge ; au retour, aucune passe ne date plus rien à l'instant d'avant."""
         self.clock.now = L_S + seconds_after_l
+        self.sync_pump()
 
     def settle(self) -> None:
-        """Attend qu'une passe ait lu une ligne écrite à l'instant courant."""
+        """Avant le match, attend qu'une passe entière ait suivi une ligne de l'instant courant."""
         line = json.loads(self.mods["A"].beat(players=self.present("A")))
-        self.rig.until(lambda _: any(r["data"] == line for r in self.records("event")))
-        time.sleep(self.engine.runtime["tick_ms"] / MS * 3)
+        self.wait_for(
+            lambda _: any(r["data"] == line for r in self.records("event")),
+            expected=f"ligne journalisée : {line}",
+        )
+        self.sync_pump()
 
     def present(self, side: str) -> tuple[str, ...]:
         player = self.state()["players"][side]
@@ -275,6 +329,8 @@ def crash_and_hold(lobby: Lobby, side: str) -> threading.Event:
 
 
 def state_entered_at(lobby: Lobby, phase: str) -> int:
+    """La phase se publie avant de se journaliser : son `state` s'attend."""
+    lobby.wait_for(lambda _: phase in lobby.phases(), expected=f"phase {phase} au journal")
     return next(r["ts_ms"] for r in lobby.records("state") if r["data"].get("phase") == phase)
 
 
@@ -310,7 +366,8 @@ def late_hook_read_with_the_deadline_pass(lobby: Lobby) -> None:
 
     def miss_the_deadline() -> None:
         # Sur le fil du moteur, juste avant `pump` : la passe qui constate l'échéance lit le hook.
-        lobby.at(120.001)
+        # Pas `at` : ce fil ne peut pas attendre ses propres passes.
+        lobby.clock.now = L_S + 120.001
         lobby.mods["B"].hook_seen()
 
     lobby.clock.on_next_read = miss_the_deadline
@@ -427,8 +484,13 @@ def test_hook_window_outlives_contract_step(engine_rig):
     engine_rig.until(lambda s: not s["capabilities"]["A"]["hooks"][HOOK]["registered"])
     assert lobby.state()["capabilities"]["active_atoms"] == active
     assert lobby.records("atom_withdrawn") == []
-    lobby.at(engine_rig.runtime["hook_window_s"] * 2)
-    lobby.settle()
+    # Chaque `at` laisse une passe juger l'instant : l'écart entre `beat` reste sous la grâce.
+    for now_s in (90, 180, engine_rig.runtime["hook_window_s"] * 2):
+        lobby.at(now_s)
+        for side in SIDES:
+            lobby.mods[side].beat(players=(PLAYERS[side],))
+    # En match, le cœur n'écrit qu'à un tick suivant : c'est `at` qui passe l'échéance.
+    lobby.at(engine_rig.runtime["hook_window_s"] * 2 + 1)
     assert lobby.state()["capabilities"]["active_atoms"] == active
     assert lobby.records("atom_withdrawn") == []
 

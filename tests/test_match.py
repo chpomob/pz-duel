@@ -341,6 +341,7 @@ def test_side_follows_the_connection_identity(engine_rig):
     # L'hôte sur B : un nom lié à A ne compte pas pour l'autre camp.
     lobby.mods["B"].beat(players=(host,))
     engine_rig.until(lambda _: lobby.records("player_refused"))
+    lobby.sync_pump()
     assert lobby.state()["players"] == {"A": host, "B": None}
 
     lobby.mods["B"].beat(players=(guest,))
@@ -603,7 +604,10 @@ class Duel(Lobby):
         return line
 
     def played(self, line: bytes) -> None:
-        """Avance jusqu'à ce que le cœur ait journalisé `line`, à un tick suivant."""
+        """Avance jusqu'à ce que le cœur ait journalisé `line`, à un tick suivant.
+
+        Le journal précède la publication : l'effet sur l'état se lit par `wait_for`.
+        """
         self.at_match(self.te_s + self.step_s)
         expected = json.loads(line)
         journal = self.rig.journal
@@ -619,6 +623,7 @@ class Duel(Lobby):
         assert state["phase"] == "over", state["error"]
         assert state["servers"] == {"A": "down", "B": "down"}
         assert stopped_for_good(self.rig)
+        self.rig.closed()
         return state
 
     def match_end(self) -> dict:
@@ -628,6 +633,52 @@ class Duel(Lobby):
     def replays(self) -> bool:
         path = self.rig.matches / self.match_id / JOURNAL_NAME
         return replay_main([str(path)]) == 0
+
+
+def test_wait_for_returns_as_soon_as_the_state_holds(engine_rig):
+    """Rien à attendre : un seul relevé, sans délai fixe, et l'état rendu est celui qu'il a vu."""
+    lobby = Lobby(engine_rig, PRESET)
+    seen = []
+
+    state = lobby.wait_for(lambda s: seen.append(s) or True)
+
+    assert seen == [state]
+    assert state["phase"] == "lobby"
+
+
+def test_wait_for_names_the_expected_event_and_the_observed_state(engine_rig):
+    lobby = Lobby(engine_rig, PRESET)
+
+    with pytest.raises(AssertionError) as failure:
+        lobby.wait_for(lambda s: s["score"]["A"] == 1, timeout_s=0.05, expected="kill de A")
+    message = str(failure.value)
+    assert "attendu en 0.05 s : kill de A" in message
+    assert "'phase': 'lobby'" in message
+    assert "'score': {'A': 0, 'B': 0}" in message
+
+    with pytest.raises(AssertionError, match=r"s\["):
+        lobby.wait_for(lambda s: s["score"]["B"] == 1, timeout_s=0.05)
+
+
+def test_no_pass_dates_the_previous_instant_after_at(engine_rig):
+    """Une passe partie avant `at` date encore à l'ancien instant : `at` l'attend."""
+    lobby = Lobby(engine_rig, PRESET)
+    lobby.sync_pump()
+    match = lobby.engine._match
+    passes, instants = match.pump, []
+
+    def recorded(now_ms: int) -> str | None:
+        instants.append(now_ms)
+        return passes(now_ms)
+
+    match.pump = recorded
+    lobby.at(7)
+    # Tout ce qui s'écrit à partir d'ici est lu par une passe datée de l'instant demandé.
+    mark = len(instants)
+    lobby.sync_pump()
+
+    assert instants[mark:]
+    assert set(instants[mark:]) == {(L_S + 7) * MS}
 
 
 def test_full_real_path(engine_rig, presets, runtime, monkeypatch):
@@ -851,6 +902,7 @@ def test_drift_real_seconds(
     state = engine_rig.until(lambda s: s["clock"]["drift_s"] == drift_s)
     if outcome is None:
         duel.played(line)
+        duel.sync_pump()
         assert duel.state()["phase"] == "running"
         assert duel.state()["result"] is None
     else:
@@ -1245,7 +1297,7 @@ def test_events_still_count_after_a_wall_clock_step(engine_rig, step_s):
     duel.reach(20)
     duel.kills("A", 1)
 
-    assert duel.state()["score"] == {"A": 2, "B": 0}
+    duel.wait_for(lambda s: s["score"] == {"A": 2, "B": 0}, expected="second kill au score")
 
 
 def test_acks_are_timed_on_the_monotonic_clock(engine_rig):
@@ -1263,8 +1315,10 @@ def test_t0_is_read_on_the_wall_when_the_match_starts(engine_rig):
     (running,) = [r for r in duel.records("state") if "t0_ms" in r["data"]]
     assert running["data"]["t0_ms"] == round((L_S + duel.t0_s + 200) * MS)
     duel.at_match(5)
+    # La passe de 5 s est close : daté de cet instant, le kill serait un retard légitime.
+    duel.mods["A"].t_ms += engine_rig.runtime["tick_ms"]
     duel.kills("A", 1)
-    assert duel.state()["score"] == {"A": 1, "B": 0}
+    duel.wait_for(lambda s: s["score"] == {"A": 1, "B": 0}, expected="kill de A au score")
     assert duel.records("late_event") == []
 
 
@@ -1344,6 +1398,7 @@ def test_cancel_during_match_stops_servers(engine_rig):
     assert state["phase"] == "idle", state["error"]
     assert state["result"] is None
     assert stopped_for_good(engine_rig)
+    engine_rig.closed()
     assert duel.records("match_end") == []
     assert all(r["mt"] is not None for r in duel.records("state")[-2:])
     assert duel.replays()
@@ -1410,8 +1465,11 @@ def test_restart_in_match(engine_rig, presets, ending):
     assert duel.engine.preset(PRESET)["disconnect_grace_s"] == 120
 
     duel.at_match(10)
+    duel.beat("A")
+    duel.beat("B")
     duel.kills("A", 1)
-    for te_s in (100, 200, 290):
+    # `at_match` laisse une passe juger l'instant avant le `beat` : l'écart reste sous 30 s.
+    for te_s in range(38, 291, 28):
         duel.at_match(te_s)
         duel.beat("A")
         duel.beat("B")
