@@ -1,5 +1,7 @@
 """R4 : binaire figé simulé, résolution (AC18, AC19) et démarrage (AC20, AC21, AC22, AC56).
 
+R8 : empaquetage et test de fumée (AC46, AC48), sur un dossier simulé, sans binaire.
+
 `service/paths.py` se résout à l'import : chaque cas tourne dans un sous-processus qui pose
 `sys.frozen` et `sys._MEIPASS` avant le premier import de `service` (D-D). Le dossier
 d'extraction est une copie marquée : une lecture qui passerait par le dépôt se verrait.
@@ -12,6 +14,7 @@ import errno
 import hashlib
 import http.client
 import http.server
+import importlib.util
 import io
 import json
 import os
@@ -28,6 +31,7 @@ from pathlib import Path
 
 import pytest
 from test_preflight import make_install
+from test_stdlib_only import foreign_imports
 
 from service import api, main as main_module, paths, platforms
 from service.journal import read_journal
@@ -1115,3 +1119,445 @@ def test_posix_other_lock_failure_is_not_taken_for_a_rival(tmp_path):
         platforms.take_instance_lock(
             tmp_path / "instance.lock", platform=platforms.LINUX, module=module
         )
+
+
+# -- Empaquetage et test de fumée (AC46, AC48) -------------------------------------------------
+
+PACKAGING = REPO / "packaging"
+SMOKE = PACKAGING / "smoke_test.py"
+ENTRY = PACKAGING / "pz_duel_entry.py"
+SPEC = PACKAGING / "pz-duel.spec"
+REQUIREMENTS = PACKAGING / "requirements-build.txt"
+SMOKE_TIMEOUT_S = 180
+FAKE_PARENT = 4321
+
+# Le processus qui porte le service, avec ou sans l'attente du parent de `pz_duel_entry.py`.
+SIMULATED_SERVICE = """
+import os, runpy, sys
+sys.frozen = True
+sys._MEIPASS = {root!r}
+sys.path.insert(0, {repo!r})
+with open({pids!r}, "a", encoding="ascii") as pids:
+    pids.write(f"{{os.getpid()}}\\n")
+{start}
+"""
+THROUGH_ENTRY = "runpy.run_path({entry!r}, run_name='__main__')"
+WITHOUT_ENTRY = "from service.main import main; main()"
+# Le chargeur d'un `--onefile` : il relance, attend et transmet le code.
+SIMULATED_LOADER = """
+import subprocess, sys
+child = subprocess.Popen([sys.executable, {service!r}, *sys.argv[1:]])
+sys.exit(child.wait() + {code_shift})
+"""
+
+
+def load_module(path: Path, name: str) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def smoke():
+    return load_module(SMOKE, "smoke_test_under_test")
+
+
+@pytest.fixture(scope="module")
+def entry():
+    return load_module(ENTRY, "pz_duel_entry_under_test")
+
+
+def read_spec() -> dict:
+    """Exécute `pz-duel.spec` contre des doubles : ce que PyInstaller recevrait, sans lui."""
+    calls: dict = {}
+
+    def analysis(scripts, **options):
+        calls["analysis"] = {"scripts": scripts, **options}
+        return types.SimpleNamespace(pure="pure", scripts="scripts", binaries="bin", datas="data")
+
+    def pyz(*args):
+        calls["pyz"] = args
+        return "archive"
+
+    def exe(*args, **options):
+        calls["exe"] = {"args": args, **options}
+
+    source = SPEC.read_text(encoding="utf-8")
+    exec(  # noqa: S102 - fichier du dépôt
+        compile(source, str(SPEC), "exec"),
+        {"SPECPATH": str(PACKAGING), "Analysis": analysis, "PYZ": pyz, "EXE": exe},
+    )
+    return calls
+
+
+@pytest.fixture
+def bundle(tmp_path):
+    """Dossier d'extraction que donneraient les `datas` de la spec, ni plus ni moins."""
+    root = tmp_path / "_MEI456"
+    for source, destination in read_spec()["analysis"]["datas"]:
+        target = root / destination
+        if Path(source).is_dir():
+            shutil.copytree(source, target)
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy(source, target)
+    return root
+
+
+def simulated_binary(
+    tmp_path: Path,
+    root: Path,
+    *args: str,
+    through_entry: bool = True,
+    loader: bool = True,
+    code_shift: int = 0,
+) -> list[str]:
+    """Rend une commande bâtie comme le binaire : un chargeur, puis le service figé."""
+    start = THROUGH_ENTRY.format(entry=str(ENTRY)) if through_entry else WITHOUT_ENTRY
+    service = tmp_path / "simulated_service.py"
+    service.write_text(
+        SIMULATED_SERVICE.format(
+            root=str(root), repo=str(REPO), pids=str(tmp_path / "pids.txt"), start=start
+        ),
+        encoding="utf-8",
+    )
+    if not loader:
+        return [sys.executable, str(service), *args]
+    script = tmp_path / "simulated_loader.py"
+    script.write_text(
+        SIMULATED_LOADER.format(service=str(service), code_shift=code_shift), encoding="utf-8"
+    )
+    return [sys.executable, str(script), *args]
+
+
+def run_smoke(*command: str, **env: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SMOKE), *command],
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **env},
+        capture_output=True,
+        text=True,
+        timeout=SMOKE_TIMEOUT_S,
+    )
+
+
+def assert_none_left(smoke, tmp_path: Path) -> None:
+    pids = [int(line) for line in lines(tmp_path / "pids.txt")]
+    assert pids
+    wait_for(lambda: not set(pids) & set(smoke.processes()))
+
+
+@pytest.mark.parametrize("loader", [True, False], ids=["two_processes", "one_process"])
+def test_ac46_smoke_passes_on_a_complete_folder(smoke, tmp_path, bundle, loader):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+
+    done = run_smoke(
+        *simulated_binary(tmp_path, bundle, loader=loader),
+        HOME=str(outer),
+        USERPROFILE=str(outer),
+        LOCALAPPDATA=str(outer),
+        XDG_DATA_HOME=str(outer),
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "Smoke test passed" in done.stdout
+    assert list(outer.iterdir()) == []
+    assert len(lines(tmp_path / "pids.txt")) == 2
+    assert_none_left(smoke, tmp_path)
+
+
+def test_ac46_smoke_fails_without_ui(smoke, tmp_path, bundle):
+    shutil.rmtree(bundle / "ui")
+
+    done = run_smoke(*simulated_binary(tmp_path, bundle))
+
+    assert done.returncode == 1
+    assert "GET / returned 404" in done.stderr
+    assert "Smoke test passed" not in done.stdout
+    assert_none_left(smoke, tmp_path)
+
+
+def drop_ui_script(root: Path) -> None:
+    (root / "ui" / "app.js").unlink()
+
+
+def change_ui_page(root: Path) -> None:
+    with open(root / "ui" / "index.html", "a", encoding="utf-8") as page:
+        page.write("<!-- stale -->")
+
+
+def drop_preset(root: Path) -> None:
+    (root / "service" / "presets" / "demo.json").unlink()
+
+
+def change_mod(root: Path) -> None:
+    (root / "mods" / "duelcore" / "extra.txt").write_text("stale", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        (drop_ui_script, "GET /app.js returned 404"),
+        (change_ui_page, "/ does not return ui/index.html"),
+        (drop_preset, "presets listed"),
+        (change_mod, "embedded mod fingerprint"),
+    ],
+    ids=["ui_file", "ui_content", "preset", "mod"],
+)
+def test_ac46_smoke_fails_on_an_incomplete_folder(tmp_path, bundle, damage, message):
+    damage(bundle)
+
+    done = run_smoke(*simulated_binary(tmp_path, bundle))
+
+    assert done.returncode == 1
+    assert message in done.stderr
+
+
+def test_ac46_smoke_fails_outside_real_mode(tmp_path, bundle):
+    done = run_smoke(*simulated_binary(tmp_path, bundle, "--mode", "mock"))
+
+    assert done.returncode == 1
+    assert "mode 'mock'" in done.stderr
+
+
+def test_ac46_smoke_fails_on_a_bad_exit_code(tmp_path, bundle):
+    done = run_smoke(*simulated_binary(tmp_path, bundle, code_shift=3))
+
+    assert done.returncode == 1
+    assert "exit code 3" in done.stderr
+
+
+def test_smoke_shows_the_log_of_a_binary_that_stops_at_startup(tmp_path, bundle):
+    (bundle / "service" / "runtime.json").write_text("{", encoding="utf-8")
+
+    done = run_smoke(*simulated_binary(tmp_path, bundle))
+
+    assert done.returncode == 1
+    assert "before answering" in done.stderr
+    assert "log: " in done.stderr
+    assert "Startup failed" in done.stderr
+
+
+def test_forced_end_of_the_parent_ends_the_child_through_the_entry(tmp_path, bundle):
+    done = run_smoke(*simulated_binary(tmp_path, bundle))
+
+    assert done.returncode == 0, done.stderr
+    assert re.search(r"Forced end passed: [1-9]", done.stdout)
+
+
+def test_forced_end_of_the_parent_catches_a_surviving_child(smoke, tmp_path, bundle):
+    """Sans l'attente du parent, l'enfant d'un `--onefile` survit : le passage 2 doit le voir."""
+    done = run_smoke(*simulated_binary(tmp_path, bundle, through_entry=False))
+
+    assert done.returncode == 1
+    assert "Normal run passed" in done.stdout
+    assert "survivors" in done.stderr
+    assert_none_left(smoke, tmp_path)
+
+
+def test_smoke_without_a_command_is_a_usage_error():
+    assert run_smoke().returncode == 2
+
+
+def test_smoke_reports_a_command_that_cannot_start(tmp_path):
+    done = run_smoke(str(tmp_path / "absent.exe"))
+
+    assert done.returncode == 1
+    assert "could not start" in done.stderr
+
+
+def test_descendants_cover_grandchildren_and_ignore_the_rest(smoke, monkeypatch):
+    table = {
+        10: smoke.Process(1, "root"),
+        11: smoke.Process(10, "child"),
+        12: smoke.Process(11, "grandchild"),
+        13: smoke.Process(13, "own parent"),
+        20: smoke.Process(1, "other"),
+    }
+    monkeypatch.setattr(smoke, "processes", lambda: table)
+
+    assert set(smoke.descendants(10)) == {11, 12}
+
+
+def test_a_reused_pid_is_no_survivor(smoke, monkeypatch):
+    monkeypatch.setattr(smoke, "processes", lambda: {11: smoke.Process(1, "notepad")})
+
+    assert smoke.still_alive({11: smoke.Process(10, "pz-duel")}) == {}
+
+
+def test_entry_imports_main_absolutely():
+    tree = ast.parse(ENTRY.read_text(encoding="utf-8"))
+    imports = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+
+    assert all(node.level == 0 for node in imports)
+    assert "service.main" in {node.module for node in imports}
+
+
+def test_entry_ends_the_service_after_its_parent(entry, monkeypatch):
+    events = []
+    monkeypatch.setattr(entry, "log_line", lambda text: events.append("log"))
+
+    entry.end_with_parent(FAKE_PARENT, lambda pid: events.append(("wait", pid)), events.append)
+
+    assert events == [("wait", FAKE_PARENT), "log", entry.FORCED_END_CODE]
+
+
+def fake_winapi(error: OSError | None = None) -> types.SimpleNamespace:
+    calls = []
+
+    def open_process(access, inherit, pid):
+        calls.append(("open", access, inherit, pid))
+        if error is not None:
+            raise error
+        return "handle"
+
+    def wait(handle, timeout):
+        calls.append(("wait", handle, timeout))
+
+    return types.SimpleNamespace(
+        calls=calls,
+        SYNCHRONIZE=0x00100000,
+        INFINITE=0xFFFFFFFF,
+        OpenProcess=open_process,
+        WaitForSingleObject=wait,
+    )
+
+
+def test_entry_waits_on_the_windows_handle_of_its_parent(entry, monkeypatch):
+    winapi = fake_winapi()
+    monkeypatch.setitem(sys.modules, "_winapi", winapi)
+
+    entry.wait_for_parent_windows(FAKE_PARENT)
+
+    assert winapi.calls == [
+        ("open", winapi.SYNCHRONIZE, False, FAKE_PARENT),
+        ("wait", "handle", winapi.INFINITE),
+    ]
+
+
+def test_entry_takes_an_unopenable_windows_parent_for_gone(entry, monkeypatch):
+    winapi = fake_winapi(OSError(errno.EINVAL, "no such process"))
+    monkeypatch.setitem(sys.modules, "_winapi", winapi)
+
+    entry.wait_for_parent_windows(FAKE_PARENT)
+
+    assert [call[0] for call in winapi.calls] == ["open"]
+
+
+def test_entry_polls_for_a_new_posix_parent(entry, monkeypatch):
+    parents = iter([FAKE_PARENT, FAKE_PARENT, 1])
+    naps = []
+    monkeypatch.setattr(entry.os, "getppid", lambda: next(parents))
+    monkeypatch.setattr(entry.time, "sleep", naps.append)
+
+    entry.wait_for_parent_posix(FAKE_PARENT)
+
+    assert naps == [entry.PARENT_POLL_S] * 2
+
+
+class ThreadSpy:
+    started: list = []
+
+    def __init__(self, target, args, name, daemon):
+        self.record = (target, args, daemon)
+
+    def start(self):
+        self.started.append(self.record)
+
+
+@pytest.fixture
+def thread_spy(entry, monkeypatch):
+    monkeypatch.setattr(ThreadSpy, "started", [])
+    monkeypatch.setattr(entry.threading, "Thread", ThreadSpy)
+    return ThreadSpy
+
+
+def test_entry_does_not_watch_from_the_sources(entry, thread_spy):
+    entry.watch_parent()
+
+    assert thread_spy.started == []
+
+
+@pytest.mark.parametrize(
+    ("name", "wait"),
+    [("win32", "wait_for_parent_windows"), ("linux", "wait_for_parent_posix")],
+)
+def test_entry_watches_the_right_way_once_frozen(entry, thread_spy, monkeypatch, name, wait):
+    monkeypatch.setattr(entry.paths, "is_frozen", lambda: True)
+    monkeypatch.setattr(entry.os, "getppid", lambda: FAKE_PARENT)
+    monkeypatch.setattr(sys, "platform", name)
+
+    entry.watch_parent()
+
+    assert thread_spy.started == [
+        (entry.end_with_parent, (FAKE_PARENT, getattr(entry, wait), os._exit), True)
+    ]
+
+
+def test_entry_keeps_the_service_when_the_parent_cannot_be_read(entry, thread_spy, monkeypatch):
+    logged = []
+
+    def unreadable():
+        raise OSError(errno.ENOSYS, "not implemented")
+
+    monkeypatch.setattr(entry.paths, "is_frozen", lambda: True)
+    monkeypatch.setattr(entry.os, "getppid", unreadable)
+    monkeypatch.setattr(entry, "log_line", logged.append)
+
+    entry.watch_parent()
+
+    assert thread_spy.started == []
+    assert len(logged) == 1
+
+
+def test_spec_builds_a_windowed_onefile_without_upx():
+    calls = read_spec()
+
+    assert calls["analysis"]["scripts"] == [str(ENTRY)]
+    assert calls["analysis"]["pathex"] == [str(REPO)]
+    assert calls["exe"]["args"][:4] == ("archive", "scripts", "bin", "data")
+    assert calls["exe"]["console"] is False
+    assert calls["exe"]["upx"] is False
+    assert not calls["exe"].get("exclude_binaries")
+
+
+def test_spec_embeds_every_resource_where_the_service_reads_it():
+    datas = {
+        (Path(source).relative_to(REPO).as_posix(), destination)
+        for source, destination in read_spec()["analysis"]["datas"]
+    }
+
+    assert datas == {
+        ("ui", "ui"),
+        ("mods/duelcore", "mods/duelcore"),
+        ("service/presets", "service/presets"),
+        ("service/runtime.json", "service"),
+        ("service/effects.json", "service"),
+    }
+
+
+def test_ac48_pyinstaller_stays_out_of_service():
+    files = [
+        path
+        for path in SERVICE_DIR.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ]
+
+    assert files
+    assert [path for path in files if b"pyinstaller" in path.read_bytes().lower()] == []
+
+
+def test_ac48_build_requirement_is_pinned():
+    entries = [
+        line
+        for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    assert entries == ["pyinstaller==6.22.3"]
+
+
+@pytest.mark.parametrize("path", [SMOKE, ENTRY], ids=["smoke", "entry"])
+def test_ac48_packaging_scripts_need_nothing_but_the_stdlib(path):
+    assert foreign_imports(ast.parse(path.read_text(encoding="utf-8"))) == []
