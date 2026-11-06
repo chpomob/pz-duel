@@ -81,6 +81,14 @@ class RecordingEngine:
         self.actions.append(folder)
         return True, "ok"
 
+    def guest_launcher(self) -> bytes:
+        self.actions.append("guest_launcher")
+        return SECRET.encode()
+
+    def set_invite_address(self, address: object) -> tuple[bool, str]:
+        self.actions.append("set_invite_address")
+        return True, "ok"
+
 
 @pytest.fixture
 def api():
@@ -241,7 +249,7 @@ def test_bad_payload_keeps_the_connection_and_answers_json(payload):
 
 SURROGATE = "\ud800"
 # Un champ tenu hors de `IDENTIFIER_FIELDS` doit être classé ici, en connaissance de cause.
-NOT_IDENTIFIERS = {"pseudo", "password", "duration_s", "day_length", "folder"}
+NOT_IDENTIFIERS = {"pseudo", "password", "duration_s", "day_length", "folder", "address"}
 SERVICE = Path(__file__).resolve().parent.parent / "service"
 PAYLOAD_KEY = re.compile(r"""(?:payload\.get\(|payload\[|_text_option\(payload, )"(\w+)\"""")
 BAD_IDENTIFIERS = (
@@ -581,6 +589,7 @@ def test_foreign_request_is_refused_before_any_body_read(api, body_reads, header
 # Le balayage part de la table : une route ajoutée y passe sans qu'on pense à la citer ici.
 POST_PATHS = tuple(Handler.POST_ROUTES)
 SETUP_BODY = json.dumps({"folder": "/jeu"}).encode()
+LAUNCHER_ROUTE = "/api/invite/launcher"
 
 
 def test_setup_routes_are_in_the_table_and_outside_the_actions():
@@ -633,6 +642,33 @@ def test_setup_state_refuses_a_foreign_host_before_measuring(api, host):
     status, _ = send(port, "/api/setup", {"Host": host.format(port=port)})
     assert status == 403
     assert engine.actions == []
+
+
+@pytest.mark.parametrize("origin", FOREIGN_ORIGINS)
+def test_launcher_refuses_a_foreign_origin_before_generating(api, origin):
+    engine, port = api
+    status, body = send(
+        port,
+        LAUNCHER_ROUTE,
+        {"Host": f"127.0.0.1:{port}", "Origin": origin.format(port=port)},
+    )
+    assert status == 403
+    assert SECRET.encode() not in body
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("host", FOREIGN_HOSTS)
+def test_launcher_refuses_a_foreign_host_before_generating(api, host):
+    engine, port = api
+    status, body = send(port, LAUNCHER_ROUTE, {"Host": host.format(port=port)})
+    assert status == 403
+    assert SECRET.encode() not in body
+    assert engine.actions == []
+
+
+def test_invite_routes_stay_outside_the_actions():
+    assert "/api/invite/address" in POST_PATHS
+    assert not {"invite", "set_invite_address", "guest_launcher"} & ACTIONS
 
 
 def test_setup_state_answers_on_the_local_interface(api):

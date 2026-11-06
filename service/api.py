@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from . import paths
+from .guest_launcher import LauncherRefused
 
 UI_DIR = str(paths.resource_root() / "ui")
 
@@ -34,6 +35,8 @@ LOCAL_NAMES = ("127.0.0.1", "localhost")
 # Début de l'en-tête `Server` : `main` y reconnaît un service déjà actif.
 SERVER_TOKEN = "PZduel/"
 JSON_TYPE = "application/json"
+LAUNCHER_NAME = "pz-duel-join.bat"
+LAUNCHER_TYPE = "application/octet-stream"
 # Tout champ qui nomme une chose s'ajoute ici : `test_api_security` balaie le service.
 IDENTIFIER_FIELDS = ("action", "preset", "mode", "side")
 IDENTIFIER_MAX = 64
@@ -165,11 +168,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # le client est parti, ou la requête n'a jamais été lisible
             LOG.debug("réponse d'erreur impossible", exc_info=True)
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, disposition: str | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if disposition is not None:
+            self.send_header("Content-Disposition", disposition)
         self.answered = True
         self.end_headers()
         if self.command == "HEAD":  # le corps est annoncé, jamais envoyé
@@ -294,10 +299,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/setup":
             self._json(200, self.engine.setup_state())
             return
+        if path == "/api/invite/launcher":
+            self._get_launcher()
+            return
         if path in ("/", ""):
             self._static("index.html")
             return
         self._static(path)
+
+    def _get_launcher(self) -> None:
+        try:
+            launcher = self.engine.guest_launcher()
+        except LauncherRefused as exc:
+            self._fail(409, str(exc))
+            return
+        disposition = f'attachment; filename="{LAUNCHER_NAME}"'
+        self._send(200, launcher, LAUNCHER_TYPE, disposition)
 
     def do_POST(self):
         path = self._path()
@@ -341,8 +358,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _post_action(self, payload: dict) -> None:
         action = payload.get("action", "")
-        ok, msg = self.engine.action(action, payload)
-        self._json(200 if ok else 409, {"ok": ok, "message": msg, "state": self.engine.snapshot()})
+        self._state_answer(*self.engine.action(action, payload))
+
+    def _state_answer(self, ok: bool, message: str) -> None:
+        answer = {"ok": ok, "message": message, "state": self.engine.snapshot()}
+        self._json(200 if ok else 409, answer)
+
+    def _post_invite_address(self, payload: dict) -> None:
+        self._state_answer(*self.engine.set_invite_address(payload.get("address")))
 
     def _setup_answer(self, ok: bool, message: str) -> None:
         self._json(200 if ok else 409, {"ok": ok, "message": message})
@@ -376,6 +399,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/setup/install-mod": _post_install_mod,
         "/api/setup/pz-dir": _post_pz_dir,
         "/api/quit": _post_quit,
+        "/api/invite/address": _post_invite_address,
     }
 
 

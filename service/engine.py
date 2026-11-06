@@ -25,9 +25,19 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
+from secrets import token_hex
 from typing import Any, NamedTuple
 
 from . import paths
+from .api import LAUNCHER_NAME
+from .guest_launcher import (
+    ADDRESS_REFUSED,
+    PASSWORD_ALLOWED,
+    PASSWORD_REFUSED,
+    LauncherRefused,
+    build_launcher,
+    is_usable_address,
+)
 from .journal import Journal, read_journal
 from .platforms import Platform, current
 from .preflight import (
@@ -140,6 +150,28 @@ SECONDS_PER_MINUTE = 60
 MIN_DURATION_S = 30
 MAX_DURATION_S = 3600
 VERDICT_FAILED = "verdict_failed"
+# 128 bits (AC38).
+SHARE_TOKEN_BYTES = 16
+SCOPE_LAN = "lan"
+SCOPE_UNVERIFIED = "unverified"
+SCOPE_NO_ADDRESS = "no_address"
+SCOPE_MOCK = "mock"
+SCOPE_LAN_TEXT = (
+    "Detected address: this invitation only works on your local network. "
+    "For a remote guest, enter your public address."
+)
+SCOPE_UNVERIFIED_TEXT = (
+    "Unverified address: PZ Duel cannot test it. For a remote guest, open UDP ports {game} "
+    "and {udp} to play and TCP port {share} for the link."
+)
+SCOPE_NO_ADDRESS_TEXT = "No usable address was detected: enter an address your guest can reach."
+SCOPE_MOCK_TEXT = "Simulated duel: there is no link and no launcher."
+REMATCH_NOTE = "rematch_note"
+REMATCH_NOTE_TEXT = (
+    "A launcher you already sent stays valid for a rematch. "
+    "A new duel can make it stale: send the new one then."
+)
+INVITE_CLOSED = "invitation unavailable: it only exists in the lobby of a real duel"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1628,6 +1660,11 @@ class Engine:
         self._stop_incomplete = False
         self._shutdown_lock = threading.Lock()
         self._stopped: bool | None = None
+        # `local_ip` n'est lu qu'à l'ouverture du lobby : il fait un `connect` (AC58).
+        self._detected_ip: str | None = None
+        self._share_token: str | None = None
+        # Survit aux lobbys : la revanche garde l'adresse que l'hôte a saisie.
+        self._entered_address: str | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -1641,7 +1678,12 @@ class Engine:
     # -- lecture ---------------------------------------------------------
     def snapshot(self) -> dict:
         with self.lock:
-            return self.state.to_dict()
+            state = self.state.to_dict()
+            # L'invitation survit au lobby, pas l'annonce (AC60).
+            if state["phase"] != "lobby":
+                invite = state["invite"].items()
+                state["invite"] = {key: value for key, value in invite if key != REMATCH_NOTE}
+            return state
 
     def presets(self) -> list[dict]:
         return self._presets
@@ -1887,6 +1929,81 @@ class Engine:
         script = self._platform.client_file(folder)
         return script if os.access(script, os.X_OK) else None
 
+    # -- invitation ------------------------------------------------------
+    # Hors d'`ACTIONS`, comme le premier lancement (H6). Rien ici ne touche au réseau (AC58).
+    def set_invite_address(self, address: object) -> tuple[bool, str]:
+        """Retient l'adresse saisie ; un refus ne la cite pas et garde la précédente."""
+        with self.lock:
+            if not self.real or self.state.phase != "lobby":
+                return False, INVITE_CLOSED
+            if not is_usable_address(address):
+                return False, ADDRESS_REFUSED
+            self._entered_address = address
+            self.state.invite = self._build_invite()
+            self.state.log("invitation address updated")
+        return True, "invitation address updated"
+
+    def guest_launcher(self) -> bytes:
+        """Rend le `.bat` du lobby, ou lève `LauncherRefused`. Il n'existe que dans la réponse."""
+        with self.lock:
+            if not self.real or self.state.phase != "lobby":
+                raise LauncherRefused(INVITE_CLOSED)
+            invite = self.state.invite
+        return build_launcher(invite["address"], invite["port"], invite["password"], MOD_SRC)
+
+    def _open_invite(self) -> None:
+        """Ouvre l'invitation d'un lobby : seul appel à `local_ip`, jeton neuf, revanche comprise."""
+        self._detected_ip = local_ip()
+        self._share_token = token_hex(SHARE_TOKEN_BYTES)
+        self.state.invite = self._build_invite()
+
+    def _build_invite(self) -> dict:
+        """Seule source de l'invitation. `invite` sort par l'API : jamais `host_password`."""
+        config = self.state.config
+        side = GUEST_SIDE if self.real else HOST_SIDE
+        invite = {
+            "ip": self._detected_ip,
+            "port": self.runtime["ports"][side]["game"],
+            "password": config["password"],
+            "code": config["code"],
+            "address": None,
+            "link": None,
+            "qr_text": None,
+            # Aucun écouteur n'existe encore : c'est lui qui dira le partage disponible.
+            "share_available": False,
+            "needs_address": False,
+            "scope": SCOPE_MOCK,
+            "scope_text": SCOPE_MOCK_TEXT,
+        }
+        if not self.real:
+            return invite
+        invite[REMATCH_NOTE] = REMATCH_NOTE_TEXT
+        detected = self._detected_ip if is_usable_address(self._detected_ip) else None
+        address = self._entered_address or detected
+        if address is None:
+            invite["needs_address"] = True
+            invite["scope"] = SCOPE_NO_ADDRESS
+            invite["scope_text"] = SCOPE_NO_ADDRESS_TEXT
+            return invite
+        invite["ip"] = invite["address"] = address
+        if self._entered_address is None:
+            invite["scope"] = SCOPE_LAN
+            invite["scope_text"] = SCOPE_LAN_TEXT
+        else:
+            ports = self.runtime["ports"][GUEST_SIDE]
+            invite["scope"] = SCOPE_UNVERIFIED
+            invite["scope_text"] = SCOPE_UNVERIFIED_TEXT.format(
+                game=ports["game"], udp=ports["udp"], share=self.runtime["share_port"]
+            )
+        if PASSWORD_ALLOWED.fullmatch(config["password"]) is None:
+            # Le mot de passe saisi ne peut pas voyager dans un `.bat` (D-H).
+            invite["launcher_refused"] = PASSWORD_REFUSED
+            return invite
+        share_port = self.runtime["share_port"]
+        link = f"http://{address}:{share_port}/{self._share_token}/{LAUNCHER_NAME}"
+        invite["link"] = invite["qr_text"] = link
+        return invite
+
     # -- moteur ----------------------------------------------------------
     def _begin(
         self, payload: dict, code: str | None = None, host_password: str | None = None
@@ -2059,12 +2176,7 @@ class Engine:
         with self.lock:
             self.state.set_step("contract", "ok", "contrat vérifié sur A et B")
             self.state.set_step("lobby", "running", "en attente des joueurs")
-            self.state.invite = {
-                "ip": local_ip(),
-                "port": self.runtime["ports"][GUEST_SIDE]["game"],
-                "password": self.state.config["password"],
-                "code": self.state.config["code"],
-            }
+            self._open_invite()
             self.state.log("lobby ouvert, invitation prête")
         match.announce_table()
         match.enter_phase("lobby")
@@ -2177,12 +2289,7 @@ class Engine:
         with self.lock:
             self.state.phase = "lobby"
             self.state.set_step("lobby", "running", "en attente de l'adversaire")
-            self.state.invite = {
-                "ip": local_ip(),
-                "port": self.runtime["ports"]["A"]["game"],
-                "password": self.state.config["password"],
-                "code": self.state.config["code"],
-            }
+            self._open_invite()
             self.state.log("lobby ouvert, invitation prête (simulé)")
         # l'hôte rejoint son propre serveur
         if not self._sleep(1.2):
