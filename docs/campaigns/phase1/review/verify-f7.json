@@ -1,0 +1,21 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "FRAMING",
+      "status": "PARTIAL",
+      "evidence": "service/api.py:121 et :139 : longueur décimale strictement positive, plafonnée à 1048576, doublons et Transfer-Encoding refusés en JSON avant read. Mais service/api.py:56 délègue au parseur BaseHTTPRequestHandler sans redéfinir send_error : une ligne Content-Length dépassant 65536 octets déclenche un refus 431 HTML avant _length ; cette réponse normale échappe au except. La garantie exclusivement JSON reste donc fausse. tests/test_api_frontier.py et tests/test_http_framing.py sont absents ; aucun test lu ne prouve que le refus précède la lecture."
+    },
+    {
+      "id": "LUA_ARGS",
+      "status": "RESOLVED",
+      "evidence": "tests/doubles/mini_lua.py:436 : le wrapper commun accepte value=None et les arguments supplémentaires ignorés, conserve la conversion numérique et préserve infini/NaN. tests/test_mini_lua.py:164 vérifie floor ET ceil avec plusieurs arguments supplémentaires ; :169 vérifie l'échec sans argument ; :142, :150, :155 et :177 couvrent arrondis, conversion, infinis, NaN et arguments invalides. Tests lus, non exécutés."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "service/api.py",
+    "tests/doubles/mini_lua.py",
+    "tests/test_mini_lua.py"
+  ]
+}
