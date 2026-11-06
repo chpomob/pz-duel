@@ -11,7 +11,7 @@ copy without saying so**, and never reuse third-party mod code without a compati
 |---|---|---|---|---|
 | **Streamer Integration Framework (SIF)** | YebNFlo | Workshop 3387594292, all rights reserved | The **idea** of a file bridge inside `Zomboid/Lua/` (periodic read, registered modules, file cleared after processing) | No code, no file |
 | **SIF — Example Events** | YebNFlo, ShavedTube | Workshop 3387596392 | The **catalogue** of 48 triggerable modules (spawns, weather, items, vehicles, player effects) as a feasibility proof | No code |
-| **Chaos Mod + Twitch/YouTube** | zoidxf (`clixff` repository) | MIT | The **inventory** of 462 effects (`05-annexe-chaos-462.md` appendix), used to map what can be generated | No effect implementation copied: our subset is written separately |
+| **Chaos Mod + Twitch/YouTube** | zoidxf (`clixff` repository) | MIT | The **inventory** of 462 effects (`docs/design/en/05-appendix-chaos-462.md`), used to map what can be generated | No effect implementation copied: our subset is written separately |
 | **log-extender** | outdead (`openzomboid` repository) | MIT | The **client/server mapping** of signals (craft through `ISHandcraftAction`, `PlayerLogger`, `CraftLogger`) | No code |
 | **zomboid-mod-analytics** | spoutnickgp | public repository | The **proof** that `OnCharacterDeath`, `OnHitZombie`, `OnWeaponHitCharacter` and `OnEnterVehicle` are usable server-side | No code |
 | **Zombie Spawn Manager** | El1oN (Elyon) | author's rights reserved (modification forbidden) | The **documentation of B42 limits** (no public per-zombie setters) | No code, no resource |

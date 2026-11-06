@@ -6,7 +6,7 @@
 
 Ce qui existe déjà (à lire, à ne pas réécrire) :
 
-- `01-etat-des-lieux.md` … `09-ui-full-ingame.md` : conception, architecture, inventaire des événements observables et générables, play flow, table de relations, spécification MVP, flow du lanceur, UI.
+- `docs/design/` (version française dans `docs/design/fr/`, anglaise dans `docs/design/en/`) : conception, architecture, inventaire des événements observables et générables, play flow, table de relations, spécification MVP, flow du lanceur, UI.
 - `service/` : ~550 lignes de Python **stdlib uniquement**. Machine à états (`engine.py`), état (`state.py`), API HTTP locale (`api.py`), point d'entrée (`main.py`), presets JSON.
 - `ui/` : page locale (HTML/CSS/JS, QR embarqué MIT).
 - `CREDITS.md` : crédits des mods et auteurs dont le projet s'inspire.

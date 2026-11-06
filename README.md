@@ -175,7 +175,7 @@ mods/duelcore/    server-side mod (Lua): captures facts, publishes capabilities,
 ui/               local interface (HTML/CSS/JS, no dependency beyond a vendored QR encoder)
 tests/            1,214 tests; server, mod and a reduced Lua interpreter as doubles
 docs/campaigns/   spec (77 criteria), plan (24 steps), 4 branch reviews, 15 fix steps
-01-…09-…          design notes (French): feasibility, architecture, mechanisms, MVP spec, UI
+docs/design/      ten design notes, English and French (see the index)
 ```
 
 ## Known limits

@@ -11,7 +11,7 @@ Ce projet n'existerait pas sans le travail de la communauté PZ. Règle de maiso
 |---|---|---|---|---|
 | **Streamer Integration Framework (SIF)** | YebNFlo | Workshop 3387594292, tous droits réservés | L'**idée** du pont par fichier dans `Zomboid/Lua/` (lecture périodique, modules enregistrés, fichier vidé après traitement) | Aucun code, aucun fichier |
 | **SIF — Example Events** | YebNFlo, ShavedTube | Workshop 3387596392 | Le **catalogue** de 48 modules déclenchables (spawns, météo, objets, véhicules, effets joueur) comme preuve de faisabilité | Aucun code |
-| **Chaos Mod + Twitch/YouTube** | zoidxf (dépôt `clixff`) | MIT | L'**inventaire** des 462 effets (annexe `05-annexe-chaos-462.md`), utilisé pour cartographier ce qui est générable | Aucune implémentation d'effet recopiée : notre sous-ensemble est écrit à part |
+| **Chaos Mod + Twitch/YouTube** | zoidxf (dépôt `clixff`) | MIT | L'**inventaire** des 462 effets (annexe `docs/design/fr/05-annexe-chaos-462.md`), utilisé pour cartographier ce qui est générable | Aucune implémentation d'effet recopiée : notre sous-ensemble est écrit à part |
 | **log-extender** | outdead (dépôt `openzomboid`) | MIT | La **cartographie client/serveur** des signaux (craft via `ISHandcraftAction`, `PlayerLogger`, `CraftLogger`) | Aucun code |
 | **zomboid-mod-analytics** | spoutnickgp | dépôt public | La **preuve** que `OnCharacterDeath`, `OnHitZombie`, `OnWeaponHitCharacter` et `OnEnterVehicle` sont exploitables côté serveur | Aucun code |
 | **Zombie Spawn Manager** | El1oN (Elyon) | droits réservés par l'auteur (interdiction de modification) | La **documentation des limites** de B42 (pas de setters publics par zombie) | Aucun code, aucune ressource |

@@ -174,7 +174,7 @@ mods/duelcore/    mod serveur (Lua) : capture les faits, publie ses capacités, 
 ui/               interface locale (HTML/CSS/JS, aucune dépendance hors QR vendorisé)
 tests/            1 214 tests ; doubles de serveur, de mod et interpréteur Lua réduit
 docs/campaigns/   spec (77 critères), plan (24 étapes), 4 revues de branche, 15 étapes de correction
-01-…09-…          conception : faisabilité, architecture, mécanismes, spec MVP, UI
+docs/design/      conception en 10 documents, anglais et français (voir l'index)
 ```
 
 ## Limites connues

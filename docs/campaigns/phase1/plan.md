@@ -60,7 +60,7 @@ La spec laisse ces points ouverts ou ils découlent de constats sur la machine. 
 Constats sur la machine, pris en compte dans les steps :
 
 - `start-server.sh` est dans `<steam>/steamapps/common/ProjectZomboid/projectzomboid/`, pas à la racine de `ProjectZomboid/`.
-- `version=42.21.0 4a0e9546ec` sort **avant** `*** SERVER STARTED ****` dans `server-console.txt`, et après dans `04-spike-0-preuves.md` : le build se lit quel que soit l'ordre.
+- `version=42.21.0 4a0e9546ec` sort **avant** `*** SERVER STARTED ****` dans `server-console.txt`, et après dans `docs/design/fr/04-spike-0-preuves.md` : le build se lit quel que soit l'ordre.
 - `duelA_SandboxVars.lua` contient `PopulationStartMultiplier` : « `Start*` » doit viser quatre clés exactes (`StartYear`, `StartMonth`, `StartDay`, `StartTime`), jamais un motif.
 - `duelA.ini` a aujourd'hui `Mods=duelsidea` et `UDPPort=16262`, écrasés par les réglages gérés. `duelA` et `duelB` existent déjà : le premier lancement les capture en snapshot sans passe de création.
 
