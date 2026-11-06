@@ -25,6 +25,7 @@ from service.api import (
     make_server,
 )
 from service.engine import ACTIONS, Engine, load_presets
+from service.share import ShareServer
 
 SECRET = "mot-de-passe-joueur"
 JSON_TYPE = "application/json"
@@ -1218,3 +1219,77 @@ def test_thread_that_cannot_start_gives_its_place_back(monkeypatch):
         accepted.close()
         server.server_close()
 
+
+
+# -- écouteur de partage : aucune route de l'API, aucune ressource de l'UI ------
+SHARE_TOKEN = "fedcba9876543210fedcba9876543210"
+SHARE_PATH = f"/{SHARE_TOKEN}/pz-duel-join.bat"
+UI_FILES = sorted(path.name for path in (Path(__file__).parent.parent / "ui").iterdir())
+GET_ROUTES = ("/api/state", "/api/presets", "/api/setup", "/api/invite/launcher")
+
+
+class LauncherOnly:
+    """Toute autre lecture du moteur que `guest_launcher` échoue et se voit."""
+
+    def __init__(self) -> None:
+        self.touched: list[str] = []
+
+    def guest_launcher(self) -> bytes:
+        return b"launcher"
+
+    def __getattr__(self, name: str):
+        self.touched.append(name)
+        raise AttributeError(name)
+
+
+@pytest.fixture
+def share():
+    engine = LauncherOnly()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = ShareServer(engine, SHARE_TOKEN, port, POLL_S)
+    yield port, engine
+    server.close()
+
+
+def share_answer(port: int, method: str, path: str, **headers: str) -> tuple[int, bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT_S)
+    try:
+        conn.request(method, path, ACTION_BODY if method == "POST" else None, headers)
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("path", [*GET_ROUTES, "/", *(f"/{name}" for name in UI_FILES)])
+def test_share_listener_serves_no_api_get_and_no_ui_file(share, path):
+    port, engine = share
+
+    assert share_answer(port, "GET", path) == (404, b"")
+    assert engine.touched == []
+
+
+@pytest.mark.parametrize("path", sorted(Handler.POST_ROUTES))
+def test_share_listener_knows_no_post_route(share, path):
+    port, engine = share
+    local = {"Host": f"127.0.0.1:{port}", "Content-Type": JSON_TYPE}
+
+    assert share_answer(port, "POST", path, **local) == (405, b"")
+    assert engine.touched == []
+
+
+@pytest.mark.parametrize("headers", [{"Host": "evil.example"}, {"Origin": "http://evil.example"}])
+def test_share_listener_gives_no_cross_origin_grant(share, headers):
+    """Le `Host` d'un invité n'est pas connu d'avance : seul le jeton protège ce chemin."""
+    port, _ = share
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT_S)
+    try:
+        conn.request("GET", SHARE_PATH, headers=headers)
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.getheader("Access-Control-Allow-Origin") is None
+        response.read()
+    finally:
+        conn.close()

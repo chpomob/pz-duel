@@ -80,6 +80,7 @@ from .servers import (
     write_ini,
     write_sandbox,
 )
+from .share import ShareServer
 from .snapshots import SnapshotError, SnapshotStore, prepare_worlds
 from .state import MatchState
 from .transport import Anomaly, CommandChannel, OutReader, PollResult
@@ -171,6 +172,15 @@ REMATCH_NOTE_TEXT = (
     "A launcher you already sent stays valid for a rematch. "
     "A new duel can make it stale: send the new one then."
 )
+SHARE_TEXT = "share_text"
+SHARE_UNAVAILABLE_TEXT = (
+    "The share link is unavailable: TCP port {port} could not be opened. "
+    "Save the launcher and send it to your guest."
+)
+# Le lobby s'ouvre depuis `contract` : l'écouteur naît juste avant lui, sans lui survivre.
+SHARE_PHASES = ("contract", "lobby")
+# Ce que `invite` ne dit que pendant le lobby (AC60).
+LOBBY_ONLY = (REMATCH_NOTE, SHARE_TEXT)
 INVITE_CLOSED = "invitation unavailable: it only exists in the lobby of a real duel"
 
 LOGGER = logging.getLogger(__name__)
@@ -1663,6 +1673,7 @@ class Engine:
         # `local_ip` n'est lu qu'à l'ouverture du lobby : il fait un `connect` (AC58).
         self._detected_ip: str | None = None
         self._share_token: str | None = None
+        self._share: ShareServer | None = None
         # Survit aux lobbys : la revanche garde l'adresse que l'hôte a saisie.
         self._entered_address: str | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
@@ -1682,7 +1693,7 @@ class Engine:
             # L'invitation survit au lobby, pas l'annonce (AC60).
             if state["phase"] != "lobby":
                 invite = state["invite"].items()
-                state["invite"] = {key: value for key, value in invite if key != REMATCH_NOTE}
+                state["invite"] = {key: value for key, value in invite if key not in LOBBY_ONLY}
             return state
 
     def presets(self) -> list[dict]:
@@ -1859,6 +1870,7 @@ class Engine:
             self._closing = True
             self._stop.set()
             match, thread = self._match, self._thread
+        self._close_share()
         stopped = match is None or match.shutdown()
         if thread is not None:
             # L'état final et la fermeture du journal sont écrits par ce fil.
@@ -1955,7 +1967,30 @@ class Engine:
         """Ouvre l'invitation d'un lobby : seul appel à `local_ip`, jeton neuf, revanche comprise."""
         self._detected_ip = local_ip()
         self._share_token = token_hex(SHARE_TOKEN_BYTES)
+        if self.real:
+            self._open_share()
         self.state.invite = self._build_invite()
+
+    def _open_share(self) -> None:
+        """Un port pris laisse le lobby ouvert : le `.bat` s'enregistre encore depuis l'UI."""
+        port = self.runtime["share_port"]
+        try:
+            poll_s = self.runtime["tick_ms"] / MS_PER_S
+            self._share = ShareServer(self, self._share_token, port, poll_s)
+        except OSError:
+            self.state.log(f"share link unavailable: TCP port {port} could not be opened", "warn")
+
+    def _close_share(self) -> None:
+        """Idempotent, à toute sortie du lobby. `close` attend l'écouteur, hors du verrou."""
+        with self.lock:
+            share, self._share = self._share, None
+            self._share_token = None
+            if share is None:
+                return
+            # Une copie : `snapshot` a pu rendre ce dictionnaire à un lecteur encore en cours.
+            closed = {"link": None, "qr_text": None, "share_available": False}
+            self.state.invite = {**self.state.invite, **closed}
+        share.close()
 
     def _build_invite(self) -> dict:
         """Seule source de l'invitation. `invite` sort par l'API : jamais `host_password`."""
@@ -1969,8 +2004,7 @@ class Engine:
             "address": None,
             "link": None,
             "qr_text": None,
-            # Aucun écouteur n'existe encore : c'est lui qui dira le partage disponible.
-            "share_available": False,
+            "share_available": self._share is not None,
             "needs_address": False,
             "scope": SCOPE_MOCK,
             "scope_text": SCOPE_MOCK_TEXT,
@@ -1978,6 +2012,8 @@ class Engine:
         if not self.real:
             return invite
         invite[REMATCH_NOTE] = REMATCH_NOTE_TEXT
+        if self._share is None:
+            invite[SHARE_TEXT] = SHARE_UNAVAILABLE_TEXT.format(port=self.runtime["share_port"])
         detected = self._detected_ip if is_usable_address(self._detected_ip) else None
         address = self._entered_address or detected
         if address is None:
@@ -1999,6 +2035,8 @@ class Engine:
             # Le mot de passe saisi ne peut pas voyager dans un `.bat` (D-H).
             invite["launcher_refused"] = PASSWORD_REFUSED
             return invite
+        if self._share is None:
+            return invite  # un lien mort ne s'affiche pas
         share_port = self.runtime["share_port"]
         link = f"http://{address}:{share_port}/{self._share_token}/{LAUNCHER_NAME}"
         invite["link"] = invite["qr_text"] = link
@@ -2066,6 +2104,7 @@ class Engine:
             self._fail(f"erreur interne: {self._redactor.redact_exception(exc)}")
 
     def _fail(self, message: str) -> None:
+        self._close_share()
         with self.lock:
             self.state.phase = "error"
             self.state.error = message
@@ -2139,6 +2178,9 @@ class Engine:
     def _change_state(self, change: Callable[[MatchState], None]) -> None:
         with self.lock:
             change(self.state)
+            left_lobby = self.state.phase not in SHARE_PHASES
+        if left_lobby:
+            self._close_share()
 
     def _drive_match(self, match: RealMatch) -> str | None:
         """Mène le match jusqu'à sa fin : `cancel` ou une panne en sort plus tôt.
@@ -2183,6 +2225,7 @@ class Engine:
 
     def _finish_match(self, match: RealMatch, failure: str | None) -> None:
         """Toute sortie passe ici : arrêt d'abord, puis état final, puis fermeture du journal."""
+        self._close_share()
         match.enter_phase("stopping")
         stopped = match.shutdown()
         with self.lock:
@@ -2227,6 +2270,7 @@ class Engine:
         return False
 
     def _cancel_state(self) -> None:
+        self._close_share()
         with self.lock:
             self.state.phase = "idle"
             self.state.servers = {"A": "down", "B": "down"}

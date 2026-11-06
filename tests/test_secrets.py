@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -11,13 +12,14 @@ from functools import partial
 from itertools import cycle
 from pathlib import Path
 from traceback import format_exception
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 import pytest
 
 from doubles.fake_server import assert_private, on_host
 from test_match import Duel
-from test_snapshots import ENGINE_READY, engine_rig  # noqa: F401
+from test_snapshots import ENGINE_READY, engine_rig, free_port  # noqa: F401
 from service.api import make_server
 from service.engine import Engine
 from service.guest_launcher import LauncherRefused, build_launcher
@@ -174,3 +176,50 @@ def test_launcher_refusal_never_cites_the_value(runtime, caplog, secret, make_ar
     assert_clean("".join(format_exception(refused.value)))
     assert_clean(repr(refused.value))
     assert_clean(caplog.text)
+
+
+def share_answer(port: int, request: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=HTTP_TIMEOUT_S) as conn:
+        conn.sendall(request)
+        answer = b""
+        while chunk := conn.recv(1 << 16):
+            answer += chunk
+    return answer
+
+
+def test_share_listener_leaks_no_secret(engine_rig, marked_secrets, monkeypatch, caplog):
+    """Refus comme téléchargement : aucun secret d'administration, et le jeton nulle part."""
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr("service.engine.local_ip", lambda: "192.168.1.20")
+    port = free_port(socket.SOCK_STREAM)
+    engine_rig.runtime["share_port"] = port
+    duel = Duel(engine_rig)
+    invite = duel.state()["invite"]
+    path = urlsplit(invite["link"]).path
+    token = path.split("/")[1]
+    password = invite["password"]
+
+    served_bat = share_answer(port, f"GET {path} HTTP/1.1\r\n\r\n".encode())
+    assert served_bat.startswith(b"HTTP/1.0 200")
+    assert password.encode() in served_bat
+    assert_clean(served_bat.decode("latin-1"))
+    for request in (
+        f"GET /{token}/other HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\n\r\n",
+        "GET /api/state HTTP/1.1\r\n\r\n",
+        f"POST {path} HTTP/1.1\r\n\r\n",
+        f"BREW {path} HTTP/1.1\r\n\r\n",
+        f"GET {path}\r\n",
+    ):
+        refusal = share_answer(port, request.encode()).decode("latin-1")
+        assert_clean(refusal, (*MARKERS, token, password))
+        assert refusal.endswith("\r\n\r\n")
+
+    assert engine_rig.engine.action("cancel")[0]
+    engine_rig.wait("idle")
+    engine_rig.closed()
+
+    state = engine_rig.engine.snapshot()
+    assert_clean(json.dumps(state, ensure_ascii=False), (*MARKERS, token))
+    assert_clean(caplog.text, (*MARKERS, token, password))
+    assert len(sweep(engine_rig.matches, (*MARKERS, token))) >= 3
