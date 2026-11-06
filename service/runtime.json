@@ -3,6 +3,7 @@
     "A": {"game": 17261, "udp": 17262, "rcon": 27015},
     "B": {"game": 17271, "udp": 17272, "rcon": 27016}
   },
+  "share_port": 17280,
   "server_start_timeout_s": 300,
   "stop_timeout_s": 30,
   "kill_grace_s": 10,
@@ -24,6 +25,9 @@
   "max_server_restarts": 1,
   "attribution_min_kills": 100,
   "log_tail_lines": 40,
+  "replace_timeout_s": 5,
+  "replace_retry_ms": 100,
+  "instance_wait_s": 10,
   "day_length_minutes": {
     "1": 15,
     "2": 30,
