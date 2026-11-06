@@ -1,0 +1,90 @@
+{
+  "findings": [
+    {
+      "id": "X1",
+      "severity": "blocker",
+      "original_id": "verdict",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 1,
+      "summary": "The APPROVE rests on a false premise: there is code to review, and no file was examined",
+      "evidence": "The worktree is not empty. `git status` shows 13 modified tracked files, and `git diff --stat` reports +2357/-172 across them. A further 97 untracked files (about 26,000 lines) hold most of phase 1, including service/rules.py, service/transport.py, service/journal.py, mods/ and tests/. HEAD is detached at 5ae0e1c, so a commit-range diff sees none of this. `git diff main...HEAD` fails outright here because no `main` ref exists; the branch is `master`. The original `read_files` lists only the worktree root, so no source file is shown as read. The service, mods and ui trees are byte-identical to master 267efad, so this is the real closure candidate. I cannot see the exact diff command the reviewer was given, so the cause of the empty diff is inferred. The non-empty tree is direct observation. The APPROVE should be void: X2 to X5 below are open in this tree.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X2",
+      "severity": "major",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "service/engine.py",
+      "line": 601,
+      "summary": "A death before t0 is never judged, so the match runs with a dead participant",
+      "evidence": "spec.md:393 says 'Mort subite | player_death d'un camp | death, l'autre camp gagne immédiatement', with no exception for the lobby or countdown. Before running, _take_event only journals the event because _core is None (engine.py:1045). _enter_running builds a fresh MatchCore without checking earlier deaths (engine.py:601-612). rules.py:878-881 _is_fatal requires t_ms >= t0, so a pre-t0 line read after t0 is not fatal either. The mod does not report again: reportDeath latches deadPlayers[name] (DuelCore.lua:499-503), and checkDeaths clears the latch only once the player is seen alive. Probe on MatchCore: player_death at t0-1 ms gave result=None after advancing 1 s; the same event at t0 gave outcome=death, winner=B. README:59 raises the exposure by telling both players to get wounded in the lobby. Commit c926460 on master adds only a fix brief (scaffolding/fixes/F14.md); no code changed, so the defect is still open in this tree. Not verified: what a dead participant does in the real game (stays online, respawns or disconnects).",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X3",
+      "severity": "major",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "service/engine.py",
+      "line": 290,
+      "summary": "The hook proof is demanded per match, so default games stall 120 s and lose a rule",
+      "evidence": "ContractWindow.due returns true early only when every required hook is proven on both sides; otherwise it waits for L + hook_window_s (engine.py:290-296, runtime.json hook_window_s=120). _advance enters the countdown only once the window is closed (engine.py:1131-1134). The mod emits the proof only from a bleeding or weapon wound (DuelCore.lua WOUND_TYPES, onPlayerGetDamage, reportWound). So unless both players deliberately get hurt, duel_rapide and pression wait the full 120 s. close() then withdraws damage_taken, and narrow_table drops every rule citing it (rules.py:237-255). README:59 confirms hurt_supply is lost in Duel rapide. This conforms to the spec, so it is a design defect rather than a coding error. It proves a property of the build and mod, yet is paid again each match. limites-connues.md also states it is unproven that BodyDamage.Update runs on the server; if it does not, the atom is withdrawn from every match. F14.md plans this change, but it is not implemented here.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X4",
+      "severity": "minor",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "service/engine.py",
+      "line": 623,
+      "summary": "A conclusion can ignore facts still in the mod's 1 s write buffer",
+      "evidence": "emit only appends to outLines; flushOut runs once per FLUSH_MS=1000 inside step (DuelCore.lua), and A and B flush on unsynchronised phases. _aim_past_conclusion re-reads only what is already in the file (engine.py:623-635), then _judged_tick concludes in the same pump (engine.py:658-667). So a death dated earlier but flushed later cannot pass a later death already read, and a kill dated just before the timer can miss the final tick. Assumption: both facts fall inside the same flush interval, which makes this a narrow race. I confirmed the mechanism by reading the code and did not re-run a timing probe. Evidence that would settle it: a test writing the older death second. F14.md lists this too; it is not fixed here.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X5",
+      "severity": "minor",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "service/rules.py",
+      "line": 814,
+      "summary": "A read failure at the end of the timer hangs the match with no match_end",
+      "evidence": "New finding, not covered by F14.md or limites-connues.md. advance_short_of_end caps time at t0 + duration - 1 ms (rules.py:814-825), even when a submitted end exists. Its docstring promises the opposite: 'Une fin soumise... clôt'. Once the last pre-timer tick has run, `_tick < last_tick` is false, so no tick runs and the submitted end is never processed. OutReader.drain sets _goal before poll, and an OSError from poll leaves _goal set (transport.py:124-130), so `behind` stays true and _pump_match keeps taking this path (engine.py:648-650). Probe, 30 s match: tick stopped at 119 after advance_short_of_end(t0+29999), then submit_end, then advancing +0 ms, +250 ms, +5 s and +1 h each gave 0 records and result=None, while conclusion_due stayed True. Submitting one tick earlier concluded normally. Separate probe: with the out file at chmod 000, three drains each raised PermissionError with behind=True. I ran the core and reader separately, not through the full Engine; their composition comes from reading engine.py:648-653. Trigger window: the failure must start in the final 250 ms, or while a reader is already behind at the timer, so severity stays minor. Effect: the match stays in running at 0 until cancel, which ends it with no result. Fix: do not cap time when _submitted_end is set.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X6",
+      "severity": "nit",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "service/transport.py",
+      "line": 306,
+      "summary": "Every server restart journals a false ack_foreign_boot",
+      "evidence": "prepare_restart truncates `in` and raises boot, but leaves the old `ack` file in place (transport.py:306-316). _poll_acks runs on every pump during the relaunch, and poll_ack reports any ack whose boot differs from the current one (transport.py:263-264). Probe: after prepare_restart, poll_ack returned Anomaly(ack_foreign_boot, boot=1, seq=1, current_boot=2) with no foreign writer involved. The mod overwrites the file only after it opens the new session. Impact is limited to a misleading journal line, reported once. Truncating `ack` in prepare_restart would remove it.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X7",
+      "severity": "nit",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "tests/test_integration_pz.py",
+      "line": 167,
+      "summary": "One test fails when pytest is installed in the user site",
+      "evidence": "Full suite under /usr/bin/python3: 1 failed, 1155 passed, 5 skipped in 51 s. The failure is test_detection_reports_absent. It overrides HOME (line 167) and then starts `sys.executable -m pytest`, so a pytest in ~/.local/lib/python3.12/site-packages cannot be found: 'No module named pytest'. This comes from the test environment, not a product defect. F14.md expects `.venv/bin/python`, and no .venv exists in this worktree, so I did not run that configuration. Green tests also say nothing about real-game behaviour here, because the pz_integration tests were skipped.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}
+READ:065546600174a5f6
+READ: /tmp/review-phase1-cloture-1/service/engine.py, service/rules.py, service/transport.py, service/api.py, service/servers.py, service/snapshots.py, service/journal.py, service/state.py, service/protocol.py, service/replay.py, service/verdict.py, service/rcon.py, service/main.py, mods/duelcore/42.21/media/lua/server/DuelCore.lua

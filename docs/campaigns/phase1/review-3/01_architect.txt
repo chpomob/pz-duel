@@ -1,0 +1,117 @@
+{
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "major",
+      "file": "service/engine.py",
+      "line": 601,
+      "summary": "A death before t0 is never judged, and the match runs on with a dead participant",
+      "evidence": "Spec section Fin, 'Mort subite | player_death d'un camp | death, l'autre camp gagne immédiatement', has no exception for the countdown. Before running, _take_event (engine.py:1045) only journals the event, because _core is None. _enter_running (engine.py:601) builds a fresh MatchCore without looking at earlier deaths, and rules.py:881 requires t_ms >= t0. The mod does not report it again: reportDeath latches deadPlayers[name] (DuelCore.lua:501) and checkDeaths clears the latch only once the player is seen alive. Probe run through the real Engine and doubles: player_death emitted during countdown gave phase=running, result=None at te=0 and still at te=5. The window is wider than the 3 s countdown, because README step 2 tells both players to get wounded in the lobby just before t0. This repeats X14 from the earlier review. No text under docs/campaigns/phase1/scaffolding/fixes, no test and no entry in limites-connues.md covers it. Not verified: what a dead participant does in the real game (stays online, respawns or disconnects). Fix: at _enter_running, refuse or adjudicate a participant with a journaled death, and add a countdown-death test.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "major",
+      "file": "service/engine.py",
+      "line": 290,
+      "summary": "The hook proof is demanded per match, so ordinary default-preset games stall 120 s and lose an advertised rule",
+      "evidence": "ContractWindow.due (engine.py:290-296) holds the lobby until OnPlayerGetDamage is proven on both sides or L + hook_window_s passes, as spec line 230 and AC67 require. The mod emits that proof only on a real bleeding wound (DuelCore.lua:457-476). So unless both players deliberately get wounded before the match, every duel_rapide or pression launch waits the full 120 s, then withdraws damage_taken. That removes hurt_supply, and in pression also untouched_minute and the combo, through narrow_table (rules.py:237). Meanwhile the UI summary still advertises '1 blessure reçue → caisse de soin', and the sealed rules_hash still names the full table. README:59 confirms the wound is the only way to keep the atom. The proof answers a question about the game build and mod (does this hook fire on this server?), not about this match, yet players pay for it in every match with a pre-match injury or a lost rule. limites-connues.md:13 also admits the hook may never fire on the server, in which case the atom is withdrawn from every match. This conforms to the spec, so the finding is against the design. Fix: prove the hook once per build and mod fingerprint and cache the result, or derive damage from a server-side health delta in step(), and show the played table in the lobby.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 977,
+      "summary": "The mod's 1 s write buffer has no settling barrier, so conclusions can ignore earlier facts",
+      "evidence": "emit buffers lines and flushOut runs once per FLUSH_MS = 1000 (DuelCore.lua:44, 977-981), with unsynchronised phases on A and B. Service-side care covers only what is already in the file: _aim_past_conclusion (engine.py:623) re-reads to the end of out, then _judged_tick concludes at once. tests/test_match.py:1953 states the intended rule, 'La mort la plus ancienne décide', but only with both lines already written. Probe with the real Engine, simulating the buffer: A's death dated 400 ms after B's, with A's line flushed first, gave outcome=death, winner=B, so the player who died first won. Second probe: a kill dated before the timer but flushed after it was dropped, and the result stayed a 0-0 draw. A kill in the last second can therefore flip a one-point match, depending only on flush phase. Fix: hold any conclusion for one flush interval plus a margin, then re-read both out files, or have the mod flush immediately on player_death.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 1076,
+      "summary": "Two players with the same username deadlock the lobby with no visible cause",
+      "evidence": "_identify refuses a name already bound to the other side (engine.py:1075-1080). The servers are separate worlds, and identity is already checked per side by _admitted, so this cross-side rule adds no protection. README:30 says the game asks each player for a username, so a collision is plausible. Probe: B's beat carrying A's name left phase=lobby and players.B=None after 20 s. The only signal was a warn log line, 'joueur durand ignoré sur le serveur B'. There is no lobby timeout and no error state, so the hosts wait until they cancel. Fix: drop the cross-side check, or surface it as a blocking lobby message.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A5",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 819,
+      "summary": "A hung server becomes a forfeit against its player, and nothing restarts it",
+      "evidence": "Restart logic triggers only on script exit (_exited_sides, engine.py:679). A live but frozen java (deadlock, long GC, I/O stall) stops beating: _watch_beats (engine.py:800) marks it suspect, and suspect has no consequence beyond a published status. _absence_end (engine.py:819) excludes only _unavailable sides, so after disconnect_grace_s the player on the frozen server loses by forfeit for a server fault. This matches the spec's letter ('joueur absent des heartbeats'), but heartbeats cannot tell a player leaving from a server freezing: a beat is emitted by the server even when empty (engine.py:565), so total beat silence does identify the server. Fix: treat beat silence as a server fault (stop, then the existing restart path, or invalidated) and keep forfeit for beats that arrive without the player.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A6",
+      "severity": "minor",
+      "file": "service/main.py",
+      "line": 21,
+      "summary": "Servers are orphaned when the service dies by SIGHUP or a crash, and nothing reclaims them",
+      "evidence": "STOP_SIGNALS covers only SIGINT and SIGTERM (main.py:21). Servers start with start_new_session=True (servers.py:273), so closing the terminal (SIGHUP) or a service crash leaves both java groups running, and the terminal's hangup does not reach them. Their per-match RCON password, held only in memory and in the .ini, is no longer known to the service. No pid file or group record exists, so the next launch can only fail preflight with 'arrêtez le processus qui l'occupe' (preflight.py:137). The orphans keep writing the worlds and out files, and keep listening on all interfaces. The spec excludes resuming a match after service death, but not cleaning up after it. Fix: handle SIGHUP, and persist the process groups so the next start can stop them.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A7",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 1692,
+      "summary": "The Redactor does not cover player passwords, so the lobby-only rule for host_password is enforced on one field",
+      "evidence": "Engine._open_match arms the Redactor with MatchSecrets, which holds only the admin and RCON secrets (engine.py:1692-1693, servers.py:189). Both player passwords go into the .ini (engine.py:516-529), yet the server output path (_read_output, log_tail, _server_detail at engine.py:746) never redacts them. That output reaches server_X.log and steps[].detail, the latter published by /api/state in every phase. state.py:22 and limites-connues.md:44 promise that host_password appears only in the lobby, but public_config filters only the config key. Assumption: PZ echoes the server password in its console. I did not check this against a real server, and a real log would confirm or refute it. Fix: add both player passwords to the Redactor; it is cheap and removes the dependency on what PZ logs.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "A8",
+      "severity": "minor",
+      "file": "README.md",
+      "line": 107,
+      "summary": "Phase closure rests on a real-mode path never run with a connected player",
+      "evidence": "README:107 lists as unproven AC19, H2, hook signatures, multiplayer server spawn, kill attribution and the -nosteam client connection. README:72 says 'AC19 reste ouvert tant que cette procédure n'a pas été déroulée'. limites-connues.md:13 adds that BodyDamage.Update may not run on the server. My run with ~/pz-duel/.venv gave 1156 passed, 5 skipped; the doubles fire every hook by hand and pytest.ini keeps the pz_integration tests behind -m pz_integration, so this result cannot prove in-game behaviour. The documents are honest about this. The point for closure is that this verdict covers the service logic only, and the core premise of the product (a client connects, a spawn lands, a kill is attributed) stays open until the README procedure is run.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "A9",
+      "severity": "nit",
+      "file": "service/transport.py",
+      "line": 241,
+      "summary": "A partial write to the in file corrupts the next command",
+      "evidence": "CommandChannel.write raises on a short os.write but leaves the fragment in the file (transport.py:241-246). The next command is appended to that fragment without a newline, decodeJson rejects the merged line and acceptCommandLine silently drops it, so two commands are lost, and ack stays below last_seq, which keeps in from being truncated until a later command is acked. Journal._append handles this same case by truncating to the last good offset (journal.py:108-113). This needs ENOSPC or a quota, so it is rare, and the core recovers through cmd_timeout.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A10",
+      "severity": "nit",
+      "file": "ui/app.js",
+      "line": 333,
+      "summary": "The invite URI is built without encoding",
+      "evidence": "pzduel://join?host=...&pw=${inv.password} is interpolated raw at ui/app.js:333 and :366. _check_ini_value (engine.py:198) accepts '&', '#' and spaces in a chosen password, so such a password yields a broken QR code and copied link. Fix: use encodeURIComponent.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A11",
+      "severity": "nit",
+      "file": ".gitignore",
+      "line": 1,
+      "summary": "The reviewed work is uncommitted, so the requested diff is empty",
+      "evidence": "HEAD equals the branch point 5ae0e1c, so 'git diff 5ae0e1c..HEAD' prints nothing: all the listed files exist only as worktree changes (33 entries in git status, HEAD detached). I reviewed the worktree files directly. No commit identifies what this verdict covers, and the same content could change without trace. Fix: commit the campaign result before recording closure.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ],
+  "verdict": "REQUEST_CHANGES"
+}
+READ:065546600174a5f6
+READ: /tmp/review-phase1-cloture-1

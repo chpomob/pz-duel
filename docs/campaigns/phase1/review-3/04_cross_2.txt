@@ -1,0 +1,160 @@
+{
+  "findings": [
+    {
+      "id": "X8",
+      "severity": "major",
+      "original_id": "A1",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 597,
+      "summary": "Countdown completion never rechecks participant readiness",
+      "evidence": "_countdown_over checks only the deadline, and _advance returns immediately once a countdown exists (1122-1124), bypassing its subsequent both_here check. Thus, even if a later heartbeat removes the dead participant from players, the engine still enters running. This strengthens A1 without assuming that corpses remain online. However, automatically awarding a loss for every historical lobby death would require a policy for respawn: DuelCore.lua:517-518 explicitly clears the death latch when the player is alive again.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X9",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "CHALLENGE",
+      "file": "docs/campaigns/phase1/spec.md",
+      "line": 230,
+      "summary": "The wait and unchanged hash are explicit degradation policy",
+      "evidence": "The specification explicitly requires the per-match window at line 230, publication of withdrawn atoms at 231, and states at 232: 'La table scellée et son hash ne changent pas, et le rejeu refait ce retrait depuis les atom_withdrawn.' Therefore, the stable hash does not establish an integrity or reproducibility defect. The stale UI summary remains a usability issue, but caching proof or substituting health deltas changes the agreed observation contract; neither is a required implementation correction under AC67.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "X10",
+      "severity": "major",
+      "original_id": "A3",
+      "action": "CHALLENGE",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 309,
+      "summary": "A fixed settling delay cannot guarantee complete final observations",
+      "evidence": "Beyond the normal buffering race already identified in round 1, flushOut returns without clearing outLines when getFileWriter fails (311-315). Flushing also depends on step being scheduled (937-981). Consequently, FLUSH_MS is not an unconditional delivery bound under stalls or write failures: waiting one interval plus a margin can still omit facts. Immediate death flushing also leaves buffered kills unresolved. Because omitted facts can change the winner, minor understates the impact. A bounded settlement policy needs an explicit completeness signal or a defined failure outcome.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X11",
+      "severity": "minor",
+      "original_id": "A4",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 1077,
+      "summary": "Duplicate-name rejection is documented, logged, and recoverable",
+      "evidence": "README.md:31 explicitly requires different usernames. _refuse_player publishes a warning to state.logs (1088-1090), and ui/app.js:100 and 346-351 render those logs, so there is a visible diagnostic. B remains unbound after rejection; reconnecting B with a unique username satisfies _identify without cancelling the match. A clearer lobby message would help, but 'deadlock with no visible cause' overstates the behavior, and removing the check changes a documented identity constraint.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X12",
+      "severity": "minor",
+      "original_id": "A5",
+      "action": "VALIDATE",
+      "file": "service/rules.py",
+      "line": 984,
+      "summary": "Suspect servers also continue receiving effects",
+      "evidence": "An additional consequence supports A5: _apply_state treats only RESTARTING as unavailable for command delivery (984-989), while _may_send gates only on that restarting set (1050-1052). The suspect state submitted by engine.py:817 therefore continues admitting commands toward a frozen server, consuming budgets until results time out. If sufficient match time remains, _absence_end can then award a forfeit. This is a design concern rather than noncompliance: spec.md:401 explicitly makes heartbeat silence count as player absence.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X13",
+      "severity": "minor",
+      "original_id": "A6",
+      "action": "CHALLENGE",
+      "file": "service/main.py",
+      "line": 110,
+      "summary": "Orphan risk concerns abrupt termination, not every service exception",
+      "evidence": "main wraps serve_forever in finally and calls engine.shutdown (110-115), so an ordinary Python exception escaping that loop still triggers cleanup. Unhandled SIGHUP and abrupt process death remain uncovered. Also, persisting process-group numbers alone is unsafe: servers.py:372-379 explicitly recognizes that an extinguished group number can be reused. Recovery must establish process identity before signalling a stored group; a bare PGID file is insufficient.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X14",
+      "severity": "minor",
+      "original_id": "A7",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 227,
+      "summary": "Adding arbitrary player passwords to the shared redactor can break events",
+      "evidence": "The console-echo leak remains conditional because no real console example was supplied. The proposed fix also needs care: _check_ini_value accepts a one-character password such as 'a', while _redacted replaces both mapping keys and values before _take_event reads event['data'] (999-1005, 1035). Assuming player passwords are simply added to this shared Redactor, 'data' would be renamed and event processing would fail. A short-password heartbeat test would confirm this regression; separating output redaction from structured event processing would avoid it.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X15",
+      "severity": "minor",
+      "original_id": "A8",
+      "action": "VALIDATE",
+      "file": "docs/campaigns/phase1/spec.md",
+      "line": 566,
+      "summary": "AC19 also requires observations that the journal checker cannot establish",
+      "evidence": "AC19 explicitly requires spawn visibility at the client and says that visibility remains 'constatée par le joueur'. tests/test_integration_pz.py likewise documents that live_checklist_gaps cannot establish visible spawning or consistently correct refusals. Consequently, even a passing supplied-journal checklist would not alone close AC19; recorded player observations are also required. This is a stronger acceptance boundary than merely distinguishing skipped integration tests from passing unit tests.",
+      "confidence": "high",
+      "basis": "spec"
+    },
+    {
+      "id": "X16",
+      "severity": "nit",
+      "original_id": "A9",
+      "action": "VALIDATE",
+      "file": "service/transport.py",
+      "line": 241,
+      "summary": "The malformed command consumes the next line but does not permanently block recovery",
+      "evidence": "The Lua parser independently confirms the failure mechanism: decodeJson rejects trailing or malformed content (DuelCore.lua:277-280), and acceptCommandLine returns before advancing lastCmdSeq for invalid JSON (806-815). The merged fragment therefore produces neither acknowledgement nor result. Recovery is nevertheless bounded once a later standalone command succeeds: poll_ack accepts its higher sequence and truncates in when it equals last_seq (transport.py:265-272). This supports the defect while limiting it to lost commands and timeout reporting rather than a permanent channel deadlock.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X17",
+      "severity": "nit",
+      "original_id": "A10",
+      "action": "VALIDATE",
+      "file": "ui/app.js",
+      "line": 333,
+      "summary": "Supported passwords can change the invitation URI structure",
+      "evidence": "For the accepted password 'a#b', both renderQr at line 333 and copy-link at 366 produce pw=a#b&code=..., placing the remainder after a fragment delimiter. The password input at 188 imposes only a length limit, so the normal UI admits this example. HTML escaping in the separately displayed password does not encode either URI. Both builders should share an encoded query construction.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X18",
+      "severity": "nit",
+      "original_id": "A11",
+      "action": "CHALLENGE",
+      "file": ".gitignore",
+      "line": 1,
+      "summary": "Missing commit provenance is an audit note, not a code defect",
+      "evidence": "The reported Git state was not independently verified under this round's file-reading restriction. Even assuming it is accurate, reviewing an uncommitted worktree does not invalidate observations against its contents. The supplied finding identifies no acceptance criterion requiring a commit, and .gitignore does not establish repository status. An immutable snapshot or content digest could identify the reviewed artifact as well; requiring a commit specifically should remain a process recommendation.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X19",
+      "severity": "major",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "ui/app.js",
+      "line": 302,
+      "summary": "The final screen can announce the wrong winner",
+      "evidence": "renderOver computes its verdict exclusively from S.score and never reads S.result.outcome or S.result.winner (300-319). However, rules.py:1019-1021 awards a death victory to the surviving side regardless of score, and engine.py:833-839 produces invalidations and forfeits. For example, A leading on score but dying produces winner=B in the service while the final screen displays 'victoire de A'. An invalidated match can likewise be presented as a victory or draw.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X20",
+      "severity": "major",
+      "original_id": "none",
+      "action": "ADD",
+      "file": "service/rules.py",
+      "line": 849,
+      "summary": "Events occurring after the timer deadline can change the result",
+      "evidence": "run_tick processes all queued events before checking the timer (849-857). _is_fatal checks only t_ms >= t0 (878-881), and RuleEvaluator.feed rejects negative event time but imposes no match-end bound (598-600). If the final pump is delayed until 30.25 seconds in a 30-second match and reads a death dated 30.1 seconds, that death is processed before the overdue timer and yields outcome=death. A kill dated after the deadline can similarly change the final score. This is the converse of A3: draining later observations can admit facts outside the match, so a settlement fix also needs a source-time cutoff.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

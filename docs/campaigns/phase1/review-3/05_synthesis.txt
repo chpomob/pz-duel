@@ -1,0 +1,141 @@
+# Phase 1 Closure Review: Synthesis
+
+## Verdict
+
+**REQUEST_CHANGES**
+
+## Summary
+
+The service logic is well tested, but phase 1 should not close yet. Five major findings remain open, and four of them can give a player the wrong outcome. A death before t0 is never judged. The final screen works out the winner from the score alone, so it contradicts the service on sudden death. A conclusion can miss facts still in the mod's write buffer. Events dated after the deadline can still change the result. The fifth major is a design cost: on the default preset, a match stalls for 120 s and loses an advertised rule unless both players get wounded first.
+
+The Inspector's APPROVE carries no weight. It reports an empty diff, and its `read_files` lists only the worktree root. Cross-Review 1 was right to challenge it: the requested range is empty because HEAD is detached at 5ae0e1c, while the real work sits in the worktree. The Architect's REQUEST_CHANGES stands, and Cross-Review 2 adds two majors (X19, X20). This synthesis received four passes, not the five announced: Architect, Inspector and two cross-reviews.
+
+I checked the disputed claims against the worktree, reading the cited sections rather than whole files. `~/pz-duel/.venv/bin/python -m pytest -q` gave 1156 passed, 5 skipped. These tests use doubles, so they prove nothing about real-game behaviour. Direct MatchCore probes reproduced X20 and the core half of X5. `service/`, `mods/`, `ui/`, `tests/` and `README.md` are identical to master 267efad. Master differs in the reviewed docs in two ways: it adds `F14.md` and 22 lines to `limites-connues.md`. No commit contains the F14 code fix. The brief only plans A1, A2 and A3, and the six minors accepted on master do not include X5, X19 or X20.
+
+## Epistemic Distribution
+
+Counts cover the 16 retained, deduplicated findings.
+
+| Confidence | Count |
+|---|---|
+| high | 12 |
+| medium | 3 |
+| low | 1 |
+
+| Basis | Count |
+|---|---|
+| spec | 2 |
+| code | 13 |
+| inference | 1 |
+| external | 0 |
+
+**Inference-only findings: 1** (m6). It needs corroboration and has no effect on the verdict. The verdict would still be REQUEST_CHANGES without it.
+
+The supplied distribution (7 high, 3 medium, 1 low; 8 code, 2 spec, 1 inference) covers only the Architect's 11 findings. The counts above add five cross-review findings, all high/code: X5, X6, X7, X19 and X20.
+
+Merged findings keep the label of the primary finding. No retained label was changed, and no labels were missing or invalid. Where merged reviewers disagreed:
+- A3 stays high over X4's medium, because the Architect ran probes through the real Engine.
+- A7 stays low over X14's medium, because the console echo remains unobserved.
+- A5 and A9 stay medium. X12 and X16 confirm the code paths, but neither scenario was run.
+
+## Critical Findings
+
+No blockers. X1 was raised as a blocker, but it challenges a review verdict and is not a product defect. The challenge is valid, and it is resolved by voiding the Inspector's APPROVE. Its side note also holds: `git rev-parse --verify main` fails here, and the branch is `master`.
+
+### M1. Major: a death before t0 is never judged, and the match runs on with a dead participant [high/code]
+
+`service/engine.py:601`, `service/engine.py:1045`, `service/engine.py:1122`, `service/rules.py:878`, `mods/duelcore/42.21/media/lua/server/DuelCore.lua:499`. Merges A1, X2, X8.
+
+- **Risk: confirmed.** The Architect probed it through the real Engine, and Cross-Review 1 probed it on MatchCore.
+- **Requirement:** `spec.md:393` makes a `player_death` an immediate `death` outcome, with no exception for the lobby or countdown.
+- **Mechanism:** before running, `_take_event` only journals the event. `_enter_running` builds a fresh core, and `_is_fatal` requires `t_ms >= t0`. The mod latches the death, so it does not report it again.
+- **X8 strengthens this:** `_advance` returns as soon as a countdown exists, so `both_here` is never rechecked. A participant who has left `players` still enters running.
+- **Exposure:** README step 2 tells players to get wounded in the lobby, which widens the window beyond the 3 s countdown.
+- **Open question:** real behaviour of a dead participant is unverified. `DuelCore.lua:517` clears the latch when the player is alive again, so the fix must define a respawn policy before judging lobby deaths. A countdown-only rule, or a refusal to launch, avoids penalising a lobby death followed by a respawn.
+
+### M2. Major: the final screen can announce the wrong winner [high/code]
+
+`ui/app.js:300`. From X19, unchallenged.
+
+- **Risk: confirmed by reading.** `renderOver` derives the verdict from `S.score` only, and `ui/app.js` never reads `S.result`, although `/api/state` publishes it (`service/state.py:113`).
+- **Effect:** `_death_result` (`service/rules.py:1019`) awards the survivor regardless of score. If A leads and dies, the service says B won and the screen says "victoire de A".
+- **Same fault elsewhere:** forfeits and invalidated matches are shown as a score win or a draw.
+- **Fix:** render `S.result.outcome`, `winner` and `reason`.
+
+### M3. Major: a conclusion can ignore facts still in the mod's write buffer [high/code]
+
+`mods/duelcore/42.21/media/lua/server/DuelCore.lua:309`, `mods/duelcore/42.21/media/lua/server/DuelCore.lua:977`, `service/engine.py:623`. Merges A3, X4, X10.
+
+- **Risk: confirmed by the Architect's Engine probes.** With A's death dated 400 ms after B's and flushed first, the player who died first won. A kill dated before the timer but flushed after it was dropped, leaving a 0-0 draw.
+- **Severity raised from minor to major.** X10's challenge is valid: the winner can change on flush phase alone.
+- **A fixed delay is not enough.** `flushOut` returns without clearing `outLines` when `getFileWriter` fails, and flushing depends on `step` being scheduled. `FLUSH_MS` is therefore not a delivery bound. The fix needs a completeness signal or a defined failure outcome.
+- **F14 gap:** the planned wait-and-reread does not cover the stall case, and it must be designed together with M4.
+
+### M4. Major: events dated after the deadline can change the result [high/code]
+
+`service/rules.py:849`, `service/rules.py:878`, `service/rules.py:598`. From X20, unchallenged.
+
+- **Risk: confirmed by my probe on the worktree.** In a 600 s match, I advanced to tick 2399, submitted an event dated 600.1 s, then advanced to 600.25 s. A death gave `outcome=death, winner=B`, and a kill gave `win, winner=A` at 1-0.
+- **Mechanism:** `run_tick` processes queued events before the timer check, and neither `_is_fatal` nor `RuleEvaluator.feed` has an upper bound.
+- **Trigger:** the event must be read before the final tick runs, so a late pump is what exposes it. Frequency in real play is unmeasured.
+- **Fix:** add a source-time cutoff at `t0 + duration`. Implement it with M3, because draining more data at the end widens this exposure.
+
+### M5. Major: the hook proof is paid per match, so default games stall 120 s and lose an advertised rule [high/spec]
+
+`service/engine.py:290`, `docs/campaigns/phase1/spec.md:230`, `service/presets/duel_rapide.json:21`. Merges A2, X3, X9.
+
+- **Risk: confirmed by reading.** Unless both players deliberately bleed, `duel_rapide` and `pression` wait out `hook_window_s`, then withdraw `damage_taken`. That drops `hurt_supply`, and in `pression` also `untouched_minute` and the combo. README:59 confirms it.
+- **X9 is partly valid.** `spec.md:230-232` mandates the per-match window and an unchanged sealed hash, so this is a design finding and not noncompliance. The stable `rules_hash` is withdrawn as a defect. The severity stays major because the player impact is undisputed: every ordinary default game pays it, and the summary still advertises the rule.
+- **Decision required:** the F14 brief asks for proof per build, and for the played table to be "scellée dans `rules_hash`". That contradicts `spec.md:232` and AC67, so the spec must be amended first. X3's code label is kept as spec, since the disputed point is what the spec requires.
+- **Open risk:** `limites-connues.md` says it is unproven that `BodyDamage.Update` runs on the server. If it does not, the atom is withdrawn from every match.
+
+## Minor Findings
+
+### Minor
+
+**m1. A read failure at the end of the timer hangs the match with no `match_end`** [high/code]. `service/rules.py:814`. From X5.
+Risk: core half confirmed by my probe; the Engine composition is confirmed by reading only. After a submitted end at the last pre-timer tick, `advance_short_of_end` returned no records at +0 ms, +250 ms, +5 s and +1 h, with `result=None` and `conclusion_due=True`. The time cap ignores `_submitted_end`, contrary to the method's docstring. `_transport_failed` submits the end (`service/engine.py:744`), but `_reading_behind` keeps `_pump_match` on this path. The trigger window is narrow. This is not covered by F14 or by `limites-connues.md`.
+
+**m2. Phase closure rests on a real-mode path never run with a connected player** [high/spec]. `README.md:107`, `docs/campaigns/phase1/spec.md:566`. Merges A8, X15.
+Risk: confirmed and documented. AC19 stays open. X15 is valid: a passing journal checklist would not close it alone, because client-side spawn visibility must be recorded by a player. This verdict covers service logic only. The core premise (a client connects, a spawn lands, a kill is attributed) is unproven.
+
+**m3. A hung server becomes a forfeit against its player** [medium/code]. `service/engine.py:819`, `service/rules.py:984`. Merges A5, X12.
+Risk: confirmed by reading, scenario not run. `suspect` triggers no restart, and `_may_send` blocks only `restarting`, so commands keep flowing to a frozen server. This conforms to `spec.md:401`, so it is a design concern. Accepted for phase 2 on master.
+
+**m4. Duplicate usernames leave the lobby waiting** [high/code]. `service/engine.py:1076`. Merges A4, X11.
+Risk: confirmed. X11's challenge is valid, and "deadlock with no visible cause" is withdrawn. `_refuse_player` writes a warning that `renderLogs` displays. `README.md:33` states the rule (X11 cites line 31, which is wrong). Reconnecting under another name recovers the lobby. What remains is that the lobby has no blocking message or timeout. A4's proposed fix of removing the check conflicts with that documented rule. Master's wording "rien dans l'UI ne dit pourquoi" overstates the problem too.
+
+**m5. Servers are orphaned on SIGHUP or abrupt service death** [medium/code]. `service/main.py:21`, `service/servers.py:273`. Merges A6, X13.
+Risk: confirmed by reading. X13's correction is valid: an ordinary exception reaches the `finally` at `service/main.py:110` and shuts down cleanly, so the scope is SIGHUP and abrupt death. A stored PGID alone is unsafe, because a number can be reused (`service/servers.py:372`). Recovery must establish process identity first. Accepted on master, whose "crash" wording should be narrowed the same way.
+
+**m6. The Redactor does not cover player passwords** [low/inference]. `service/engine.py:1692`. Merges A7, X14.
+Risk: unverified, needs corroboration. It assumes PZ echoes the password to its console; a real server log would settle this. X14's caution on the fix is sound by reading: `_check_ini_value` accepts a one-character password, and `_redacted` rewrites mapping keys, so a password of `a` could corrupt the `data` key. Separate output redaction from structured event processing. Accepted on master.
+
+### Nits
+
+**n1. The invite URI is built without encoding** [high/code]. `ui/app.js:333`, `ui/app.js:366`. Merges A10, X17.
+A password such as `a#b` moves the rest of the URI into a fragment. Both builders should share `encodeURIComponent`. Accepted on master.
+
+**n2. Every server restart can journal a false `ack_foreign_boot`** [high/code]. `service/transport.py:306`. From X6.
+`prepare_restart` leaves the old `ack` file while `boot` rises, and `poll_ack` reports any boot mismatch. Impact is one misleading journal line. Truncating `ack` there removes it.
+
+**n3. A partial write to `in` corrupts the next command** [medium/code]. `service/transport.py:241`. Merges A9, X16.
+Two commands are lost, but X16 shows recovery is bounded once a later standalone command is acked, so the channel does not deadlock. It requires ENOSPC or a quota. Accepted on master.
+
+**n4. One test fails when pytest lives in the user site** [high/code]. `tests/test_integration_pz.py:167`. From X7.
+This is a test-environment issue, seen under `/usr/bin/python3`. The configured venv is green (1156 passed, 5 skipped).
+
+**n5. The reviewed worktree is detached and uncommitted** [high/code]. `.gitignore:1`. Merges A11, X18.
+X18 is right that this is a process note, not a code defect. A11's claim that no commit identifies the content is refuted for code: master 267efad holds the same `service/`, `mods/`, `ui/` and `tests/` content. X18's own basis was inference and is superseded by this comparison. Record closure against a commit, and note that the worktree's docs lag master.
+
+## Operational Risk Assessment
+
+- **Result integrity:** until M1 to M4 are fixed, any result that turns on the last second, or on a death, needs checking against the journal rather than the final screen.
+- **Real environment unproven:** client connection with `-nosteam`, spawn visibility, kill attribution and server-side `BodyDamage.Update` have never been exercised. Run the README procedure before any closure claim, and keep the player's observations alongside the journal.
+- **Launch time:** plan for a 120 s lobby wait and a reduced rule table on `duel_rapide` and `pression` until M5 is decided.
+- **Failure modes:** a disk or permission failure late in a match can leave it running at 0 until cancelled (m1). A frozen server costs its player the match (m3). Terminal closure leaves two java groups holding ports, and the next preflight then refuses to start (m5). Each server takes 2 GB, so orphans also consume the memory budget.
+- **Assumptions that may not hold:** the service assumes a single-user machine, since the local API has no token and secrets are visible in `ps`. It also assumes file writes stay reliable and that `step` keeps being scheduled. M3 shows the second assumption decides match outcomes.
+- **Sequencing:** fix M3 and M4 together, since one drains more data and the other bounds it. Amend the spec before M5. Add M2, M4 and m1 to the F14 scope, as the brief does not cover them.
+
+READ:065546600174a5f6
+READ: /tmp/review-phase1-cloture-1/service/engine.py, service/rules.py, service/transport.py, service/main.py, service/servers.py, service/state.py, ui/app.js, mods/duelcore/42.21/media/lua/server/DuelCore.lua, docs/campaigns/phase1/spec.md, docs/campaigns/phase1/limites-connues.md, README.md
