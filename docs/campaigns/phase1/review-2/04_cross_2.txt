@@ -1,0 +1,112 @@
+{
+  "findings": [
+    {
+      "id": "X6",
+      "severity": "blocker",
+      "original_id": "A1",
+      "action": "VALIDATE",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 437,
+      "summary": "The reported hook mismatch has no alternative damage detector to rescue startup",
+      "evidence": "The Lua handler emits damage_taken and its hook proof only for player targets, and registration uses selfProved=true, preventing generic receipt of the hook from supplying proof. Although emitBeat publishes health, engine.py:968-974 only updates identity, presence and world age; it does not derive damage from health changes. effects.json requires this hook, and engine.py:1074-1095 revalidates after withdrawal. Assuming the supplied 42.21.0 bytecode analysis is complete, the documented Duel rapide procedure therefore fails closed. The bytecode was not independently inspected; a real zombie hit producing the proof would refute the unreachability premise.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X7",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 1005,
+      "summary": "A spawn KO can be recorded without invoking the spawn API",
+      "evidence": "DuelCore.lua applyCommand checks refusalReason before calling the handler, so asleep and in_vehicle return refused without reaching addZombiesInOutfit. Likewise, spawnGroup returns no_square before spawnAt. Nevertheless, engine.py:1005-1013 permanently marks these results KO, and _send_probes excludes any side already present in _probes. tests/test_match.py:104-137 explicitly expects an asleep refusal to stop both servers. This confirms an intentional but coarse readiness policy. As README explains, solo_ipc is only reported; no fallback implementation is launched.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X8",
+      "severity": "minor",
+      "original_id": "A3",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 1629,
+      "summary": "Missing terminal results do not erase all previously recorded scores",
+      "evidence": "_publish_match at engine.py:891-896 copies core scores into state.score. The failure path through _finish_match and _fail changes phase and error without clearing that score, and does not delete earlier journal records. Thus A3 overstates the loss: the terminal result and potentially unpublished progress are missing, while the last published score and written journal prefix survive. Also, submit_end cannot guarantee a durable match_end during storage failure: _conclude explicitly tolerates that write failing at lines 864-868. Preserving an in-memory invalidated result remains a useful improvement.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X9",
+      "severity": "minor",
+      "original_id": "A4",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 1278,
+      "summary": "Wall-clock discontinuities also affect startup deadlines",
+      "evidence": "The default clock is time.time. Besides running timers, _send_probes computes its deadline from now_ms at line 1052, ContractWindow compares the same clock against its hook deadline, and countdown completion compares it with _countdown_end_ms. A forward adjustment can therefore expire startup windows prematurely; a backward adjustment prolongs them. The claimed simultaneous absence is conditional: pump reads out before _absence_end, so newly received player beats can reset _seen_ms to the adjusted time. This qualification does not remove the clock-domain problem.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X10",
+      "severity": "minor",
+      "original_id": "A4",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 956,
+      "summary": "Replacing only the service clock requires checking event timestamp alignment",
+      "evidence": "The proposed wall-anchored monotonic clock would keep service time continuous, but DuelCore.lua emit timestamps events with getTimestampMs, and _take_event forwards those timestamps unchanged into MatchCore. Assuming getTimestampMs follows the adjusted host wall clock, a clock step would separate event timestamps from the service timeline. Lua also schedules reads, beats and pending commands with getTimestampMs, so its own scheduling could still jump. A complete remedy needs separate pacing and event-time handling. Injecting a clock offset independently into the service and emitter would confirm or refute this concern.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X11",
+      "severity": "minor",
+      "original_id": "A5",
+      "action": "VALIDATE",
+      "file": "service/api.py",
+      "line": 153,
+      "summary": "The API checks browser headers rather than local-user authorization",
+      "evidence": "_refused accepts an allowed Host with no Origin because its origin check iterates an empty list. After that check, do_POST calls engine.action without any credential or session check, so local callers can start and cancel matches. Independently, servers.py:171-172 places the admin password directly in argv. The 0600 INI protection does not establish equivalent protection for these interfaces. README documents the client password in ps, while the inspected limitations document describes only client launching. Visibility of another user's argv remains dependent on host process-access policy.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X12",
+      "severity": "nit",
+      "original_id": "A6",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 1326,
+      "summary": "Client launching also bypasses the service shutdown guard",
+      "evidence": "action dispatches real open_game before inspecting phase or _closing. _open_game_real checks only the retained password and keeps no process handle or launch-in-progress flag. Consequently, concurrent requests can launch multiple clients, and setting _closing during shutdown does not prevent a subsequent client launch. launch_client intentionally detaches the process and returns after its startup grace. Any phase restriction should preserve an appropriate running-phase reconnect path, given the engine's disconnect grace.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X13",
+      "severity": "nit",
+      "original_id": "A7",
+      "action": "CHALLENGE",
+      "file": "tests/test_match.py",
+      "line": 1190,
+      "summary": "Remove the H3 rationale while retaining delayed-heartbeat recovery coverage",
+      "evidence": "README contradicts the empty-server premise, and runtime.json explicitly sets PauseEmpty=false. However, the test manually withholds A's first post-restart heartbeat while advancing B; this still exercises a useful delayed-observation case. _track_age at engine.py:794-800 rebases on the first available heartbeat without checking player presence, so its implementation does not require H3. Correcting comments is justified, but making this test emit immediate heartbeats would remove coverage rather than establish a necessary behavioral correction.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X14",
+      "severity": "major",
+      "original_id": "A1",
+      "action": "ADD",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 461,
+      "summary": "A countdown death may consume the death notification before arbitration starts",
+      "evidence": "reportDeath latches deadPlayers[name], and checkDeaths suppresses further notifications until that player is observed alive. Meanwhile, engine.py:951-956 journals pre-running events without submitting them to a core, and _enter_running creates a fresh core without forwarding those deaths. Thus a death processed during lobby or countdown is not re-emitted when running begins. The outcome risk assumes the dead player remains online and MatchCore does not independently adjudicate beat.hp; those behaviors were not established by the permitted reads. A countdown-death test should verify that starting with a dead participant is rejected or adjudicated.",
+      "confidence": "medium",
+      "basis": "inference"
+    }
+  ]
+}

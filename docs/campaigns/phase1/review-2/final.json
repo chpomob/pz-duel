@@ -1,0 +1,529 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "status": "complete",
+  "summary": "# Phase 1 final review: synthesis report\n\n## Verdict\n\n**REQUEST_CHANGES**\n",
+  "findings": {
+    "blocker": 1,
+    "minor": 6,
+    "nit": 2
+  },
+  "finding_details": [
+    {
+      "id": "A1",
+      "severity": "blocker",
+      "file": "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+      "line": 437,
+      "summary": "damage_taken cannot fire in a duel, so the default preset can never leave the lobby in real mode",
+      "evidence": "Source: build 42.21.0 projectzomboid.jar, disassembled with javap on 2026-11-06. The string OnWeaponHitCharacter is triggered in exactly one place: zombie/characters/IsoGameCharacter.Hit(HandWeapon, IsoGameCharacter, float, boolean, float, boolean). The only callers found are WeaponHit.process (used by the PlayerHitZombie, PlayerHitPlayer, PlayerHitCharacter and PlayerHitAnimal packets), CombatManager.attackCollisionCheck (called only from SwipeStatePlayer) and IsoZombie.Hit. A zombie hitting a player takes another path: ZombieHitPlayerPacket.process -> Bite.process -> BodyDamage.AddRandomDamageFromZombie, and Bite contains no call to Hit (AttackState and FakeDeadAttackState also call AddRandomDamageFromZombie directly). So the hook fires only for a weapon hit by a player. onWeaponHitCharacter discards every non-player target (DuelCore.lua:438), and MaxPlayers=1 (runtime.json) with separate worlds leaves no second player to strike the first. hook_seen(OnWeaponHitCharacter) is therefore never emitted. Consequence in code: effects.json makes this hook the proof for damage_taken; ContractWindow withdraws the atom at the deadline; _close_window (engine.py:1074) revalidates with active_atoms and refuses the table. duel_rapide, the default preset (engine.py:1446), and pression both list damage_taken, so each ends in error after hook_window_s. Only demo and hardcore can reach the countdown. README 'Proc\u00e9dure de verdict en jeu' step 2 ('Faites-vous frapper par un zombie') cannot succeed, so AC19 cannot be closed by the documented procedure. This turns the earlier A4 concern (silent loss) into a certain refusal. The 1044 passing tests do not see it, because tests/test_lua_attribution.py:282 fires the hook by hand with a player target and tests/doubles/fake_mod.py:106 emits hook_seen itself. Not run with a real player: the conclusion is from bytecode only, and one zombie hit in a real session would confirm it. Fix: detect damage from a signal on the zombie path, such as a server-side health or BodyDamage delta in step(), or OnPlayerGetDamage (triggered in BodyDamage.Update and in Hit, but whether it runs on the server is unverified), and make that signal the hook_proof. Until then, drop damage_taken from the default preset.",
+      "confidence": "high",
+      "basis": "external"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 1005,
+      "summary": "A one-shot spawn probe turns a transient refusal into a torn-down launch and a solo_ipc fallback",
+      "evidence": "_send_probes sends one probe per side at first connection, and _take_probe_result marks any status other than applied as KO. _failed_probes then stops both servers and publishes fallback(KO, ...) = solo_ipc, the branch meaning server spawning does not work. The mod also answers refused (no_player, asleep, in_vehicle) and failed/no_square when PLACE_ATTEMPTS finds no free square, for example if chunks 30-60 tiles out are not loaded yet just after connecting. None of these says addZombiesInOutfit is broken. This matches the spec ('ko si elle revient autrement', spec.md:480-482; AC57), so the weakness is in the design as well as the code. Assumption: such states can occur at first connection; the README only records probe_spawn ending refused with no player. A real connection would confirm how often. Fix: retry within probe_timeout_s on refused and no_square, and keep KO for a persistent failure or a definite spawned=0.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 633,
+      "summary": "Unguarded file I/O in the running pump discards a match with no match_end or result",
+      "evidence": "Journal writes in the match are protected by _write_safely so that a disk failure cannot lose the result, but the transport calls in the same pump are not. _on_server_exit calls prepare_restart (engine.py:633), which truncates in and rewrites session; poll_ack calls _truncate_in outside its try (transport.py); OutReader._read_from_offset catches only FileNotFoundError. Any other OSError propagates through pump and _drive_match to the generic handler in _run_real, which reports 'lancement impossible' for a match already running. _finish_match then calls _fail, because match.result is None: no match_end is written and the scores held by MatchCore are lost. The failure is also left unhandled exactly when a server has just crashed, the moment _on_server_exit runs. _unavailable has already been updated at that point. Fix: catch OSError in these calls during running and submit_end an invalidated result naming the cause, so the journal always closes.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 1278,
+      "summary": "Match cadence and absence timers run on the wall clock, so a clock step can end or freeze a match",
+      "evidence": "Engine defaults to time.time (engine.py:1278), and _drive_match feeds it to pump (engine.py:1599). That one value drives MatchCore.advance, _watch_beats and _absence_end. A forward step of at least disconnect_grace_s (120 s in all presets), from NTP correction or suspend/resume, makes both sides look absent and invalidates the match, and advance also catches up every skipped tick. A backward step stops last_tick from rising, so the timer freezes until the clock catches up. Wall time is needed to compare with the mod's t_ms, but not to pace ticks. Assumption: the host clock can step during a 25-minute match, which is plausible on a desktop but untested. Fix: anchor t0 on the wall clock once and derive now_ms from time.monotonic, keeping replay inputs unchanged.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A5",
+      "severity": "minor",
+      "file": "service/api.py",
+      "line": 215,
+      "summary": "The single-user-machine assumption behind the local API and argv secrets is undocumented",
+      "evidence": "_refused only stops browsers: any local process that sends Host: 127.0.0.1:<port> with no Origin gets /api/state, whose config holds both player passwords (host_password and password), and can POST start or cancel. No token is required. servers.py:171 also puts the admin password on the server's argv, visible in ps to other local users, while the README only warns about the client password. Assumption: the host is a single-user desktop, in which case the exposure is small. On a shared machine, any local account could read the passwords and drive the duel. Fix: state the assumption in the README and limites-connues.md, or add a per-run token issued in the URL printed at startup, and strip host_password from /api/state outside the lobby.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A6",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 1411,
+      "summary": "open_game has no phase guard and can launch clients at servers that are down",
+      "evidence": "_open_game_real checks only that config holds a password, and config survives over, error and cancel (_cancel_state does not clear it). Pressing the action in those phases, or during preflight, starts an untracked client aimed at a stopped server. Each call runs outside the lock and blocks its HTTP thread for 2 s, so repeated calls start several clients. Fix: accept only lobby-related phases and refuse a second launch while one is alive.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A7",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 548,
+      "summary": "Comments and the spec still state H3 after the README recorded it as contradicted",
+      "evidence": "README 'Premier contact' says H3 is contradicted: with PauseEmpty=false an empty server ticks and beats every 10 s. engine.py:548 and engine.py:791 still give 'un serveur vide ne tique pas' as the reason for their behaviour, spec.md:127 still asserts it, and tests/test_match.py:1190 models that behaviour. In _track_age the stated reason is now false: the first beat after a restart no longer waits for the player to reconnect. Behaviour looks acceptable, but the next reader will reason from a disproved premise. Fix: update the comments and spec, and make the test double match the observed behaviour.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "B1",
+      "severity": "minor",
+      "file": "service/api.py",
+      "line": 196,
+      "summary": "A partial request body holds a handler indefinitely",
+      "evidence": "_body calls rfile.read(length) without a socket timeout or read deadline. A client can declare an allowed Content-Length, send fewer bytes, and keep the connection open indefinitely. make_server uses ThreadingHTTPServer, so repeated connections retain unbounded threads and sockets. do_POST also performs this read before checking Host or Origin. Bound request reads with a deadline and return an explicit timeout response.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "B2",
+      "severity": "minor",
+      "file": "service/transport.py",
+      "line": 83,
+      "summary": "An unterminated output record is repeatedly read without bounds",
+      "evidence": "_read_from_offset calls handle.read() without a size limit, while poll advances offset only past complete newline-terminated records. A growing unterminated tail is therefore allocated and scanned again on every poll. A sufficiently large malformed tail can exhaust memory or stall the match pump. Bound both bytes read per poll and record length, with explicit handling for oversized records.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ],
+  "epistemic_labels": {
+    "confidence": {
+      "high": 5,
+      "medium": 4,
+      "low": 0
+    },
+    "basis": {
+      "spec": 0,
+      "code": 5,
+      "inference": 3,
+      "external": 1
+    },
+    "combined": {
+      "high/external": 1,
+      "medium/inference": 3,
+      "medium/code": 1,
+      "high/code": 4
+    }
+  },
+  "epistemic_distribution": {
+    "confidence": {
+      "high": 5,
+      "medium": 4,
+      "low": 0
+    },
+    "basis": {
+      "spec": 0,
+      "code": 5,
+      "inference": 3,
+      "external": 1
+    },
+    "combined": {
+      "high/external": 1,
+      "medium/inference": 3,
+      "medium/code": 1,
+      "high/code": 4
+    }
+  },
+  "warnings": [],
+  "report": "docs/campaigns/phase1/review-2/review.md",
+  "source_diff": true,
+  "context": {
+    "ok": true,
+    "reason": "ok",
+    "thresholds": {
+      "min_chars": 1,
+      "min_tokens": 1,
+      "required_sections": [],
+      "min_source_lines": 1
+    }
+  },
+  "thresholds": {
+    "min_chars": 1,
+    "min_tokens": 1,
+    "required_sections": [],
+    "min_source_lines": 1
+  },
+  "complexity": {
+    "score": 2565142,
+    "level": "high",
+    "recommended_agents": 6,
+    "stats": {
+      "chars": 1487352,
+      "files": 83,
+      "source_lines": 25056,
+      "hunks": 108,
+      "requirements": 0,
+      "modules": 83
+    },
+    "tier": "high",
+    "max_agents": 6,
+    "summary": "high: 1487352 chars, 83 files, 25056 source lines, 108 hunks, 0 requirements, 83 modules"
+  },
+  "execution": {
+    "max_retries": 3,
+    "max_input_chars": 262144,
+    "max_output_chars": 131072,
+    "truncate_input": false,
+    "show_costs": false,
+    "concurrency": null,
+    "max_concurrency": 6,
+    "max_agents": 6
+  },
+  "parallel": {
+    "perspectives": [
+      "architect",
+      "inspector"
+    ],
+    "requested_concurrency": 6,
+    "max_concurrency": 6,
+    "effective_concurrency": 2
+  },
+  "attempts": [
+    {
+      "call": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 566.2749616480432,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1429,
+        "completion_tokens": 2230,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 193.66786037385464,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1137,
+        "completion_tokens": 3029,
+        "est_cost_usd": 0.0,
+        "estimated": false,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "call": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 195.780877599027,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1190,
+        "completion_tokens": 1740,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 382.5942941349931,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4471,
+        "completion_tokens": 2106,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 301.9364562188275,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 7317,
+        "completion_tokens": 4063,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "cap_events": [
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 697501,
+      "truncated": true
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 341487,
+      "truncated": true
+    }
+  ],
+  "calls": [
+    {
+      "label": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1429,
+        "completion_tokens": 2230,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "label": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "ok": true,
+      "returncode": 0,
+      "stderr": "Reading additional input from stdin...\nOpenAI Codex v0.163.0\n--------\nworkdir: /tmp/review-phase1-final-1\nmodel: gpt-6.1-sol\nprovider: openai\napproval: on-request\nsandbox: read-only\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1ae9a-2ee3-76c0-b7ce-f814f3e55825\n--------\nuser\nYou are an **Inspector** reviewer. Your focus is edge cases, bug-hunting, error handling, and code-level correctness.\n\nFor every piece of code you see, scrutinize:\n1. **Edge cases** \u2014 Boundary conditions, empty states, invalid inputs, overflow/underflow, null or default values. What happens at the limits?\n2. **Error handling** \u2014 Are errors propagated correctly or silently swallowed? Are failure modes logged with sufficient context? Can a single error cascade?\n3. **Resource management** \u2014 Memory leaks, unbounded growth, file descriptor exhaustion, unclosed handles, missing cleanup on error paths.\n4. **Race conditions and concurrency** \u2014 Data races, deadlocks, ordering assumptions, missing or incorrect synchronization primitives.\n5. **Input validation** \u2014 Deserialization safety, protocol parsing robustness, user input sanitization. Can malformed data cause crashes or security issues?\n\n# Git Workflow (Canonical)\n\nCanonical definition \u2014 personas reference this file instead of copying its\ntext; the library's `inject_persona` splices this text into every prompt that\ncarries the reference line, so the rules always reach the model.\n\n## Git workflow rules\n\n- BUILD phase: Write complete, working code on disk. All new and modified files will be staged and committed automatically by the orchestrator after you finish. Do NOT produce markdown code blocks, JSON, or text reports \u2014 produce ACTUAL FILES on disk. Sole exception: if the environment refuses disk writes outright (sandbox denial: the write tool blocks writing to disk \u2014 not a user-denied permission prompt, lint/hook rejection, or invalid path), fall back to complete source in markdown code blocks and state the fallback plus the refusa",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1137,
+        "completion_tokens": 3029,
+        "est_cost_usd": 0.0,
+        "estimated": false,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "label": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1190,
+        "completion_tokens": 1740,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "stderr": "Reading additional input from stdin...\nOpenAI Codex v0.163.0\n--------\nworkdir: /tmp/review-phase1-final-1\nmodel: gpt-6.1-sol\nprovider: openai\napproval: on-request\nsandbox: read-only\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1aea5-cfae-7350-b65f-a43322cd8ee6\n--------\nuser\nYou are a **Cross-Reviewer** \u2014 a devil's advocate. You have been shown another reviewer's findings and must VALIDATE, CHALLENGE, or ADD to each one.\n\nYour job:\n1. **VALIDATE** findings you agree with \u2014 confirm them with additional evidence\n2. **CHALLENGE** findings based on system constraints, design trade-offs, or alternative interpretations. A finding may be wrong if it ignores real-world operational constraints or overestimates what the system guarantees.\n3. **ADD** findings the original reviewer missed \u2014 especially around resilience, edge cases, security, and architectural assumptions\n\nFocus on cross-cutting concerns: reliability under load, failure modes, security boundaries, and operational realism. Are the claims backed by the actual code behaviour?\n\nOutput JSON:\n```json\n{\n  \"findings\": [\n    {\n      \"id\": \"X1\",\n      \"severity\": \"blocker|major|minor|nit\",\n      \"original_id\": \"A1 or B1\",\n      \"action\": \"VALIDATE|CHALLENGE|ADD\",\n      \"file\": \"path/to/file.c\",\n      \"line\": 42,\n      \"summary\": \"Short title\",\n      \"evidence\": \"Why this changes or confirms the original finding\",\n      \"confidence\": \"high|medium|low\",\n      \"basis\": \"spec|code|inference|external\"\n    }\n  ]\n}\n```\n\n\n## Epistemic labels\n\nEvery finding must include `confidence` (`high`, `medium`, or `low`) and\n`basis` (`spec`, `code`, `inference`, or `external`). Choose both labels from\nthe evidence actually cited, not from the finding's severity or the original\nreviewer's labels.\n\nEvidence must match `basis`:\n- `spec`: quote or identify the exact requirement or acceptance criterion.\n- `code`: cite the concrete file/line and the behavior visible in the code or diff.\n- `inference`: state the reasoning and ass",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4471,
+        "completion_tokens": 2106,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 7317,
+        "completion_tokens": 4063,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "failures": [],
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 15544,
+        "completion_tokens": 13168,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "inspector": {
+        "prompt_tokens": 1137,
+        "completion_tokens": 3029,
+        "est_cost_usd": 0.0,
+        "estimated": false
+      },
+      "architect": {
+        "prompt_tokens": 1429,
+        "completion_tokens": 2230,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_1": {
+        "prompt_tokens": 1190,
+        "completion_tokens": 1740,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_2": {
+        "prompt_tokens": 4471,
+        "completion_tokens": 2106,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 7317,
+        "completion_tokens": 4063,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "inspector": {
+        "prompt_tokens": 1137,
+        "completion_tokens": 3029,
+        "est_cost_usd": 0.0,
+        "estimated": false
+      },
+      "architect": {
+        "prompt_tokens": 1429,
+        "completion_tokens": 2230,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review": {
+        "prompt_tokens": 5661,
+        "completion_tokens": 3846,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 7317,
+        "completion_tokens": 4063,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 15544,
+      "completion_tokens": 13168,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 1137,
+        "completion_tokens": 3029,
+        "est_cost_usd": 0.0,
+        "estimated": false,
+        "phase": "inspector",
+        "persona": "inspector"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 1429,
+        "completion_tokens": 2230,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 1190,
+        "completion_tokens": 1740,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 4471,
+        "completion_tokens": 2106,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 7317,
+        "completion_tokens": 4063,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    ]
+  },
+  "artifacts": {
+    "01_architect": "docs/campaigns/phase1/review-2/01_architect.txt",
+    "02_inspector": "docs/campaigns/phase1/review-2/02_inspector.txt",
+    "03_cross_1": "docs/campaigns/phase1/review-2/03_cross_1.txt",
+    "04_cross_2": "docs/campaigns/phase1/review-2/04_cross_2.txt",
+    "05_synthesis": "docs/campaigns/phase1/review-2/05_synthesis.txt",
+    "review": "docs/campaigns/phase1/review-2/review.md"
+  },
+  "cleanup_warnings": []
+}

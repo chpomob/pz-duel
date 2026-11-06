@@ -1,0 +1,62 @@
+{
+  "findings": [
+    {
+      "id": "B1",
+      "severity": "minor",
+      "file": "service/api.py",
+      "line": 196,
+      "summary": "A partial request body holds a handler indefinitely",
+      "evidence": "_body calls rfile.read(length) without a socket timeout or read deadline. A client can declare an allowed Content-Length, send fewer bytes, and keep the connection open indefinitely. make_server uses ThreadingHTTPServer, so repeated connections retain unbounded threads and sockets. do_POST also performs this read before checking Host or Origin. Bound request reads with a deadline and return an explicit timeout response.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "B2",
+      "severity": "minor",
+      "file": "service/transport.py",
+      "line": 83,
+      "summary": "An unterminated output record is repeatedly read without bounds",
+      "evidence": "_read_from_offset calls handle.read() without a size limit, while poll advances offset only past complete newline-terminated records. A growing unterminated tail is therefore allocated and scanned again on every poll. A sufficiently large malformed tail can exhaust memory or stall the match pump. Bound both bytes read per poll and record length, with explicit handling for oversized records.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ],
+  "verdict": "REQUEST_CHANGES",
+  "review_limitations": [
+    "The final access rule prohibited git commands and test execution. Findings are based on the named worktree files; membership of the cited lines in the requested diff could not be verified."
+  ],
+  "read_files": [
+    "/tmp/review-phase1-final-1",
+    "service/engine.py",
+    "service/state.py",
+    "service/protocol.py",
+    "service/transport.py",
+    "service/journal.py",
+    "docs/campaigns/phase1/review/review.md",
+    "docs/campaigns/phase1/review/final.json",
+    "docs/campaigns/phase1/review/verify-fixes-2.json",
+    "README.md",
+    "service/api.py",
+    "service/snapshots.py",
+    "service/main.py",
+    "mods/duelcore/42.21/media/lua/server/DuelCore.lua",
+    "service/servers.py",
+    "service/rules.py",
+    "service/replay.py",
+    "service/verdict.py",
+    "tests/test_clock.py",
+    "tests/test_api_security.py",
+    "docs/campaigns/phase1/scaffolding/run_campaign.py",
+    "docs/campaigns/phase1/scaffolding/run_fixes.py",
+    "docs/campaigns/phase1/scaffolding/fixes/F1.md",
+    "docs/campaigns/phase1/scaffolding/fixes/F5.md",
+    "docs/campaigns/phase1/scaffolding/fixes/F6.md",
+    "docs/campaigns/phase1/scaffolding/fixes/F7.md",
+    "docs/campaigns/phase1/scaffolding/fixes/F8.md",
+    "tests/test_transport.py",
+    "tests/test_snapshots.py",
+    "service/runtime.json",
+    "tests/test_match.py"
+  ],
+  "read_nonce": "READ:cb6c479983e95d85"
+}
