@@ -1,0 +1,18 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "id": "A2",
+      "status": "PARTIAL",
+      "evidence": "service/engine.py:481,1300,1331,1434 : hash, scellement, publication et cœur (ligne 622) dérivent de _played_table, avec ou sans retrait ; ui/app.js:24,235 lit cette publication. Cependant tests/test_match.py:2384-2388 vérifie les règles déclenchées et seulement l'inclusion des types de commandes dans les effets autorisés. Le test passerait si hurt_supply était journalisée comme déclenchée sans émettre son supply_drop, puisque spawn_pop suffit à l'attente ligne 2362. Aucun résultat applied n'est vérifié dans ce test. Le croisement exigé entre table, hash et effets réellement appliqués reste incomplet."
+    }
+  ],
+  "new_findings": [],
+  "read_files": [
+    "service/engine.py",
+    "service/rules.py",
+    "ui/app.js",
+    "tests/test_match.py",
+    "docs/campaigns/phase1/spec.md"
+  ]
+}
