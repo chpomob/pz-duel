@@ -28,7 +28,7 @@ CAMPAIGN_LOG = SCAFF / "campaign.log"
 PY = str(REPO / ".venv/bin/python")
 LOOP = "/home/chpo/.hermes/skills/adversarial-code-loop/scripts/adversarial_loop.py"
 DEV_CMD = ("python3 /home/chpo/claude-tmux-wrapper/claude-tmux.py "
-           "--timeout 2700 --hard-timeout 3300 --max-turns 30 --cwd /home/chpo/pz-duel")
+           "--timeout 3600 --hard-timeout 4200 --max-turns 40 --cwd /home/chpo/pz-duel")
 REVIEW_CMD = "bash /home/chpo/.config/adversarial/codex-loop-review.sh"
 TEST_CMD = f"{PY} -m pytest -q"
 
