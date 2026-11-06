@@ -180,8 +180,8 @@ docs/campaigns/   spec (77 criteria), plan (24 steps), 4 branch reviews, 15 fix 
 
 ## Known limits
 
-The dated detail lives in [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md)
-(French). The important ones:
+The dated detail lives in [`docs/campaigns/phase1/limites-connues.md`](docs/campaigns/phase1/limites-connues.md).
+The important ones:
 
 - **Damage detection relies on a server-side health reading** that has not been observed working for a
   connected player. If it does not, the atom is withdrawn and the wound rule disappears — the lobby

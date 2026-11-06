@@ -1,95 +1,125 @@
-# Limites connues de la phase 1
+# Known limits of phase 1
 
-## Détection de `damage_taken`
+*English — [version française](limites-connues.fr.md)*
 
-Constaté dans les classes de 42.21, jamais en session réelle.
+## Detecting `damage_taken`
 
-- Le signal premier est le relevé de `getOverallBodyHealth` dans `step()`, une fois par seconde : une chute d'au moins 1 point donne l'atome.
-- `OnWeaponHitCharacter` ne suit qu'un coup d'arme de joueur : aucune morsure ne le tire.
-- `OnBeingHitByZombie` est déclaré par `LuaEventManager`, mais aucune classe du jar ni aucun Lua du jeu ne le déclenche. Le mod l'enregistre sans en attendre de preuve.
-- `OnPlayerGetDamage` porte `hook_proof` et confirme le relevé. Une morsure n'y paraît qu'à travers le saignement (`BLEEDING`, depuis `BodyPart.DamageUpdate`).
+Established from the 42.21 classes, never in a live session.
 
-### Non prouvé
+- The primary signal is `getOverallBodyHealth` sampled in `step()`, once per second: a drop of at
+  least 1 point yields the atom.
+- `OnWeaponHitCharacter` only follows a player's weapon hit: no bite ever fires it.
+- `OnBeingHitByZombie` is declared by `LuaEventManager`, but no class in the jar and no game Lua
+  triggers it. The mod registers it without expecting a proof from it.
+- `OnPlayerGetDamage` carries `hook_proof` and confirms the reading. A bite only shows through
+  bleeding (`BLEEDING`, from `BodyPart.DamageUpdate`).
 
-- **Que la santé bouge sur le serveur pour un joueur connecté, et que `BodyDamage.Update` y tourne.** `calculateOverallHealth` en dépend. Si ni l'un ni l'autre ne vaut, aucun `damage_taken` n'arrive : le match se joue sans que `hurt_supply` tire, sans le dire, jusqu'à la première mort, qui rend le couple `failed` et retire l'atome des matchs suivants.
-- **Que le seuil de 1 point soit le bon.** Il vient de la lecture du code, pas d'une mesure. Une griffure plus légère passe dessous, sauf si le hook la voit. Une chute ou une perte brutale sans attaquant passe dessus et compte comme blessure, ce que le hook seul excluait.
-- Une mort lente, de faim par exemple, sans chute d'au moins 1 point ni blessure, rend le couple `failed` à tort. Le premier signal reçu efface cet échec, y compris au lobby.
-- Pendant un saignement, une seconde morsure ne donne pas de nouvel atome : il faut 5 s sans perte de sang.
+### Not proven
 
-## Mort avant `t0`
+- **That health moves server-side for a connected player, and that `BodyDamage.Update` runs there.**
+  `calculateOverallHealth` depends on it. If neither holds, no `damage_taken` ever arrives: the match
+  plays without `hurt_supply` firing, without saying so, until the first death, which marks the
+  (build, mod) pair as failed and withdraws the atom from later matches.
+- **That the 1-point threshold is the right one.** It comes from reading the code, not from a
+  measurement. A lighter scratch slips under it, unless the hook sees it. A fall or a sudden loss with
+  no attacker goes over it and counts as a wound, which the hook alone used to exclude.
+- A slow death, from hunger for instance, with no ≥1 point drop and no wound, wrongly marks the pair
+  as failed. The first signal received clears that failure, lobby included.
+- While bleeding, a second bite yields no new atom: 5 s without blood loss are required.
 
-- Toute mort d'un camp lue avant `running` perd le match, lobby compris, même si le joueur a recréé un personnage depuis. Ce que devient un mort dans le vrai jeu n'a pas été observé.
-- Si le relevé `isDead` du mod rate la mort et qu'aucun hook ne tire, rien ne la signale.
+## Death before `t0`
 
-## Attente avant conclusion
+- Any death on a side read before `running` loses the match, lobby included, even if the player has
+  recreated a character since. What a dead player becomes in the real game has not been observed.
+- If the mod's `isDead` reading misses the death and no hook fires, nothing reports it.
 
-- Toute fin non due à une panne arrive 1,5 s plus tard. Pendant cette attente, les règles tournent encore : des kills datés d'après une mort en attente peuvent partir en commandes et figurer au score final, sans changer le vainqueur.
-- Un saut de l'heure murale vers l'avant, juste avant le tick du minuteur, peut dater après le terme un fait du dernier instant : il ne compte alors pas.
-- Le mod écrit `out` à chaque atome : une horde tuée d'un coup ouvre le fichier autant de fois. Le coût sur le vrai serveur n'a pas été mesuré.
+## Waiting before the verdict
 
-## Connexion du client sans Steam
+- Any finish not caused by a failure arrives 1.5 s later. During that wait, rules still run: kills
+  dated after a pending death can still go out as commands and appear in the final score, without
+  changing the winner.
+- A forward jump of the wall clock, just before the timer tick, can date a last-instant fact after the
+  end: it then does not count.
+- The mod writes `out` on every atom: a horde killed at once opens the file as many times. The cost on
+  a real server has not been measured.
 
-Les serveurs tournent avec `-Dzomboid.steam=0`. `Ouvrir PZ` lance donc `projectzomboid.sh -nosteam +connect <adresse> +password …`, sans relais par Steam : Steam rendrait la main sans rien dire du client.
+## Connecting the client without Steam
 
-### Prouvé
+The servers run with `-Dzomboid.steam=0`. `Open PZ` therefore launches
+`projectzomboid.sh -nosteam +connect <address> +password …`, with no Steam relay: Steam would return
+without saying anything about the client.
 
-Par les tests de `tests/test_modes.py`, avec un faux lanceur ou un faux script. Aucun ne lance le vrai jeu.
+### Proven
 
-- `open_game` appelle le script du client, avec `-nosteam`, l'adresse et le mot de passe de A.
-- Script absent ou non exécutable : aucun lancement, échec qui nomme le fichier et donne la marche à suivre à la main.
-- Script qui ne démarre pas, ou qui s'arrête dans les 2 s, quel que soit son code : échec. Le vrai script finit par `exit 0` : son code ne prouve rien.
-- Le mot de passe ne figure ni dans les messages ni dans les logs du service.
-- Hors de la phase `lobby` : refus explicite, aucun lancement. Tant que le client lancé tourne, ou démarre encore : second lancement refusé.
+By the tests in `tests/test_modes.py`, with a fake launcher or a fake script. None launches the real
+game.
 
-### Non prouvé
+- `open_game` calls the client script with `-nosteam`, A's address and password.
+- Missing or non-executable script: no launch, a failure naming the file and giving the manual steps.
+- Script that does not start, or that stops within 2 s, whatever its exit code: failure. The real
+  script ends with `exit 0`: its code proves nothing.
+- The password appears neither in messages nor in the service logs.
+- Outside the `lobby` phase: explicit refusal, no launch. While the launched client runs or is still
+  starting: a second launch is refused.
 
-- **La connexion elle-même.** Elle demande un second joueur et un client réel : aucun essai n'a eu lieu. Un client `-nosteam` peut donc encore être refusé par un serveur lancé par `start-server.sh`.
-- Que le vrai client accepte `-nosteam`, `+connect` et `+password` ensemble.
-- Un refus après 2 s : un client qui tient ce délai compte comme lancé. C'est pourquoi le succès dit de vérifier la connexion en jeu.
+### Not proven
 
-Le service constate la présence d'un joueur par les `beat` du mod, jamais par ce lancement.
+- **The connection itself.** It needs a second player and a real client: no attempt has been made. A
+  `-nosteam` client may therefore still be refused by a server launched by `start-server.sh`.
+- That the real client accepts `-nosteam`, `+connect` and `+password` together.
+- A refusal after 2 s: a client surviving that delay counts as launched. That is why success says to
+  check the connection in game.
 
-## Machine mono-utilisateur
+The service observes a player's presence through the mod's `beat`, never through this launch.
 
-Le service suppose une machine de bureau à un seul utilisateur. Sur une machine partagée, tout compte local peut lire les mots de passe et piloter le duel : ne l'y lancez pas.
+## Single-user machine
 
-- **API locale sans jeton.** Le contrôle de `Host` et d'`Origin` n'arrête que les navigateurs. Un processus local qui envoie `Host: 127.0.0.1:<port>` sans `Origin` lit `/api/state` et poste les actions, dont `start` et `cancel`.
-- **Mots de passe dans `/api/state`.** `config.password`, celui de B, y reste à toute phase. `config.host_password`, celui de A, n'y paraît qu'en phase `lobby`, où l'hôte en a besoin.
-- **Secrets dans `ps`.** Le mot de passe admin figure dans la ligne de commande de chaque serveur (`-adminpassword`), et celui de A dans celle du client lancé par `Ouvrir PZ`.
+The service assumes a single-user desktop. On a shared machine, any local account can read the
+passwords and drive the duel: do not run it there.
 
-## Constats de la revue de clôture laissés ouverts (2026-11-06)
+- **Local API without a token.** The `Host` and `Origin` checks only stop browsers. A local process
+  sending `Host: 127.0.0.1:<port>` with no `Origin` reads `/api/state` and posts actions, including
+  `start` and `cancel`.
+- **Passwords in `/api/state`.** `config.password`, B's, stays there in every phase.
+  `config.host_password`, A's, only appears in the `lobby` phase, where the host needs it.
+- **Secrets in `ps`.** The admin password appears in each server's command line (`-adminpassword`),
+  and A's in that of the client launched by `Open PZ`.
 
-Réels, non corrigés, assumés pour la phase 1. Aucun ne change la promesse tenue ici — le service
-et le contrat — mais chacun a un effet observable, décrit tel quel.
+## Closing-review findings left open (2026-11-06)
 
-- **Deux joueurs avec le même pseudo bloquent le lobby sans cause visible.** La liaison d'identité
-  refuse le second, et rien dans l'UI ne dit pourquoi.
-- **Un serveur figé devient un forfait pour son joueur** : l'absence est comptée contre lui, et
-  rien ne le redémarre. À traiter avec la supervision des serveurs, en phase 2.
-- **Serveurs orphelins si le service meurt par `SIGHUP` ou par crash** : aucun processus ne les
-  récupère. Un arrêt propre les arrête.
-- **Le `Redactor` ne couvre pas les mots de passe joueurs** : la règle « `host_password` en lobby
-  seulement » ne protège qu'un champ nommé, pas la classe.
-- **Une écriture partielle dans le fichier `in` corrompt la commande suivante** : le mod lit une
-  ligne tronquée comme une commande invalide.
-- **L'URI d'invitation est construite sans encodage** : un mot de passe ou un nom contenant un
-  caractère réservé casse le lien.
-- **Le jugement attend un intervalle de vidage** (`conclusion_settle_ms`) avant de conclure. Pendant
-  cette fenêtre bornée, le match tourne encore sans résultat alors qu'une mort est déjà journalisée.
-  C'est volontaire : c'est ce qui garantit que la mort la plus ancienne décide même si elle est
-  encore dans le tampon du mod (cf. constat A3 de la revue de clôture).
+Real, not fixed, accepted for phase 1. None changes the promise kept here — the service and the
+contract — but each has an observable effect, described as is.
 
-Ces six points sont des correctifs courts ; ils sont différés parce qu'aucun ne touche la chaîne
-prouvée (mod chargé, `caps`, contrat, arrêt RCON), et parce que les corriger sans le premier duel
-réel reviendrait à régler des cas dont on ignore la fréquence.
+- **Two players with the same nickname deadlock the lobby with no visible cause.** Identity binding
+  refuses the second one, and nothing in the UI says why.
+- **A hung server becomes a forfeit for its player**: absence is counted against them, and nothing
+  restarts it. To be handled with server supervision, in phase 2.
+- **Orphaned servers if the service dies on `SIGHUP` or a crash**: no process reclaims them. A clean
+  stop does stop them.
+- **`Redactor` does not cover player passwords**: the "`host_password` in the lobby only" rule protects
+  one named field, not the class.
+- **A partial write to the `in` file corrupts the next command**: the mod reads a truncated line as an
+  invalid command.
+- **The invitation URI is built without encoding**: a password or name containing a reserved character
+  breaks the link.
+- **The verdict waits for one flush interval** (`conclusion_settle_ms`) before concluding. During that
+  bounded window the match keeps running without a result although a death is already journaled. This
+  is deliberate: it is what guarantees the oldest death wins even when it is still in the mod's buffer
+  (cf. finding A3 of the closing review).
 
-## Table annoncée et table jouée
+These six points are short fixes; they are deferred because none touches the proven chain (mod loaded,
+`caps`, contract, RCON stop), and because fixing them without the first real duel would tune cases
+whose frequency is unknown.
 
-Une seule table fait foi : celle que le cœur joue, dont `rules_hash` dérive. Deux écarts d'annonce restent, faute de savoir plus tôt.
+## Announced table versus played table
 
-- **L'aperçu de `Nouveau duel` montre le preset, pas la table jouée.** Le couple (build, mod) n'est
-  connu qu'aux `caps` : avant, rien ne dit si un atome sera retiré. L'écran le dit, et le lobby
-  annonce ensuite la table jouée. Une table réduite perd aussi son `summary`, texte libre sans lien
-  aux règles : le lobby liste les identifiants de règles, pas leur description.
-- **Le `rules_hash` publié au lobby reste provisoire jusqu'à `L`** : un signal reçu au lobby peut
-  lever l'échec, et le hash change alors avec la table. `table_sealed` est le seul hash définitif.
+One table prevails: the one the core plays, from which `rules_hash` derives. Two announcement gaps
+remain, for lack of knowing earlier.
+
+- **The `New duel` preview shows the preset, not the played table.** The (build, mod) pair is only
+  known at `caps`: before that, nothing says whether an atom will be withdrawn. The screen says so,
+  and the lobby then announces the played table. A reduced table also loses its `summary`, free text
+  with no link to the rules: the lobby lists rule identifiers, not their description.
+- **The `rules_hash` published in the lobby stays provisional until `L`**: a signal received in the
+  lobby can clear the failure, and the hash then changes with the table. `table_sealed` is the only
+  definitive hash.
