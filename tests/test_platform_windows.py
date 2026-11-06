@@ -1,4 +1,4 @@
-"""R1, R3 : description des plateformes, remplacement tolérant, écrivains (AC6, AC13 à AC17).
+"""R1, R3 : plateformes, remplacement tolérant, écrivains, préflight (AC4 à AC6, AC13 à AC17).
 
 D-A : un test qui n'a de sens que sur un seul système est défini dans un bloc `if` de ce
 module, il n'est pas sauté. Les branches Windows s'exécutent ici par injection (D-B).
@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ from typing import NamedTuple
 
 import pytest
 
-from service import platforms, replay, rules, servers, transport
+from service import platforms, preflight, replay, rules, servers, transport
 from service import proofs as proofs_module
 from service.engine import MODE_REAL, Engine, MatchSecrets, RealMatch
 from service.journal import read_journal
@@ -743,3 +744,56 @@ with open(sys.argv[1], "rb"):
         assert writer.holds(1)
         assert server.ready
         assert server.ini_failure is None
+
+
+# AC4 et AC5 sur le vrai Windows (D-A) -------------------------------------------------------
+
+if sys.platform == "win32":
+    LOOPBACK = "127.0.0.1"
+
+    @contextlib.contextmanager
+    def held_port(kind: int, *, reuse: bool = False, host: str = "") -> Iterator[int]:
+        """Tient un port libre, avec les options que poserait un autre programme."""
+        with socket.socket(socket.AF_INET, kind) as holder:
+            if reuse:
+                holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            holder.bind((host, 0))
+            if kind == socket.SOCK_STREAM:
+                holder.listen()
+            yield holder.getsockname()[1]
+
+    def free_port(kind: int) -> int:
+        with held_port(kind) as port:
+            return port
+
+    def test_windows_real_ram_measure_is_positive():
+        measured = preflight.read_windows_ram_mb()
+        assert isinstance(measured, int) and measured > 0
+
+    @pytest.mark.parametrize("reuse", [False, True], ids=["exclusive", "reuseaddr"])
+    @pytest.mark.parametrize("host", ["", LOOPBACK], ids=["wildcard", "loopback"])
+    def test_windows_held_tcp_port_is_one_failure(reuse, host):
+        with held_port(socket.SOCK_STREAM, reuse=reuse, host=host) as port:
+            free, failures = preflight.check_ports({"A": {"rcon": port}})
+        (failure,) = failures
+        assert free == [] and f"Port {port}/TCP" in failure
+
+    @pytest.mark.parametrize("host", ["", LOOPBACK], ids=["wildcard", "loopback"])
+    def test_windows_bound_udp_port_is_one_failure(host):
+        with held_port(socket.SOCK_DGRAM, host=host) as port:
+            free, failures = preflight.check_ports({"A": {"game": port}})
+        (failure,) = failures
+        assert free == [] and f"Port {port}/UDP" in failure
+
+    def test_windows_free_port_gives_no_failure():
+        tcp, udp = free_port(socket.SOCK_STREAM), free_port(socket.SOCK_DGRAM)
+        free, failures = preflight.check_ports({"A": {"rcon": tcp, "game": udp}})
+        assert failures == [] and free == [f"{tcp}/TCP", f"{udp}/UDP"]
+
+    def test_windows_injected_10013_is_unusable(monkeypatch):
+        def refuse(port, kind, platform):
+            raise OSError(preflight.WSAEACCES, "forbidden")
+
+        monkeypatch.setattr(preflight, "_bind", refuse)
+        (failure,) = preflight.check_ports({"A": {"rcon": 27015}})[1]
+        assert "Port 27015/TCP" in failure and "inutilisable" in failure
