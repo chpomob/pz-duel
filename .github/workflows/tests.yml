@@ -42,3 +42,23 @@ jobs:
       - run: python -m pip install --upgrade pip pytest
       # -rs imprime chaque raison de skip : AC54 se relit dans le journal du job.
       - run: python -m pytest -q -rs
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      # Avant le checkout : le binaire embarque le mod, et son empreinte se compare au dépôt.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r packaging/requirements-build.txt
+      # Sortie hors du dépôt : `.gitignore` ne change pas.
+      - name: Build
+        shell: bash
+        run: python -m PyInstaller packaging/pz-duel.spec --distpath "$RUNNER_TEMP/dist" --workpath "$RUNNER_TEMP/build"
+      - name: Smoke test
+        shell: bash
+        run: python packaging/smoke_test.py "$RUNNER_TEMP/dist/pz-duel.exe"
