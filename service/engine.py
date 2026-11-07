@@ -37,6 +37,7 @@ from .guest_launcher import (
     build_launcher,
     is_usable_address,
     launcher_code,
+    read_mod,
 )
 from .http_kit import LAUNCHER_NAME
 from .journal import Journal, read_journal
@@ -185,10 +186,11 @@ SHARE_PHASES = ("contract", "lobby")
 LOBBY_ONLY = (REMATCH_NOTE, SHARE_TEXT)
 INVITE_CLOSED = "invitation unavailable: it only exists in the lobby of a real duel"
 LAUNCHER_CODE_TEXT = (
-    "Your guest must see this code in their launcher: read it aloud, never next to the link. "
+    "Read this code aloud to your guest, never next to the link. "
+    "Their launcher does not show it: it asks them to type it, and stops if it does not match. "
+    "A launcher that does not ask for a code must not be run: the file was replaced. "
     "Before opening the file, they run: certutil -hashfile {name} SHA256. "
     "The result must start with this code, or the file was replaced and must not be opened. "
-    "The launcher asks for the code too, but a replaced file can skip that step. "
     "This invitation is meant for a trusted network: "
     "the code is the only protection against a replaced file."
 )
@@ -1976,13 +1978,14 @@ class Engine:
     # Hors d'`ACTIONS`, comme le premier lancement (H6). Rien ici ne touche au réseau (AC58).
     def set_invite_address(self, address: object) -> tuple[bool, str]:
         """Retient l'adresse saisie ; un refus ne la cite pas et garde la précédente."""
+        mod = self._read_mod() if self.real and is_usable_address(address) else None
         with self.lock:
             if not self.real or self.state.phase != "lobby":
                 return False, INVITE_CLOSED
             if not is_usable_address(address):
                 return False, ADDRESS_REFUSED
             self._entered_address = address
-            self.state.invite = self._build_invite()
+            self.state.invite = self._build_invite(mod)
             self.state.log("invitation address updated")
         return True, "invitation address updated"
 
@@ -1995,20 +1998,31 @@ class Engine:
                 raise LauncherRefused(self._launcher_refusal)
             return self._launcher
 
-    def _open_invite(self) -> None:
-        """Ouvre l'invitation d'un lobby : seul appel à `local_ip`, jeton neuf, revanche comprise."""
+    def _read_mod(self) -> tuple[str, ...] | LauncherRefused:
+        """Lit et hache le mod, jamais sous `self.lock` : un disque lent figerait `/api/state`."""
+        try:
+            return read_mod(MOD_SRC)
+        except LauncherRefused as refused:
+            return refused
+
+    def _open_invite(self, mod: tuple[str, ...] | LauncherRefused | None) -> None:
+        """Ouvre l'invitation d'un lobby : seul appel à `local_ip`, jeton neuf, revanche comprise.
+
+        `mod` vient de `_read_mod`, appelé avant le verrou ; `None` hors du vrai mode.
+        """
         self._detected_ip = local_ip()
         self._share_token = token_hex(SHARE_TOKEN_BYTES)
         if self.real:
             self._open_share()
-        self.state.invite = self._build_invite()
+        self.state.invite = self._build_invite(mod)
 
     def _open_share(self) -> None:
         """Un port pris laisse le lobby ouvert : le `.bat` s'enregistre encore depuis l'UI."""
         port = self.runtime["share_port"]
         try:
             poll_s = self.runtime["tick_ms"] / MS_PER_S
-            self._share = ShareServer(self, self._share_token, port, poll_s)
+            peer_max = self.runtime["share_connections_per_peer"]
+            self._share = ShareServer(self, self._share_token, port, poll_s, peer_max=peer_max)
         except OSError:
             self.state.log(f"share link unavailable: TCP port {port} could not be opened", "warn")
 
@@ -2024,15 +2038,18 @@ class Engine:
             self.state.invite = {**self.state.invite, **closed}
         share.close()
 
-    def _build_invite(self) -> dict:
-        """Rend l'invitation et génère son `.bat`, une fois : le code porte sur les octets servis."""
+    def _build_invite(self, mod: tuple[str, ...] | LauncherRefused | None) -> dict:
+        """Rend l'invitation et génère son `.bat`, une fois : le code porte sur les octets servis.
+
+        Appelé sous `self.lock` : `mod`, lu et haché avant par `_read_mod`, n'y est qu'assemblé.
+        """
         invite = self._invite_fields()
         self._launcher = None
         if not self.real:
             return invite
         try:
             self._launcher = build_launcher(
-                invite["address"], invite["port"], invite["password"], MOD_SRC
+                invite["address"], invite["port"], invite["password"], mod
             )
         except LauncherRefused as refused:
             self._launcher_refusal = str(refused)
@@ -2264,10 +2281,11 @@ class Engine:
         return None
 
     def _open_lobby(self, match: RealMatch) -> None:
+        mod = self._read_mod()  # avant le verrou : le hachage du mod ne fige pas `/api/state`
         with self.lock:
             self.state.set_step("contract", "ok", "contrat vérifié sur A et B")
             self.state.set_step("lobby", "running", "en attente des joueurs")
-            self._open_invite()
+            self._open_invite(mod)
             self.state.log("lobby ouvert, invitation prête")
         match.announce_table()
         match.enter_phase("lobby")
@@ -2382,7 +2400,7 @@ class Engine:
         with self.lock:
             self.state.phase = "lobby"
             self.state.set_step("lobby", "running", "en attente de l'adversaire")
-            self._open_invite()
+            self._open_invite(None)
             self.state.log("lobby ouvert, invitation prête (simulé)")
         # l'hôte rejoint son propre serveur
         if not self._sleep(1.2):

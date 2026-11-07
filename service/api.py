@@ -63,6 +63,9 @@ PROTOCOL_REFUSALS = {
     505: "version HTTP non prise en charge",
 }
 PROTOCOL_REFUSED = "requête refusée"
+# Les valeurs de `Sec-Fetch-Site` qui viennent de nous : `same-site` serait un autre port de la
+# même machine, `cross-site` un site tiers. Toute autre valeur se refuse aussi.
+FETCH_SITES_OURS = ("same-origin", "none")
 LOG = logging.getLogger(__name__)
 
 
@@ -283,6 +286,14 @@ class Handler(BaseHTTPRequestHandler):
         self._static(path)
 
     def _get_launcher(self) -> None:
+        # `_refused` a déjà jugé `Host` et `Origin`. Une navigation de haut niveau n'envoie pas
+        # `Origin` en GET : le navigateur dit d'où elle vient par `Sec-Fetch-Site`. Seuls notre
+        # page (`same-origin`) et l'utilisateur (`none`, adresse tapée) passent ; sans l'en-tête
+        # (vieux navigateur, `curl`), la requête passe comme avant.
+        sites = [site.strip().lower() for site in self.headers.get_all("Sec-Fetch-Site", [])]
+        if any(site not in FETCH_SITES_OURS for site in sites):
+            self._fail(403, "en-tête Sec-Fetch-Site refusé")
+            return
         try:
             launcher = self.engine.guest_launcher()
         except LauncherRefused as exc:

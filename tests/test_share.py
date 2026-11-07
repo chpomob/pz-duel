@@ -23,6 +23,7 @@ from test_modes import FastClock, settle, wait_phase
 from test_snapshots import PLAYER_PASSWORD, engine_rig, free_port  # noqa: F401
 from service import engine as engine_module
 from service.api import CONNECTIONS_MAX, LAUNCHER_NAME, make_server
+from service.http_kit import turned_away
 from service.engine import REMATCH_NOTE_TEXT, Engine
 from service.guest_launcher import (
     JOIN_MARK,
@@ -90,6 +91,12 @@ QR_HEADER_BITS = 20
 BITS_PER_BYTE = 8
 # Le plus long nom admis par `is_usable_address` : 253 caractères, labels de 63 au plus.
 LONGEST_HOST = ".".join(["a" * 63] * 3 + ["a" * 61])
+# Le budget livré d'A1 : les places d'une même adresse sur l'écouteur de partage.
+PEER_MAX = json.loads((Path(engine_module.__file__).parent / "runtime.json").read_text("utf-8"))[
+    "share_connections_per_peer"
+]
+# Une seconde adresse de la boucle locale : Linux et Windows routent tout 127.0.0.0/8 vers elle.
+OTHER_LOOPBACK = "127.0.0.2"
 OTHER_METHODS = ("POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT", "FOO")
 
 
@@ -289,11 +296,11 @@ def test_ac57_entered_address_names_the_shipped_ports(tmp_path, runtime, monkeyp
     """Sans le banc : il tire des ports libres, et lier ceux livrés dépendrait de la machine."""
     detect(monkeypatch, LAN_ADDRESS)
     # Ce moteur n'a ni match ni fin : un vrai écouteur survivrait au test.
-    monkeypatch.setattr(engine_module, "ShareServer", lambda *args: object())
+    monkeypatch.setattr(engine_module, "ShareServer", lambda *args, **kwargs: object())
     engine = Engine("real", runtime=runtime, matches_dir=tmp_path)
     engine.state.config = {"password": PLAYER_PASSWORD, "code": "ABCDE"}
     engine.state.phase = "lobby"
-    engine._open_invite()
+    engine._open_invite(engine._read_mod())
 
     assert engine.set_invite_address(PUBLIC_ADDRESS)[0]
 
@@ -600,9 +607,87 @@ def test_unreadable_mod_keeps_the_lobby_and_refuses_with_a_reason(
     assert json.loads(body)["error"] == MOD_UNREADABLE
 
 
+def lock_is_free(engine: Engine) -> bool:
+    """Vrai si un autre fil prend `engine.lock` : un `RLock` se reprend dans le fil qui le tient."""
+    taken = []
+
+    def attempt() -> None:
+        got = engine.lock.acquire(timeout=SHORT_READ_S)
+        taken.append(got)
+        if got:
+            engine.lock.release()
+
+    other = threading.Thread(target=attempt)
+    other.start()
+    other.join(WAIT_S)
+    return taken == [True]
+
+
+def test_lobby_hashes_the_mod_outside_the_lock(engine_rig, monkeypatch):
+    """A5 : le mod se lit et se hache avant `self.lock`, à l'ouverture du lobby comme ailleurs."""
+    detect(monkeypatch, LAN_ADDRESS)
+    real_read, real_build = engine_module.read_mod, engine_rig.build
+    built: list[Engine] = []
+    reads: list[bool] = []
+
+    def build(*args, **kwargs) -> Engine:
+        built.append(real_build(*args, **kwargs))
+        return built[-1]
+
+    def watched(mod_src):
+        reads.append(lock_is_free(built[-1]))
+        return real_read(mod_src)
+
+    monkeypatch.setattr(engine_rig, "build", build)
+    monkeypatch.setattr(engine_module, "read_mod", watched)
+    lobby = Lobby(engine_rig, PRESET)
+
+    assert reads == [True]
+    assert "launcher_code" in lobby.state()["invite"]
+
+
+def test_state_answers_while_the_invitation_hashes_a_slow_mod(lobby, monkeypatch, api_port):
+    """A5 : un mod lent ne fige pas `/api/state` pendant qu'une invitation se construit."""
+    engine = lobby.engine
+    port = api_port(engine)
+    reading, release = threading.Event(), threading.Event()
+    real_read = engine_module.read_mod
+
+    def slow(mod_src):
+        reading.set()
+        release.wait(WAIT_S)
+        return real_read(mod_src)
+
+    monkeypatch.setattr(engine_module, "read_mod", slow)
+    answers = []
+    worker = threading.Thread(
+        target=lambda: answers.append(engine.set_invite_address(PUBLIC_ADDRESS))
+    )
+    worker.start()
+    try:
+        assert reading.wait(WAIT_S)
+        conn = http.client.HTTPConnection(LOOPBACK, port, timeout=CLOSE_LIMIT_S)
+        try:
+            conn.request("GET", "/api/state")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read())["invite"]["address"] == LAN_ADDRESS
+        finally:
+            conn.close()
+        assert worker.is_alive()  # l'invitation attend encore son mod : l'état a répondu avant
+    finally:
+        release.set()
+        worker.join(WAIT_S)
+    assert answers and answers[0][0]
+    assert engine.snapshot()["invite"]["address"] == PUBLIC_ADDRESS
+    assert launcher_code(engine.guest_launcher()) == engine.snapshot()["invite"]["launcher_code"]
+
+
 def test_code_text_says_who_compares_what(lobby):
     text = lobby.state()["invite"]["launcher_code_text"]
-    assert "must see this code in their launcher" in text
+    assert "asks them to type it" in text
+    assert "must see this code" not in text
+    assert "A launcher that does not ask for a code must not be run" in text
     assert f"certutil -hashfile {LAUNCHER_NAME} SHA256" in text
     assert "trusted network" in text
     assert "only protection" in text
@@ -713,9 +798,10 @@ class StubEngine:
 
 @pytest.fixture
 def stub_share():
-    """Écouteur seul, sur un moteur factice."""
+    """Écouteur seul, sur un moteur factice. AC40 mesure la limite globale : un pair la remplit."""
     engine = StubEngine()
-    share = ShareServer(engine, STUB_TOKEN, free_port(socket.SOCK_STREAM), POLL_S)
+    port = free_port(socket.SOCK_STREAM)
+    share = ShareServer(engine, STUB_TOKEN, port, POLL_S, peer_max=CONNECTIONS_MAX)
     yield share, engine
     share.close()
 
@@ -831,7 +917,8 @@ def test_binding_asks_no_name_resolution(monkeypatch):
         raise AssertionError("résolution de nom à la liaison")
 
     monkeypatch.setattr(socket, "getfqdn", refuse)
-    ShareServer(StubEngine(), STUB_TOKEN, free_port(socket.SOCK_STREAM), POLL_S).close()
+    port = free_port(socket.SOCK_STREAM)
+    ShareServer(StubEngine(), STUB_TOKEN, port, POLL_S, peer_max=PEER_MAX).close()
 
 
 # -- AC39 --------------------------------------------------------------------
@@ -1107,6 +1194,93 @@ def test_ac40_connections_are_capped(stub_share):
     assert split_answer(raw(port, get_line(STUB_PATH)))[0] == 200
 
 
+@pytest.fixture
+def peer_share():
+    """Écouteur seul, au budget par pair livré dans `runtime.json`."""
+    engine = StubEngine()
+    port = free_port(socket.SOCK_STREAM)
+    share = ShareServer(engine, STUB_TOKEN, port, POLL_S, peer_max=PEER_MAX)
+    yield share, engine
+    share.close()
+
+
+def hold(port: int, count: int, source: str = LOOPBACK) -> list[socket.socket]:
+    return [
+        socket.create_connection((LOOPBACK, port), timeout=WAIT_S, source_address=(source, 0))
+        for _ in range(count)
+    ]
+
+
+def wait_free_slots(share: ShareServer, free: int) -> None:
+    slots = share._httpd._slots
+    deadline = time.monotonic() + WAIT_S
+    while slots._value != free and time.monotonic() < deadline:
+        time.sleep(POLL_S)
+    assert slots._value == free
+
+
+def test_a1_shipped_peer_budget_leaves_room_for_the_guest():
+    assert 1 <= PEER_MAX < CONNECTIONS_MAX
+
+
+def test_a1_lobby_listener_applies_the_runtime_budget(lobby):
+    httpd = lobby.engine._share._httpd
+    assert httpd.peer_max == lobby.engine.runtime["share_connections_per_peer"] == PEER_MAX
+
+
+def test_a1_one_peer_cannot_take_every_place(peer_share):
+    """`PEER_MAX` connexions lentes d'une adresse : la suivante reçoit le refus de saturation."""
+    share, engine = peer_share
+    port = port_of(share)
+    held = hold(port, PEER_MAX)
+    try:
+        wait_free_slots(share, CONNECTIONS_MAX - PEER_MAX)
+        refusal = raw(port, get_line(STUB_PATH))
+        # Le même 503 JSON que la saturation de toutes les places, octet pour octet.
+        assert refusal == turned_away(CONNECTIONS_MAX)
+        code, head, body = split_answer(refusal)
+        assert code == 503
+        assert b"Content-Type: application/json" in head
+        assert json.loads(body)["ok"] is False
+        assert engine.calls == 0
+        # Le refus n'a pris aucune place : les autres restent libres.
+        assert share._httpd._slots._value == CONNECTIONS_MAX - PEER_MAX
+    finally:
+        for conn in held:
+            conn.close()
+    wait_free_slots(share, CONNECTIONS_MAX)
+    assert share._httpd._peers == {}
+    assert split_answer(raw(port, get_line(STUB_PATH)))[0] == 200
+
+
+def test_a1_another_address_keeps_its_place(peer_share):
+    share, engine = peer_share
+    port = port_of(share)
+    held = hold(port, PEER_MAX)
+    try:
+        wait_free_slots(share, CONNECTIONS_MAX - PEER_MAX)
+        assert split_answer(raw(port, get_line(STUB_PATH)))[0] == 503
+        with socket.create_connection(
+            (LOOPBACK, port), timeout=HTTP_TIMEOUT_S, source_address=(OTHER_LOOPBACK, 0)
+        ) as guest:
+            guest.sendall(get_line(STUB_PATH))
+            answer = b""
+            while chunk := guest.recv(1 << 16):
+                answer += chunk
+        assert split_answer(answer)[0] == 200
+        assert engine.calls == 1
+    finally:
+        for conn in held:
+            conn.close()
+
+
+def test_a1_peer_budget_is_bounded_by_the_listener():
+    for peer_max in (0, CONNECTIONS_MAX + 1):
+        with pytest.raises(ValueError):
+            ShareServer(StubEngine(), STUB_TOKEN, free_port(socket.SOCK_STREAM), POLL_S,
+                        peer_max=peer_max)  # fmt: skip
+
+
 def fill_slots(share: ShareServer) -> list[socket.socket]:
     """Prend toutes les places : la connexion suivante est refusée."""
     port = port_of(share)
@@ -1207,7 +1381,8 @@ def test_close_is_idempotent(stub_share):
 
 def test_close_right_after_opening_does_not_hang():
     for _ in range(20):
-        share = ShareServer(StubEngine(), STUB_TOKEN, free_port(socket.SOCK_STREAM), POLL_S)
+        port = free_port(socket.SOCK_STREAM)
+        share = ShareServer(StubEngine(), STUB_TOKEN, port, POLL_S, peer_max=PEER_MAX)
         closer = threading.Thread(target=share.close, daemon=True)
         closer.start()
         closer.join(WAIT_S)

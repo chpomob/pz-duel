@@ -74,6 +74,8 @@ echo pz-duel: this invitation is meant for a trusted network.
 echo The code the host reads to you is the only protection against a replaced file.
 echo It must be compared before this file is run: certutil -hashfile "this file" SHA256
 echo must print a value that starts with that code. If it was not, close this window now.
+echo This launcher asks for that code below. A launcher that does not ask for a code was replaced:
+echo never run one, and ask the host for a new file.
 set "PZDUEL_TYPED="
 set /p "PZDUEL_TYPED=Type the code the host read to you, then press Enter: "
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$l=[IO.File]::ReadAllLines($env:PZDUEL_SELF,[Text.Encoding]::ASCII);$b=[Array]::IndexOf($l,'{SCRIPT_MARK}');$e=[Array]::IndexOf($l,'{DATA_MARK}');& ([ScriptBlock]::Create($l[($b+1)..($e-1)] -join [Environment]::NewLine)) $l"
@@ -312,6 +314,15 @@ def _is_port(port: object) -> bool:
     return isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= MAX_PORT
 
 
+def read_mod(mod_src: str | os.PathLike[str]) -> tuple[str, ...]:
+    """Lit et hache le mod : la seule étape lente du `.bat`, à faire hors de tout verrou.
+
+    Rend les lignes de données que `build_launcher` accepte à la place du dossier, ou lève
+    `LauncherRefused`.
+    """
+    return tuple(_mod_lines(mod_src))
+
+
 def _mod_lines(mod_src: str | os.PathLike[str]) -> list[str]:
     """Rend le mod en lignes de données, avec les fichiers et l'ordre de `mod_fingerprint`."""
     root = Path(mod_src)
@@ -343,27 +354,37 @@ def build_launcher(
     address: str,
     port: int,
     password: str,
-    mod_src: str | os.PathLike[str],
+    mod: str | os.PathLike[str] | tuple[str, ...] | LauncherRefused,
 ) -> bytes:
     """Rend les octets du `.bat`, ou lève `LauncherRefused`. Rien n'est écrit (R6).
 
+    `mod` est le dossier du mod, ou ce que `read_mod` en a rendu, refus compris : sous cette
+    forme, rien n'est lu ni haché ici et l'appelant peut tenir un verrou. Un refus du mod ne
+    passe qu'après ceux de l'adresse, du port et du mot de passe.
+
     Les mêmes entrées rendent les mêmes octets : ni date, ni tirage, ni chemin de l'hôte.
     """
-    if not is_usable_address(address):
-        raise LauncherRefused(ADDRESS_REFUSED)
-    if not _is_port(port):
-        raise LauncherRefused(PORT_REFUSED)
-    if not isinstance(password, str) or not PASSWORD_ALLOWED.fullmatch(password):
-        raise LauncherRefused(PASSWORD_REFUSED)
+    _check_join(address, port, password)
+    if isinstance(mod, LauncherRefused):
+        raise mod
     lines = [
         *BATCH.splitlines(),
         SCRIPT_MARK,
         *POWERSHELL.splitlines(),
         DATA_MARK,
         f"{JOIN_MARK} {address} {port} {password}",
-        *_mod_lines(mod_src),
+        *(mod if isinstance(mod, tuple) else read_mod(mod)),
     ]
     launcher = (CRLF.join(lines) + CRLF).encode("ascii")
     if max(map(len, lines)) > MAX_LINE_BYTES or len(launcher) >= MAX_LAUNCHER_BYTES:
         raise LauncherRefused(FORMAT_REFUSED)
     return launcher
+
+
+def _check_join(address: object, port: object, password: object) -> None:
+    if not is_usable_address(address):
+        raise LauncherRefused(ADDRESS_REFUSED)
+    if not _is_port(port):
+        raise LauncherRefused(PORT_REFUSED)
+    if not isinstance(password, str) or not PASSWORD_ALLOWED.fullmatch(password):
+        raise LauncherRefused(PASSWORD_REFUSED)

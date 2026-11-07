@@ -667,6 +667,56 @@ def test_launcher_refuses_a_foreign_host_before_generating(api, host):
     assert engine.actions == []
 
 
+# A4 : une navigation de haut niveau n'envoie pas `Origin` en GET, mais `Sec-Fetch-Site`.
+@pytest.mark.parametrize("site", ["cross-site", "same-site", "Cross-Site", "autre"])
+def test_launcher_refuses_a_navigation_from_another_site(api, site):
+    engine, port = api
+    headers = {"Host": f"127.0.0.1:{port}", "Sec-Fetch-Site": site}
+    status, body = send(port, LAUNCHER_ROUTE, headers)
+    assert status == 403
+    assert json.loads(body) == {"ok": False, "error": "en-tête Sec-Fetch-Site refusé"}
+    assert SECRET.encode() not in body
+    assert engine.actions == []
+
+
+def test_launcher_refuses_a_foreign_origin_with_a_json_answer(api):
+    engine, port = api
+    headers = {"Host": f"127.0.0.1:{port}", "Origin": "http://evil.example"}
+    status, body = send(port, LAUNCHER_ROUTE, headers)
+    assert status == 403
+    assert json.loads(body) == {"ok": False, "error": "en-tête Origin refusé"}
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"Sec-Fetch-Site": "same-origin"},
+        {"Sec-Fetch-Site": "none"},
+        {"Origin": "http://127.0.0.1:{port}", "Sec-Fetch-Site": "same-origin"},
+    ],
+    ids=["our_page", "typed_address", "our_origin"],
+)
+def test_launcher_follows_a_navigation_of_ours(api, extra):
+    engine, port = api
+    headers = {"Host": f"127.0.0.1:{port}"} | {
+        name: value.format(port=port) for name, value in extra.items()
+    }
+    status, body = send(port, LAUNCHER_ROUTE, headers)
+    assert status == 200
+    assert body == SECRET.encode()
+    assert engine.actions == ["guest_launcher"]
+
+
+def test_bare_curl_still_gets_the_launcher(api):
+    """Ni `Origin` ni `Sec-Fetch-Site` : un vieux client ou `curl` passe, comme avant A4."""
+    engine, port = api
+    status, body = send(port, LAUNCHER_ROUTE, {"Host": f"127.0.0.1:{port}"})
+    assert status == 200
+    assert body == SECRET.encode()
+    assert engine.actions == ["guest_launcher"]
+
+
 def test_invite_routes_stay_outside_the_actions():
     assert "/api/invite/address" in POST_PATHS
     assert not {"invite", "set_invite_address", "guest_launcher"} & ACTIONS
@@ -1301,7 +1351,7 @@ def share():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    server = ShareServer(engine, SHARE_TOKEN, port, POLL_S)
+    server = ShareServer(engine, SHARE_TOKEN, port, POLL_S, peer_max=CONNECTIONS_MAX)
     yield port, engine
     server.close()
 

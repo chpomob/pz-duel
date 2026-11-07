@@ -38,6 +38,8 @@ KEY = re.compile(r"([\w-]+):")
 CONDITION = re.compile(r"^\s*(?:- )?if:", re.MULTILINE)
 SWALLOWED = re.compile(r"continue-on-error|\|\|\s*(?:true|:|exit 0)|set \+e")
 # `\binstaller\b` et non `installer` : `PyInstaller` construit le binaire, il n'installe rien.
+# Une action ne s'épingle qu'à un commit complet : un tag (`@v4`) ou un préfixe se déplacent.
+PINNED_ACTION = re.compile(r"uses: [\w.-]+/[\w./-]+@[0-9a-f]{40}")
 FORBIDDEN = re.compile(
     r"signtool|osslsigncode|codesign|cosign|\bgpg\b"
     r"|\binstaller\b|\bnsis\b|makensis|inno ?setup|\biscc\b|\bwix\b|\.msi\b"
@@ -107,6 +109,15 @@ def matrix_pythons(job: list[str]) -> list[str]:
     return re.findall(r"3\.\d+", line)
 
 
+def pin_problems(workflow: str, text: str) -> list[str]:
+    """Chaque `uses:` est épinglé à 40 caractères hexadécimaux, sinon c'est un défaut."""
+    return [
+        f"{workflow}: action not pinned to a full commit: {line.strip(' -')}"
+        for line in code_lines(text)
+        if "uses:" in line and not PINNED_ACTION.fullmatch(line.strip(" -"))
+    ]
+
+
 def checkout_problems(name: str, steps: list[str], windows: bool) -> list[str]:
     problems = []
     checkout = first_step(steps, "actions/checkout@")
@@ -154,7 +165,7 @@ def exe_name() -> str:
 
 def ci_problems(text: str) -> list[str]:
     top, jobs = parse(text)
-    problems = []
+    problems = pin_problems("tests", text)
     if "pull_request" not in blocks(top.get("on", [])[1:], 2):
         problems.append("tests: no pull_request trigger")
 
@@ -240,7 +251,7 @@ def gate_problems(text: str, jobs: dict[str, list[str]]) -> list[str]:
 def release_problems(text: str) -> list[str]:
     top, jobs = parse(text)
     exe = exe_name()
-    problems = []
+    problems = pin_problems("release", text)
 
     trigger = blocks(top.get("on", [])[1:], 2)
     tags = [line for line in trigger.get("push", []) if line.strip().startswith("tags:")]
@@ -249,8 +260,11 @@ def release_problems(text: str) -> list[str]:
     elif re.findall(r'"([^"]+)"', tags[0]) != ["v*"]:
         problems.append("release: tags are not v*")
 
-    if "permissions" in top:
-        problems.append("release: permissions belong to the job")
+    # Lecture seule pour tout le workflow : `contents: write` n'appartient qu'au job qui publie.
+    if [line.strip() for line in top.get("permissions", [])] != ["permissions:", "contents: read"]:
+        problems.append("release: workflow permissions are not exactly contents: read")
+    if any("write" in line for line in top.get("permissions", [])):
+        problems.append("release: write permissions belong to the publishing job")
     # Un seul job publie, et ses étapes ordonnent la publication : le reste n'est que sa porte.
     if sorted(jobs) != sorted([RELEASE_JOB, *RELEASE_SUITES]):
         return problems + ["release: expected the publishing job and the two test suites only"]
@@ -304,7 +318,10 @@ def replaced(old: str, new: str, count: int = 1):
 SMOKE_RUN = '        run: python packaging/smoke_test.py "$RUNNER_TEMP/dist/pz-duel.exe"\n'
 PUBLISH_NAME = "      - name: Publish\n"
 AUTOCRLF_STEP = "      - run: git config --global core.autocrlf false\n"
-CHECKOUT_STEP = "      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n"
+CHECKOUT_PIN = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+SETUP_PYTHON_PIN = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+CHECKOUT_STEP = f"      - uses: {CHECKOUT_PIN} # v4.4.0\n        with:\n          fetch-depth: 0\n"
+WORKFLOW_READ = "permissions:\n  contents: read\n"
 BUILD_JOB = "  build-windows:\n"
 
 
@@ -337,6 +354,13 @@ TESTS_MUTANTS = {
     "smoke_on_another_file": in_build_job("pz-duel.exe", "other.exe"),
     "smoke_may_fail": in_build_job(SMOKE_RUN, SMOKE_RUN + "        continue-on-error: true\n"),
     "build_on_linux": in_build_job("windows-latest", "ubuntu-latest"),
+    # A2 : la règle d'épinglage vaut pour `tests.yml` aussi, toutes actions comprises.
+    "action_on_a_moving_tag": replaced(CHECKOUT_PIN, "actions/checkout@v4"),
+    "action_on_a_short_sha": replaced(SETUP_PYTHON_PIN, SETUP_PYTHON_PIN[:-33]),
+    "action_on_a_branch": in_build_job(CHECKOUT_PIN, "actions/checkout@main"),
+    "action_in_upper_case": replaced(
+        CHECKOUT_PIN, "actions/checkout@" + CHECKOUT_PIN[-40:].upper()
+    ),
 }
 
 RELEASE_MUTANTS = {
@@ -399,8 +423,16 @@ RELEASE_MUTANTS = {
     ),
     "tests_swallowed": replaced("python -m pytest -q\n", "python -m pytest -q || true\n"),
     "tests_never_run": replaced("python -m pytest -q -rs", "python -m pytest --co -q"),
-    "actions_pinned_by_half": replaced(
-        "actions/checkout@v4", "actions/checkout@0000000000000000000000000000000000000000"
+    "actions_pinned_by_half": replaced(CHECKOUT_PIN, "actions/checkout@" + "0" * 40),
+    # A2 : un tag se déplace, un préfixe de commit aussi, une branche encore plus.
+    "release_action_on_a_moving_tag": replaced(CHECKOUT_PIN, "actions/checkout@v4", 3),
+    "release_action_on_a_short_sha": replaced(SETUP_PYTHON_PIN, SETUP_PYTHON_PIN[:-33], 3),
+    "release_action_on_a_branch": replaced(CHECKOUT_PIN, "actions/checkout@main", 3),
+    "no_workflow_permissions": replaced(WORKFLOW_READ, ""),
+    "workflow_write_instead_of_read": replaced(WORKFLOW_READ, "permissions:\n  contents: write\n"),
+    "workflow_write_all": replaced(WORKFLOW_READ, "permissions: write-all\n"),
+    "workflow_reads_and_writes_packages": replaced(
+        WORKFLOW_READ, WORKFLOW_READ + "  packages: write\n"
     ),
     "second_job": replaced("    steps:\n", "    steps:\n      - run: echo\n  other:\n    steps:\n"),
     "signtool": replaced(SMOKE_RUN, SMOKE_RUN + "      - run: signtool sign x\n"),
@@ -435,6 +467,40 @@ def test_ac47_defect_in_release_workflow_is_seen(mutant):
 
     assert mutated != text
     assert release_problems(mutated) != []
+
+
+@pytest.mark.parametrize(
+    ("line", "pinned"),
+    [
+        (f"      - uses: {CHECKOUT_PIN} # v4.4.0", True),
+        (f"      - uses: {SETUP_PYTHON_PIN}", True),
+        ("      - uses: actions/checkout@v4", False),
+        ("      - uses: actions/checkout@v4.4.0", False),
+        ("      - uses: actions/checkout@main", False),
+        ("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af67726", False),
+        ("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af6772620", False),
+        ("      - uses: actions/checkout@11D5960A326750D5838078E36CF38B85AF677262", False),
+        ("      - uses: actions/checkout", False),
+        ("      - uses: ./local-action", False),
+        ("      # uses: actions/checkout@v4", True),  # commentée, l'étape n'existe pas
+    ],
+)
+def test_a2_every_action_is_pinned_to_a_full_commit(line, pinned):
+    assert (pin_problems("w", f"jobs:\n  j:\n    steps:\n{line}\n") == []) is pinned
+
+
+@pytest.mark.parametrize("path", [TESTS_YML, RELEASE_YML], ids=lambda path: path.name)
+def test_a2_shipped_workflows_pin_every_action(path):
+    text = path.read_text(encoding="utf-8")
+    assert pin_problems(path.stem, text) == []
+    assert uses_lines(text) == {f"uses: {CHECKOUT_PIN}", f"uses: {SETUP_PYTHON_PIN}"}
+
+
+def test_a2_release_workflow_reads_and_only_the_publishing_job_writes():
+    top, jobs = parse(RELEASE_YML.read_text(encoding="utf-8"))
+    assert [line.strip() for line in top["permissions"]] == ["permissions:", "contents: read"]
+    writers = [name for name, job in jobs.items() if any("write" in line for line in job)]
+    assert writers == [RELEASE_JOB]
 
 
 def test_ac47_comments_do_not_trip_the_forbidden_words():

@@ -123,11 +123,11 @@ class ShareHTTPServer(BoundedHTTPServer):
     # écouteur y reste refusé. Sous Windows, cette option laisserait lier un port tenu.
     allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
 
-    def __init__(self, address: tuple[str, int], engine, route: bytes) -> None:
+    def __init__(self, address: tuple[str, int], engine, route: bytes, peer_max: int) -> None:
         self.engine = engine
         self.route = route
         self.closed = threading.Event()
-        super().__init__(address, ShareHandler)
+        super().__init__(address, ShareHandler, peer_max=peer_max)
 
     def server_bind(self) -> None:
         """Sans `HTTPServer.server_bind` : sur toutes les interfaces, son `getfqdn` interroge le
@@ -141,11 +141,15 @@ class ShareHTTPServer(BoundedHTTPServer):
 
 
 class ShareServer:
-    """Sert `/<jeton>/pz-duel-join.bat` dès sa création. Lève `OSError` si le port est pris."""
+    """Sert `/<jeton>/pz-duel-join.bat` dès sa création. Lève `OSError` si le port est pris.
 
-    def __init__(self, engine, token: str, port: int, poll_s: float) -> None:
+    Il écoute sur le réseau : `peer_max` (`share_connections_per_peer` de `runtime.json`) borne
+    les places d'une même adresse, pour qu'un seul pair lent ne refuse pas le vrai invité.
+    """
+
+    def __init__(self, engine, token: str, port: int, poll_s: float, *, peer_max: int) -> None:
         route = f"/{token}/{LAUNCHER_NAME}".encode("ascii")
-        self._httpd = ShareHTTPServer((ALL_INTERFACES, port), engine, route)
+        self._httpd = ShareHTTPServer((ALL_INTERFACES, port), engine, route, peer_max)
         self._lock = threading.Lock()
         serve = partial(self._httpd.serve_forever, poll_s)
         threading.Thread(target=serve, name="duel-share", daemon=True).start()

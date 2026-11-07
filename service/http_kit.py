@@ -85,7 +85,11 @@ def claim_address(sock: socket.socket) -> None:
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
-    """Un fil par connexion, `connections_max` au plus ; un refus retient `accept` un temps borné."""
+    """Un fil par connexion, `connections_max` au plus ; un refus retient `accept` un temps borné.
+
+    `peer_max`, s'il est donné, borne aussi les connexions d'une même adresse source : sans lui,
+    un seul pair lent prendrait toutes les places. Le refus est le même 503, sans fil.
+    """
 
     request_queue_size = CONNECTIONS_MAX  # une rafale se refuse, elle ne se perd pas en SYN
     # `HTTPServer` l'active, et `SO_REUSEADDR` laisserait sous Windows lier un port tenu.
@@ -93,9 +97,20 @@ class BoundedHTTPServer(ThreadingHTTPServer):
     # Posé par `main` : idempotent, il rend la main tout de suite. Sans lui, la sortie rend 409.
     on_quit = None
 
-    def __init__(self, *args, connections_max: int = CONNECTIONS_MAX, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        connections_max: int = CONNECTIONS_MAX,
+        peer_max: int | None = None,
+        **kwargs,
+    ) -> None:
+        if peer_max is not None and not 1 <= peer_max <= connections_max:
+            raise ValueError(f"peer_max must be from 1 to {connections_max}")
         self.connections_max = connections_max
+        self.peer_max = peer_max
         self._slots = threading.BoundedSemaphore(connections_max)
+        self._peers: dict[str, int] = {}  # adresse source -> connexions ouvertes, jamais 0
+        self._peers_lock = threading.Lock()
         super().__init__(*args, **kwargs)
 
     def server_bind(self) -> None:
@@ -103,7 +118,12 @@ class BoundedHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
     def process_request(self, request, client_address) -> None:
+        if not self._take_peer(client_address):
+            self._turn_away(request)
+            self.shutdown_request(request)
+            return
         if not self._slots.acquire(blocking=False):
+            self._release_peer(client_address)
             self._turn_away(request)
             self.shutdown_request(request)
             return
@@ -111,6 +131,7 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             super().process_request(request, client_address)
         except BaseException:  # le fil n'a pas démarré : personne d'autre ne rendrait la place
             self._slots.release()
+            self._release_peer(client_address)
             raise
 
     def process_request_thread(self, request, client_address) -> None:
@@ -118,6 +139,28 @@ class BoundedHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+            self._release_peer(client_address)
+
+    def _take_peer(self, client_address) -> bool:
+        """Compte la connexion pour son adresse ; faux si celle-ci a déjà `peer_max` places."""
+        if self.peer_max is None:
+            return True
+        peer = client_address[0]
+        with self._peers_lock:
+            held = self._peers.get(peer, 0)
+            if held >= self.peer_max:
+                return False
+            self._peers[peer] = held + 1
+        return True
+
+    def _release_peer(self, client_address) -> None:
+        if self.peer_max is None:
+            return
+        peer = client_address[0]
+        with self._peers_lock:
+            held = self._peers.pop(peer) - 1
+            if held:
+                self._peers[peer] = held
 
     def _turn_away(self, request: socket.socket) -> None:
         """Tourne sur le fil d'`accept` : l'envoi n'attend pas, la vidange s'arrête au budget."""
