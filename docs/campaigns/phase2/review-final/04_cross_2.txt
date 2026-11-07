@@ -1,0 +1,76 @@
+{
+  "findings": [
+    {
+      "id": "X1",
+      "severity": "minor",
+      "original_id": "A1",
+      "action": "VALIDATE",
+      "file": "service/http_kit.py",
+      "line": 105,
+      "summary": "Connection limits bound resources but do not guarantee guest availability",
+      "evidence": "The semaphore in http_kit.py:105-120 admits connections without considering their source. ShareHandler authenticates the token only after parsing headers (share.py:99-103), so unauthenticated connections consume slots. Sustained starvation requires reconnecting: HeadReader's absolute deadline at http_kit.py:57-63 prevents periodic bytes from extending an individual connection indefinitely. Additionally, overload rejection synchronously drains each refused connection for up to 0.5 seconds on the accept thread (http_kit.py:122-130), so overload can produce queued connections and delays as well as 503 responses.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X2",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "VALIDATE",
+      "file": ".github/workflows/release.yml",
+      "line": 14,
+      "summary": "Release dependencies execute inside the publication permission boundary",
+      "evidence": "The release job grants contents:write before checkout, setup-python, dependency installation, building, and publication. Checkout and setup-python use version tags, and the pip command does not require hashes. The publication permission therefore encompasses dependency execution, independently of whether the test jobs inherit write permissions. The latter claim remains conditional because repository settings were not provided; this supports hardening, not a claim of an observed compromise.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X3",
+      "severity": "nit",
+      "original_id": "A3",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 188,
+      "summary": "The ambiguous opening sentence is followed by explicit verification instructions",
+      "evidence": "Although 'see this code in their launcher' is misleading, engine.py:189-193 immediately instructs the guest to run certutil before opening the file, compare the hash prefix, and recognize that a replaced launcher can skip its internal check. The complete message supplies exactly the procedure the finding recommends. Rewording the first sentence is justified, but treating this message itself as defeating the verification control overstates the evidence.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X4",
+      "severity": "minor",
+      "original_id": "A4",
+      "action": "VALIDATE",
+      "file": "service/api.py",
+      "line": 180,
+      "summary": "Originless navigation can pass the launcher endpoint's checks",
+      "evidence": "api.py:184-191 requires one allowed Host but accepts an absent Origin; api.py:277-292 then serves the launcher as an attachment. Assuming the browser permits the cross-site navigation and supplies no Origin, the server will accept it during a real lobby. This supports the limited unwanted-download concern. It does not establish password disclosure to the initiating website or automatic execution. Actual download behavior requires verification in the supported browser.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X5",
+      "severity": "nit",
+      "original_id": "A5",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 2034,
+      "summary": "Launcher generation holds the shared engine lock across disk reads",
+      "evidence": "set_invite_address holds self.lock while rebuilding at engine.py:1979-1985; _open_lobby similarly holds it when calling _open_invite at 2267-2270. build_launcher invokes _mod_lines, which traverses and reads the mod at guest_launcher.py:318-324. snapshot and guest_launcher acquire the same lock at engine.py:1708 and 1991. Slow storage therefore delays those operations. The impact is limited because downloads return cached launcher bytes rather than rebuilding on every request.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X6",
+      "severity": "minor",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/guest_launcher.py",
+      "line": 222,
+      "summary": "Immediate client failure is classified as successful startup",
+      "evidence": "Start-Client discards the Process returned by Process.Start at line 222 and performs no exit check. If the executable starts successfully but immediately exits with an error, the caller proceeds through line 255 to set code=0 at line 267. Rollback is skipped, staging cleanup removes the previous mod at lines 273-274, and the batch wrapper receives success. Thus a common startup failure bypasses both recovery and failure reporting, despite README.md's guest instructions promising restoration on failure.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

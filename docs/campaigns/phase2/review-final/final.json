@@ -1,0 +1,486 @@
+{
+  "verdict": "REJECT",
+  "status": "complete",
+  "summary": "READ:e5e51ac1fb4e9547\nREAD: /tmp/review-phase2-final-1/READ:e5e51ac1fb4e9547\n\n# Phase 2 Final Review: Synthesis\n\n## Verdict",
+  "findings": {
+    "minor": 4,
+    "nit": 1
+  },
+  "finding_details": [
+    {
+      "id": "A1",
+      "severity": "minor",
+      "file": "service/share.py",
+      "line": 153,
+      "summary": "LAN-facing share listener can be starved by slow clients (32 slots, 5 s head deadline, no per-peer limit)",
+      "evidence": "ShareServer binds ALL_INTERFACES (share.py:33,153) on BoundedHTTPServer with CONNECTIONS_MAX=32 (http_kit.py:22). Each connection holds a slot for up to REQUEST_READ_S=5 s (head deadline) plus DRAIN_S=1 s. Any host on the LAN can open 32 slow connections in a loop, so the guest gets 503 for as long as the lobby is open. The token prevents reading the file but not this denial of service. Nothing limits connections per source address. Assumption: the 'trusted network' framing in the README and limites-connues covers this. To confirm, open 32 sockets that send one byte every 4 s and try the real URL.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": ".github/workflows/release.yml",
+      "line": 1,
+      "summary": "Release workflow: no workflow-level permissions block, and actions pinned by mutable tag, on a job that holds contents:write",
+      "evidence": "Only the `release` job declares `permissions: contents: write`. The `pytest` and `pytest-windows` jobs inherit the repository's default GITHUB_TOKEN permissions, which may be write on older repos. The same job that publishes the unsigned exe uses actions/checkout@v4 and actions/setup-python@v5 (mutable tags) and installs PyInstaller from PyPI without --require-hashes (requirements-build.txt pins only the version). A compromised tag or package would be built into the published binary, and the published .sha256 would vouch for it. Fix: add top-level `permissions: contents: read`, pin actions by commit SHA, and use hash-pinned build requirements.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 188,
+      "summary": "Host-facing code text says the guest 'must see this code in their launcher', but the launcher never shows it",
+      "evidence": "LAUNCHER_CODE_TEXT starts 'Your guest must see this code in their launcher'. The guest_launcher.py docstring states 'le code n'est jamais affich\u00e9 par le lanceur', and the .bat only asks the guest to type it (BATCH set /p). A host who takes the text literally may expect the guest to read the code off the launcher, which defeats the out-of-band check. That check (certutil before opening) is the only one that holds against substitution. The sentence should say the guest compares the code with certutil before opening the file.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "minor",
+      "file": "service/api.py",
+      "line": 242,
+      "summary": "GET /api/invite/launcher is reachable by cross-site top-level navigation (Host check only)",
+      "evidence": "do_GET calls _refused() (Host/Origin checks) for /api/ paths. A top-level navigation or <a download> from any web page sends Host 127.0.0.1:<port> and no Origin, so it passes, and _get_launcher answers with Content-Disposition attachment. A malicious page that knows or guesses the port (8765 by default, main.py:99) can drop pz-duel-join.bat, with the server password inside, into the user's Downloads during a lobby. The page cannot read the response, so impact is limited to an unrequested download. Requiring a custom header or Sec-Fetch-Site=same-origin on this route would close it.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A5",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 2033,
+      "summary": "_build_invite reads and hashes every mod file while the engine lock is held",
+      "evidence": "_open_invite and set_invite_address hold self.lock, call _build_invite, which calls build_launcher, which calls _mod_lines, which runs rglob and read_bytes on MOD_SRC. On a slow disk or AV-scanned Windows profile, /api/state, actions and the share handler's guest_launcher() block on this I/O. The comment at engine.py:1789 shows the code already avoids disk I/O under the lock elsewhere. The mod bytes could be read once, outside the lock.",
+      "confidence": "medium",
+      "basis": "code"
+    }
+  ],
+  "epistemic_labels": {
+    "confidence": {
+      "high": 1,
+      "medium": 4,
+      "low": 0
+    },
+    "basis": {
+      "spec": 0,
+      "code": 4,
+      "inference": 1,
+      "external": 0
+    },
+    "combined": {
+      "medium/code": 3,
+      "high/code": 1,
+      "medium/inference": 1
+    }
+  },
+  "epistemic_distribution": {
+    "confidence": {
+      "high": 1,
+      "medium": 4,
+      "low": 0
+    },
+    "basis": {
+      "spec": 0,
+      "code": 4,
+      "inference": 1,
+      "external": 0
+    },
+    "combined": {
+      "medium/code": 3,
+      "high/code": 1,
+      "medium/inference": 1
+    }
+  },
+  "warnings": [],
+  "report": "docs/campaigns/phase2/review-final/review.md",
+  "source_diff": true,
+  "context": {
+    "ok": true,
+    "reason": "ok",
+    "thresholds": {
+      "min_chars": 1,
+      "min_tokens": 1,
+      "required_sections": [],
+      "min_source_lines": 1
+    }
+  },
+  "thresholds": {
+    "min_chars": 1,
+    "min_tokens": 1,
+    "required_sections": [],
+    "min_source_lines": 1
+  },
+  "complexity": {
+    "score": 1381418,
+    "level": "high",
+    "recommended_agents": 6,
+    "stats": {
+      "chars": 693698,
+      "files": 52,
+      "source_lines": 15138,
+      "hunks": 242,
+      "requirements": 0,
+      "modules": 52
+    },
+    "tier": "high",
+    "max_agents": 6,
+    "summary": "high: 693698 chars, 52 files, 15138 source lines, 242 hunks, 0 requirements, 52 modules"
+  },
+  "execution": {
+    "max_retries": 3,
+    "max_input_chars": 262144,
+    "max_output_chars": 131072,
+    "truncate_input": false,
+    "show_costs": false,
+    "concurrency": null,
+    "max_concurrency": 6,
+    "max_agents": 6
+  },
+  "parallel": {
+    "perspectives": [
+      "architect",
+      "inspector"
+    ],
+    "requested_concurrency": 6,
+    "max_concurrency": 6,
+    "effective_concurrency": 2
+  },
+  "attempts": [
+    {
+      "call": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 65.60901218373328,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1168,
+        "completion_tokens": 1115,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 134.6708290167153,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2921,
+        "completion_tokens": 571,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "call": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 67.6137047749944,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1093,
+        "completion_tokens": 1075,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 136.07331312680617,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2719,
+        "completion_tokens": 1259,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 67.61942204507068,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4618,
+        "completion_tokens": 3145,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "cap_events": [
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 627127,
+      "truncated": true
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 183806,
+      "truncated": true
+    }
+  ],
+  "calls": [
+    {
+      "label": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1168,
+        "completion_tokens": 1115,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "label": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "ok": true,
+      "returncode": 0,
+      "stderr": "Reading additional input from stdin...\nOpenAI Codex v0.163.0\n--------\nworkdir: /tmp/review-phase2-final-1\nmodel: gpt-6.1-sol\nprovider: openai\napproval: on-request\nsandbox: read-only\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1b568-cf4c-76b3-a454-a703c085490c\n--------\nuser\nYou are an **Inspector** reviewer. Your focus is edge cases, bug-hunting, error handling, and code-level correctness.\n\nFor every piece of code you see, scrutinize:\n1. **Edge cases** \u2014 Boundary conditions, empty states, invalid inputs, overflow/underflow, null or default values. What happens at the limits?\n2. **Error handling** \u2014 Are errors propagated correctly or silently swallowed? Are failure modes logged with sufficient context? Can a single error cascade?\n3. **Resource management** \u2014 Memory leaks, unbounded growth, file descriptor exhaustion, unclosed handles, missing cleanup on error paths.\n4. **Race conditions and concurrency** \u2014 Data races, deadlocks, ordering assumptions, missing or incorrect synchronization primitives.\n5. **Input validation** \u2014 Deserialization safety, protocol parsing robustness, user input sanitization. Can malformed data cause crashes or security issues?\n\n# Git Workflow (Canonical)\n\nCanonical definition \u2014 personas reference this file instead of copying its\ntext; the library's `inject_persona` splices this text into every prompt that\ncarries the reference line, so the rules always reach the model.\n\n## Git workflow rules\n\n- BUILD phase: Write complete, working code on disk. All new and modified files will be staged and committed automatically by the orchestrator after you finish. Do NOT produce markdown code blocks, JSON, or text reports \u2014 produce ACTUAL FILES on disk. Sole exception: if the environment refuses disk writes outright (sandbox denial: the write tool blocks writing to disk \u2014 not a user-denied permission prompt, lint/hook rejection, or invalid path), fall back to complete source in markdown code blocks and state the fallback plus the refusa",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2921,
+        "completion_tokens": 571,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "label": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1093,
+        "completion_tokens": 1075,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "stderr": "Reading additional input from stdin...\nOpenAI Codex v0.163.0\n--------\nworkdir: /tmp/review-phase2-final-1\nmodel: gpt-6.1-sol\nprovider: openai\napproval: on-request\nsandbox: read-only\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1b56b-e5d1-7222-8859-5480fea24501\n--------\nuser\nYou are a **Cross-Reviewer** \u2014 a devil's advocate. You have been shown another reviewer's findings and must VALIDATE, CHALLENGE, or ADD to each one.\n\nYour job:\n1. **VALIDATE** findings you agree with \u2014 confirm them with additional evidence\n2. **CHALLENGE** findings based on system constraints, design trade-offs, or alternative interpretations. A finding may be wrong if it ignores real-world operational constraints or overestimates what the system guarantees.\n3. **ADD** findings the original reviewer missed \u2014 especially around resilience, edge cases, security, and architectural assumptions\n\nFocus on cross-cutting concerns: reliability under load, failure modes, security boundaries, and operational realism. Are the claims backed by the actual code behaviour?\n\nOutput JSON:\n```json\n{\n  \"findings\": [\n    {\n      \"id\": \"X1\",\n      \"severity\": \"blocker|major|minor|nit\",\n      \"original_id\": \"A1 or B1\",\n      \"action\": \"VALIDATE|CHALLENGE|ADD\",\n      \"file\": \"path/to/file.c\",\n      \"line\": 42,\n      \"summary\": \"Short title\",\n      \"evidence\": \"Why this changes or confirms the original finding\",\n      \"confidence\": \"high|medium|low\",\n      \"basis\": \"spec|code|inference|external\"\n    }\n  ]\n}\n```\n\n\n## Epistemic labels\n\nEvery finding must include `confidence` (`high`, `medium`, or `low`) and\n`basis` (`spec`, `code`, `inference`, or `external`). Choose both labels from\nthe evidence actually cited, not from the finding's severity or the original\nreviewer's labels.\n\nEvidence must match `basis`:\n- `spec`: quote or identify the exact requirement or acceptance criterion.\n- `code`: cite the concrete file/line and the behavior visible in the code or diff.\n- `inference`: state the reasoning and ass",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2719,
+        "completion_tokens": 1259,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4618,
+        "completion_tokens": 3145,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "failures": [],
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 12519,
+        "completion_tokens": 7165,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "architect": {
+        "prompt_tokens": 1168,
+        "completion_tokens": 1115,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "inspector": {
+        "prompt_tokens": 2921,
+        "completion_tokens": 571,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_1": {
+        "prompt_tokens": 1093,
+        "completion_tokens": 1075,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_2": {
+        "prompt_tokens": 2719,
+        "completion_tokens": 1259,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 4618,
+        "completion_tokens": 3145,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "architect": {
+        "prompt_tokens": 1168,
+        "completion_tokens": 1115,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "inspector": {
+        "prompt_tokens": 2921,
+        "completion_tokens": 571,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review": {
+        "prompt_tokens": 3812,
+        "completion_tokens": 2334,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 4618,
+        "completion_tokens": 3145,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 12519,
+      "completion_tokens": 7165,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 1168,
+        "completion_tokens": 1115,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2921,
+        "completion_tokens": 571,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 1093,
+        "completion_tokens": 1075,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2719,
+        "completion_tokens": 1259,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 4618,
+        "completion_tokens": 3145,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    ]
+  },
+  "artifacts": {
+    "01_architect": "docs/campaigns/phase2/review-final/01_architect.txt",
+    "02_inspector": "docs/campaigns/phase2/review-final/02_inspector.txt",
+    "03_cross_1": "docs/campaigns/phase2/review-final/03_cross_1.txt",
+    "04_cross_2": "docs/campaigns/phase2/review-final/04_cross_2.txt",
+    "05_synthesis": "docs/campaigns/phase2/review-final/05_synthesis.txt",
+    "review": "docs/campaigns/phase2/review-final/review.md"
+  },
+  "cleanup_warnings": []
+}

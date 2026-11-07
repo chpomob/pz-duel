@@ -1,0 +1,57 @@
+READ:e5e51ac1fb4e9547
+READ: /tmp/review-phase2-final-1
+{
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "minor",
+      "file": "service/share.py",
+      "line": 153,
+      "summary": "LAN-facing share listener can be starved by slow clients (32 slots, 5 s head deadline, no per-peer limit)",
+      "evidence": "ShareServer binds ALL_INTERFACES (share.py:33,153) on BoundedHTTPServer with CONNECTIONS_MAX=32 (http_kit.py:22). Each connection holds a slot for up to REQUEST_READ_S=5 s (head deadline) plus DRAIN_S=1 s. Any host on the LAN can open 32 slow connections in a loop, so the guest gets 503 for as long as the lobby is open. The token prevents reading the file but not this denial of service. Nothing limits connections per source address. Assumption: the 'trusted network' framing in the README and limites-connues covers this. To confirm, open 32 sockets that send one byte every 4 s and try the real URL.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": ".github/workflows/release.yml",
+      "line": 1,
+      "summary": "Release workflow: no workflow-level permissions block, and actions pinned by mutable tag, on a job that holds contents:write",
+      "evidence": "Only the `release` job declares `permissions: contents: write`. The `pytest` and `pytest-windows` jobs inherit the repository's default GITHUB_TOKEN permissions, which may be write on older repos. The same job that publishes the unsigned exe uses actions/checkout@v4 and actions/setup-python@v5 (mutable tags) and installs PyInstaller from PyPI without --require-hashes (requirements-build.txt pins only the version). A compromised tag or package would be built into the published binary, and the published .sha256 would vouch for it. Fix: add top-level `permissions: contents: read`, pin actions by commit SHA, and use hash-pinned build requirements.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 188,
+      "summary": "Host-facing code text says the guest 'must see this code in their launcher', but the launcher never shows it",
+      "evidence": "LAUNCHER_CODE_TEXT starts 'Your guest must see this code in their launcher'. The guest_launcher.py docstring states 'le code n'est jamais affiché par le lanceur', and the .bat only asks the guest to type it (BATCH set /p). A host who takes the text literally may expect the guest to read the code off the launcher, which defeats the out-of-band check. That check (certutil before opening) is the only one that holds against substitution. The sentence should say the guest compares the code with certutil before opening the file.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "minor",
+      "file": "service/api.py",
+      "line": 242,
+      "summary": "GET /api/invite/launcher is reachable by cross-site top-level navigation (Host check only)",
+      "evidence": "do_GET calls _refused() (Host/Origin checks) for /api/ paths. A top-level navigation or <a download> from any web page sends Host 127.0.0.1:<port> and no Origin, so it passes, and _get_launcher answers with Content-Disposition attachment. A malicious page that knows or guesses the port (8765 by default, main.py:99) can drop pz-duel-join.bat, with the server password inside, into the user's Downloads during a lobby. The page cannot read the response, so impact is limited to an unrequested download. Requiring a custom header or Sec-Fetch-Site=same-origin on this route would close it.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A5",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 2033,
+      "summary": "_build_invite reads and hashes every mod file while the engine lock is held",
+      "evidence": "_open_invite and set_invite_address hold self.lock, call _build_invite, which calls build_launcher, which calls _mod_lines, which runs rglob and read_bytes on MOD_SRC. On a slow disk or AV-scanned Windows profile, /api/state, actions and the share handler's guest_launcher() block on this I/O. The comment at engine.py:1789 shows the code already avoids disk I/O under the lock elsewhere. The mod bytes could be read once, outside the lock.",
+      "confidence": "medium",
+      "basis": "code"
+    }
+  ],
+  "verdict": "APPROVE"
+}
