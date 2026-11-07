@@ -1614,13 +1614,16 @@ def test_ac48_pyinstaller_stays_out_of_service():
 
 
 def test_ac48_build_requirement_is_pinned():
+    """P19F6 : chaque paquet porte ses empreintes ; PyInstaller reste figé en 6.22.3."""
     entries = [
-        line
+        line.split(" ")[0]
         for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
+        if line.strip() and not line.startswith(("#", " "))
     ]
 
-    assert entries == ["pyinstaller==6.22.3"]
+    assert entries[0] == "pyinstaller==6.22.3"
+    assert all("==" in entry for entry in entries)
+    assert "--hash=sha256:" in REQUIREMENTS.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("path", [SMOKE, ENTRY], ids=["smoke", "entry"])

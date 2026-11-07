@@ -37,9 +37,17 @@ MAX_LINE_BYTES = 8000
 MAX_LAUNCHER_BYTES = 256 * 1024
 BASE64_LINE_CHARS = 6000
 MAX_PORT = 65535
-# 48 bits : un faux fichier au même code coûte des heures de GPU, bien plus que la vie d'un lobby.
-# Le PowerShell écrit la même valeur dans `$CodeChars`.
-LAUNCHER_CODE_CHARS = 12
+# 64 bits : un faux fichier au même code coûte de l'ordre de 2^64 calculs, hors de portée d'un
+# attaquant pendant la vie d'un lobby. Le PowerShell écrit la même valeur dans `$CodeChars`.
+LAUNCHER_CODE_CHARS = 16
+# Le client doit apparaître, puis tourner encore `CLIENT_SETTLE_S` secondes, dans les
+# `CLIENT_START_S` secondes qui suivent son lancement ; sinon, le lancement a échoué. Le PowerShell
+# écrit les mêmes valeurs dans `$StartSeconds` et `$SettleSeconds`.
+CLIENT_START_S = 30
+CLIENT_SETTLE_S = 5
+# Le mod remplacé est gardé dans `Zomboid`, hors de `mods` : le jeu y verrait sinon deux mods de
+# même identifiant.
+PREVIOUS_SUFFIX = ".previous"
 
 PASSWORD_ALLOWED = re.compile(r"[A-Za-z0-9._-]+")
 HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
@@ -91,7 +99,12 @@ $ErrorActionPreference = 'Stop'
 $ClientName = 'ProjectZomboid64.exe'
 $ModId = 'duelcore'
 $Damaged = 'This launcher file is damaged. Ask the host for a new one.'
-$CodeChars = 12
+$CodeChars = 16
+$StartSeconds = 30
+$SettleSeconds = 5
+$PollMs = 250
+$ClientProcess = [IO.Path]::GetFileNameWithoutExtension($ClientName)
+$NotStarted = 'Project Zomboid did not start, or closed at once. Start it once from Steam to check that it works, then run this file again.'
 $CodeRefused = 'This is not the code of this file. Do not use it: ask the host for a new launcher.'
 
 function Test-Code([string]$Path, [string]$Typed) {
@@ -224,6 +237,57 @@ function Start-Client([string]$Client, [string[]]$Join) {
     [void][Diagnostics.Process]::Start($info)
 }
 
+# The game's processes, by name: the one started may hand over to another, so its object proves nothing.
+function Get-ClientIds {
+    @(Get-Process | Where-Object {
+        [IO.Path]::GetFileNameWithoutExtension($_.ProcessName) -ieq $ClientProcess
+    } | ForEach-Object { $_.Id })
+}
+
+# True once a game process that was not there before has run for $SettleSeconds.
+# One that appears then vanishes is a failure at once; none at all is one after $StartSeconds.
+function Wait-Client([int[]]$Before) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $seen = $null
+    while ($clock.Elapsed.TotalSeconds -lt $StartSeconds) {
+        $new = @(Get-ClientIds | Where-Object { $Before -notcontains $_ })
+        if ($new.Count -gt 0) {
+            if ($null -eq $seen) { $seen = $clock.Elapsed.TotalSeconds }
+            if ($clock.Elapsed.TotalSeconds - $seen -ge $SettleSeconds) { return $true }
+        } elseif ($null -ne $seen) {
+            return $false
+        }
+        Start-Sleep -Milliseconds $PollMs
+    }
+    $false
+}
+
+function Get-Sums([string]$Folder) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $root = [IO.Path]::GetFullPath($Folder)
+    $sums = foreach ($file in [IO.Directory]::GetFiles($root, '*', [IO.SearchOption]::AllDirectories)) {
+        $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($file)))
+        $file.Substring($root.Length) + ' ' + $hash
+    }
+    (@($sums) | Sort-Object) -join "`n"
+}
+
+# The replaced mod goes to Zomboid, outside mods. One that equals the new mod is not kept:
+# it would push out the guest's own earlier mod, on a rematch.
+function Save-Previous([string]$Previous, [string]$Target, [string]$Backup) {
+    if ((Get-Sums $Previous) -ceq (Get-Sums $Target)) {
+        Remove-Item -LiteralPath $Previous -Recurse -Force
+        if (Test-Path -LiteralPath $Backup) {
+            Write-Host "Your earlier $ModId mod is still kept in: $Backup"
+        }
+        return
+    }
+    if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }
+    Move-Item -LiteralPath $Previous -Destination $Backup
+    Write-Host "Your previous $ModId mod was not deleted. It is kept in: $Backup"
+    Write-Host "To go back to it, quit the game, delete $Target and move that folder back in its place, named $ModId."
+}
+
 if (-not (Test-Code $env:PZDUEL_SELF $env:PZDUEL_TYPED)) {
     Write-Host ('ERROR: ' + $CodeRefused) -ForegroundColor Red
     Write-Host 'The game was not started and the installed mod was not changed.'
@@ -242,6 +306,7 @@ try {
     $zomboid = [IO.Path]::Combine($env:USERPROFILE, 'Zomboid')
     $mods = [IO.Path]::Combine($zomboid, 'mods')
     $target = [IO.Path]::Combine($mods, $ModId)
+    $backup = [IO.Path]::Combine($zomboid, $ModId + '.previous')
     $stage = [IO.Path]::Combine($zomboid, '.' + $ModId + '-' + [Guid]::NewGuid().ToString('N'))
     $staged = [IO.Path]::Combine($stage, 'new')
     $previous = [IO.Path]::Combine($stage, 'previous')
@@ -251,10 +316,15 @@ try {
     [void][IO.Directory]::CreateDirectory($mods)
     $replacing = Test-Path -LiteralPath $target
     if ($replacing) { Move-Item -LiteralPath $target -Destination $previous }
+    $waited = $false
     try {
         Move-Item -LiteralPath $staged -Destination $target
         Write-Host 'Starting Project Zomboid...'
+        $before = Get-ClientIds
         Start-Client $client $join
+        Write-Host "Checking that the game keeps running ($SettleSeconds seconds)..."
+        $waited = $true
+        if (-not (Wait-Client $before)) { throw $NotStarted }
     } catch {
         $cause = $_.Exception.Message
         try {
@@ -264,9 +334,22 @@ try {
             $keepStage = $true
             throw "$cause The previous mod could not be put back; it is kept in: $previous"
         }
+        if ($waited) {
+            $keepStage = $true
+            throw "$cause The installed mod was not changed. The mod that was tried is kept in: $rejected"
+        }
         throw $cause
     }
     $code = 0
+    Write-Host 'Project Zomboid is running.'
+    if ($replacing) {
+        try {
+            Save-Previous $previous $target $backup
+        } catch {
+            $keepStage = $true
+            Write-Host "Your previous $ModId mod is kept in: $previous"
+        }
+    }
 } catch {
     Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red
     if (-not $keepStage) { Write-Host 'The game was not started and the installed mod was not changed.' }

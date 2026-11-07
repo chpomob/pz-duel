@@ -1,2 +1,31 @@
 # Build only: nothing in service/ imports it, and the service stays stdlib.
-pyinstaller==6.22.3
+# Every package of the build is pinned with the SHA-256 of its PyPI wheels, and installed with
+# `pip install --require-hashes --only-binary :all: -r` by tests.yml and release.yml alike: a
+# substituted package refuses the install instead of entering a binary that `.sha256` would vouch for.
+# pefile stays below 2024.8.26, the release PyInstaller once excluded for its slowness.
+# To move a version: `pip download` the wheels, and copy each `sha256sum` here, with PyPI's to compare.
+
+pyinstaller==6.22.3 \
+    --hash=sha256:052f4a1cd4f81092ccb7a18fe8ebc9ecf832a5917317e39fb3775af4e959b253 \
+    --hash=sha256:312da84b4b31ab9750066a823734c11b7c68757fdd67c9f038bf19c330a954e4 \
+    --hash=sha256:020d4fe0627f5c73dfbcfad1a6578ef354d5fe4bdccd9d8e5a615528f5a45d2b \
+    --hash=sha256:9e4f7bd64b2103f14b4a6240fb9155e9fe7bc61391b4043bbddb7d3ebc8ab0fa \
+    --hash=sha256:f82d0fb89f21c3ed6f482ee16f341bc59e8a31dbabb9bae9ef04e53ade4dc0d9 \
+    --hash=sha256:451a4ae14b719365bf1a2f0a99dae7b3463060061c3a394c70d5264cfb439528 \
+    --hash=sha256:ea240b5dfa831ff673c97505eee0ec24670bccf71396c83109440348944c83d0 \
+    --hash=sha256:a2b6fc26601e8c2596c3d54981566934a3382e85d05d0fe91b55b6a8dcc6b282 \
+    --hash=sha256:46a3e30a118341a1ec20667a5a95aa7e0aa8c4fa129893c0151b3eb3f801a722 \
+    --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b \
+    --hash=sha256:31df3cc4261e804a53d358b7897c293ec8b88b167a7cca06c78018085c855f97
+altgraph==0.17.5 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pyinstaller-hooks-contrib==2026.9 \
+    --hash=sha256:fb3e67dd64122561724c48ad0366ac9e8c16e638b63bf7d85de03bf3fdbf06c3
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
+pefile==2023.2.7 ; sys_platform == "win32" \
+    --hash=sha256:da185cd2af68c08a6cd4481f7325ed600a88f6a813bad9dea07ab3ef73d8d8d6
+pywin32-ctypes==0.2.3 ; sys_platform == "win32" \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8

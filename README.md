@@ -65,7 +65,9 @@ runs both servers and needs about 6 GB of free RAM.
    your guest will not get in: open *Windows Security*, *Firewall & network protection*, *Allow an app
    through firewall*.
 6. **Invite your opponent** from the lobby: `Copy link`, or `Save launcher` to get
-   `pz-duel-join.bat`. Then `Ouvrir PZ` joins your own server.
+   `pz-duel-join.bat`. The lobby also shows a **verification code**: **read it aloud** to your guest,
+   by voice, **separately from the link**, never in the same message as the link or the file. It is
+   the only protection against a file replaced on the way. Then `Ouvrir PZ` joins your own server.
 7. **Leave with `Quit`** in the page. Closing the browser tab does not stop PZ Duel.
 
 If `Launch duel` ends on an error, use `Try again`. If the screen tells you to, quit and reopen PZ Duel.
@@ -75,10 +77,19 @@ If `Launch duel` ends on an error, use `Try again`. If the screen tells you to, 
 1. **Get the `.bat`** on the Windows PC that has the game: open the host's link there, or save the file
    the host sent. The link only works while the host is in the lobby. Scanning the QR code with a phone
    puts the file on the phone, where it is no use.
-2. **Double-click `pz-duel-join.bat`.** **SmartScreen** may warn here too: **More info**, then **Run
-   anyway**. Only do this for a file from someone you trust.
-3. It installs the mod and starts the game, connected to the host. If it cannot find the game, it asks
-   for the folder. If anything fails, your existing mod is left as it was and the window stays open.
+2. **Check the file before opening it.** Ask the host for the verification code they read aloud. In
+   the folder that holds the file, right-click an empty spot, choose **Open in Terminal** (on Windows 10,
+   hold Shift while right-clicking to get the same kind of window), and type
+   `certutil -hashfile pz-duel-join.bat SHA256`. **Do not open the file if the result does not start
+   with that code**: it was replaced on the way. Delete it and ask the host for a new one.
+3. **Only then, double-click `pz-duel-join.bat`.** **SmartScreen** may warn here too: **More info**,
+   then **Run anyway**. Only do this for a file from someone you trust, checked at step 2. It asks for
+   the code again: type it, then press Enter. A launcher that does not ask for it was replaced.
+4. It installs the mod, starts the game connected to the host, and waits a few seconds to check that
+   the game keeps running. If it cannot find the game, it asks for the folder. If anything fails, or
+   the game closes at once, your existing mod is put back as it was and the window stays open. When
+   it succeeds, the `duelcore` mod it replaced is not deleted: it is kept in
+   `Zomboid\duelcore.previous`, in your user folder, and the window says how to go back to it.
 
 ### Playing over the Internet
 

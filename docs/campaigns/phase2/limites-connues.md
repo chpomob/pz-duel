@@ -121,7 +121,8 @@ The invitation is **meant for a trusted network**. The link is plain HTTP, as AC
 under the guest's account. The SHA-256 sums inside the `.bat` only tie its embedded files to each other.
 **The code is the only protection against a replaced file.**
 
-- **What the code is**: the first 12 hexadecimal characters of the SHA-256 of the whole `.bat`, as served.
+- **What the code is**: the first 16 hexadecimal characters (64 bits) of the SHA-256 of the whole `.bat`,
+  as served (P19F6; 12 characters before).
   The lobby shows it next to the invitation, and the host reads it to the guest, never next to the link:
   `tests/test_share.py::test_shown_code_comes_from_the_very_bytes_served` and
   `tests/test_share.py::test_changed_byte_no_longer_matches_the_code_and_the_check_refuses`.
@@ -138,8 +139,27 @@ under the guest's account. The SHA-256 sums inside the `.bat` only tie its embed
 - **A guest who skips `certutil` is not protected**, and nothing in PZ Duel can make them run it.
 - **The code protects the file, not the secrecy of the invitation.** The password still crosses the
   network in clear. Someone who can read the traffic can use it, whatever the code says.
-- **48 bits**: a replaced file with the same code is possible at the cost of about 2^48 hashes. That is
-  hours of GPU time, far longer than a lobby usually lasts, but not out of reach.
+- **64 bits**: a replaced file with the same code costs about 2^64 hashes, out of reach for the length
+  of a lobby. The README tells the guest to run `certutil` before opening the file, and the host to read
+  the code aloud, apart from the link:
+  `tests/test_guest_launcher.py::test_code_is_64_bits` and
+  `tests/test_ci_workflows.py::test_guest_checks_the_file_with_certutil_before_opening_it`.
+- **The launcher only reports success once the game keeps running.** A `ProjectZomboid64` process that
+  was not there before must appear and still run 5 seconds later, within 30 seconds of the launch. The
+  check follows the process name, not the object `Process.Start` returns, so a client that hands over to
+  another process still counts. A game that closes at once, or never appears, is a failure: the guest's
+  previous mod is put back, and the mod that was tried stays in the `.duelcore-*` folder of `Zomboid`,
+  whose path the window gives:
+  `tests/test_guest_launcher.py::test_client_closing_at_once_fails_and_puts_the_old_mod_back`.
+  A game that crashes later, once in the menu or the server, is not seen. Another
+  `ProjectZomboid64` started by someone else during those seconds would be taken for the game.
+- **The replaced `duelcore` is kept, in `Zomboid\duelcore.previous`**, outside `mods` so the game does
+  not see two mods with the same id. The window gives its path and how to go back. A second run with the
+  same mod keeps the guest's earlier copy there; a run with another mod replaces it:
+  `tests/test_guest_launcher.py::test_running_client_succeeds_and_keeps_the_previous_mod`.
+- **These two behaviours have run on PowerShell 7 under Linux only**, with a shell-script double; PowerShell
+  5.1 and the real process names are first exercised by
+  `tests/test_guest_launcher.py::test_windows_client_closing_at_once_fails`.
 - **The code covers the password**, since it covers the whole file, but it reveals nothing the `.bat`
   does not already give the guest. `host_password` is not in the `.bat`.
 - **`-ExecutionPolicy Bypass` was not tightened, because there was nothing to tighten.** The flag only
@@ -168,6 +188,12 @@ under the guest's account. The SHA-256 sums inside the `.bat` only tie its embed
 
 ## Binary (P15)
 
+- **The build installs only pinned, hashed wheels** (P19F6): `packaging/requirements-build.txt` gives each
+  package of the build its exact version and the SHA-256 of its PyPI wheels, and `tests.yml` and
+  `release.yml` both install it with `--require-hashes --only-binary :all:`:
+  `tests/test_ci_workflows.py::test_build_requirements_are_pinned_with_their_hashes` and
+  `tests/test_ci_workflows.py::test_build_and_release_install_the_same_hashed_file`. This trusts PyPI's
+  files as they were on the day they were pinned; a package already compromised then would still pass.
 - **A forced stop leaves the `_MEI*` folder in `%TEMP%`.** The onefile loader cleans it only on a normal
   exit. The space is lost until someone deletes it.
 - **A forced stop of the loader** ends the service, because the entry point watches the loader:

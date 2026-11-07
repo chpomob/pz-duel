@@ -17,12 +17,15 @@ from doubles.fake_server import compile_windows_client, plan_windows_client
 from doubles.launcher_check import CODE_REFUSED, run_embedded_check
 from service import guest_launcher
 from service.guest_launcher import (
+    CLIENT_SETTLE_S,
+    CLIENT_START_S,
     FILE_MARK,
     JOIN_MARK,
     MAX_LAUNCHER_BYTES,
     MAX_LINE_BYTES,
     LAUNCHER_CODE_CHARS,
     MOD_MARK,
+    PREVIOUS_SUFFIX,
     LauncherRefused,
     build_launcher,
     is_usable_address,
@@ -237,6 +240,12 @@ def test_code_is_the_start_of_the_sha256_of_the_whole_file(launcher):
     assert f"$CodeChars = {LAUNCHER_CODE_CHARS}\n" in guest_launcher.POWERSHELL
 
 
+def test_code_is_64_bits():
+    """P19F6 : 48 bits laissaient un faux fichier à quelques heures de GPU."""
+    assert LAUNCHER_CODE_CHARS * 4 == 64
+    assert len(launcher_code(b"x")) == 16
+
+
 def test_code_is_stable_over_two_generations_and_follows_each_input(launcher, port, tmp_path):
     mod = tmp_path / "mod"
     shutil.copytree(MOD_SRC, mod)
@@ -398,6 +407,96 @@ def test_embedded_check_refuses_the_right_code_on_a_changed_byte(launcher, tmp_p
     assert CODE_REFUSED in done.stdout
 
 
+# Le jeu doit tourner, et le mod remplacé reste (P19F6) ---------------------------------------
+
+NOT_STARTED = b"Project Zomboid did not start, or closed at once."
+
+
+def test_start_budgets_match_the_python_constants():
+    script = guest_launcher.POWERSHELL
+    assert f"$StartSeconds = {CLIENT_START_S}\n" in script
+    assert f"$SettleSeconds = {CLIENT_SETTLE_S}\n" in script
+    assert CLIENT_START_S > CLIENT_SETTLE_S > 0
+    assert f"$ModId + '{PREVIOUS_SUFFIX}'" in script
+
+
+def test_success_is_decided_by_the_game_process_not_the_started_one():
+    """Le lancement passe par le shell : l'objet de `Start` ne prouve pas que le jeu tourne."""
+    script = guest_launcher.POWERSHELL
+    start = script.index("Start-Client $client $join")
+    assert script.index("$before = Get-ClientIds") < start < script.index("Wait-Client $before")
+    assert script.index("Wait-Client $before") < script.index("$code = 0")
+    assert "[void][Diagnostics.Process]::Start($info)" in script
+
+
+def plan_posix_client(folder: Path, stay_s: float) -> Path:
+    """Le client trouvé par le chemin Steam par défaut de `run_embedded_check`."""
+    game = folder / "no-steam" / "Steam" / "steamapps" / "common" / "ProjectZomboid"
+    game.mkdir(parents=True)
+    client = game / "ProjectZomboid64.exe"
+    args = folder / "client-args.txt"
+    client.write_text(f'#!/bin/sh\necho "$@" > "{args}"\nsleep {stay_s}\n', encoding="ascii")
+    client.chmod(0o755)
+    return args
+
+
+def posix_guest_mod(folder: Path) -> tuple[Path, str]:
+    mod = folder / "profile" / "Zomboid" / "mods" / MOD_ID
+    mod.mkdir(parents=True)
+    (mod / "old.txt").write_text("old", encoding="utf-8")
+    return mod, mod_fingerprint(mod)
+
+
+def stages_of(folder: Path) -> list[Path]:
+    return sorted((folder / "profile" / "Zomboid").glob(f".{MOD_ID}-*"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="test_windows_client_closing_at_once_fails")
+def test_client_closing_at_once_fails_and_puts_the_old_mod_back(launcher, tmp_path):
+    """Constat 2 de P19F6 : un jeu qui se ferme aussitôt était rapporté comme un succès."""
+    args = plan_posix_client(tmp_path, 1)
+    mod, before = posix_guest_mod(tmp_path)
+
+    done = run_embedded_check(launcher, launcher_code(launcher), tmp_path)
+
+    assert args.exists(), done.stdout
+    assert done.returncode == 1, done.stdout
+    assert NOT_STARTED in done.stdout
+    assert mod_fingerprint(mod) == before
+    (stage,) = stages_of(tmp_path)
+    assert mod_fingerprint(stage / "rejected") == mod_fingerprint(MOD_SRC)
+    assert str(stage / "rejected").encode() in done.stdout.replace(b"\n", b"")
+    assert not (mod.parent.parent / f"{MOD_ID}{PREVIOUS_SUFFIX}").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="test_windows_previous_mod_is_replaced_not_merged"
+)
+def test_running_client_succeeds_and_keeps_the_previous_mod(launcher, tmp_path):
+    """Constat 4 de P19F6 : l'ancien `duelcore` est gardé hors de `mods`, et le lanceur le dit."""
+    plan_posix_client(tmp_path, CLIENT_SETTLE_S + 3)
+    mod, before = posix_guest_mod(tmp_path)
+    backup = mod.parent.parent / f"{MOD_ID}{PREVIOUS_SUFFIX}"
+
+    done = run_embedded_check(launcher, launcher_code(launcher), tmp_path)
+
+    assert done.returncode == 0, done.stdout
+    assert NOT_STARTED not in done.stdout
+    assert mod_fingerprint(mod) == mod_fingerprint(MOD_SRC)
+    assert mod_fingerprint(backup) == before
+    assert b"was not deleted" in done.stdout
+    assert str(backup).encode() in done.stdout.replace(b"\n", b"")
+    assert stages_of(tmp_path) == []
+
+    # Une revanche relance le même `.bat` : le mod d'origine de l'invité reste la sauvegarde.
+    again = run_embedded_check(launcher, launcher_code(launcher), tmp_path)
+
+    assert again.returncode == 0, again.stdout
+    assert mod_fingerprint(backup) == before
+    assert mod_fingerprint(mod) == mod_fingerprint(MOD_SRC)
+    assert stages_of(tmp_path) == []
+
+
 # AC33 : mots de passe -----------------------------------------------------------------------
 
 
@@ -512,6 +611,8 @@ if sys.platform == "win32":
     POLL_S = 0.05
     GAME_FOLDER = Path("steamapps") / "common" / "ProjectZomboid"
     CLIENT_NAME = "ProjectZomboid64.exe"
+    # Le lanceur n'annonce un succès qu'après `CLIENT_SETTLE_S` secondes de jeu (P19F6).
+    CLIENT_STAY_MS = (CLIENT_SETTLE_S + 5) * 1000
 
     @pytest.fixture(scope="session")
     def compiled_client(tmp_path_factory):
@@ -540,7 +641,7 @@ if sys.platform == "win32":
             folder.mkdir(parents=True)
             target = folder / CLIENT_NAME
             shutil.copyfile(self.client, target)
-            plan_windows_client(target, self.args_file)
+            plan_windows_client(target, self.args_file, stay_ms=CLIENT_STAY_MS)
             return folder
 
         def old_mod(self) -> str:
@@ -590,7 +691,9 @@ if sys.platform == "win32":
         return ["-nosteam", "+connect", f"{ADDRESS}:{port}", "+password", password]
 
     def staging_left(guest: Guest) -> list[Path]:
-        return [path for path in guest.mods.parent.iterdir() if path != guest.mods]
+        """Ce que le lanceur laisse dans `Zomboid`, hors `mods` et la sauvegarde annoncée."""
+        backup = guest.mods.parent / f"{MOD_ID}{PREVIOUS_SUFFIX}"
+        return [path for path in guest.mods.parent.iterdir() if path not in (guest.mods, backup)]
 
     def test_windows_two_generations_are_identical(port):
         first = build_launcher(ADDRESS, port, PASSWORD, MOD_SRC)
@@ -622,12 +725,31 @@ if sys.platform == "win32":
 
     def test_windows_previous_mod_is_replaced_not_merged(guest, launcher):
         guest.install_game()
-        guest.old_mod()
+        before = guest.old_mod()
 
-        assert guest.run(launcher).returncode == 0
+        done = guest.run(launcher)
 
+        assert done.returncode == 0, done.stdout
         assert not (guest.mod / "old.txt").exists()
         assert mod_fingerprint(guest.mod) == mod_fingerprint(MOD_SRC)
+        backup = guest.mods.parent / f"{MOD_ID}{PREVIOUS_SUFFIX}"
+        assert mod_fingerprint(backup) == before
+        assert b"was not deleted" in done.stdout
+
+    def test_windows_client_closing_at_once_fails(guest, launcher, port):
+        folder = guest.install_game()
+        plan_windows_client(folder / CLIENT_NAME, guest.args_file, code=1, stay_ms=500)
+        before = guest.old_mod()
+
+        done = guest.run(launcher)
+
+        assert done.returncode != 0
+        assert NOT_STARTED in done.stdout
+        assert guest.client_args() == expected_args(port)
+        assert mod_fingerprint(guest.mod) == before
+        (stage,) = staging_left(guest)
+        assert mod_fingerprint(stage / "rejected") == mod_fingerprint(MOD_SRC)
+        assert not (guest.mods.parent / f"{MOD_ID}{PREVIOUS_SUFFIX}").exists()
 
     @pytest.mark.parametrize("password", HOSTILE_PASSWORDS)
     def test_windows_hostile_password_leaves_no_file(guest, port, password):
@@ -718,7 +840,7 @@ if sys.platform == "win32":
         assert not guest.args_file.exists()
         assert staging_left(guest) == []
 
-    @pytest.mark.parametrize("typed", [b"", b"000000000000", b'x" & echo pwned>pwned.txt'])
+    @pytest.mark.parametrize("typed", [b"", b"0" * 16, b'x" & echo pwned>pwned.txt'])
     def test_windows_wrong_code_stops_before_the_game(guest, launcher, typed):
         guest.install_game()
         before = guest.old_mod()

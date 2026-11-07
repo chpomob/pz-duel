@@ -67,7 +67,10 @@ sous Windows. L'hôte fait tourner les deux serveurs et a besoin d'environ 6 Go 
    votre place. Si vous avez refermé l'invite, votre invité n'entrera pas : ouvrez *Sécurité Windows*,
    *Pare-feu et protection du réseau*, *Autoriser une application via le pare-feu*.
 6. **Invitez votre adversaire** depuis le lobby : `Copy link`, ou `Save launcher` pour obtenir
-   `pz-duel-join.bat`. Ensuite, `Ouvrir PZ` vous connecte à votre propre serveur.
+   `pz-duel-join.bat`. Le lobby affiche aussi un **code de vérification** : **lisez-le à voix haute** à
+   votre invité, **séparément du lien**, jamais dans le même message que le lien ou le fichier. C'est la
+   seule protection contre un fichier remplacé en route. Ensuite, `Ouvrir PZ` vous connecte à votre
+   propre serveur.
 7. **Partez par `Quit`** dans la page. Fermer l'onglet du navigateur n'arrête pas PZ Duel.
 
 Si `Launch duel` finit sur une erreur, utilisez `Try again`. Si l'écran vous le demande, quittez et
@@ -78,11 +81,21 @@ rouvrez PZ Duel.
 1. **Récupérez le `.bat`** sur le PC Windows qui a le jeu : ouvrez-y le lien de l'hôte, ou enregistrez
    le fichier qu'il vous a envoyé. Le lien ne marche que pendant que l'hôte est dans le lobby. Scanner
    le QR avec un téléphone met le fichier sur le téléphone, où il ne sert à rien.
-2. **Double-cliquez sur `pz-duel-join.bat`.** **SmartScreen** peut aussi prévenir ici : **Informations
-   complémentaires**, puis **Exécuter quand même**. Ne le faites que pour un fichier reçu d'une personne
-   de confiance.
-3. Il installe le mod et lance le jeu, connecté à l'hôte. S'il ne trouve pas le jeu, il demande le
-   dossier. En cas d'échec, votre mod existant reste tel quel et la fenêtre reste ouverte.
+2. **Vérifiez le fichier avant de l'ouvrir.** Demandez à l'hôte le code de vérification qu'il lit à
+   voix haute. Dans le dossier qui contient le fichier, faites un clic droit sur un espace vide,
+   choisissez **Ouvrir dans le Terminal** (sous Windows 10, maintenez Maj pendant le clic droit pour
+   obtenir une fenêtre du même genre), et tapez `certutil -hashfile pz-duel-join.bat SHA256`.
+   **N'ouvrez pas le fichier si le résultat ne commence pas par ce code** : il a été remplacé en route.
+   Supprimez-le et demandez-en un nouveau à l'hôte.
+3. **Seulement ensuite, double-cliquez sur `pz-duel-join.bat`.** **SmartScreen** peut aussi prévenir
+   ici : **Informations complémentaires**, puis **Exécuter quand même**. Ne le faites que pour un
+   fichier reçu d'une personne de confiance, vérifié à l'étape 2. Il redemande le code : tapez-le, puis
+   Entrée. Un lanceur qui ne le demande pas a été remplacé.
+4. Il installe le mod, lance le jeu connecté à l'hôte, et attend quelques secondes pour vérifier que le
+   jeu tourne toujours. S'il ne trouve pas le jeu, il demande le dossier. En cas d'échec, ou si le jeu
+   se ferme aussitôt, votre mod existant est remis tel quel et la fenêtre reste ouverte. En cas de
+   succès, le mod `duelcore` qu'il a remplacé n'est pas supprimé : il est gardé dans
+   `Zomboid\duelcore.previous`, dans votre dossier utilisateur, et la fenêtre dit comment y revenir.
 
 ### Jouer par Internet
 

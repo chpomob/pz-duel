@@ -27,6 +27,10 @@ LIMITS_DIR = REPO / "docs" / "campaigns" / "phase2"
 SUITE_PYTHONS = ["3.12", "3.13", "3.14"]
 BUILD_PYTHON = "3.13"
 REQUIREMENTS = "packaging/requirements-build.txt"
+# Sans `--require-hashes`, un paquet substitué entrerait dans un binaire que `.sha256` attesterait.
+REQUIREMENTS_INSTALL = f"pip install --require-hashes --only-binary :all: -r {REQUIREMENTS}"
+PINNED = re.compile(r"^([A-Za-z0-9][\w.-]*)==([\w.]+)(?: ; [^\\]+)? \\$")
+HASH = re.compile(r"^    --hash=sha256:[0-9a-f]{64}( \\)?$")
 SPEC_PATH = "packaging/pz-duel.spec"
 SMOKE_PATH = "packaging/smoke_test.py"
 # Les suites dont dépend la publication : ce sont celles de `tests.yml`, à l'identique.
@@ -143,7 +147,7 @@ def build_problems(name: str, job: list[str], exe: str) -> tuple[list[str], list
         problems.append(f"{name}: not built with Python {BUILD_PYTHON}")
     chain = [
         python,
-        first_step(steps, f"pip install -r {REQUIREMENTS}"),
+        first_step(steps, REQUIREMENTS_INSTALL),
         first_step(steps, f"PyInstaller {SPEC_PATH}"),
         first_step(steps, f"{SMOKE_PATH} "),
     ]
@@ -349,6 +353,8 @@ TESTS_MUTANTS = {
     "build_without_requirements": in_build_job(
         "-r packaging/requirements-build.txt", "pyinstaller"
     ),
+    "build_without_hashes": in_build_job("--require-hashes ", ""),
+    "build_from_sources": in_build_job("--only-binary :all: ", ""),
     "build_on_another_python": in_build_job('"3.13"', '"3.14"'),
     "smoke_commented_out": in_build_job(SMOKE_RUN, "        # " + SMOKE_RUN.lstrip()),
     "smoke_on_another_file": in_build_job("pz-duel.exe", "other.exe"),
@@ -523,6 +529,65 @@ def test_release_builds_exactly_like_the_pull_requests():
     assert chain(RELEASE_YML) == chain(TESTS_YML)
 
 
+def requirement_problems(text: str) -> list[str]:
+    """Chaque paquet de la construction : version exacte, puis au moins une empreinte."""
+    problems, current, hashes = [], None, 0
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(" "):
+            if current is None or not HASH.match(line):
+                problems.append(f"malformed hash line: {line.strip()}")
+            hashes += 1
+            continue
+        if current is not None and hashes == 0:
+            problems.append(f"{current}: no hash")
+        pinned = PINNED.match(line)
+        if pinned is None:
+            problems.append(f"not pinned with hashes: {line}")
+            current = None
+        else:
+            current, hashes = pinned[1], 0
+    if current is not None and hashes == 0:
+        problems.append(f"{current}: no hash")
+    return problems
+
+
+def test_build_requirements_are_pinned_with_their_hashes():
+    text = (REPO / REQUIREMENTS).read_text(encoding="utf-8")
+    assert requirement_problems(text) == []
+    names = {match[1].lower() for match in map(PINNED.match, text.splitlines()) if match}
+    # PyInstaller et tout ce qu'il tire sous Windows : `--require-hashes` refuserait un oubli.
+    assert names == {
+        "pyinstaller", "altgraph", "packaging", "pyinstaller-hooks-contrib", "setuptools",
+        "pefile", "pywin32-ctypes",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        lambda text: text.replace("pyinstaller==6.22.3", "pyinstaller>=6.22.3", 1),
+        lambda text: text.replace(
+            "altgraph==0.17.5 \\\n    --hash=", "altgraph==0.17.5 \\\n    #", 1
+        ),
+        lambda text: text + "requests\n",
+        lambda text: text.replace("--hash=sha256:", "--hash=sha256:x", 1),
+    ],
+    ids=["range", "hash_removed", "unpinned_added", "bad_hash"],
+)
+def test_requirement_mutants_are_caught(mutant):
+    text = (REPO / REQUIREMENTS).read_text(encoding="utf-8")
+    assert mutant(text) != text
+    assert requirement_problems(mutant(text)) != []
+
+
+def test_build_and_release_install_the_same_hashed_file():
+    for path in (TESTS_YML, RELEASE_YML):
+        text = path.read_text(encoding="utf-8")
+        assert text.count(REQUIREMENTS) == text.count(REQUIREMENTS_INSTALL) == 1, path.name
+
+
 # ---------------------------------------------------------------- documentation (R9)
 EN, FR = "en", "fr"
 LANGUAGES = [EN, FR]
@@ -651,6 +716,98 @@ def start_problems(text: str, language: str, ports: dict[str, int]) -> list[str]
     if command:
         problems.append(f"start: terminal command {command[0]!r}")
     return problems
+
+
+# P19F6 : la seule vérification qui tienne se fait hors du fichier, avant de l'ouvrir.
+GUEST_HEADING = {EN: "### Guest", FR: "### Invité"}
+HOST_HEADING = {EN: "### Host", FR: "### Hôte"}
+CERTUTIL = "`certutil -hashfile pz-duel-join.bat SHA256`"
+OPENS_FILE = {
+    EN: r"double-click|\bopen (?:it|the file|the `\.bat`)",
+    FR: r"double-clique|\bouvr\w* (?:le|-le)",
+}
+REFUSES = {
+    EN: r"Do not open the file if the result does not start with that code",
+    FR: r"N'ouvrez pas le fichier si le résultat ne commence pas par ce code",
+}
+READ_ALOUD = {
+    EN: r"read it aloud[^.]*separately from the link",
+    FR: r"lisez-le à voix haute[^.]*séparément du lien",
+}
+
+
+def steps_of(text: str, heading: str) -> list[str]:
+    """Les étapes numérotées d'une sous-section, chacune sur une ligne."""
+    lines = text.splitlines()
+    if heading not in lines:
+        return []
+    body = []
+    for line in lines[lines.index(heading) + 1:]:
+        if line.startswith("#"):
+            break
+        body.append(line)
+    flat = re.sub(r"\n(?!\d+\. )\s*", " ", "\n".join(body))
+    return [line for line in flat.splitlines() if re.match(r"\d+\. ", line)]
+
+
+def guest_check_problems(text: str, language: str) -> list[str]:
+    guest = steps_of(text, GUEST_HEADING[language])
+    host = steps_of(text, HOST_HEADING[language])
+    if not guest or not host:
+        return ["guest: no host or guest steps"]
+    problems = []
+    checked = False
+    for step in guest:
+        if CERTUTIL in step and re.search(REFUSES[language], step):
+            checked = True
+        elif re.search(OPENS_FILE[language], step, re.IGNORECASE) and not checked:
+            problems.append(f"guest: opens the file before the certutil check: {step[:40]}")
+    if not checked:
+        problems.append("guest: no certutil check")
+    if not any(re.search(READ_ALOUD[language], step) for step in host):
+        problems.append("host: the code is not read aloud, apart from the link")
+    return problems
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+def test_guest_checks_the_file_with_certutil_before_opening_it(language):
+    assert guest_check_problems(read(README[language]), language) == []
+
+
+@pytest.mark.parametrize("language", LANGUAGES)
+@pytest.mark.parametrize(
+    "mutant", ["unchanged", "no_check", "check_after_opening", "no_refusal", "not_aloud"]
+)
+def test_guest_check_mutants_are_caught(language, mutant):
+    """`unchanged` passe par la même remise en lignes : un mutant n'est pas pris par accident."""
+    text = read(README[language])
+    guest = steps_of(text, GUEST_HEADING[language])
+    check = next(step for step in guest if CERTUTIL in step)
+    flat = re.sub(r"\s*\n\s*", " ", text)
+    if mutant == "unchanged":
+        mutated = flat
+    elif mutant == "no_check":
+        mutated = flat.replace(CERTUTIL, "`dir`")
+    elif mutant == "check_after_opening":
+        opening = next(step for step in guest if step is not check and re.search(
+            OPENS_FILE[language], step, re.IGNORECASE))
+        swapped = flat.replace(check[3:], "@@").replace(opening[3:], check[3:])
+        mutated = swapped.replace("@@", opening[3:])
+    elif mutant == "no_refusal":
+        mutated = re.sub(REFUSES[language], "Go on", flat)
+    else:
+        mutated = re.sub(READ_ALOUD[language], "send it", flat)
+    # Remettre les titres sur leur ligne : `steps_of` les cherche seuls.
+    for heading in (GUEST_HEADING[language], HOST_HEADING[language]):
+        mutated = mutated.replace(f" {heading} ", f"\n{heading}\n")
+    mutated = re.sub(r" (\d+\. \*\*)", r"\n\1", mutated)
+    mutated = re.sub(r" (#{2,3} )", r"\n\1", mutated)
+
+    if mutant == "unchanged":
+        assert guest_check_problems(mutated, language) == []
+    else:
+        assert mutated != flat
+        assert guest_check_problems(mutated, language) != []
 
 
 def defined_names(path: Path) -> set[str]:

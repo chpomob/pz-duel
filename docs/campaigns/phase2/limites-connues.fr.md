@@ -127,8 +127,8 @@ et le `.bat` exécute PowerShell : quelqu'un sur le chemin réseau peut remplace
 sert s'exécute alors sous le compte de l'invité. Les SHA-256 du `.bat` ne lient que ses fichiers embarqués
 entre eux. **Le code est la seule protection contre un fichier remplacé.**
 
-- **Ce qu'est le code** : les 12 premiers caractères hexadécimaux du SHA-256 de tout le `.bat`, tel que
-  servi. Le lobby l'affiche à côté de l'invitation, et l'hôte le lit à l'invité, jamais à côté du lien :
+- **Ce qu'est le code** : les 16 premiers caractères hexadécimaux (64 bits) du SHA-256 de tout le `.bat`,
+  tel que servi (P19F6 ; 12 caractères avant). Le lobby l'affiche à côté de l'invitation, et l'hôte le lit à l'invité, jamais à côté du lien :
   `tests/test_share.py::test_shown_code_comes_from_the_very_bytes_served` et
   `tests/test_share.py::test_changed_byte_no_longer_matches_the_code_and_the_check_refuses`.
 - **Seule une comparaison faite avant d'ouvrir le fichier arrête un attaquant.** L'invité lance
@@ -145,8 +145,28 @@ entre eux. **Le code est la seule protection contre un fichier remplacé.**
 - **Un invité qui saute `certutil` n'est pas protégé**, et rien dans PZ Duel ne peut l'y obliger.
 - **Le code protège le fichier, pas le secret de l'invitation.** Le mot de passe circule toujours en
   clair. Qui lit le trafic peut s'en servir, quoi que dise le code.
-- **48 bits** : un fichier remplacé de même code reste possible, pour environ 2^48 calculs. C'est des
-  heures de GPU, bien plus que la durée habituelle d'un lobby, mais ce n'est pas hors de portée.
+- **64 bits** : un fichier remplacé de même code coûte environ 2^64 calculs, hors de portée pendant la
+  durée d'un lobby. Le README dit à l'invité de lancer `certutil` avant d'ouvrir le fichier, et à l'hôte
+  de lire le code à voix haute, séparément du lien :
+  `tests/test_guest_launcher.py::test_code_is_64_bits` et
+  `tests/test_ci_workflows.py::test_guest_checks_the_file_with_certutil_before_opening_it`.
+- **Le lanceur n'annonce un succès que si le jeu tourne.** Un processus `ProjectZomboid64` absent
+  avant le lancement doit apparaître et tourner encore 5 secondes plus tard, dans les 30 secondes qui
+  suivent le lancement. Le contrôle suit le nom du processus, pas l'objet rendu par `Process.Start` : un
+  client qui passe la main à un autre processus compte quand même. Un jeu qui se ferme aussitôt, ou
+  n'apparaît jamais, est un échec : le mod précédent de l'invité est remis, et le mod essayé reste dans
+  le dossier `.duelcore-*` de `Zomboid`, dont la fenêtre donne le chemin :
+  `tests/test_guest_launcher.py::test_client_closing_at_once_fails_and_puts_the_old_mod_back`.
+  Un plantage plus tardif, au menu ou sur le serveur, n'est pas vu. Un autre `ProjectZomboid64` lancé
+  par quelqu'un d'autre pendant ces secondes serait pris pour le jeu.
+- **Le `duelcore` remplacé est gardé, dans `Zomboid\duelcore.previous`**, hors de `mods` pour que le
+  jeu ne voie pas deux mods de même identifiant. La fenêtre donne son chemin et la façon d'y revenir. Un
+  second lancement du même mod y laisse la copie antérieure de l'invité ; un lancement d'un autre mod la
+  remplace :
+  `tests/test_guest_launcher.py::test_running_client_succeeds_and_keeps_the_previous_mod`.
+- **Ces deux comportements n'ont tourné que sur PowerShell 7 sous Linux**, avec un double en script
+  shell ; PowerShell 5.1 et les vrais noms de processus ne sont exercés que par
+  `tests/test_guest_launcher.py::test_windows_client_closing_at_once_fails`.
 - **Le code couvre le mot de passe**, puisqu'il couvre tout le fichier, mais il ne révèle rien que le
   `.bat` ne donne déjà à l'invité. `host_password` n'est pas dans le `.bat`.
 - **`-ExecutionPolicy Bypass` n'a pas été resserré, car il n'y avait rien à resserrer.** L'option ne vaut
@@ -176,6 +196,14 @@ entre eux. **Le code est la seule protection contre un fichier remplacé.**
 
 ## Binaire (P15)
 
+- **La construction n'installe que des wheels figées et hachées** (P19F6) :
+  `packaging/requirements-build.txt` donne à chaque paquet de la construction sa version exacte et le
+  SHA-256 de ses wheels PyPI, et `tests.yml` comme `release.yml` l'installent avec
+  `--require-hashes --only-binary :all:` :
+  `tests/test_ci_workflows.py::test_build_requirements_are_pinned_with_their_hashes` et
+  `tests/test_ci_workflows.py::test_build_and_release_install_the_same_hashed_file`. Cela fait confiance
+  aux fichiers de PyPI tels qu'ils étaient le jour où ils ont été figés : un paquet déjà compromis ce
+  jour-là passerait quand même.
 - **Un arrêt forcé laisse le dossier `_MEI*` dans `%TEMP%`.** Le chargeur onefile ne le nettoie qu'à une
   sortie normale. La place reste perdue jusqu'à ce qu'on le supprime.
 - **Un arrêt forcé du chargeur** termine le service, car le point d'entrée le surveille :
