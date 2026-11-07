@@ -1,9 +1,9 @@
 # Phase 2 — first branch review, findings and closure (P19)
 
-The raw artifacts of the first review pass (`01_architect.txt`, `02_inspector.txt`, cross-reviews,
-`final.json`) were deleted by the loop harness's `git clean -fd` before they were committed. This file
-is the durable record: every finding, verbatim from that run, with the step that closed it. The
-re-review that followed is kept in full in `../review-final/`.
+The raw artifacts of this pass (`01_architect.txt`, `02_inspector.txt`, cross-reviews, `final.json`,
+`review.md`) are kept alongside this file. The loop harness stashes untracked files before building and
+restores them on merge, so they were temporarily absent from the worktree mid-run — they were never
+lost. This file remains the compact index; the step that closed each finding is in the last column.
 
 Verdict: **REQUEST_CHANGES** — 4 major, 4 minor, 4 nit (12 findings).
 

@@ -1,0 +1,555 @@
+{
+  "verdict": "REQUEST_CHANGES",
+  "status": "complete",
+  "summary": "# PZ Duel phase 2: consolidated review\n\n## Verdict\n\n**REQUEST_CHANGES**\n",
+  "findings": {
+    "major": 4,
+    "minor": 4,
+    "nit": 4
+  },
+  "finding_details": [
+    {
+      "id": "A1",
+      "severity": "major",
+      "file": "service/engine.py",
+      "line": 228,
+      "summary": "Host client is launched on Windows with no working directory",
+      "evidence": "_spawn_detached (service/engine.py:219-231) calls subprocess.Popen(command, **streams, **attempt) with no cwd, so ProjectZomboid64.exe inherits the service's directory; for a double-clicked pz-duel.exe that is wherever the file was downloaded. The other two launch paths set it explicitly: the guest launcher sets $info.WorkingDirectory to the game folder (service/guest_launcher.py:189) and ServerProcess.start passes cwd=pz_dir. The old Linux path did not need this because the client went through a shell script, and P5 replaced that with a direct .exe on Windows. Assumption: the game resolves its launcher config, classpath and media relative to the working directory, as Steam-launched installs do. No test asserts a cwd for the client, and the CI double cannot show the difference. Confirm by starting the real exe from another folder. Likely effect: 'Ouvrir PZ' fails or the client exits, for the host only, while the guest path works. Fix: pass cwd=script.parent.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A2",
+      "severity": "major",
+      "file": "service/snapshots.py",
+      "line": 68,
+      "summary": "World and mod directory renames have no Windows lock tolerance",
+      "evidence": "_install copies a whole world into a staging folder, then _switch immediately calls os.rename on the live world and the staged folder (service/snapshots.py:62-70), with no retry. install_mod does the same after copytree (service/preflight.py:539-544). Phase 2 added replace_file retries because Windows refuses a rename while another process holds a handle, but R3 and the code apply this only to single files (session, .ini, proofs). A directory rename fails the same way if any contained file is open, and freshly written files are the usual target of antivirus and indexer scans. The restore runs before every real match, so one PermissionError stops the launch with 'restauration impossible'. The world stays intact and a retry may succeed, so this is an availability problem, not data loss. Assumption: desktop real-time scanning holds such handles; windows-latest CI would not reliably reproduce it. Confirm with a test that holds a handle on a file inside the target during _switch, or on a real desktop. Fix: give directory renames the same bounded PermissionError retry as replace_file.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A3",
+      "severity": "major",
+      "file": "service/guest_launcher.py",
+      "line": 57,
+      "summary": "Executable .bat is delivered over plain HTTP with no integrity check",
+      "evidence": "The invite link is http:// (service/engine.py, _build_invite; required by AC37), and the served .bat runs PowerShell with -ExecutionPolicy Bypass (service/guest_launcher.py:57). Anyone on the network path can replace the response, which gives code execution on the guest's machine under the guest's account, not just disclosure. The SHA-256 lines inside the file (service/guest_launcher.py:179) travel with the payload, so they detect damage but not tampering. docs/campaigns/phase2/limites-connues.md:150 records only the confidentiality side ('cross the network in clear'), and the README flow for a remote guest forwards TCP 17280 to the Internet. HTTP and no signing are operator decisions, so the transport is not a spec violation. The gap is that the code-execution risk is undocumented and the guest has no out-of-band check. Fix: state the risk in the limits and README, and show the launcher's SHA-256 in the host UI so it can be compared over another channel, or steer remote guests to sending the saved .bat through an authenticated channel.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "minor",
+      "file": "README.md",
+      "line": 46,
+      "summary": "README and known limits still declare a fixed defect as a blocker",
+      "evidence": "README.md:46 and README.fr.md:47 say a real match stops at launch until a known defect is fixed. docs/campaigns/phase2/limites-connues.md:20 has a 'Blocker' section saying service/snapshots.py calls os.sync() and every real match stops with AttributeError. That is false in this tree: snapshots.py:119 and :212 call sync_disk, and platforms.py handles Windows. The same file contradicts itself: lines 16-18 say no CI run is recorded and 'none recorded yet', while lines 163-170 list green runs and the release run required by AC49. Line 5 also says no step has run on a real Windows machine without distinguishing CI runners, which the last section of the file does. tests/test_ci_workflows.py only requires the term `os.sync` to be present, so it does not catch this. The claim that nothing was tried with the real game is still accurate and should stay.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A5",
+      "severity": "minor",
+      "file": "packaging/pz-duel.spec",
+      "line": 6,
+      "summary": "Runtime logger output is lost in the windowed binary",
+      "evidence": "The spec comment says that with console=False 'les erreurs vont au fichier de log', but only main.log_line writes to that file. No logging handler or basicConfig exists anywhere in service/ or packaging/ (grep for basicConfig, FileHandler, addHandler finds nothing). Without a console sys.stderr is None, so Python's last-resort handler has nowhere to write. These records therefore vanish in the shipped build: unexpected API exceptions (service/api.py:173), share launcher failures (service/share.py:109), command and journal write failures (service/engine.py:1015, :1589), and proof-store warnings (service/engine.py:1639). R4 strictly requires only startup errors in the file, so this is a diagnosability gap, and it hits the platform where no developer console exists. Fix: attach a FileHandler on paths.log_file() when frozen, keeping the existing rule that messages carry no secrets.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A6",
+      "severity": "minor",
+      "file": ".github/workflows/release.yml",
+      "line": 5,
+      "summary": "Release publishes without the test suite and with unpinned build inputs",
+      "evidence": "release.yml triggers on any v* tag and gates publishing only on the smoke test, while tests.yml runs only for pushes to master and pull requests (tests.yml:5). A tag on a commit with failing tests, or on a commit that never reached master, can therefore publish pz-duel.exe. AC47 requires only the smoke-test dependency, so this meets the spec but leaves a gap. This job also holds contents: write and uses actions by floating tag (actions/checkout@v4, actions/setup-python@v5). packaging/requirements-build.txt pins only pyinstaller, so its transitive dependencies are unpinned and unhashed for a binary users are told to run past SmartScreen. Fix: run the pytest jobs as a prerequisite in release.yml, pin actions by SHA, and use a hashed lock file for the build.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A7",
+      "severity": "nit",
+      "file": "ui/app.js",
+      "line": 31,
+      "summary": "A non-2xx /api/state body replaces the UI state",
+      "evidence": "api() returns res.json() without checking res.ok (ui/app.js:31), and poll assigns the result to S (ui/app.js:37). A 403, 500 or the 503 from turned_away() has a JSON body without phase, so the badge shows 'service : ok', render falls through to renderLive, and S.steps.map throws. The next successful poll recovers, so the effect is transient. Fix: treat a body without phase as unreachable.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A8",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 1717,
+      "summary": "setup_state hashes the mod while holding the engine lock",
+      "evidence": "setup_state calls _setup_view under self.lock (service/engine.py:1717), and _setup_view reads and hashes the whole mod through mod_fingerprint(MOD_SRC) (service/engine.py:1779). The _measure docstring states the opposite intent: a slow disk must not freeze the state. /api/state waits on this lock. The mod is small, so the impact is low. Fix: compute the fingerprint before taking the lock.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A9",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 32,
+      "summary": "Engine and share listener depend on HTTP handler internals",
+      "evidence": "engine.py imports LAUNCHER_NAME from the HTTP layer (service/engine.py:32), and share.py borrows Handler._drain plus HeadReader and BoundedHTTPServer from api.py (service/share.py:20-28, :43). The domain layer therefore depends on the transport layer, and any change to the loopback API's internals also changes the only network-exposed listener. There is no import cycle today. Fix: move LAUNCHER_NAME to guest_launcher.py and the bounded-socket helpers to a small shared module.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A10",
+      "severity": "nit",
+      "file": ".",
+      "line": 1,
+      "summary": "Requested diff range is empty; the review covered uncommitted files",
+      "evidence": "HEAD equals the branch point 8d75f0f, so `git diff 8d75f0f..HEAD` is empty. All phase 2 work exists as uncommitted changes and untracked files on a detached HEAD, which I reviewed directly from the worktree. The commit-based checks in the P19 scope cannot be evaluated from this state. I read the service, packaging, workflow and UI files and the limits document in full or through their diffs; test files were only searched for specific claims, and no tests were run.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "B1",
+      "severity": "major",
+      "file": "service/preflight.py",
+      "line": 547,
+      "summary": "Failed rollback deletes the previous mod",
+      "evidence": "If installing the staged directory fails and restoring `previous` also raises OSError, unwinding the TemporaryDirectory context deletes `previous`, destroying the user's original mod. Preserve the staging directory when rollback fails and report its recovery path. This behavior is confirmed in the worktree; changed-line membership could not be verified because git commands were prohibited.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "B2",
+      "severity": "minor",
+      "file": "service/api.py",
+      "line": 260,
+      "summary": "Framing refusals close without draining the request",
+      "evidence": "When `_length()` rejects framing, `_body()` returns without calling `_hang_up()`. A client sending an oversized body can therefore encounter a reset instead of receiving the JSON refusal\u2014the same unread-data failure described in P18F4. The framing tests send headers without a body, leaving this case uncovered. Confirm with a socket test that sends an oversized body and reads through EOF. Diff membership remains unverified because git commands were prohibited.",
+      "confidence": "medium",
+      "basis": "inference"
+    }
+  ],
+  "epistemic_labels": {
+    "confidence": {
+      "high": 9,
+      "medium": 3,
+      "low": 0
+    },
+    "basis": {
+      "spec": 0,
+      "code": 9,
+      "inference": 3,
+      "external": 0
+    },
+    "combined": {
+      "medium/inference": 3,
+      "high/code": 9
+    }
+  },
+  "epistemic_distribution": {
+    "confidence": {
+      "high": 9,
+      "medium": 3,
+      "low": 0
+    },
+    "basis": {
+      "spec": 0,
+      "code": 9,
+      "inference": 3,
+      "external": 0
+    },
+    "combined": {
+      "medium/inference": 3,
+      "high/code": 9
+    }
+  },
+  "warnings": [],
+  "report": "docs/campaigns/phase2/review/review.md",
+  "source_diff": true,
+  "context": {
+    "ok": true,
+    "reason": "ok",
+    "thresholds": {
+      "min_chars": 1,
+      "min_tokens": 1,
+      "required_sections": [],
+      "min_source_lines": 1
+    }
+  },
+  "thresholds": {
+    "min_chars": 1,
+    "min_tokens": 1,
+    "required_sections": [],
+    "min_source_lines": 1
+  },
+  "complexity": {
+    "score": 1213076,
+    "level": "high",
+    "recommended_agents": 6,
+    "stats": {
+      "chars": 605506,
+      "files": 45,
+      "source_lines": 13348,
+      "hunks": 222,
+      "requirements": 0,
+      "modules": 45
+    },
+    "tier": "high",
+    "max_agents": 6,
+    "summary": "high: 605506 chars, 45 files, 13348 source lines, 222 hunks, 0 requirements, 45 modules"
+  },
+  "execution": {
+    "max_retries": 3,
+    "max_input_chars": 262144,
+    "max_output_chars": 131072,
+    "truncate_input": false,
+    "show_costs": false,
+    "concurrency": null,
+    "max_concurrency": 6,
+    "max_agents": 6
+  },
+  "parallel": {
+    "perspectives": [
+      "architect",
+      "inspector"
+    ],
+    "requested_concurrency": 6,
+    "max_concurrency": 6,
+    "effective_concurrency": 2
+  },
+  "attempts": [
+    {
+      "call": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 311.96219630306587,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1099,
+        "completion_tokens": 2529,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 318.87347820727155,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2853,
+        "completion_tokens": 686,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "call": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 95.65305077470839,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1171,
+        "completion_tokens": 1376,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 279.7261209208518,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4363,
+        "completion_tokens": 2505,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 123.69177999394014,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 7581,
+        "completion_tokens": 4340,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "cap_events": [
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 1026602,
+      "truncated": true
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "kind": "output",
+      "stream": "stderr",
+      "attempt": 1,
+      "limit": 131072,
+      "original_chars": 659265,
+      "truncated": true
+    }
+  ],
+  "calls": [
+    {
+      "label": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1099,
+        "completion_tokens": 2529,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "label": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "ok": true,
+      "returncode": 0,
+      "stderr": "Reading additional input from stdin...\nOpenAI Codex v0.163.0\n--------\nworkdir: /tmp/review-phase2-full-1\nmodel: gpt-6.1-sol\nprovider: openai\napproval: on-request\nsandbox: read-only\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1b4f1-ad35-7a62-8cd1-6e867d31c849\n--------\nuser\nYou are an **Inspector** reviewer. Your focus is edge cases, bug-hunting, error handling, and code-level correctness.\n\nFor every piece of code you see, scrutinize:\n1. **Edge cases** \u2014 Boundary conditions, empty states, invalid inputs, overflow/underflow, null or default values. What happens at the limits?\n2. **Error handling** \u2014 Are errors propagated correctly or silently swallowed? Are failure modes logged with sufficient context? Can a single error cascade?\n3. **Resource management** \u2014 Memory leaks, unbounded growth, file descriptor exhaustion, unclosed handles, missing cleanup on error paths.\n4. **Race conditions and concurrency** \u2014 Data races, deadlocks, ordering assumptions, missing or incorrect synchronization primitives.\n5. **Input validation** \u2014 Deserialization safety, protocol parsing robustness, user input sanitization. Can malformed data cause crashes or security issues?\n\n# Git Workflow (Canonical)\n\nCanonical definition \u2014 personas reference this file instead of copying its\ntext; the library's `inject_persona` splices this text into every prompt that\ncarries the reference line, so the rules always reach the model.\n\n## Git workflow rules\n\n- BUILD phase: Write complete, working code on disk. All new and modified files will be staged and committed automatically by the orchestrator after you finish. Do NOT produce markdown code blocks, JSON, or text reports \u2014 produce ACTUAL FILES on disk. Sole exception: if the environment refuses disk writes outright (sandbox denial: the write tool blocks writing to disk \u2014 not a user-denied permission prompt, lint/hook rejection, or invalid path), fall back to complete source in markdown code blocks and state the fallback plus the refusal",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2853,
+        "completion_tokens": 686,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "label": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1171,
+        "completion_tokens": 1376,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "stderr": "Reading additional input from stdin...\nOpenAI Codex v0.163.0\n--------\nworkdir: /tmp/review-phase2-full-1\nmodel: gpt-6.1-sol\nprovider: openai\napproval: on-request\nsandbox: read-only\nreasoning effort: high\nreasoning summaries: none\nsession id: 01a1b4f8-00c0-7932-8cac-60537097e388\n--------\nuser\nYou are a **Cross-Reviewer** \u2014 a devil's advocate. You have been shown another reviewer's findings and must VALIDATE, CHALLENGE, or ADD to each one.\n\nYour job:\n1. **VALIDATE** findings you agree with \u2014 confirm them with additional evidence\n2. **CHALLENGE** findings based on system constraints, design trade-offs, or alternative interpretations. A finding may be wrong if it ignores real-world operational constraints or overestimates what the system guarantees.\n3. **ADD** findings the original reviewer missed \u2014 especially around resilience, edge cases, security, and architectural assumptions\n\nFocus on cross-cutting concerns: reliability under load, failure modes, security boundaries, and operational realism. Are the claims backed by the actual code behaviour?\n\nOutput JSON:\n```json\n{\n  \"findings\": [\n    {\n      \"id\": \"X1\",\n      \"severity\": \"blocker|major|minor|nit\",\n      \"original_id\": \"A1 or B1\",\n      \"action\": \"VALIDATE|CHALLENGE|ADD\",\n      \"file\": \"path/to/file.c\",\n      \"line\": 42,\n      \"summary\": \"Short title\",\n      \"evidence\": \"Why this changes or confirms the original finding\",\n      \"confidence\": \"high|medium|low\",\n      \"basis\": \"spec|code|inference|external\"\n    }\n  ]\n}\n```\n\n\n## Epistemic labels\n\nEvery finding must include `confidence` (`high`, `medium`, or `low`) and\n`basis` (`spec`, `code`, `inference`, or `external`). Choose both labels from\nthe evidence actually cited, not from the finding's severity or the original\nreviewer's labels.\n\nEvidence must match `basis`:\n- `spec`: quote or identify the exact requirement or acceptance criterion.\n- `code`: cite the concrete file/line and the behavior visible in the code or diff.\n- `inference`: state the reasoning and assu",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4363,
+        "completion_tokens": 2505,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 7581,
+        "completion_tokens": 4340,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "failures": [],
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 17067,
+        "completion_tokens": 11436,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "architect": {
+        "prompt_tokens": 1099,
+        "completion_tokens": 2529,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "inspector": {
+        "prompt_tokens": 2853,
+        "completion_tokens": 686,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_1": {
+        "prompt_tokens": 1171,
+        "completion_tokens": 1376,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_2": {
+        "prompt_tokens": 4363,
+        "completion_tokens": 2505,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 7581,
+        "completion_tokens": 4340,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "architect": {
+        "prompt_tokens": 1099,
+        "completion_tokens": 2529,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "inspector": {
+        "prompt_tokens": 2853,
+        "completion_tokens": 686,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review": {
+        "prompt_tokens": 5534,
+        "completion_tokens": 3881,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 7581,
+        "completion_tokens": 4340,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 17067,
+      "completion_tokens": 11436,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 1099,
+        "completion_tokens": 2529,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2853,
+        "completion_tokens": 686,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 1171,
+        "completion_tokens": 1376,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 4363,
+        "completion_tokens": 2505,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 7581,
+        "completion_tokens": 4340,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    ]
+  },
+  "artifacts": {
+    "01_architect": "docs/campaigns/phase2/review/01_architect.txt",
+    "02_inspector": "docs/campaigns/phase2/review/02_inspector.txt",
+    "03_cross_1": "docs/campaigns/phase2/review/03_cross_1.txt",
+    "04_cross_2": "docs/campaigns/phase2/review/04_cross_2.txt",
+    "05_synthesis": "docs/campaigns/phase2/review/05_synthesis.txt",
+    "review": "docs/campaigns/phase2/review/review.md"
+  },
+  "cleanup_warnings": []
+}

@@ -1,0 +1,136 @@
+{
+  "findings": [
+    {
+      "id": "X5",
+      "severity": "minor",
+      "original_id": "A1",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 228,
+      "summary": "Missing cwd is confirmed; real-client launch failure remains unproven",
+      "evidence": "Both Popen calls omit cwd, and Platform.client_popen_attempts supplies only process flags. However, the guest launcher's explicit WorkingDirectory does not establish that ProjectZomboid64.exe requires it. The known-limits document explicitly leaves real-client behavior unobserved. The major-impact claim assumes resources resolve against the inherited directory rather than the executable directory. Launching the real executable from another directory would confirm or refute that assumption. Passing script.parent is sensible hardening, but the available evidence does not demonstrate a broken host launch.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X6",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "CHALLENGE",
+      "file": "service/snapshots.py",
+      "line": 68,
+      "summary": "Missing rename retries are real; major scanner-induced disruption is not established",
+      "evidence": "The renames in _switch have no retry. However, lines 73-83 roll back completed moves, and _install at lines 214-217 preserves staging directories when rollback fails. Thus ordinary rename failure has deliberate recovery behavior. The claimed desktop frequency depends on scanners holding handles that actually prevent these operations; no such observation is supplied. A controlled Windows handle test would establish the failure mode, while desktop measurements would establish its operational significance. Bounded retries are reasonable availability hardening, but the major rating exceeds the demonstrated evidence.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X7",
+      "severity": "major",
+      "original_id": "A3",
+      "action": "VALIDATE",
+      "file": "service/guest_launcher.py",
+      "line": 57,
+      "summary": "The downloaded executable script has no authenticated integrity protection",
+      "evidence": "Engine._build_invite constructs an HTTP URL, and the batch header executes a ScriptBlock extracted from the downloaded file. Write-Mod verifies embedded mod contents against hashes embedded in that same file; it does not authenticate the batch header, PowerShell program, or join data. An active on-path attacker can therefore substitute executable instructions that run when the guest launches the file. The random route token prevents guessing, not response modification. This requires guest execution and gives that user's privileges; ExecutionPolicy Bypass is not itself a privilege escalation.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X8",
+      "severity": "minor",
+      "original_id": "A4",
+      "action": "VALIDATE",
+      "file": "README.md",
+      "line": 46,
+      "summary": "The documentation still describes an explicitly repaired blocker",
+      "evidence": "snapshots.py:119 and :212 call sync_disk; platforms.py selects per-file fsync on Windows instead of os.sync. Additionally, the comment preceding LIMITS_TERMS in tests/test_ci_workflows.py explicitly says os.sync stopped being a blocker after P18F1. Nevertheless, the README and known-limits Blocker section still present that failure as current. The known-limits Proof status section also says no CI runs are recorded while its final section records Windows and release runs. These are internal contradictions; real-game verification should remain separately marked unproven.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X9",
+      "severity": "minor",
+      "original_id": "A5",
+      "action": "VALIDATE",
+      "file": "packaging/pz-duel.spec",
+      "line": 6,
+      "summary": "Runtime diagnostics lack a visible connection to the application log",
+      "evidence": "main.log_line writes its own messages directly to the log file; the reviewed main startup path installs no logging handler. Meanwhile api.py:173 uses LOG.exception, share.py:109 uses LOG.error, and engine.py:1589 uses LOGGER.error. With console=False, these records need a separate sink. Assuming the packaged entry point does not configure one, the reported diagnostic loss follows. Inspecting that entry point or emitting a runtime logging record in the packaged smoke test would confirm or refute the remaining assumption. Startup errors already have explicit log_line handling.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X10",
+      "severity": "minor",
+      "original_id": "A6",
+      "action": "VALIDATE",
+      "file": ".github/workflows/release.yml",
+      "line": 5,
+      "summary": "The release workflow does not require successful suite results",
+      "evidence": "The sole release job builds, smoke-tests, computes a checksum and publishes; it neither runs pytest nor checks another workflow's result. tests.yml has branch-push and pull-request triggers, so this workflow itself provides no suite gate for a tagged commit. Repository tag restrictions could constrain operators, but are not established by these files. The proposed prerequisite jobs also need care: tests/test_ci_workflows.py::release_problems explicitly rejects more than one release job. Adding pytest steps or revising that constraint would be necessary. Mutable action references and the single-package build pin are also directly visible.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X11",
+      "severity": "nit",
+      "original_id": "A7",
+      "action": "VALIDATE",
+      "file": "ui/app.js",
+      "line": 37,
+      "summary": "Error JSON corrupts polling state outside the recovery catch",
+      "evidence": "api returns parsed JSON regardless of status. poll assigns it to S and marks the service healthy inside its try block, but render runs afterward at line 54. Consequently, an error body's missing state fields cause a rendering exception outside that catch, leaving the healthy badge and malformed S until another successful poll. Validate the state response before assignment. A blanket change making api throw for every non-2xx response would also need to preserve answered(), which intentionally consumes action refusals and their returned state.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X12",
+      "severity": "nit",
+      "original_id": "A8",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 1717,
+      "summary": "Setup performs redundant filesystem hashing under the state lock",
+      "evidence": "setup_state calls _setup_view inside self.lock, and _setup_view calls mod_fingerprint. preflight.py's implementation traverses the tree and reads every file, so this is filesystem I/O under the same lock needed by snapshot and state updates. run_preflight has already computed the expected fingerprint through _check_mod, making the later read redundant on a successful measurement. The load impact is limited by ui/app.js:52-59: setup refreshes on settled-phase transitions and explicit actions, rather than every polling interval.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X13",
+      "severity": "nit",
+      "original_id": "A9",
+      "action": "CHALLENGE",
+      "file": "service/share.py",
+      "line": 43,
+      "summary": "Shared HTTP helpers do not by themselves demonstrate a security-boundary defect",
+      "evidence": "The dependencies exist, including borrowing Handler._drain. However, that method only delegates to bounded socket draining, while HeadReader and BoundedHTTPServer centralize deadlines and connection limits used by both listeners. ShareHandler independently checks its exact token route and only calls guest_launcher; it does not inherit the loopback API routes. Moving helpers could improve ownership and maintainability, but the cited imports alone demonstrate neither weaker authorization nor incorrect runtime behavior. Treat this as an optional refactor.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X14",
+      "severity": "nit",
+      "original_id": "A10",
+      "action": "CHALLENGE",
+      "file": ".",
+      "line": 1,
+      "summary": "Repository-state observations belong in review scope, not product findings",
+      "evidence": "An empty requested commit range would limit commit-based verification, but it does not demonstrate a software defect or invalidate a clearly identified worktree review. The claimed HEAD identity and untracked status cannot be independently authenticated through the permitted file-only inspection. Preserve this as a coverage qualification rather than a finding supporting REQUEST_CHANGES; confirming the repository metadata would settle the factual part.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "X15",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "ADD",
+      "file": "service/snapshots.py",
+      "line": 238,
+      "summary": "Interrupted initial capture can permanently bypass creation recovery",
+      "evidence": "_switch installs snapshot directories sequentially at lines 65-71. Termination after installing the first snapshot but before installing the second leaves a partial snapshot pair and, during initial creation, the creation marker. On restart, prepare_worlds checks elif snapshots at line 238 before creation_pending at line 242, so it refuses without reaching marker recovery. Repeated launches encounter the same persistent state. This safely refuses inconsistent snapshots, but leaves an interruption requiring filesystem repair. Recovery should explicitly handle a partial pair with a creation marker, or document the repair procedure.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}
