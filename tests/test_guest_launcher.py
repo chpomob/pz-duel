@@ -301,11 +301,75 @@ def test_launcher_says_trusted_network_and_only_protection(launcher):
     assert b"certutil -hashfile" in text
 
 
+POLICY_PROBE = (
+    "powershell.exe", "-NoProfile", "-Command", "Get-ExecutionPolicy -List | Out-String"
+)
+
+
+def assert_policy_only_on_the_process_line(launcher: bytes) -> None:
+    """Preuve statique : la seule politique est le drapeau du processus `powershell`.
+
+    PowerShell ignore la casse : `set-executionpolicy`, `$env:PSExecutionPolicyPreference` ou une
+    clé `...\\ExecutionPolicy` du registre contiennent tous `executionpolicy`, en un mot.
+    """
+    lowered = launcher.lower()
+    assert lowered.count(b"executionpolicy") == 1, "une politique s'ajoute au drapeau du processus"
+    (call,) = [line for line in batch_header(launcher) if b"powershell.exe" in line]
+    flags, command = call.split(b" -Command ", 1)
+    assert flags.endswith(b" -ExecutionPolicy Bypass")
+    assert b"executionpolicy" not in command.lower()
+    assert b"set-executionpolicy" not in lowered
+
+
+def execution_policies() -> bytes:
+    """Sonde le runner ; s'il ne répond pas, cette moitié est sautée, motif à l'appui."""
+    try:
+        done = subprocess.run(POLICY_PROBE, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        pytest.skip(f"sonde de politique d'exécution impossible : {error!r}")
+    if done.returncode != 0:
+        lines = done.stderr.decode("utf-8", "replace").strip().splitlines()
+        first = lines[0] if lines else "<stderr vide>"
+        pytest.skip(f"sonde de politique d'exécution refusée (code {done.returncode}) : {first}")
+    return done.stdout
+
+
 def test_execution_policy_stays_a_process_flag(launcher):
     """`-ExecutionPolicy` ne vaut que pour le processus : rien de persistant ne doit s'y ajouter."""
     assert launcher.count(b"-ExecutionPolicy Bypass") == 1
-    assert b"Set-ExecutionPolicy" not in launcher
-    assert b"PSExecutionPolicyPreference" not in launcher
+    assert_policy_only_on_the_process_line(launcher)
+
+
+@pytest.mark.parametrize(
+    "added",
+    [
+        b"Set-ExecutionPolicy Bypass -Scope CurrentUser -Force",
+        b"set-executionpolicy unrestricted",
+        b"$env:PSExecutionPolicyPreference='Bypass'",
+    ],
+)
+def test_a_persisted_policy_in_the_launcher_is_caught(launcher, added):
+    """Mutation (a) gardée : ce qu'on glisserait dans le script ou le `-Command` est vu."""
+    script = guest_launcher.SCRIPT_MARK.encode() + CRLF
+    in_script = launcher.replace(script, script + added + CRLF, 1)
+    in_command = launcher.replace(b"$ErrorActionPreference='Stop';", added + b";", 1)
+    for mutant in (in_script, in_command):
+        assert mutant != launcher
+        with pytest.raises(AssertionError):
+            assert_policy_only_on_the_process_line(mutant)
+
+
+def test_a_probe_that_refuses_to_answer_skips_with_its_reason(monkeypatch):
+    """Mutation (b) gardée : un runner muet saute la moitié dynamique, sans la faire échouer."""
+    refused = subprocess.CompletedProcess(
+        POLICY_PROBE, 1, b"", b"Access denied by policy\r\nsecond line\r\n"
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: refused)
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        execution_policies()
+    assert "code 1" in str(skipped.value)
+    assert "Access denied by policy" in str(skipped.value)
+    assert "second line" not in str(skipped.value)
 
 
 @pytest.mark.parametrize("typed", ["", " ", "0" * LAUNCHER_CODE_CHARS, 'x" & echo pwned'])
@@ -690,13 +754,8 @@ if sys.platform == "win32":
         digest = done.stdout.splitlines()[1].replace(b" ", b"").decode("ascii")
         assert digest.startswith(launcher_code(launcher))
 
-    def execution_policies() -> bytes:
-        script = "Get-ExecutionPolicy -List | Out-String"
-        return subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", script], capture_output=True, check=True
-        ).stdout
-
     def test_windows_execution_policy_is_unchanged_after_a_run(guest, launcher):
+        assert_policy_only_on_the_process_line(launcher)
         guest.install_game()
         before = execution_policies()
 
