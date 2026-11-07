@@ -159,3 +159,30 @@ of `tests/test_guest_launcher.py`.
   `tests/test_setup_flow.py::test_error_screen_can_run_the_checks_again`. The fix belongs in
   `service/engine.py`.
 - **The interface mixes French and English**: phase 2 screens are in English, older ones in French.
+
+## Real CI and release runs (P18)
+
+Everything below was produced by GitHub Actions on the public repository, not locally. Dates are UTC.
+
+- **`tests.yml`** runs on `master`, Linux 3.12/3.13/3.14 plus `pytest-windows` on the same three
+  versions and `build-windows`:
+  - [42316172795](https://github.com/chpomob/pz-duel/actions/runs/42316172795) — commit `5bfa440`,
+    **green twice** (the second pass was a rerun, because the defect fixed in P18F4 was a race).
+- **`release.yml`** run [42319708603](https://github.com/chpomob/pz-duel/actions/runs/42319708603)
+  on tag `v0.0.0-phase2-test` created release
+  [v0.0.0-phase2-test](https://github.com/chpomob/pz-duel/releases/tag/v0.0.0-phase2-test), marked
+  **pre-release**, with exactly two assets: `pz-duel.exe` (10 351 421 bytes) and
+  `pz-duel.exe.sha256`. The downloaded binary matches its checksum:
+  `db754a39e7a8d6a2b2bea76514ae90916ee76d5a459efcf9e8bf7e1a4b6a7608`.
+- **The Windows jobs are the reference for anything platform-specific.** They caught five waves of
+  defects that 2 000+ Linux tests could not see, each fixed by its own reviewed step: `os.sync`
+  missing on Windows (P18F1), ten failures in the process-tree and stop-stage doubles (P18F2), two
+  waits with no margin (P18F3), and a connection refusal closed with RST instead of FIN (P18F4).
+  Earlier red runs stay in the history as evidence:
+  [42296912989](https://github.com/chpomob/pz-duel/actions/runs/42296912989),
+  [42309448633](https://github.com/chpomob/pz-duel/actions/runs/42309448633),
+  [42313084724](https://github.com/chpomob/pz-duel/actions/runs/42313084724).
+- **The test release stays public until the operator deletes it.** It is a pre-release on a
+  `v0.0.0-*` tag, contains an unsigned binary, and exists to prove `release.yml` end to end.
+- **No Windows machine was ever touched by hand.** All Windows evidence comes from
+  `windows-latest` runners; a real desktop was never used to play a duel.

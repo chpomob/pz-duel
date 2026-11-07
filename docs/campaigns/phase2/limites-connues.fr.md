@@ -164,3 +164,32 @@ réelle est le bloc `win32` de `tests/test_guest_launcher.py`.
   `service/engine.py`.
 - **L'interface mêle français et anglais** : les écrans de la phase 2 sont en anglais, les anciens en
   français.
+
+## Exécutions réelles de CI et de release (P18)
+
+Tout ce qui suit a été produit par GitHub Actions sur le dépôt public, pas en local. Les heures sont en UTC.
+
+- **`tests.yml`** tourne sur `master` : Linux 3.12/3.13/3.14, plus `pytest-windows` sur les trois
+  mêmes versions et `build-windows` :
+  - [42316172795](https://github.com/chpomob/pz-duel/actions/runs/42316172795) — commit `5bfa440`,
+    **vert deux fois** (la seconde passe est une relance, parce que le défaut corrigé en P18F4 était
+    une course).
+- **`release.yml`**, run [42319708603](https://github.com/chpomob/pz-duel/actions/runs/42319708603)
+  sur le tag `v0.0.0-phase2-test`, a créé la release
+  [v0.0.0-phase2-test](https://github.com/chpomob/pz-duel/releases/tag/v0.0.0-phase2-test), marquée
+  **préversion**, avec exactement deux pièces jointes : `pz-duel.exe` (10 351 421 octets) et
+  `pz-duel.exe.sha256`. Le binaire téléchargé correspond à son empreinte :
+  `db754a39e7a8d6a2b2bea76514ae90916ee76d5a459efcf9e8bf7e1a4b6a7608`.
+- **Les jobs Windows font référence pour tout ce qui touche à la plateforme.** Ils ont attrapé cinq
+  vagues de défauts que plus de 2 000 tests Linux ne pouvaient pas voir, chacune corrigée par son
+  étape relue : `os.sync` absent sous Windows (P18F1), dix échecs dans les doubles d'arbre de
+  processus et de palier d'arrêt (P18F2), deux attentes sans marge (P18F3), et un refus de connexion
+  fermé par RST au lieu d'un FIN (P18F4). Les runs rouges restent dans l'historique comme preuves :
+  [42296912989](https://github.com/chpomob/pz-duel/actions/runs/42296912989),
+  [42309448633](https://github.com/chpomob/pz-duel/actions/runs/42309448633),
+  [42313084724](https://github.com/chpomob/pz-duel/actions/runs/42313084724).
+- **La release de test reste publique jusqu'à ce que l'opérateur la supprime.** C'est une préversion
+  sur un tag `v0.0.0-*`, elle contient un binaire non signé, et elle existe pour prouver
+  `release.yml` de bout en bout.
+- **Aucune machine Windows n'a été touchée à la main.** Toute la preuve Windows vient des runners
+  `windows-latest` ; aucun poste réel n'a servi à jouer un duel.
