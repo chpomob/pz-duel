@@ -21,8 +21,9 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from functools import partial
 from pathlib import Path
+from typing import Any
 
-from .platforms import Platform, current, sync_disk
+from .platforms import Platform, current, replace_file, sync_disk
 from .preflight import check_ports
 from .rules import load_runtime
 from .servers import ServerPair, ServerProcess, server_name
@@ -37,6 +38,7 @@ CREATION_MARKER = ".creation-en-cours"
 SNAPSHOT_MODE = 0o700
 
 Copy = Callable[[Path, Path], None]
+Rename = Callable[[Path, Path], None]
 
 
 class SnapshotError(Exception):
@@ -59,20 +61,20 @@ def remove_path(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _switch(moves: Iterable[tuple[Path, Path, Path]]) -> None:
+def _switch(moves: Iterable[tuple[Path, Path, Path]], rename: Rename) -> None:
     """Fait les `rename` de `(préparé, cible, ancien)` ; une panne les défait tous."""
     done: list[tuple[Path, Path]] = []
     try:
         for staged, target, replaced in moves:
             if os.path.lexists(target):
-                os.rename(target, replaced)
+                rename(target, replaced)
                 done.append((replaced, target))
-            os.rename(staged, target)
+            rename(staged, target)
             done.append((target, staged))
     except OSError as exc:
         try:
             for moved, origin in reversed(done):
-                os.rename(moved, origin)
+                rename(moved, origin)
         except OSError as undo_exc:
             raise SnapshotError(
                 f"bascule interrompue ({exc}) et non défaite ({undo_exc}) : "
@@ -81,10 +83,16 @@ def _switch(moves: Iterable[tuple[Path, Path, Path]]) -> None:
         raise
 
 
+def _discard(stages: Iterable[Path]) -> None:
+    for stage in stages:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 class SnapshotStore:
     """Snapshots sous `zomboid_dir`. `ports` vaut par défaut ceux de `runtime.json`.
 
-    `copy(src, dst)` est injectable pour simuler une panne à mi-copie.
+    `copy(src, dst)` est injectable pour simuler une panne à mi-copie. `policy` et `platform`
+    vont à `replace_file` : voir `service/platforms.py`.
     """
 
     def __init__(
@@ -93,6 +101,7 @@ class SnapshotStore:
         *,
         ports: Mapping[str, Mapping[str, int]] | None = None,
         copy: Copy = copy_path,
+        policy: Mapping[str, Any] | None = None,
         platform: Platform | None = None,
     ) -> None:
         self._zomboid_dir = Path(zomboid_dir)
@@ -100,6 +109,7 @@ class SnapshotStore:
         self._marker = self._root / CREATION_MARKER
         self._ports = load_runtime()["ports"] if ports is None else ports
         self._copy = copy
+        self._policy = policy
         self._platform = current() if platform is None else platform
 
     def has(self, side: str) -> bool:
@@ -198,6 +208,7 @@ class SnapshotStore:
 
         Le dossier temporaire partage le parent de sa cible, donc son système de fichiers.
         Il reçoit aussi l'ancien contenu, qui ne disparaît qu'avec lui, après la bascule.
+        Il ne s'efface donc que là où l'ancien est sûrement ailleurs : jamais par défaut.
         """
         stages: list[Path] = []
         try:
@@ -210,14 +221,14 @@ class SnapshotStore:
                 moves.append((stage / STAGED, target, stage / REPLACED))
             # Sans cela, une coupure pourrait garder le `rename` et perdre les données.
             sync_disk([staged for staged, _, _ in moves], platform=self._platform)
-            _switch(moves)
+            _switch(moves, partial(replace_file, policy=self._policy, platform=self._platform))
         except SnapshotError:
             # Bascule non défaite : ces dossiers tiennent peut-être le seul ancien monde.
-            stages.clear()
             raise
-        finally:
-            for stage in stages:
-                shutil.rmtree(stage, ignore_errors=True)
+        except OSError:
+            _discard(stages)
+            raise
+        _discard(stages)
 
 
 def prepare_worlds(

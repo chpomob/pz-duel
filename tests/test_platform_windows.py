@@ -626,6 +626,33 @@ def test_session_write_failure_before_the_replace_is_not_masked(tmp_path):
     assert "session.txt.tmp" in str(caught.value)
 
 
+def test_held_folder_is_renamed_once_released(tmp_path, fake_time, monkeypatch):
+    """A2 : la primitive des fichiers vaut pour un dossier, et le déplace avec son contenu."""
+    folder, moved = tmp_path / "world", tmp_path / "old"
+    folder.mkdir()
+    (folder / "map.bin").write_text("kept", encoding="utf-8")
+    monkeypatch.setattr(os, "replace", HeldTarget(fake_time, failures=3))
+
+    replace_on_windows((folder, moved), fake_time, POLICY)
+
+    assert (moved / "map.bin").read_text(encoding="utf-8") == "kept"
+    assert not folder.exists()
+
+
+def test_held_folder_error_names_the_held_source(tmp_path, fake_time, monkeypatch):
+    """Déplacé vers un dossier d'attente, c'est le monde qui est tenu : il faut le citer."""
+    folder, moved = tmp_path / "world", tmp_path / "stage" / "old"
+    folder.mkdir()
+    monkeypatch.setattr(os, "replace", HeldTarget(fake_time))
+
+    with pytest.raises(ReplaceError) as caught:
+        replace_on_windows((folder, moved), fake_time, POLICY)
+
+    assert str(folder) in str(caught.value)
+    assert str(moved) in str(caught.value)
+    assert folder.is_dir()
+
+
 def test_held_proofs_report_names_the_cause(tmp_path, monkeypatch):
     """`ReplaceError` n'a pas de `strerror` : le rapport ne doit pas dire `None`."""
     path = tmp_path / PROOFS_NAME
@@ -804,6 +831,17 @@ with open(sys.argv[1], "rb"):
         with held_by_another_process(target, SUBPROCESS_TIMEOUT_S):
             with pytest.raises(PermissionError):
                 os.replace(temporary, target)
+
+    def test_windows_folder_rename_survives_a_short_hold(tmp_path):
+        """A2 : la seule mesure d'un vrai handle, tenu dans un dossier qu'on déplace."""
+        folder, moved = tmp_path / "world", tmp_path / "old"
+        folder.mkdir()
+        (folder / "map.bin").write_text("kept", encoding="utf-8")
+
+        with held_by_another_process(folder / "map.bin", HOLD_S):
+            replace_file(folder, moved, policy=load_runtime(), platform=WINDOWS)
+
+        assert (moved / "map.bin").read_text(encoding="utf-8") == "kept"
 
     def test_windows_in_has_no_carriage_return(tmp_path):
         channel = CommandChannel("A", tmp_path)
@@ -1038,7 +1076,9 @@ def test_windows_missing_client_is_not_retried(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", launch)
 
     with pytest.raises(ClientLaunchError, match="ne démarre pas") as caught:
-        launch_client(tmp_path / WINDOWS.client_program, ["+password", "marker"], WINDOWS)
+        launch_client(
+            tmp_path / WINDOWS.client_program, ["+password", "marker"], WINDOWS, cwd=tmp_path
+        )
 
     assert "marker" not in str(caught.value)
     assert len(launch.calls) == 1
@@ -1326,7 +1366,7 @@ if sys.platform != "win32":
         monkeypatch.setattr(subprocess, "Popen", launch)
         client = write_client(tmp_path / WINDOWS.client_program, "exec sleep 1")
 
-        process = launch_client(client, ["-nosteam"], WINDOWS)
+        process = launch_client(client, ["-nosteam"], WINDOWS, cwd=tmp_path)
 
         assert process.poll() is None
         process.kill()
@@ -1348,7 +1388,7 @@ if sys.platform != "win32":
         monkeypatch.setattr(subprocess, "Popen", launch)
         client = write_client(tmp_path / WINDOWS.client_program, "exec sleep 1")
 
-        process = launch_client(client, [], WINDOWS)
+        process = launch_client(client, [], WINDOWS, cwd=tmp_path)
 
         process.kill()
         process.wait()

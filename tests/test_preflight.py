@@ -9,17 +9,20 @@ from __future__ import annotations
 import ctypes
 import errno
 import json
+import math
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import time
 from contextlib import ExitStack, contextmanager
+from functools import partial
 from pathlib import Path
 
 import pytest
 
-from service import paths, preflight
+from service import paths, platforms, preflight
 from service.platforms import LINUX, WINDOWS, current
 from service.preflight import (
     ABSENT,
@@ -245,6 +248,114 @@ def test_mod_content_is_checked(ready, zomboid_home, runtime):
     shutil.rmtree(version_dir / "media" / "lua" / "server")
     (failure,) = ready().failures
     assert str(Path("media/lua/server")) in failure and "--install-mod" in failure
+
+
+class TransientLock:
+    """Refuse les renommages pendant `hold_s` dès le premier essai, comme un handle Windows.
+
+    Couvre `os.rename` et `os.replace` : le verrou tient quel que soit l'appel du code testé.
+    Sans `hold_s`, il ne se relâche jamais.
+    """
+
+    def __init__(self, monkeypatch, hold_s: float = math.inf) -> None:
+        self.hold_s = hold_s
+        self.released_at: float | None = None
+        self.refused = 0
+        for name in ("rename", "replace"):
+            monkeypatch.setattr(os, name, partial(self._attempt, getattr(os, name)))
+
+    def _attempt(self, real, src, dst) -> None:
+        if self.released_at is None:
+            self.released_at = time.monotonic() + self.hold_s
+        if time.monotonic() < self.released_at:
+            self.refused += 1
+            raise PermissionError(13, "held by another process")
+        real(src, dst)
+
+
+class FailingMoves:
+    """Laisse passer `allowed` renommages du mod, puis les refuse, sauf `spared` s'il est dit."""
+
+    def __init__(self, monkeypatch, allowed: int, spared: str = "") -> None:
+        self.allowed = allowed
+        self.spared = spared
+        for name in ("rename", "replace"):
+            monkeypatch.setattr(os, name, partial(self._attempt, getattr(os, name)))
+
+    def _attempt(self, real, src, dst) -> None:
+        if MOD_ID in os.fspath(src) and Path(src).name != self.spared:
+            if not self.allowed:
+                raise OSError(5, "Input/output error")
+            self.allowed -= 1
+        real(src, dst)
+
+
+RETRYING = {"replace_timeout_s": 2, "replace_retry_ms": 5}
+GIVING_UP = {"replace_timeout_s": 0.05, "replace_retry_ms": 5}
+TRANSIENT_HOLD_S = 0.05
+
+
+def player_mod(zomboid_dir: Path) -> Path:
+    """Un `duelcore` que seul le joueur possède : retouché, il n'est dans aucune source."""
+    mod = zomboid_dir / "mods" / MOD_ID
+    mod.mkdir(parents=True, exist_ok=True)
+    (mod / "retouche.txt").write_text("du joueur", encoding="utf-8")
+    return mod
+
+
+def test_install_outlasts_a_transient_lock(tmp_path, monkeypatch):
+    """A2 : un antivirus qui tient le mod quelques dizaines de ms ne fait plus échouer."""
+    zomboid = tmp_path / "Zomboid"
+    mod = player_mod(zomboid)
+    lock = TransientLock(monkeypatch, TRANSIENT_HOLD_S)
+
+    assert install_mod(MOD_SRC, zomboid, policy=RETRYING, platform=WINDOWS) == mod
+
+    assert lock.refused > 1
+    assert mod_fingerprint(mod) == mod_fingerprint(MOD_SRC)
+    assert sorted(path.name for path in zomboid.iterdir()) == ["mods"]
+
+
+def test_lasting_lock_gives_up_in_bounds_and_keeps_the_mod(tmp_path, monkeypatch):
+    zomboid = tmp_path / "Zomboid"
+    mod = player_mod(zomboid)
+    TransientLock(monkeypatch)
+
+    with pytest.raises(platforms.ReplaceError):
+        install_mod(MOD_SRC, zomboid, policy=GIVING_UP, platform=WINDOWS)
+
+    assert (mod / "retouche.txt").read_text(encoding="utf-8") == "du joueur"
+    assert sorted(path.name for path in zomboid.iterdir()) == ["mods"]
+
+
+def test_failed_install_puts_the_mod_back_and_cleans_up(tmp_path, monkeypatch):
+    zomboid = tmp_path / "Zomboid"
+    mod = player_mod(zomboid)
+    FailingMoves(monkeypatch, allowed=1, spared="previous")
+
+    with pytest.raises(OSError, match="Input/output error"):
+        install_mod(MOD_SRC, zomboid)
+
+    assert (mod / "retouche.txt").read_text(encoding="utf-8") == "du joueur"
+    assert sorted(path.name for path in zomboid.iterdir()) == ["mods"]
+
+
+def test_failed_restore_keeps_the_mod_and_says_where(tmp_path, monkeypatch):
+    """B1 : installation et restauration en échec, le mod du joueur survit à la sortie."""
+    zomboid = tmp_path / "Zomboid"
+    mod = player_mod(zomboid)
+    FailingMoves(monkeypatch, allowed=1)
+
+    with pytest.raises(OSError) as caught:
+        install_mod(MOD_SRC, zomboid)
+
+    assert not mod.exists(), "le double doit laisser le mod hors de sa place"
+    (kept,) = zomboid.glob(f".{MOD_ID}-*/previous")
+    assert (kept / "retouche.txt").read_text(encoding="utf-8") == "du joueur"
+    message = str(caught.value)
+    assert str(kept) in message
+    assert str(mod) in message
+    assert "do not delete" in message
 
 
 def test_fingerprint_covers_paths_and_contents(tmp_path):

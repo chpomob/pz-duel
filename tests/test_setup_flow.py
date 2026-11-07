@@ -19,7 +19,14 @@ import pytest
 from doubles.fake_server import FakeRcon
 from test_match import Duel
 from test_modes import forbidden_factory, settle, step
-from test_preflight import assert_no_terminal, free_ports, make_install, zomboid_home  # noqa: F401
+from test_preflight import (  # noqa: F401
+    FailingMoves,
+    assert_no_terminal,
+    free_ports,
+    make_install,
+    player_mod,
+    zomboid_home,
+)
 from test_servers import Service, stopped_for_good, until
 from test_snapshots import engine_rig  # noqa: F401
 
@@ -219,8 +226,29 @@ def test_install_route_replaces_an_outdated_mod(healthy, serve, game):
     assert setup(port)["ok"] is True
 
 
+def test_failed_restore_reaches_the_ui_with_the_kept_folder(
+    healthy, serve, game, monkeypatch
+):
+    """B1 : l'avis s'efface, le journal reste ; les deux disent où le mod du joueur est sauvé."""
+    mod = player_mod(healthy)
+    FailingMoves(monkeypatch, allowed=1)
+    engine, port = serve(zomboid_dir=healthy, pz_dir=game)
+
+    status, answer = request(port, INSTALL_ROUTE, {})
+
+    (kept,) = healthy.glob(f".{MOD_ID}-*/previous")
+    assert (kept / "retouche.txt").read_text(encoding="utf-8") == "du joueur"
+    assert status == 409
+    assert answer["ok"] is False
+    assert answer["message"].startswith("Could not install the mod: ")
+    assert str(kept) in answer["message"]
+    assert str(mod) in answer["message"]
+    assert_no_terminal(answer["message"], healthy)
+    assert any(str(kept) in entry["msg"] for entry in engine.snapshot()["logs"])
+
+
 def test_failed_install_answers_without_trace(healthy, serve, game, monkeypatch):
-    def refuse(*_):
+    def refuse(*_, **__):
         raise PermissionError(13, "denied by the disk")
 
     monkeypatch.setattr(engine_module, "install_mod", refuse)
@@ -421,10 +449,10 @@ def test_start_preflight_waits_for_a_running_install(healthy, serve, game, monke
     shutil.rmtree(healthy / "mods" / MOD_ID)
     entered, release = threading.Event(), threading.Event()
 
-    def slow_install(*args):
+    def slow_install(*args, **options):
         entered.set()
         assert release.wait(WAIT_S)
-        return install_mod(*args)
+        return install_mod(*args, **options)
 
     monkeypatch.setattr(engine_module, "install_mod", slow_install)
     engine, port = serve(zomboid_dir=healthy, pz_dir=game)
@@ -446,10 +474,10 @@ def test_shutdown_waits_for_a_running_install(healthy, serve, game, monkeypatch)
     shutil.rmtree(healthy / "mods" / MOD_ID)
     entered, release = threading.Event(), threading.Event()
 
-    def slow_install(*args):
+    def slow_install(*args, **options):
         entered.set()
         assert release.wait(WAIT_S)
-        return install_mod(*args)
+        return install_mod(*args, **options)
 
     monkeypatch.setattr(engine_module, "install_mod", slow_install)
     engine, port = serve(zomboid_dir=healthy, pz_dir=game)

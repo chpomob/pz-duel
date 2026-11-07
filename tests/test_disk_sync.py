@@ -188,18 +188,18 @@ def test_restore_syncs_before_the_first_rename(monkeypatch, rig, captured, platf
     pair, _, origin = captured
     events: list[str] = []
     record_os_sync(monkeypatch, events)
-    real_fsync, real_rename = os.fsync, os.rename
+    real_fsync, real_replace = os.fsync, os.replace
 
     def fsync(descriptor: int) -> None:
         events.append("sync")
         real_fsync(descriptor)
 
-    def rename(src, dst) -> None:
+    def replace(src, dst) -> None:
         events.append("rename")
-        real_rename(src, dst)
+        real_replace(src, dst)
 
     monkeypatch.setattr(os, "fsync", fsync)
-    monkeypatch.setattr(os, "rename", rename)
+    monkeypatch.setattr(os, "replace", replace)
     store = SnapshotStore(rig.zomboid, ports=rig.runtime["ports"], platform=platform)
 
     store.restore(pair)

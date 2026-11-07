@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -20,8 +22,8 @@ from service import engine as engine_module
 from service import main as main_module
 from service.api import make_server
 from service.engine import ACTIONS, Engine, load_presets
-from service.platforms import current
-from service.preflight import MOD_SRC, install_mod
+from service.platforms import WINDOWS, current
+from service.preflight import MOD_SRC, detect_pz, install_mod
 from service.servers import ServerProcess
 from service.state import PHASE_LABELS
 
@@ -82,7 +84,7 @@ class Launcher:
         self.calls: list[tuple[Path, list[str]]] = []
         self.client = FakeClient()
 
-    def __call__(self, script, args) -> FakeClient:
+    def __call__(self, script, args, *, cwd) -> FakeClient:
         self.calls.append((script, list(args)))
         if self.failure is not None:
             raise engine_module.ClientLaunchError(self.failure)
@@ -423,6 +425,60 @@ def test_open_game_is_direct_and_leaves_steam_mode(zomboid_home, tmp_path, runti
     assert not any("marqueur-hote" in entry["msg"] for entry in engine.snapshot()["logs"])
 
 
+class PopenSpy:
+    """Tient lieu de `subprocess.Popen` : note les options, et le client « reste ouvert »."""
+
+    def __init__(self, refused: int = 0) -> None:
+        self.refused = refused
+        self.options: list[dict] = []
+
+    def __call__(self, command, **options) -> PopenSpy:
+        self.options.append(options)
+        if len(self.options) <= self.refused:
+            raise PermissionError(13, "Access is denied")
+        return self
+
+    def wait(self, timeout=None) -> int:
+        raise subprocess.TimeoutExpired("client", timeout)
+
+    def poll(self) -> None:
+        return None
+
+
+def test_open_game_runs_the_client_in_the_detected_game_folder(
+    zomboid_home, tmp_path, runtime, monkeypatch
+):
+    """A1 : sans `cwd`, le client hérite du dossier du service, celui du téléchargement.
+
+    C'est le dossier détecté, celui des serveurs, et non le parent du client : sous Linux,
+    ce parent est un cran au-dessus.
+    """
+    pz_dir, _ = client_install(tmp_path)
+    service_folder = tmp_path / "downloads"
+    service_folder.mkdir()
+    monkeypatch.chdir(service_folder)
+    spy = PopenSpy()
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir)
+    engine.state.config = dict(HOST_CONFIG)
+    engine.state.phase = "lobby"
+
+    assert engine.action("open_game")[0] is True
+
+    (options,) = spy.options
+    assert options["cwd"] == detect_pz(pz_dir, os.environ, Path.home()).path
+
+
+def test_every_launch_attempt_keeps_the_game_folder(tmp_path, monkeypatch):
+    """Un Job qui refuse la sortie provoque un second essai : il doit garder le dossier."""
+    spy = PopenSpy(refused=1)
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    engine_module.launch_client(tmp_path / WINDOWS.client_program, [], WINDOWS, cwd=tmp_path)
+
+    assert [options["cwd"] for options in spy.options] == [tmp_path, tmp_path]
+
+
 def test_open_game_without_the_client_fails_explicitly(zomboid_home, tmp_path, runtime):
     """Binaire absent : aucun lancement, ni de relais qui se dirait réussi sans rien constater."""
     pz_dir, script = client_install(tmp_path)
@@ -463,7 +519,7 @@ def test_open_game_keeps_the_engine_free_while_launching(zomboid_home, tmp_path,
         if acquired:
             engine.lock.release()
 
-    def launcher(script, args):
+    def launcher(script, args, *, cwd):
         other = threading.Thread(target=probe)
         other.start()
         other.join()
@@ -504,7 +560,7 @@ def test_second_open_game_is_refused_while_the_first_is_starting(zomboid_home, t
     starting, release = threading.Event(), threading.Event()
     calls: list[list[str]] = []
 
-    def launcher(script, args):
+    def launcher(script, args, *, cwd):
         calls.append(list(args))
         starting.set()
         release.wait(WAIT_S)
@@ -582,7 +638,7 @@ def test_default_client_launcher_accepts_a_client_that_stays_up(
         stay_ms=1000,
     )
 
-    process = engine_module.launch_client(script, ["-nosteam", "+connect"])
+    process = engine_module.launch_client(script, ["-nosteam", "+connect"], cwd=tmp_path)
     assert process.poll() is None, "l'engine suit ce processus pour refuser un second client"
     deadline = time.monotonic() + WAIT_S
     while not (marker.exists() and marker.read_text(encoding="utf-8")):
@@ -602,12 +658,14 @@ def test_default_client_launcher_refuses_an_early_exit(
 
     stopped = f"{re.escape(script.name)} s'est arrêté aussitôt \\(code {code}\\)"
     with pytest.raises(engine_module.ClientLaunchError, match=stopped):
-        engine_module.launch_client(script, ["+password", "marqueur-hote"])
+        engine_module.launch_client(script, ["+password", "marqueur-hote"], cwd=tmp_path)
 
 
 def test_default_client_launcher_names_a_missing_binary(tmp_path):
     with pytest.raises(engine_module.ClientLaunchError, match="pz.sh ne démarre pas") as caught:
-        engine_module.launch_client(tmp_path / "pz.sh", ["+password", "marqueur-hote"])
+        engine_module.launch_client(
+            tmp_path / "pz.sh", ["+password", "marqueur-hote"], cwd=tmp_path
+        )
 
     assert "marqueur-hote" not in str(caught.value)
 

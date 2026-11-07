@@ -14,17 +14,25 @@ import shutil
 import socket
 import threading
 import time
+from functools import partial
 from pathlib import Path
 
 import pytest
 
 from doubles.fake_mod import FakeMod
 from doubles.fake_server import install_fake_server, kill_tree, on_host, write_script
-from test_preflight import free_ports, zomboid_home  # noqa: F401
+from test_preflight import (  # noqa: F401
+    GIVING_UP,
+    RETRYING,
+    TRANSIENT_HOLD_S,
+    TransientLock,
+    free_ports,
+    zomboid_home,
+)
 from service import snapshots
 from service.engine import Engine, RealMatch
 from service.journal import JOURNAL_NAME, read_journal
-from service.platforms import current
+from service.platforms import WINDOWS, current
 from service.preflight import MOD_SRC, install_mod
 from service.replay import START_FIELDS
 from service.rules import load_runtime
@@ -555,7 +563,7 @@ def test_switch_failure_rolls_back(rig, captured, monkeypatch, failing_rename):
     pair, store, _ = captured
     altered = worlds_state(rig.zomboid)
     before = listing(rig.zomboid)
-    real_rename = os.rename
+    real_rename = os.replace
     calls = []
 
     def rename(src, dst):
@@ -564,7 +572,7 @@ def test_switch_failure_rolls_back(rig, captured, monkeypatch, failing_rename):
             raise OSError(5, "Input/output error")
         real_rename(src, dst)
 
-    monkeypatch.setattr(snapshots.os, "rename", rename)
+    monkeypatch.setattr(snapshots.os, "replace", rename)
 
     with pytest.raises(SnapshotError, match="monde intact"):
         store.restore(pair)
@@ -575,7 +583,7 @@ def test_switch_failure_rolls_back(rig, captured, monkeypatch, failing_rename):
 
 def test_failed_rollback_keeps_the_old_world(rig, captured, monkeypatch):
     pair, store, _ = captured
-    real_rename = os.rename
+    real_rename = os.replace
     calls = []
 
     def rename(src, dst):
@@ -584,9 +592,91 @@ def test_failed_rollback_keeps_the_old_world(rig, captured, monkeypatch):
             raise OSError(5, "Input/output error")
         real_rename(src, dst)
 
-    monkeypatch.setattr(snapshots.os, "rename", rename)
+    monkeypatch.setattr(snapshots.os, "replace", rename)
 
     with pytest.raises(SnapshotError, match="non défaite"):
+        store.restore(pair)
+
+    (kept,) = (rig.zomboid / "Saves" / "Multiplayer").glob(".duelA.*/old")
+    assert (kept / "map" / "chunk.bin").read_bytes() == b"after the match"
+
+
+def test_restore_outlasts_a_transient_lock(rig, captured, monkeypatch):
+    """A2 : un monde tenu quelques dizaines de ms n'annule plus la restauration."""
+    pair, _, origin = captured
+    store = SnapshotStore(
+        rig.zomboid, ports=rig.runtime["ports"], policy=RETRYING, platform=WINDOWS
+    )
+    lock = TransientLock(monkeypatch, TRANSIENT_HOLD_S)
+
+    store.restore(pair)
+
+    assert lock.refused > 1
+    assert worlds_state(rig.zomboid) == origin
+
+
+def test_lasting_lock_refuses_the_restore_and_keeps_the_world(rig, captured, monkeypatch):
+    pair, _, _ = captured
+    altered = worlds_state(rig.zomboid)
+    before = listing(rig.zomboid)
+    store = SnapshotStore(
+        rig.zomboid, ports=rig.runtime["ports"], policy=GIVING_UP, platform=WINDOWS
+    )
+    TransientLock(monkeypatch)
+
+    with pytest.raises(SnapshotError, match="monde intact.*still in use"):
+        store.restore(pair)
+
+    assert worlds_state(rig.zomboid) == altered
+    assert listing(rig.zomboid) == before
+
+
+def test_rollback_outlasts_a_transient_lock(rig, captured, monkeypatch):
+    """Défaire une bascule est le pire moment pour renoncer : le monde est hors de sa place."""
+    pair, _, _ = captured
+    altered = worlds_state(rig.zomboid)
+    before = listing(rig.zomboid)
+    store = SnapshotStore(
+        rig.zomboid, ports=rig.runtime["ports"], policy=RETRYING, platform=WINDOWS
+    )
+    calls = []
+    held = []
+
+    def attempt(real, src, dst):
+        calls.append(src)
+        if len(calls) == 2:
+            raise OSError(5, "Input/output error")
+        if len(calls) in (3, 4):
+            held.append(src)
+            raise PermissionError(13, "held by another process")
+        real(src, dst)
+
+    for name in ("rename", "replace"):
+        monkeypatch.setattr(os, name, partial(attempt, getattr(os, name)))
+
+    with pytest.raises(SnapshotError, match="monde intact"):
+        store.restore(pair)
+
+    assert len(held) == 2
+    assert worlds_state(rig.zomboid) == altered
+    assert listing(rig.zomboid) == before
+
+
+def test_interrupted_switch_keeps_the_stage_of_the_old_world(rig, captured, monkeypatch):
+    """Aucune suppression sur un chemin imprévu : l'ancien monde reste dans son attente."""
+    pair, store, _ = captured
+    real_rename = os.replace
+    calls = []
+
+    def rename(src, dst):
+        calls.append(src)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        real_rename(src, dst)
+
+    monkeypatch.setattr(snapshots.os, "replace", rename)
+
+    with pytest.raises(KeyboardInterrupt):
         store.restore(pair)
 
     (kept,) = (rig.zomboid / "Saves" / "Multiplayer").glob(".duelA.*/old")

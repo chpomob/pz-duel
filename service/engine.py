@@ -45,6 +45,7 @@ from .preflight import (
     MOD_SRC,
     PRESENT,
     PreflightResult,
+    ModRestoreError,
     detect_pz,
     install_mod,
     mod_fingerprint,
@@ -216,7 +217,7 @@ class ClientLaunchError(Exception):
     """Client non lancé : le message dit la cause, sans jamais citer les arguments."""
 
 
-def _spawn_detached(command: Sequence[str], platform: Platform) -> subprocess.Popen:
+def _spawn_detached(command: Sequence[str], cwd: Path, platform: Platform) -> subprocess.Popen:
     *first, last = platform.client_popen_attempts()
     streams = {
         "stdin": subprocess.DEVNULL,
@@ -225,23 +226,27 @@ def _spawn_detached(command: Sequence[str], platform: Platform) -> subprocess.Po
     }
     for attempt in first:
         try:
-            return subprocess.Popen(command, **streams, **attempt)
+            return subprocess.Popen(command, cwd=cwd, **streams, **attempt)
         except PermissionError:
             continue
-    return subprocess.Popen(command, **streams, **last)
+    return subprocess.Popen(command, cwd=cwd, **streams, **last)
 
 
 def launch_client(
-    script: Path, args: Sequence[str], platform: Platform | None = None
+    script: Path, args: Sequence[str], platform: Platform | None = None, *, cwd: Path
 ) -> subprocess.Popen:
     """Lance le client, détaché du service, et rend son processus démarré.
+
+    `cwd` est le dossier de jeu détecté, celui des serveurs : sans lui, le client hériterait
+    du dossier du service, celui du téléchargement pour un binaire double-cliqué. Ce n'est pas
+    toujours le parent de `script` : sous Linux, le client est un cran au-dessus.
 
     Le script Linux garde le client au premier plan et finit toujours par `exit 0` : le code
     ne prouve rien, seul compte qu'il tourne encore au bout de `CLIENT_START_GRACE_S`.
     """
     platform = current() if platform is None else platform
     try:
-        process = _spawn_detached([str(script), *args], platform)
+        process = _spawn_detached([str(script), *args], cwd, platform)
     except OSError as exc:
         raise ClientLaunchError(f"{script.name} ne démarre pas ({exc.strerror})") from exc
     try:
@@ -540,7 +545,7 @@ class RealMatch:
             side: server_factory(side, cfg, self.match_dir, self.redactor) for side in SIDES
         }
         self.pair = ServerPair(servers, runtime, self._publish_status)
-        self._store = SnapshotStore(zomboid_dir, ports=runtime["ports"])
+        self._store = SnapshotStore(zomboid_dir, ports=runtime["ports"], policy=runtime)
         lua_dir = zomboid_dir / LUA_DIR
         self._lua_dir = lua_dir
         self._channels = {
@@ -1623,7 +1628,7 @@ class Engine:
         clock: Callable[[], float] | None = None,
         monotonic: Callable[[], float] | None = None,
         matches_dir: str | os.PathLike[str] | None = None,
-        client_launcher: Callable[[Path, Sequence[str]], subprocess.Popen] | None = None,
+        client_launcher: Callable[..., subprocess.Popen] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
         platform: Platform | None = None,
     ) -> None:
@@ -1721,7 +1726,15 @@ class Engine:
             if refusal := self._setup_refusal():
                 return False, refusal
             try:
-                install_mod(MOD_SRC, self.zomboid_dir)
+                install_mod(
+                    MOD_SRC, self.zomboid_dir, policy=self.runtime, platform=self._platform
+                )
+            except ModRestoreError as exc:
+                # Le journal garde le chemin du mod sauvé : l'avis de l'UI, lui, disparaît.
+                message = f"Could not install the mod: {exc}"
+                with self.lock:
+                    self.state.log(message, "warn")
+                return False, message
             except OSError as exc:
                 return False, f"Could not install the mod: {exc.strerror or exc}"
             with self.lock:
@@ -1916,12 +1929,13 @@ class Engine:
         est connecté.
         """
         args = [NO_STEAM_FLAG, "+connect", address, "+password", password]
-        script = self._client_script()
+        found = self._client_install()
         try:
-            if script is None:
+            if found is None:
                 program = self._platform.client_program
                 raise ClientLaunchError(f"client PZ introuvable ({program} absent)")
-            client = self._client_launcher(script, args)
+            script, folder = found
+            client = self._client_launcher(script, args, cwd=folder)
         except ClientLaunchError as exc:
             manual = f"lancez PZ à la main avec {NO_STEAM_FLAG}, puis rejoignez {address}"
             message = f"{exc} : {manual}"
@@ -1934,12 +1948,13 @@ class Engine:
             self.state.log(message)
         return True, message
 
-    def _client_script(self) -> Path | None:
+    def _client_install(self) -> tuple[Path, Path] | None:
+        """Rend le programme client et le dossier de jeu détecté, ou `None` sans client."""
         folder = detect_pz(self.pz_dir, os.environ, Path.home(), platform=self._platform).path
         if folder is None:
             return None
         script = self._platform.client_file(folder)
-        return script if os.access(script, os.X_OK) else None
+        return (script, folder) if os.access(script, os.X_OK) else None
 
     # -- invitation ------------------------------------------------------
     # Hors d'`ACTIONS`, comme le premier lancement (H6). Rien ici ne touche au réseau (AC58).

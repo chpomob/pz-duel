@@ -515,10 +515,14 @@ def replace_file(
 ) -> None:
     """Remplace `dst` par `src` d'un seul `rename`, sans jamais effacer `dst`.
 
-    Sous Windows, un autre processus qui tient `dst` ouvert fait échouer le remplacement :
-    il est réessayé sur `PermissionError` jusqu'à `replace_timeout_s`, tous les
-    `replace_retry_ms`, puis `ReplaceError` nomme le fichier. La dernière attente est tronquée
-    à l'échéance, où a lieu un dernier essai. `policy` vaut `load_runtime()` par défaut.
+    Seul renommage du service, pour un fichier comme pour un dossier. Un dossier ne remplace
+    rien sous Windows : `dst` doit alors être libre, et l'appelant y a déplacé l'ancien.
+
+    Sous Windows, un autre processus qui tient `src`, `dst` ou un fichier d'un dossier déplacé
+    fait échouer le remplacement : il est réessayé sur `PermissionError` jusqu'à
+    `replace_timeout_s`, tous les `replace_retry_ms`, puis `ReplaceError` nomme les deux
+    chemins, car rien ne dit lequel est tenu. La dernière attente est tronquée à l'échéance,
+    où a lieu un dernier essai. `policy` vaut `load_runtime()` par défaut.
 
     Deux bornes valent ensemble : le temps et le nombre d'essais, `replace_attempts(policy)`.
     Une horloge à gros grain, comme celle de Windows, peut rendre une veille plus courte que
@@ -547,8 +551,8 @@ def replace_file(
             remaining_s = deadline - clock()
             if remaining_s <= 0 or not attempts_left:
                 raise ReplaceError(
-                    f"Could not replace {os.fspath(dst)}: "
-                    f"file still in use after {timeout_s} s."
+                    f"Could not replace {os.fspath(dst)} with {os.fspath(src)}: "
+                    f"still in use after {timeout_s} s."
                 ) from exc
         if attempts_left > 1:
             sleep(min(retry_s, remaining_s))

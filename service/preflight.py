@@ -525,25 +525,59 @@ def run_preflight(
     return PreflightResult(tuple(failures), values, _detail(values, failures), defects)
 
 
-def install_mod(src: Path, zomboid_dir: Path) -> Path:
+class ModRestoreError(OSError):
+    """Ancien mod resté hors de `mods/` : le message cite où il est et dit quoi en faire."""
+
+
+def _swap_mod(src: Path, stage: Path, destination: Path, rename: Callable[..., None]) -> None:
+    """Met une copie de `src` à la place de `destination`, ou y remet l'ancien contenu."""
+    staged, previous = stage / "new", stage / "previous"
+    shutil.copytree(src, staged)
+    replaced = os.path.lexists(destination)
+    if replaced:
+        rename(destination, previous)
+    try:
+        rename(staged, destination)
+    except OSError as exc:
+        if replaced:
+            try:
+                rename(previous, destination)
+            except OSError as undo_exc:
+                raise ModRestoreError(
+                    f"{exc} The previous mod could not be put back either ({undo_exc}). "
+                    f"It is safe in {previous}: do not delete that folder. Close Project "
+                    f"Zomboid, then move it to {destination}."
+                ) from undo_exc
+        raise
+
+
+def install_mod(
+    src: Path,
+    zomboid_dir: Path,
+    *,
+    policy: Mapping[str, Any] | None = None,
+    platform: platforms.Platform | None = None,
+) -> Path:
     """Remplace `<zomboid_dir>/mods/duelcore/` par une copie de `src` et rend sa destination.
 
     La copie se prépare à côté de `mods/`, sur le même système de fichiers : rien d'autre
     que `duelcore/` n'apparaît dans `mods/`, et un échec de copie laisse l'ancien en place.
+
+    Le dossier d'attente reçoit l'ancien mod : il ne s'efface que là où celui-ci est sûrement
+    ailleurs, jamais par défaut. `ModRestoreError` le laisse donc en place, et le cite.
+    `policy` et `platform` vont à `replace_file` : voir `service/platforms.py`.
     """
     zomboid_dir = Path(zomboid_dir)
     destination = zomboid_dir / "mods" / MOD_ID
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=f".{MOD_ID}-", dir=zomboid_dir) as stage:
-        staged, previous = Path(stage) / "new", Path(stage) / "previous"
-        shutil.copytree(src, staged)
-        replaced = os.path.lexists(destination)
-        if replaced:
-            os.rename(destination, previous)
-        try:
-            os.rename(staged, destination)
-        except OSError:
-            if replaced:
-                os.rename(previous, destination)
-            raise
+    stage = Path(tempfile.mkdtemp(prefix=f".{MOD_ID}-", dir=zomboid_dir))
+    rename = partial(platforms.replace_file, policy=policy, platform=platform)
+    try:
+        _swap_mod(src, stage, destination, rename)
+    except ModRestoreError:
+        raise
+    except OSError:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    shutil.rmtree(stage, ignore_errors=True)
     return destination
