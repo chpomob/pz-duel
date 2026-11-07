@@ -68,6 +68,8 @@ CLOSE_LIMIT_S = 2
 # `close` attend un tour de `serve_forever` : les tests sans moteur ne le paient pas.
 POLL_S = 0.01
 SHORT_READ_S = 0.2
+# Bien plus que les microsecondes où l'ancien refus fermait, et qu'un RST met à revenir.
+LATE_REQUEST_S = 0.1
 WAIT_S = 5
 STUB_TOKEN = "0123456789abcdef0123456789abcdef"
 STUB_PATH = f"/{STUB_TOKEN}/{LAUNCHER_NAME}"
@@ -993,6 +995,56 @@ def test_ac40_connections_are_capped(stub_share):
     while slots._value < CONNECTIONS_MAX and time.monotonic() < deadline:
         time.sleep(POLL_S)
     assert split_answer(raw(port, get_line(STUB_PATH)))[0] == 200
+
+
+def fill_slots(share: ShareServer) -> list[socket.socket]:
+    """Prend toutes les places : la connexion suivante est refusée."""
+    port = port_of(share)
+    held = [socket.create_connection((LOOPBACK, port)) for _ in range(CONNECTIONS_MAX)]
+    slots = share._httpd._slots
+    deadline = time.monotonic() + WAIT_S
+    while slots._value and time.monotonic() < deadline:
+        time.sleep(POLL_S)
+    assert slots._value == 0
+    return held
+
+
+def test_ac40_request_sent_after_the_refusal_does_not_reset_it(stub_share, monkeypatch):
+    """Le refus précède toujours la requête ici : le serveur doit encore être là pour la lire.
+
+    Fermé trop tôt, il répond au client par un RST. Windows jette alors le 503 non lu et `recv`
+    lève `WinError 10053` ; Linux garde le 503, mais `SO_ERROR` montre le RST.
+    """
+    # Le budget réel est le test suivant : celui-ci ne doit pas dépendre d'un runner chargé.
+    monkeypatch.setattr("service.api.REFUSAL_DRAIN_S", WAIT_S, raising=False)
+    share, engine = stub_share
+    held = fill_slots(share)
+    try:
+        with socket.create_connection((LOOPBACK, port_of(share)), timeout=WAIT_S) as conn:
+            assert conn.recv(1, socket.MSG_PEEK) == b"H"  # le refus est là, encore non lu
+            time.sleep(LATE_REQUEST_S)
+            conn.sendall(get_line(STUB_PATH))
+            time.sleep(LATE_REQUEST_S)
+            assert conn.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0
+            answer = b""
+            while chunk := conn.recv(1 << 16):
+                answer += chunk
+    finally:
+        for conn in held:
+            conn.close()
+
+    assert answer.startswith(b"HTTP/1.0 503 ")
+    assert engine.calls == 0
+
+
+def test_ac40_silent_client_holds_accept_for_a_bounded_time(stub_share):
+    share, _ = stub_share
+    client, accepted = socket.socketpair()
+    with client, accepted:
+        started = time.monotonic()
+        share._httpd._turn_away(accepted)
+        assert time.monotonic() - started < CLOSE_LIMIT_S / 2
+        assert client.recv(1 << 16).startswith(b"HTTP/1.0 503 ")
 
 
 def test_dripped_request_cannot_renew_the_deadline(stub_share, monkeypatch):
