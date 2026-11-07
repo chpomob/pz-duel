@@ -5,7 +5,11 @@ on:
     tags: ["v*"]
 
 jobs:
+  # Un tag peut viser un commit que `tests.yml` n'a jamais vu : la publication attend ici les mêmes
+  # suites. Les versions d'actions restent celles de `tests.yml`, tags compris : la construction
+  # doit rester celle des pull requests, et les deux fichiers ne s'épinglent qu'ensemble.
   release:
+    needs: [pytest, pytest-windows]
     runs-on: windows-latest
     permissions:
       contents: write
@@ -48,3 +52,40 @@ jobs:
           fi
           gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/dist/pz-duel.exe" \
             "$RUNNER_TEMP/dist/pz-duel.exe.sha256" --clobber
+
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      # Historique complet : AC53 extrait 1d854d0 par `git archive`.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip pytest
+      # Les tests du vrai jeu sont en skip hors d'une machine avec Project Zomboid.
+      - run: python -m pytest -q
+
+  pytest-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      # Avant le checkout : en CRLF, les fixtures et le mod fausseraient AC17 et AC30.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip pytest
+      # -rs imprime chaque raison de skip : AC54 se relit dans le journal du job.
+      - run: python -m pytest -q -rs

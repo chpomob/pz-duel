@@ -17,6 +17,7 @@ import http.server
 import importlib.util
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -1166,6 +1167,70 @@ def smoke():
 @pytest.fixture(scope="module")
 def entry():
     return load_module(ENTRY, "pz_duel_entry_under_test")
+
+
+# Le binaire sans console : pas de `stderr`, et `main` remplacé par ce qu'il consignerait.
+WINDOWED_SERVICE = """
+import logging, runpy, sys
+sys.frozen = True
+sys._MEIPASS = {repo!r}
+sys.stderr = None
+sys.path.insert(0, {repo!r})
+import service.main
+def main():
+    logger = logging.getLogger("service.engine")
+    logger.info("info-marker")
+    logger.warning("warning-marker %s", "\\udc80")
+    try:
+        raise RuntimeError("secret-" + "marker")
+    except RuntimeError:
+        logger.exception("exception-marker")
+service.main.main = main
+runpy.run_path({entry!r}, run_name="__main__")
+"""
+
+
+def run_windowed(env: dict[str, str]) -> subprocess.CompletedProcess:
+    script = WINDOWED_SERVICE.format(repo=str(REPO), entry=str(ENTRY))
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, **env},
+        capture_output=True,
+        timeout=SMOKE_TIMEOUT_S,
+    )
+
+
+def test_windowed_binary_keeps_its_warnings_in_the_log_file(user_env, log_file):
+    assert run_windowed(user_env).returncode == 0
+
+    text = log_file.read_text(encoding="utf-8")
+    assert "WARNING service.engine: warning-marker" in text
+    assert "info-marker" not in text
+
+
+def test_log_file_keeps_the_trace_of_an_exception_but_not_its_message(user_env, log_file):
+    assert run_windowed(user_env).returncode == 0
+
+    text = log_file.read_text(encoding="utf-8")
+    assert "exception-marker" in text
+    assert "RuntimeError" in text
+    assert "secret-marker" not in text
+
+
+def test_unwritable_log_file_keeps_the_service(user_env, log_file):
+    log_file.mkdir(parents=True)  # un dossier à sa place : l'ouverture échoue
+
+    assert run_windowed(user_env).returncode == 0
+
+
+def test_log_file_is_not_opened_from_the_sources(entry, monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    root = logging.getLogger()
+    before = list(root.handlers)
+
+    entry.open_log_file()
+
+    assert root.handlers == before
 
 
 def read_spec() -> dict:

@@ -1016,7 +1016,7 @@ def test_ac40_request_sent_after_the_refusal_does_not_reset_it(stub_share, monke
     lève `WinError 10053` ; Linux garde le 503, mais `SO_ERROR` montre le RST.
     """
     # Le budget réel est le test suivant : celui-ci ne doit pas dépendre d'un runner chargé.
-    monkeypatch.setattr("service.api.REFUSAL_DRAIN_S", WAIT_S, raising=False)
+    monkeypatch.setattr("service.http_kit.REFUSAL_DRAIN_S", WAIT_S)
     share, engine = stub_share
     held = fill_slots(share)
     try:

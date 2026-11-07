@@ -3,8 +3,8 @@
 *Français — [English version](README.md)*
 
 > ⚠️ **Prototype de concept — aucun duel réel n'a encore été joué.** Les serveurs, le mod et le
-> contrat sont prouvés sur le vrai jeu sous Linux ; tout ce qui demande un joueur, et tout Windows,
-> reste à constater.
+> contrat sont prouvés sur le vrai jeu sous Linux ; tout ce qui demande un joueur, et Windows au-delà
+> de ses machines de CI, reste à constater.
 
 Deux parties solo de Project Zomboid, reliées par un arbitre local : les joueurs ne se croisent
 jamais, mais **chaque action de l'un devient une pression dans le monde de l'autre**. Un zombie tué
@@ -44,9 +44,9 @@ indépendante de cette idée, sans lien avec lui ; l'idée, elle, est la sienne.
 
 ## Démarrage sous Windows
 
-> ⛔ **Pas encore jouable sous Windows.** Un vrai match s'arrête au lancement tant qu'un défaut connu
-> n'est pas corrigé, et rien de ce qui suit n'a été essayé sur une vraie machine Windows ni avec le vrai
-> jeu. C'est le parcours visé ; les [limites connues de la phase 2](docs/campaigns/phase2/limites-connues.fr.md)
+> ⚠️ **Pas encore essayé avec le vrai jeu sous Windows.** La version Windows passe ses tests sur les
+> machines de CI, mais rien de ce qui suit n'a été joué sur un vrai poste Windows ni face au vrai jeu.
+> C'est le parcours visé ; les [limites connues de la phase 2](docs/campaigns/phase2/limites-connues.fr.md)
 > disent ce qui est prouvé.
 
 Aucun terminal n'est nécessaire. Les deux joueurs ont besoin de Project Zomboid **42.21** sur Steam,

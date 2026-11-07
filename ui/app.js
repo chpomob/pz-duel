@@ -32,9 +32,17 @@ async function api(path, body) {
   return res.json();
 }
 
+function unreachable() {
+  $('#svc').textContent = 'service injoignable';
+  $('#svc').className = 'badge badge-bad';
+}
+
 async function poll() {
   try {
-    S = await api('/api/state');
+    const state = await api('/api/state');
+    // Un 403, un 500 ou le 503 de `turned_away` portent du JSON sans `phase` : `S` ne change pas.
+    if (!state || typeof state.phase !== 'string') return unreachable();
+    S = state;
     $('#svc').textContent = 'service : ok';
     $('#svc').className = 'badge badge-ok';
   } catch (e) {
@@ -45,9 +53,7 @@ async function poll() {
       $('#svc').className = 'badge badge-mock';
       return render();
     }
-    $('#svc').textContent = 'service injoignable';
-    $('#svc').className = 'badge badge-bad';
-    return;
+    return unreachable();
   }
   if (S.phase !== setupPhase && SETTLED_PHASES.includes(S.phase)) refreshSetup();
   setupPhase = S.phase;

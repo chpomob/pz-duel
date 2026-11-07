@@ -29,6 +29,9 @@ BUILD_PYTHON = "3.13"
 REQUIREMENTS = "packaging/requirements-build.txt"
 SPEC_PATH = "packaging/pz-duel.spec"
 SMOKE_PATH = "packaging/smoke_test.py"
+# Les suites dont dépend la publication : ce sont celles de `tests.yml`, à l'identique.
+RELEASE_SUITES = ["pytest", "pytest-windows"]
+RELEASE_JOB = "release"
 
 STEP_INDENT = 6
 KEY = re.compile(r"([\w-]+):")
@@ -213,6 +216,27 @@ def publish_problems(step: str, exe: str) -> list[str]:
     return problems
 
 
+def uses_lines(text: str) -> set[str]:
+    return {line.strip(" -") for line in code_lines(text) if "uses:" in line}
+
+
+def gate_problems(text: str, jobs: dict[str, list[str]]) -> list[str]:
+    """Un tag ne publie qu'après les suites des pull requests, sous Linux et sous Windows."""
+    problems = []
+    reference_text = TESTS_YML.read_text(encoding="utf-8")
+    reference = parse(reference_text)[1]
+    for suite in RELEASE_SUITES:
+        if jobs[suite] != reference[suite]:
+            problems.append(f"release: {suite} differs from tests.yml")
+    needs = job_value(jobs[RELEASE_JOB], "needs") or ""
+    if sorted(re.findall(r"[\w-]+", needs)) != RELEASE_SUITES:
+        problems.append(f"release: the publication does not need {RELEASE_SUITES}")
+    # Une action épinglée d'un seul côté le serait à moitié : les deux fichiers vont ensemble.
+    if uses_lines(text) != uses_lines(reference_text):
+        problems.append("release: actions are not at the same revisions as tests.yml")
+    return problems
+
+
 def release_problems(text: str) -> list[str]:
     top, jobs = parse(text)
     exe = exe_name()
@@ -227,9 +251,11 @@ def release_problems(text: str) -> list[str]:
 
     if "permissions" in top:
         problems.append("release: permissions belong to the job")
-    if len(jobs) != 1:
-        return problems + ["release: expected one job, so that steps order the publication"]
-    name, job = next(iter(jobs.items()))
+    # Un seul job publie, et ses étapes ordonnent la publication : le reste n'est que sa porte.
+    if sorted(jobs) != sorted([RELEASE_JOB, *RELEASE_SUITES]):
+        return problems + ["release: expected the publishing job and the two test suites only"]
+    problems += gate_problems(text, jobs)
+    name, job = RELEASE_JOB, jobs[RELEASE_JOB]
     if [line.strip() for line in blocks(job[1:], 4).get("permissions", [])] != [
         "permissions:",
         "contents: write",
@@ -354,6 +380,28 @@ RELEASE_MUTANTS = {
         "          if ! gh release view",
     ),
     "upload_without_checksum": replaced('"$RUNNER_TEMP/dist/pz-duel.exe.sha256" ', ""),
+    "publish_without_tests": replaced("    needs: [pytest, pytest-windows]\n", ""),
+    "publish_without_linux_tests": replaced("needs: [pytest, pytest-windows]", "needs: [pytest-windows]"),
+    "publish_without_windows_tests": replaced("needs: [pytest, pytest-windows]", "needs: [pytest]"),
+    "publish_needs_commented_out": replaced("    needs: [", "    # needs: ["),
+    "publish_despite_failed_tests": replaced(
+        "    needs: [pytest, pytest-windows]\n",
+        "    needs: [pytest, pytest-windows]\n    if: always()\n",
+    ),
+    "linux_tests_removed": lambda text: text[: text.index("  pytest:\n")]
+    + text[text.index("  pytest-windows:\n") :],
+    "windows_tests_removed": lambda text: text[: text.index("  pytest-windows:\n")],
+    "tests_on_one_system_only": replaced("runs-on: ubuntu-latest", "runs-on: windows-latest"),
+    "tests_lose_a_version": replaced('["3.12", "3.13", "3.14"]', '["3.13"]'),
+    "tests_may_fail": replaced(
+        "      - run: python -m pytest -q\n",
+        "      - run: python -m pytest -q\n        continue-on-error: true\n",
+    ),
+    "tests_swallowed": replaced("python -m pytest -q\n", "python -m pytest -q || true\n"),
+    "tests_never_run": replaced("python -m pytest -q -rs", "python -m pytest --co -q"),
+    "actions_pinned_by_half": replaced(
+        "actions/checkout@v4", "actions/checkout@0000000000000000000000000000000000000000"
+    ),
     "second_job": replaced("    steps:\n", "    steps:\n      - run: echo\n  other:\n    steps:\n"),
     "signtool": replaced(SMOKE_RUN, SMOKE_RUN + "      - run: signtool sign x\n"),
     "nsis_installer": replaced(SMOKE_RUN, SMOKE_RUN + "      - run: makensis pz-duel.nsi\n"),

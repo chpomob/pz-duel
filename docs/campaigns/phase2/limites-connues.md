@@ -2,9 +2,9 @@
 
 *English — [version française](limites-connues.fr.md)*
 
-Phase 2 was written on Linux. **No step of it has run on a real Windows machine, and no step has run
-against the real Windows game.** The CI has no game: it proves our code against a double, not against
-Project Zomboid.
+Phase 2 was written on Linux. **No step of it has been tried on a real Windows desktop, and no step has
+run against the real Windows game.** The CI runs on `windows-latest` but has no game: it proves our
+code against a double, not against Project Zomboid.
 
 How to read this file: a proof is written `file::test`, and `tests/test_ci_workflows.py` checks that
 each name exists. A name in a `win32` block only proves something once it has run on `windows-latest`.
@@ -12,22 +12,20 @@ each name exists. A name in a `win32` block only proves something once it has ru
 ## Proof status
 
 - **Linux**: `python -m pytest -q` is green, with Windows branches run through an injected platform.
-- **Windows**: the `pytest-windows` and `build-windows` jobs of `.github/workflows/tests.yml` exist, but
-  no run has been recorded yet. Until then, every test of a `win32` block cited here is written, not
-  proven.
-- **CI runs (AC49)**: none recorded yet. Step P18 adds their URLs to this section.
+- **Windows**: the `pytest-windows` and `build-windows` jobs of `.github/workflows/tests.yml` have run
+  on `windows-latest`. A test of a `win32` block cited here proves something from the runs recorded in
+  [Real CI and release runs (P18)](#real-ci-and-release-runs-p18) on, for what a runner can show.
+- **CI runs (AC49)**: their URLs are in that same section.
 
-## Blocker: a real match cannot start on Windows
+## Disk durability on Windows (as of 2026-11-07)
 
-`service/snapshots.py` calls `os.sync()` in `begin_creation` and in the staged world replacement.
-`os.sync` does not exist on Windows, so **every real match stops with `AttributeError` when worlds are
-prepared**, before any server starts. It also keeps `windows-latest` red, which blocks the release
-that the README's download step relies on. Measured locally under wine: 168 failures and 15 errors
-out of 1,418 tests without a stand-in for `os.sync`, 3 failures with one. That is an observation, not a
-proof.
-
-`service/snapshots.py` is outside the phase's `targets`, so only the operator can open this fix. A
-no-op stand-in would silently drop the durability that file relies on.
+A real match no longer stops when worlds are prepared: since P18F1, `service/snapshots.py` calls
+`sync_disk`, in `begin_creation` and in the staged world replacement, and never `os.sync`, which does
+not exist on Windows. What remains is a narrower guarantee on that system. `sync_disk` flushes each
+file of a world one by one, so directory entries, read-only files and the targets of links stay outside
+it: `tests/test_disk_sync.py::test_windows_flushes_every_file_without_os_sync` and
+`tests/test_disk_sync.py::test_windows_skips_a_read_only_file`. No power cut has been simulated on a
+real Windows disk.
 
 ## Not proven on the real game
 

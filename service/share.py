@@ -17,16 +17,17 @@ from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 
-from .api import (
+from .guest_launcher import LauncherRefused
+from .http_kit import (
+    DRAIN_S,
     LAUNCHER_NAME,
     LAUNCHER_TYPE,
     REQUEST_READ_S,
     BoundedHTTPServer,
-    Handler,
     HeadReader,
     claim_address,
+    drain,
 )
-from .guest_launcher import LauncherRefused
 
 # Toutes les interfaces : l'invité n'est jamais sur la boucle locale (H1).
 ALL_INTERFACES = ""
@@ -39,14 +40,16 @@ class ShareHandler(BaseHTTPRequestHandler):
     # Posé sur le socket dès `setup`, avant toute lecture.
     timeout = REQUEST_READ_S
     answered = False  # vrai dès que l'en-tête de réponse part : plus rien ne peut le remplacer
-    # Refuser ne dépend que de la connexion, et fermer sur des octets non lus couperait le refus.
-    _drain = Handler._drain
 
     def setup(self) -> None:
         super().setup()
         self.rfile.close()
         self.head_reader = HeadReader(self.connection)
         self.rfile = io.BufferedReader(self.head_reader)
+
+    def _drain(self) -> None:
+        """Fermer sur des octets non lus couperait le refus : ils se jettent, en temps borné."""
+        drain(self.connection, DRAIN_S)
 
     def log_message(self, fmt, *args) -> None:  # la bibliothèque y met la ligne de requête
         return

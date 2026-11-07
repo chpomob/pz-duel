@@ -29,7 +29,6 @@ from secrets import token_hex
 from typing import Any, NamedTuple
 
 from . import paths
-from .api import LAUNCHER_NAME
 from .guest_launcher import (
     ADDRESS_REFUSED,
     PASSWORD_ALLOWED,
@@ -38,6 +37,7 @@ from .guest_launcher import (
     build_launcher,
     is_usable_address,
 )
+from .http_kit import LAUNCHER_NAME
 from .journal import Journal, read_journal
 from .platforms import Platform, current
 from .preflight import (
@@ -1713,13 +1713,15 @@ class Engine:
         Une UI qui sonde pendant un duel lierait sinon les ports du serveur. En mock, rien ne
         se mesure, et `ok` reste vrai pour garder le parcours simulé.
         """
+        # Avant tout verrou : lire et hacher le mod figerait `snapshot`, comme dans `_measure`.
+        expected = self._expected_fingerprint()
         if not self.real:
-            return self._setup_view(None)
+            return self._setup_view(None, expected)
         with self._setup_lock:
             if self._setup_refusal() is None:
                 self._measure(self._default_table())
             with self.lock:
-                return self._setup_view(self._setup_result)
+                return self._setup_view(self._setup_result, expected)
 
     def install_mod(self) -> tuple[bool, str]:
         with self._setup_lock:
@@ -1787,11 +1789,13 @@ class Engine:
             self._setup_result = result
         return result
 
-    def _setup_view(self, result: PreflightResult | None) -> dict:
+    def _expected_fingerprint(self) -> str | None:
         try:
-            expected = mod_fingerprint(MOD_SRC)
+            return mod_fingerprint(MOD_SRC)
         except OSError:
-            expected = None
+            return None
+
+    def _setup_view(self, result: PreflightResult | None, expected: str | None) -> dict:
         values = {} if result is None else result.values
         return {
             "ok": not self.real if result is None else result.ok,

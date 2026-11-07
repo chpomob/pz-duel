@@ -728,6 +728,35 @@ def test_ac27_foreign_quit_is_refused_and_the_service_stays(run_main, runtime, t
     assert run.wait() == 0
 
 
+@pytest.mark.parametrize("real", [True, False], ids=["reel", "simule"])
+def test_setup_state_hashes_the_mod_with_no_lock_held(healthy, monkeypatch, real):
+    """Depuis un autre fil : `lock` est réentrant, et un disque lent figerait `snapshot`."""
+    engine = Engine(mode="real" if real else "mock")
+    free = []
+
+    def lock_is_free(lock) -> bool:
+        taken = []
+
+        def attempt() -> None:
+            taken.append(lock.acquire(blocking=False))
+            if taken[0]:
+                lock.release()
+
+        thread = threading.Thread(target=attempt)
+        thread.start()
+        thread.join()
+        return taken[0]
+
+    def fingerprint(root):
+        free.append((lock_is_free(engine.lock), lock_is_free(engine._setup_lock)))
+        return "empreinte"
+
+    monkeypatch.setattr("service.engine.mod_fingerprint", fingerprint)
+
+    assert engine.setup_state()["expected_mod_fingerprint"] == "empreinte"
+    assert free == [(True, True)]
+
+
 # -- UI : lecture statique, le rendu se vérifie à la main ---------------------
 
 
@@ -768,6 +797,18 @@ def test_setup_is_not_measured_at_the_pace_of_the_poll():
 
     assert "/api/setup" not in poll
     assert "if (S.phase !== setupPhase && SETTLED_PHASES.includes(S.phase)) refreshSetup();" in poll
+
+
+def test_answer_without_a_phase_keeps_the_state_and_says_unreachable():
+    """Un 403, un 500 ou un 503 portent du JSON : ni `S` ni le badge ne doivent le croire."""
+    script = ui_script()
+    poll = script[script.index("async function poll()") : script.index("async function refreshSetup")]
+
+    check = "if (!state || typeof state.phase !== 'string') return unreachable();"
+    assert poll.index("await api('/api/state')") < poll.index(check) < poll.index("S = state;")
+    assert poll.index("S = state;") < poll.index("'service : ok'")
+    assert poll.count("S = ") == 1
+    assert "'service injoignable'" in script[: script.index("async function poll()")]
 
 
 def test_error_screen_can_run_the_checks_again():

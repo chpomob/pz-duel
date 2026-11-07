@@ -2,9 +2,9 @@
 
 *Français — [English version](limites-connues.md)*
 
-La phase 2 a été écrite sous Linux. **Aucune de ses étapes n'a tourné sur une vraie machine Windows, et
-aucune face au vrai jeu sous Windows.** La CI n'a pas le jeu : elle prouve notre code contre un double,
-pas contre Project Zomboid.
+La phase 2 a été écrite sous Linux. **Aucune de ses étapes n'a été essayée sur un vrai poste Windows, et
+aucune face au vrai jeu sous Windows.** La CI tourne sur `windows-latest` mais n'a pas le jeu : elle
+prouve notre code contre un double, pas contre Project Zomboid.
 
 Comment lire ce fichier : une preuve s'écrit `fichier::test`, et `tests/test_ci_workflows.py` vérifie
 que chaque nom existe. Un nom placé dans un bloc `win32` ne prouve quelque chose qu'une fois exécuté
@@ -13,21 +13,22 @@ sur `windows-latest`.
 ## État des preuves
 
 - **Linux** : `python -m pytest -q` est vert, les branches Windows passant par une plateforme injectée.
-- **Windows** : les jobs `pytest-windows` et `build-windows` de `.github/workflows/tests.yml` existent,
-  mais aucune exécution n'est encore consignée. D'ici là, chaque test d'un bloc `win32` cité ici est
-  écrit, pas prouvé.
-- **Exécutions de CI (AC49)** : aucune consignée pour l'instant. L'étape P18 ajoute leurs URL ici.
+- **Windows** : les jobs `pytest-windows` et `build-windows` de `.github/workflows/tests.yml` ont tourné
+  sur `windows-latest`. Un test d'un bloc `win32` cité ici prouve quelque chose à partir des exécutions
+  consignées dans [Exécutions réelles de CI et de release (P18)](#exécutions-réelles-de-ci-et-de-release-p18),
+  pour ce qu'un runner peut montrer.
+- **Exécutions de CI (AC49)** : leurs URL sont dans cette même section.
 
-## Blocage : un vrai match ne peut pas démarrer sous Windows
+## Durabilité disque sous Windows (au 2026-11-07)
 
-`service/snapshots.py` appelle `os.sync()` dans `begin_creation` et dans le remplacement des mondes.
-`os.sync` n'existe pas sous Windows : **tout match réel s'arrête sur `AttributeError` à la préparation
-des mondes**, avant le démarrage des serveurs. Cela garde aussi `windows-latest` au rouge, et bloque la
-release dont dépend l'étape de téléchargement du README. Mesure locale sous wine : 168 échecs et
-15 erreurs sur 1418 tests sans doublure d'`os.sync`, 3 échecs avec. C'est un constat, pas une preuve.
-
-`service/snapshots.py` est hors des `targets` de la phase : seul l'opérateur peut ouvrir ce correctif.
-Une doublure sans effet ferait perdre sans le dire la durabilité dont ce fichier dépend.
+Un vrai match ne s'arrête plus à la préparation des mondes : depuis P18F1, `service/snapshots.py`
+appelle `sync_disk`, dans `begin_creation` et dans le remplacement des mondes, et jamais `os.sync`, qui
+n'existe pas sous Windows. Reste une garantie plus étroite sur ce système. `sync_disk` synchronise
+chaque fichier d'un monde un par un : les entrées de dossier, les fichiers en lecture seule et les
+cibles de liens restent hors de cette garantie :
+`tests/test_disk_sync.py::test_windows_flushes_every_file_without_os_sync` et
+`tests/test_disk_sync.py::test_windows_skips_a_read_only_file`. Aucune coupure de courant n'a été
+simulée sur un vrai disque Windows.
 
 ## Non prouvé sur le vrai jeu
 

@@ -1067,6 +1067,59 @@ class Gone(Flood):
         raise OSError("déconnecté")
 
 
+def request_head(port: int, framing: str) -> bytes:
+    return (
+        f"POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Content-Type: {JSON_TYPE}\r\n{framing}\r\n\r\n"
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("code", "framing"),
+    [
+        (413, f"Content-Length: {4 * BODY_MAX}"),
+        (400, "Content-Length: 5\r\nContent-Length: 6"),
+        (400, "Content-Length: +5"),
+        (400, "Transfer-Encoding: chunked"),
+    ],
+    ids=["trop-long", "longueurs-multiples", "longueur-invalide", "chunked"],
+)
+def test_framing_refusal_reaches_a_client_still_sending_its_body(code, framing):
+    """Fermer sur ce corps non lu enverrait un RST : le client doit lire le refus puis l'EOF."""
+    engine = RecordingEngine()
+    server = serve(engine)
+    port = server.server_address[1]
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
+            conn.sendall(request_head(port, framing) + b"x" * (4 * BODY_MAX))
+            answer = b""
+            while chunk := conn.recv(1 << 16):
+                answer += chunk
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    status, _, body = split_answer(answer)
+    assert status == code
+    assert json.loads(body)["ok"] is False
+    assert answer.count(b"HTTP/1.") == 1  # le corps jeté ne se relit pas comme une requête
+    assert engine.actions == []
+
+
+def test_framing_refusal_gives_a_silent_client_a_bounded_time(monkeypatch):
+    monkeypatch.setattr("service.api.DRAIN_S", 0.05)
+    server = serve(RecordingEngine())
+    port = server.server_address[1]
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
+            conn.sendall(request_head(port, f"Content-Length: {BODY_MAX + 1}"))
+            assert conn.recv(1 << 16).startswith(b"HTTP/1.")
+            eventually(lambda: server._slots._value == CONNECTIONS_MAX)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_drain_stops_at_the_deadline(monkeypatch):
     monkeypatch.setattr("service.api.DRAIN_S", 0.01)
     sink = Sink()

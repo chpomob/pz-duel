@@ -11,15 +11,19 @@ Le service attend donc son parent, et meurt avec lui comme s'il avait été tué
 noyau ferme le handle du Job et tue l'arbre (D-E). Pas d'arrêt ordonné ici : ses paliers
 durent plus que les 5 s d'AC10.
 
-Cette attente vit ici et non dans `service/` : elle ne concerne que le binaire.
+Cette attente vit ici et non dans `service/` : elle ne concerne que le binaire. Le journal
+fichier aussi : sans console, `sys.stderr` vaut `None`, et le gestionnaire de dernier recours de
+`logging` n'a plus nulle part où écrire. Depuis les sources, `stderr` reste là pour ça.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 
 from service import paths
@@ -27,6 +31,36 @@ from service.main import log_line, main
 
 FORCED_END_CODE = 1
 PARENT_POLL_S = 1
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+class SecretSafeFormatter(logging.Formatter):
+    """Garde la trace et le type d'une exception, jamais son message.
+
+    Le fichier reste sur le disque, et un message d'exception pourrait citer un mot de passe.
+    """
+
+    def formatException(self, ei) -> str:
+        return "".join(traceback.format_tb(ei[2])) + ei[0].__name__
+
+
+def open_log_file() -> None:
+    """En mode figé, envoie `logging` au fichier de log, dès `WARNING`.
+
+    Le gestionnaire s'ouvre ici et non au premier message : une ouverture ratée lèverait alors
+    chez l'appelant de `logging`. Un disque plein n'arrête pas le service, comme pour `log_line`.
+    """
+    if not paths.is_frozen():
+        return
+    path = paths.log_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(path, encoding="utf-8", errors="backslashreplace")
+    except OSError:
+        return
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(SecretSafeFormatter(LOG_FORMAT))
+    logging.getLogger().addHandler(handler)
 
 
 def wait_for_parent_windows(parent: int) -> None:
@@ -68,5 +102,6 @@ def watch_parent() -> None:
 
 
 if __name__ == "__main__":
+    open_log_file()
     watch_parent()
     main()

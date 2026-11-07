@@ -3,8 +3,8 @@
 *English — [version française](README.fr.md)*
 
 > ⚠️ **Concept prototype — not a single real duel has been played yet.** The servers, the mod and
-> the contract are proven against the real game on Linux; everything that needs a player, and all of
-> Windows, is still unverified.
+> the contract are proven against the real game on Linux; everything that needs a player, and Windows
+> beyond its CI runners, is still unverified.
 
 Two separate Project Zomboid solo games, linked by a local referee: the players never meet, but
 **every action on one side becomes pressure in the other player's world**. One zombie killed on A
@@ -43,9 +43,10 @@ implementation of that idea, not affiliated with him; the idea itself is his.
 
 ## Getting started on Windows
 
-> ⛔ **Not playable on Windows yet.** A real match stops at launch until a known defect is fixed, and
-> nothing below has been tried on a real Windows machine or with the real game. This is the intended
-> path; the [known limits of phase 2](docs/campaigns/phase2/limites-connues.md) say what is proven.
+> ⚠️ **Not yet tried with the real game on Windows.** The Windows build passes its tests on CI runners,
+> but nothing below has been played on a real Windows desktop or against the real game. This is the
+> intended path; the [known limits of phase 2](docs/campaigns/phase2/limites-connues.md) say what is
+> proven.
 
 You never need a terminal. Both players need Project Zomboid **42.21** from Steam, on Windows. The host
 runs both servers and needs about 6 GB of free RAM.

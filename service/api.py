@@ -8,14 +8,23 @@ import logging
 import mimetypes
 import os
 import re
-import socket
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 from . import paths
 from .guest_launcher import LauncherRefused
+from .http_kit import (
+    CONNECTIONS_MAX,
+    DRAIN_S,
+    LAUNCHER_NAME,
+    LAUNCHER_TYPE,
+    REQUEST_READ_S,
+    BoundedHTTPServer,
+    HeadReader,
+    claim_address,  # noqa: F401 : `main` le lit ici, comme `LOCAL_NAMES` et `SERVER_TOKEN`
+    drain,
+)
 
 UI_DIR = str(paths.resource_root() / "ui")
 
@@ -35,8 +44,6 @@ LOCAL_NAMES = ("127.0.0.1", "localhost")
 # Début de l'en-tête `Server` : `main` y reconnaît un service déjà actif.
 SERVER_TOKEN = "PZduel/"
 JSON_TYPE = "application/json"
-LAUNCHER_NAME = "pz-duel-join.bat"
-LAUNCHER_TYPE = "application/octet-stream"
 # Tout champ qui nomme une chose s'ajoute ici : `test_api_security` balaie le service.
 IDENTIFIER_FIELDS = ("action", "preset", "mode", "side")
 IDENTIFIER_MAX = 64
@@ -45,10 +52,6 @@ IDENTIFIER = re.compile(rf"[A-Za-z0-9_-]{{1,{IDENTIFIER_MAX}}}")
 BODY_MAX = 1 << 20
 # Ce qu'un client obtient pour livrer tout son corps : sur la boucle locale, c'est très large.
 BODY_READ_S = 5.0
-# Délai de socket de toute connexion, et échéance de la ligne de requête et des en-têtes.
-REQUEST_READ_S = 5.0
-# Bien plus qu'un navigateur n'en ouvre : au-delà, le refus part sans créer de fil.
-CONNECTIONS_MAX = 32
 # Ni `int` ni `str.isdigit` : ils admettent `+5`, `1_0` ou `²`, qu'aucun client honnête n'envoie.
 DIGITS = re.compile(r"[0-9]+")
 # Les refus du parseur de `http.server`. Son message cite la requête : il ne sort jamais.
@@ -60,52 +63,11 @@ PROTOCOL_REFUSALS = {
     505: "version HTTP non prise en charge",
 }
 PROTOCOL_REFUSED = "requête refusée"
-# Ce qu'un client encore en train d'émettre obtient pour finir d'écrire puis lire le refus.
-DRAIN_S = 1.0
-DRAIN_CHUNK = 1 << 16
-# Le même sursis pour un refus de connexion, mais sur le fil d'`accept`, donc plus court. Sur la
-# boucle locale, une requête en vol arrive en moins d'une milliseconde : la marge couvre les
-# arrêts d'un Windows chargé. Quatre fois moins que la limite d'AC40, car `shutdown` l'attend.
-REFUSAL_DRAIN_S = 0.5
 LOG = logging.getLogger(__name__)
-
-
-def drain(conn: socket.socket, budget_s: float) -> None:
-    """Émet le FIN, puis jette ce qui arrive jusqu'à l'EOF du client ou la fin du budget.
-
-    Attendre l'EOF, pas seulement lire : une requête arrivée après la fermeture recevrait un
-    RST, et Windows jette alors la réponse que le client n'a pas encore lue.
-    """
-    deadline = time.monotonic() + budget_s
-    try:
-        conn.shutdown(socket.SHUT_WR)
-        while (left := deadline - time.monotonic()) > 0:
-            conn.settimeout(left)
-            if not conn.recv(DRAIN_CHUNK):
-                return
-    except OSError:  # le client est parti, ou il se tait : la réponse est déjà sortie
-        LOG.debug("fin de lecture après refus", exc_info=True)
 
 
 def is_identifier(value: object) -> bool:
     return isinstance(value, str) and IDENTIFIER.fullmatch(value) is not None
-
-
-class HeadReader(socket.SocketIO):
-    """Lit sous une échéance : un délai par `recv` se renouvellerait à chaque octet."""
-
-    def __init__(self, connection: socket.socket) -> None:
-        super().__init__(connection, "rb")
-        self.connection = connection
-        self.deadline: float | None = None
-
-    def readinto(self, buffer) -> int | None:
-        if self.deadline is not None:
-            left = self.deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError
-            self.connection.settimeout(left)
-        return super().readinto(buffer)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -256,8 +218,8 @@ class Handler(BaseHTTPRequestHandler):
     def _body(self) -> bytes | None:
         """Rend le corps, lu sur une longueur validée ; sinon répond et rend `None`."""
         length = self._length()
-        if length is None:
-            return None
+        if length is None:  # le corps annoncé arrive quand même : le laisser couperait le refus
+            return self._hang_up()
         try:
             raw = self._read_body(length)
         except TimeoutError:
@@ -416,72 +378,6 @@ class Handler(BaseHTTPRequestHandler):
     }
 
 
-def turned_away() -> bytes:
-    """Le refus d'une connexion de trop, entier : il part sans `Handler` ni fil."""
-    error = f"trop de connexions : {CONNECTIONS_MAX} au plus"
-    body = json.dumps({"ok": False, "error": error}).encode("ascii")
-    head = (
-        "HTTP/1.0 503 Service Unavailable\r\n"
-        "Content-Type: application/json; charset=utf-8\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: close\r\n\r\n"
-    )
-    return head.encode("ascii") + body
-
-
-def claim_address(sock: socket.socket) -> None:
-    """Sous Windows, interdit de partager l'adresse. La constante n'existe que là."""
-    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
-    if exclusive is not None:
-        sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
-
-
-class BoundedHTTPServer(ThreadingHTTPServer):
-    """Un fil par connexion, `CONNECTIONS_MAX` au plus ; un refus retient `accept` un temps borné."""
-
-    request_queue_size = CONNECTIONS_MAX  # une rafale se refuse, elle ne se perd pas en SYN
-    # `HTTPServer` l'active, et `SO_REUSEADDR` laisserait sous Windows lier un port tenu.
-    allow_reuse_address = False
-    # Posé par `main` : idempotent, il rend la main tout de suite. Sans lui, la sortie rend 409.
-    on_quit = None
-
-    def __init__(self, *args, **kwargs) -> None:
-        self._slots = threading.BoundedSemaphore(CONNECTIONS_MAX)
-        super().__init__(*args, **kwargs)
-
-    def server_bind(self) -> None:
-        claim_address(self.socket)
-        super().server_bind()
-
-    def process_request(self, request, client_address) -> None:
-        if not self._slots.acquire(blocking=False):
-            self._turn_away(request)
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:  # le fil n'a pas démarré : personne d'autre ne rendrait la place
-            self._slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._slots.release()
-
-    def _turn_away(self, request: socket.socket) -> None:
-        """Tourne sur le fil d'`accept` : l'envoi n'attend pas, la vidange s'arrête au budget."""
-        try:
-            request.setblocking(False)
-            request.send(turned_away())
-        except OSError:  # le client est parti : plus personne à qui répondre
-            LOG.debug("fin du refus de connexion", exc_info=True)
-            return
-        drain(request, REFUSAL_DRAIN_S)
-
-
 def make_server(engine, host: str = "127.0.0.1", port: int = 0) -> BoundedHTTPServer:
     handler = type("BoundHandler", (Handler,), {"engine": engine, "timeout": REQUEST_READ_S})
-    return BoundedHTTPServer((host, port), handler)
+    return BoundedHTTPServer((host, port), handler, connections_max=CONNECTIONS_MAX)
