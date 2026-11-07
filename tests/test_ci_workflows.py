@@ -1,4 +1,4 @@
-"""Workflows de CI et de release (R8), par lecture textuelle : la stdlib n'a pas de `yaml`.
+"""Workflows de CI et de release (R8), par lecture textuelle ; `yaml` vérifie seulement qu'ils se chargent.
 
 Chaque exigence est une entrée de `ci_problems` ou de `release_problems`. Les mutants
 ci-dessous prouvent que ces lectures voient le défaut, y compris une étape seulement commentée.
@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO / ".github" / "workflows"
@@ -447,6 +448,37 @@ RELEASE_MUTANTS = {
     "installer_step": replaced(SMOKE_RUN, SMOKE_RUN + "      - name: Build installer\n"),
     "workshop": replaced(SMOKE_RUN, SMOKE_RUN + "      - run: steamcmd +workshop_build_item x\n"),
 }
+
+
+def yaml_problems(name: str, text: str) -> list[str]:
+    # GitHub refuse un fichier illisible en entier : le run est créé sans aucun job.
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError as error:
+        mark = getattr(error, "problem_mark", None)
+        where = f"line {mark.line + 1}" if mark is not None else "unknown line"
+        return [f"{name}: invalid YAML at {where}: {getattr(error, 'problem', error)}"]
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("jobs"), dict):
+        return [f"{name}: YAML loads but has no `jobs` mapping"]
+    return []
+
+
+@pytest.mark.parametrize("workflow", [TESTS_YML, RELEASE_YML], ids=lambda path: path.name)
+def test_workflow_is_valid_yaml(workflow):
+    assert yaml_problems(workflow.name, workflow.read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("workflow", [TESTS_YML, RELEASE_YML], ids=lambda path: path.name)
+def test_unquoted_colon_value_in_workflow_is_seen(workflow):
+    text = workflow.read_text(encoding="utf-8")
+    quoted = f'run: "python -m {REQUIREMENTS_INSTALL}"'
+    mutated = text.replace(quoted, f"run: python -m {REQUIREMENTS_INSTALL}")
+    line = text[: text.index(quoted)].count("\n") + 1
+
+    assert mutated != text
+    assert yaml_problems(workflow.name, mutated) == [
+        f"{workflow.name}: invalid YAML at line {line}: mapping values are not allowed here"
+    ]
 
 
 def test_ac45_tests_workflow_covers_windows_and_the_binary():
