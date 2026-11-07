@@ -400,6 +400,9 @@ function inviteCard() {
         <div class="invite-body">
           ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
           <div class="code">${esc(inv.code || '')}</div>
+          ${inv.launcher_code ? `<p class="hint">Launcher code:</p>
+          <div class="line"><b>${esc(inv.launcher_code)}</b></div>
+          <p class="hint">${esc(inv.launcher_code_text)}</p>` : ''}
           ${inv.needs_address ? '' : `<p class="hint">Manual join, for a guest on Linux:</p>
           <div class="line">${esc(inv.ip)}:${inv.port}</div>
           <div class="line">mot de passe : <b>${esc(inv.password)}</b></div>`}

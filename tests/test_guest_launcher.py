@@ -14,16 +14,19 @@ from pathlib import Path
 import pytest
 
 from doubles.fake_server import compile_windows_client, plan_windows_client
+from doubles.launcher_check import CODE_REFUSED, run_embedded_check
 from service import guest_launcher
 from service.guest_launcher import (
     FILE_MARK,
     JOIN_MARK,
     MAX_LAUNCHER_BYTES,
     MAX_LINE_BYTES,
+    LAUNCHER_CODE_CHARS,
     MOD_MARK,
     LauncherRefused,
     build_launcher,
     is_usable_address,
+    launcher_code,
 )
 from service.preflight import MOD_ID, MOD_SRC, mod_fingerprint, steam_from_registry
 from service.servers import gen_secret
@@ -226,6 +229,111 @@ def test_markers_stand_alone_for_powershell(launcher):
         assert lines.count(mark.encode()) == 1
 
 
+# Le code de vérification --------------------------------------------------------------------
+
+
+def test_code_is_the_start_of_the_sha256_of_the_whole_file(launcher):
+    assert launcher_code(launcher) == hashlib.sha256(launcher).hexdigest()[:LAUNCHER_CODE_CHARS]
+    assert f"$CodeChars = {LAUNCHER_CODE_CHARS}\n" in guest_launcher.POWERSHELL
+
+
+def test_code_is_stable_over_two_generations_and_follows_each_input(launcher, port, tmp_path):
+    mod = tmp_path / "mod"
+    shutil.copytree(MOD_SRC, mod)
+    code = launcher_code(launcher)
+    assert launcher_code(build_launcher(ADDRESS, port, PASSWORD, mod)) == code
+
+    (mod / "ajout.txt").write_bytes(b"x")
+    others = (
+        build_launcher("192.168.1.21", port, PASSWORD, MOD_SRC),
+        build_launcher(ADDRESS, port + 1, PASSWORD, MOD_SRC),
+        build_launcher(ADDRESS, port, PASSWORD + "0", MOD_SRC),
+        build_launcher(ADDRESS, port, PASSWORD, mod),
+    )
+    assert code not in map(launcher_code, others)
+
+
+@pytest.mark.parametrize("where", [0, 0.5, -3], ids=["en-tete", "milieu", "fin"])
+def test_any_changed_byte_changes_the_code(launcher, where):
+    index = int(len(launcher) * where) if where >= 0 else where
+    changed = bytearray(launcher)
+    changed[index] ^= 1
+    assert launcher_code(bytes(changed)) != launcher_code(launcher)
+
+
+def test_code_is_not_in_the_file_and_shows_no_secret(launcher):
+    code = launcher_code(launcher)
+    assert code.encode() not in launcher
+    assert PASSWORD not in code
+
+
+def test_batch_asks_the_code_with_no_default_before_powershell(launcher):
+    header = batch_header(launcher)
+    (ask,) = [i for i, line in enumerate(header) if line.startswith(b"set /p ")]
+    call = next(i for i, line in enumerate(header) if b"powershell.exe" in line)
+    assert header[ask - 1] == b'set "PZDUEL_TYPED="'
+    assert header[ask].startswith(b'set /p "PZDUEL_TYPED=')
+    assert ask < call
+
+
+def test_cmd_never_expands_what_the_guest_types(launcher):
+    assert b"%PZDUEL_TYPED%" not in launcher
+    assert b"!PZDUEL_TYPED!" not in launcher
+
+
+def test_check_runs_before_anything_is_looked_for_or_written():
+    script = guest_launcher.POWERSHELL
+    check = script.index("if (-not (Test-Code $env:PZDUEL_SELF $env:PZDUEL_TYPED))")
+    assert check < script.index("$client = Find-Client")
+    assert check < script.index("Write-Mod $Lines $data $staged")
+
+
+def test_launcher_never_shows_the_code_it_computes():
+    """L'invité doit saisir ce que l'hôte lit, pas recopier ce que le fichier affiche."""
+    body = guest_launcher.POWERSHELL.split("function Test-Code")[1].split("function ")[0]
+    assert "Write-" not in body
+
+
+def test_launcher_says_trusted_network_and_only_protection(launcher):
+    text = b" ".join(batch_header(launcher))
+    assert b"trusted network" in text
+    assert b"only protection" in text
+    assert b"certutil -hashfile" in text
+
+
+def test_execution_policy_stays_a_process_flag(launcher):
+    """`-ExecutionPolicy` ne vaut que pour le processus : rien de persistant ne doit s'y ajouter."""
+    assert launcher.count(b"-ExecutionPolicy Bypass") == 1
+    assert b"Set-ExecutionPolicy" not in launcher
+    assert b"PSExecutionPolicyPreference" not in launcher
+
+
+@pytest.mark.parametrize("typed", ["", " ", "0" * LAUNCHER_CODE_CHARS, 'x" & echo pwned'])
+def test_embedded_check_refuses_a_wrong_code(launcher, tmp_path, typed):
+    done = run_embedded_check(launcher, typed, tmp_path)
+    assert done.returncode == 1
+    assert CODE_REFUSED in done.stdout
+    assert not (tmp_path / "profile" / "Zomboid").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="test_windows_launcher_installs_the_mod_and_connects"
+)
+@pytest.mark.parametrize("shape", [str, str.upper, lambda code: f" {code[:4]} {code[4:]} "])
+def test_embedded_check_admits_the_code_whatever_its_case_and_spaces(
+    launcher, tmp_path, shape
+):
+    done = run_embedded_check(launcher, shape(launcher_code(launcher)), tmp_path)
+    assert CODE_REFUSED not in done.stdout
+    assert b"Project Zomboid was not found" in done.stdout
+
+
+def test_embedded_check_refuses_the_right_code_on_a_changed_byte(launcher, tmp_path):
+    done = run_embedded_check(alter_payload(launcher), launcher_code(launcher), tmp_path)
+    assert done.returncode == 1
+    assert CODE_REFUSED in done.stdout
+
+
 # AC33 : mots de passe -----------------------------------------------------------------------
 
 
@@ -377,22 +485,30 @@ if sys.platform == "win32":
             return mod_fingerprint(self.mod)
 
         def run(
-            self, launcher: bytes, answer: bytes = b"", bat: Path | None = None
+            self,
+            launcher: bytes,
+            answer: bytes = b"",
+            bat: Path | None = None,
+            typed: bytes | None = None,
         ) -> subprocess.CompletedProcess[bytes]:
+            """Saisit le code du fichier lancé, sauf `typed` ; `b""` ne laisse rien à lire."""
             target = bat or self.bat
             target.write_bytes(launcher)
+            typed = launcher_code(launcher).encode("ascii") if typed is None else typed
+            feed = typed + CRLF + answer if typed else b""
             env = dict(os.environ)
             env["USERPROFILE"] = str(self.profile)
             env["PROGRAMFILES(X86)"] = str(self.steam.parent)
             # La ligne de l'Explorateur au double-clic : `list2cmdline` ne protégerait pas `&`.
-            return subprocess.run(
-                f'cmd.exe /d /c ""{target}" "',
-                input=answer,
-                capture_output=True,
-                cwd=self.work,
-                env=env,
-                timeout=RUN_TIMEOUT_S,
-            )
+            command = f'cmd.exe /d /c ""{target}" "'
+            options = {"capture_output": True, "cwd": self.work, "env": env}
+            if not answer:
+                return subprocess.run(command, input=feed, timeout=RUN_TIMEOUT_S, **options)
+            # `set /p` lit par blocs et ne rembobine qu'un fichier : un tube perdrait la réponse.
+            feed_file = self.root / "typed.txt"
+            feed_file.write_bytes(feed)
+            with feed_file.open("rb") as stdin:
+                return subprocess.run(command, stdin=stdin, timeout=RUN_TIMEOUT_S, **options)
 
         def client_args(self) -> list[str]:
             deadline = time.monotonic() + ARGS_WAIT_S
@@ -529,6 +645,64 @@ if sys.platform == "win32":
         assert mod_fingerprint(guest.mod) == before
         assert PASSWORD.encode() not in done.stdout + done.stderr
         assert staging_left(guest) == []
+
+    def assert_refused_untouched(guest: Guest, done, before: str) -> None:
+        assert done.returncode != 0
+        assert CODE_REFUSED in done.stdout
+        assert b"not found" not in done.stdout
+        assert mod_fingerprint(guest.mod) == before
+        assert not guest.args_file.exists()
+        assert staging_left(guest) == []
+
+    @pytest.mark.parametrize("typed", [b"", b"000000000000", b'x" & echo pwned>pwned.txt'])
+    def test_windows_wrong_code_stops_before_the_game(guest, launcher, typed):
+        guest.install_game()
+        before = guest.old_mod()
+
+        done = guest.run(launcher, typed=typed)
+
+        assert_refused_untouched(guest, done, before)
+        assert list(guest.root.rglob("pwned.txt")) == []
+
+    def test_windows_changed_byte_is_refused_with_the_code_of_the_host(guest, launcher):
+        guest.install_game()
+        before = guest.old_mod()
+
+        done = guest.run(alter_payload(launcher), typed=launcher_code(launcher).encode("ascii"))
+
+        assert_refused_untouched(guest, done, before)
+
+    def test_windows_inherited_value_is_no_default_for_the_code(guest, launcher, monkeypatch):
+        guest.install_game()
+        before = guest.old_mod()
+        monkeypatch.setenv("PZDUEL_TYPED", launcher_code(launcher))
+
+        done = guest.run(launcher, typed=b"")
+
+        assert_refused_untouched(guest, done, before)
+
+    def test_windows_code_matches_what_certutil_prints(guest, launcher):
+        """Le contrôle fait avant d'ouvrir le fichier : un `.bat` substitué ne le fausse pas."""
+        guest.bat.write_bytes(launcher)
+        done = subprocess.run(
+            ["certutil", "-hashfile", str(guest.bat), "SHA256"], capture_output=True, check=True
+        )
+        digest = done.stdout.splitlines()[1].replace(b" ", b"").decode("ascii")
+        assert digest.startswith(launcher_code(launcher))
+
+    def execution_policies() -> bytes:
+        script = "Get-ExecutionPolicy -List | Out-String"
+        return subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", script], capture_output=True, check=True
+        ).stdout
+
+    def test_windows_execution_policy_is_unchanged_after_a_run(guest, launcher):
+        guest.install_game()
+        before = execution_policies()
+
+        assert guest.run(launcher).returncode == 0
+
+        assert execution_policies() == before
 
     def test_windows_second_library_is_found_without_input(guest, launcher, port):
         first = guest.root / "first library"

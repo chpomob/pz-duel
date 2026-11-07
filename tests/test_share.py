@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from doubles.launcher_check import CODE_REFUSED, run_embedded_check
 from test_contract import Lobby
 from test_match import Duel
 from test_modes import FastClock, settle, wait_phase
@@ -23,7 +24,14 @@ from test_snapshots import PLAYER_PASSWORD, engine_rig, free_port  # noqa: F401
 from service import engine as engine_module
 from service.api import CONNECTIONS_MAX, LAUNCHER_NAME, make_server
 from service.engine import REMATCH_NOTE_TEXT, Engine
-from service.guest_launcher import JOIN_MARK, PASSWORD_REFUSED, LauncherRefused
+from service.guest_launcher import (
+    JOIN_MARK,
+    MOD_UNREADABLE,
+    PASSWORD_REFUSED,
+    LauncherRefused,
+    build_launcher,
+    launcher_code,
+)
 from service.servers import read_ini
 from service.share import ShareHandler, ShareServer
 
@@ -500,8 +508,110 @@ def test_ac38_rematch_keeps_the_launcher_and_changes_the_token(engine_rig, monke
     assert token_of(first) != token_of(second)
     assert second["scope"] == first["scope"]
     assert join_line(engine.guest_launcher()) == join_line(launcher)
+    assert second["launcher_code"] == first["launcher_code"]
     assert join_line(launcher)[0] == (entered or LAN_ADDRESS)
     assert join_line(launcher)[2] == b_password(rig)
+
+
+# -- Le code de vérification (P19F3) -----------------------------------------
+def served_by_the_link(invite: dict) -> bytes:
+    url = urlsplit(invite["link"])
+    status, _, launcher = request(url.port, "GET", url.path)
+    assert status == 200
+    return launcher
+
+
+def test_changed_byte_no_longer_matches_the_code_and_the_check_refuses(lobby, api_port, tmp_path):
+    shown = json.loads(request(api_port(lobby.engine), "GET", "/api/state")[2])["invite"]
+    served = served_by_the_link(shown)
+    assert launcher_code(served) == shown["launcher_code"]
+
+    for index in (0, len(served) // 2, len(served) - 3):
+        changed = bytearray(served)
+        changed[index] ^= 1
+        assert launcher_code(bytes(changed)) != shown["launcher_code"]
+
+    done = run_embedded_check(bytes(changed), shown["launcher_code"], tmp_path)
+    assert done.returncode == 1
+    assert CODE_REFUSED in done.stdout
+
+
+def test_shown_code_comes_from_the_very_bytes_served(engine_rig, monkeypatch, api_port):
+    """Chaque génération diffère ici : une seconde génération ne donnerait plus le même code."""
+    detect(monkeypatch, LAN_ADDRESS)
+    generated = []
+
+    def unique_generation(*args) -> bytes:
+        generated.append(build_launcher(*args) + b"%d" % len(generated))
+        return generated[-1]
+
+    monkeypatch.setattr(engine_module, "build_launcher", unique_generation)
+    lobby = Lobby(engine_rig, PRESET)
+    port = api_port(lobby.engine)
+    shown = json.loads(request(port, "GET", "/api/state")[2])["invite"]
+
+    from_ui = request(port, "GET", LAUNCHER_ROUTE)[2]
+    from_link = served_by_the_link(shown)
+
+    assert from_ui == from_link == generated[-1]
+    assert len(generated) == 1
+    assert launcher_code(from_ui) == shown["launcher_code"]
+
+
+def test_code_is_stable_in_a_lobby_and_follows_the_address(lobby):
+    engine = lobby.engine
+    first = lobby.state()["invite"]["launcher_code"]
+    assert lobby.state()["invite"]["launcher_code"] == first
+    assert launcher_code(engine.guest_launcher()) == first
+    assert launcher_code(engine.guest_launcher()) == first
+
+    assert engine.set_invite_address(PUBLIC_ADDRESS)[0]
+
+    second = lobby.state()["invite"]["launcher_code"]
+    assert second != first
+    assert launcher_code(engine.guest_launcher()) == second
+
+
+def test_no_launcher_means_no_code(engine_rig, monkeypatch):
+    detect(monkeypatch, LOOPBACK)
+    invite = Lobby(engine_rig, PRESET).state()["invite"]
+    assert invite["needs_address"]
+    assert "launcher_code" not in invite
+
+
+def test_mock_invite_has_no_code(mock_lobby):
+    assert "launcher_code" not in mock_lobby.snapshot()["invite"]
+
+
+def test_unreadable_mod_keeps_the_lobby_and_refuses_with_a_reason(
+    engine_rig, monkeypatch, api_port
+):
+    detect(monkeypatch, LAN_ADDRESS)
+
+    def refused(*args) -> bytes:
+        raise LauncherRefused(MOD_UNREADABLE)
+
+    monkeypatch.setattr(engine_module, "build_launcher", refused)
+    lobby = Lobby(engine_rig, PRESET)
+
+    assert "launcher_code" not in lobby.state()["invite"]
+    status, _, body = request(api_port(lobby.engine), "GET", LAUNCHER_ROUTE)
+    assert status == 409
+    assert json.loads(body)["error"] == MOD_UNREADABLE
+
+
+def test_code_text_says_who_compares_what(lobby):
+    text = lobby.state()["invite"]["launcher_code_text"]
+    assert "must see this code in their launcher" in text
+    assert f"certutil -hashfile {LAUNCHER_NAME} SHA256" in text
+    assert "trusted network" in text
+    assert "only protection" in text
+
+
+def test_ui_shows_the_code_next_to_the_invitation():
+    card = invite_card()
+    assert "esc(inv.launcher_code)" in card
+    assert "esc(inv.launcher_code_text)" in card
 
 
 # -- AC59 --------------------------------------------------------------------

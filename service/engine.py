@@ -36,6 +36,7 @@ from .guest_launcher import (
     LauncherRefused,
     build_launcher,
     is_usable_address,
+    launcher_code,
 )
 from .http_kit import LAUNCHER_NAME
 from .journal import Journal, read_journal
@@ -183,6 +184,14 @@ SHARE_PHASES = ("contract", "lobby")
 # Ce que `invite` ne dit que pendant le lobby (AC60).
 LOBBY_ONLY = (REMATCH_NOTE, SHARE_TEXT)
 INVITE_CLOSED = "invitation unavailable: it only exists in the lobby of a real duel"
+LAUNCHER_CODE_TEXT = (
+    "Your guest must see this code in their launcher: read it aloud, never next to the link. "
+    "Before opening the file, they run: certutil -hashfile {name} SHA256. "
+    "The result must start with this code, or the file was replaced and must not be opened. "
+    "The launcher asks for the code too, but a replaced file can skip that step. "
+    "This invitation is meant for a trusted network: "
+    "the code is the only protection against a replaced file."
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1679,6 +1688,9 @@ class Engine:
         self._detected_ip: str | None = None
         self._share_token: str | None = None
         self._share: ShareServer | None = None
+        # Le `.bat` de l'invitation en cours, en mémoire seulement, ou la raison de son absence.
+        self._launcher: bytes | None = None
+        self._launcher_refusal = INVITE_CLOSED
         # Survit aux lobbys : la revanche garde l'adresse que l'hôte a saisie.
         self._entered_address: str | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
@@ -1975,12 +1987,13 @@ class Engine:
         return True, "invitation address updated"
 
     def guest_launcher(self) -> bytes:
-        """Rend le `.bat` du lobby, ou lève `LauncherRefused`. Il n'existe que dans la réponse."""
+        """Rend le `.bat` de l'invitation, ou lève `LauncherRefused`. Rien n'est écrit sur disque."""
         with self.lock:
             if not self.real or self.state.phase != "lobby":
                 raise LauncherRefused(INVITE_CLOSED)
-            invite = self.state.invite
-        return build_launcher(invite["address"], invite["port"], invite["password"], MOD_SRC)
+            if self._launcher is None:
+                raise LauncherRefused(self._launcher_refusal)
+            return self._launcher
 
     def _open_invite(self) -> None:
         """Ouvre l'invitation d'un lobby : seul appel à `local_ip`, jeton neuf, revanche comprise."""
@@ -2012,6 +2025,23 @@ class Engine:
         share.close()
 
     def _build_invite(self) -> dict:
+        """Rend l'invitation et génère son `.bat`, une fois : le code porte sur les octets servis."""
+        invite = self._invite_fields()
+        self._launcher = None
+        if not self.real:
+            return invite
+        try:
+            self._launcher = build_launcher(
+                invite["address"], invite["port"], invite["password"], MOD_SRC
+            )
+        except LauncherRefused as refused:
+            self._launcher_refusal = str(refused)
+            return invite
+        invite["launcher_code"] = launcher_code(self._launcher)
+        invite["launcher_code_text"] = LAUNCHER_CODE_TEXT.format(name=LAUNCHER_NAME)
+        return invite
+
+    def _invite_fields(self) -> dict:
         """Seule source de l'invitation. `invite` sort par l'API : jamais `host_password`."""
         config = self.state.config
         side = GUEST_SIDE if self.real else HOST_SIDE

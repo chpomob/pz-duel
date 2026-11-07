@@ -114,6 +114,43 @@ of `tests/test_guest_launcher.py`.
 - **A guest on Linux** gets no `.bat` and joins by hand (H2):
   `tests/test_share.py::test_manual_block_stays_for_a_linux_guest`.
 
+## Guest `.bat` verification code (P19F3)
+
+The invitation is **meant for a trusted network**. The link is plain HTTP, as AC37 requires, and the
+`.bat` runs PowerShell: someone on the network path can replace the answer, and what they serve then runs
+under the guest's account. The SHA-256 sums inside the `.bat` only tie its embedded files to each other.
+**The code is the only protection against a replaced file.**
+
+- **What the code is**: the first 12 hexadecimal characters of the SHA-256 of the whole `.bat`, as served.
+  The lobby shows it next to the invitation, and the host reads it to the guest, never next to the link:
+  `tests/test_share.py::test_shown_code_comes_from_the_very_bytes_served` and
+  `tests/test_share.py::test_changed_byte_no_longer_matches_the_code_and_the_check_refuses`.
+- **Only a comparison made before opening the file stops an attacker.** The guest runs
+  `certutil -hashfile pz-duel-join.bat SHA256`, and the result must start with the code. A replaced file
+  gives another result, and the guest refuses to open it:
+  `tests/test_guest_launcher.py::test_windows_code_matches_what_certutil_prints`.
+- **The check inside the `.bat` is no protection against an attacker.** It refuses a code that does not
+  match the file, before anything is installed:
+  `tests/test_guest_launcher.py::test_embedded_check_refuses_the_right_code_on_a_changed_byte` and
+  `tests/test_guest_launcher.py::test_windows_changed_byte_is_refused_with_the_code_of_the_host`. But it
+  runs inside the file it checks: a replaced `.bat` can leave it out, accept any code, or run its own
+  commands first. It only stops a damaged file, or a change that leaves the check in place.
+- **A guest who skips `certutil` is not protected**, and nothing in PZ Duel can make them run it.
+- **The code protects the file, not the secrecy of the invitation.** The password still crosses the
+  network in clear. Someone who can read the traffic can use it, whatever the code says.
+- **48 bits**: a replaced file with the same code is possible at the cost of about 2^48 hashes. That is
+  hours of GPU time, far longer than a lobby usually lasts, but not out of reach.
+- **The code covers the password**, since it covers the whole file, but it reveals nothing the `.bat`
+  does not already give the guest. `host_password` is not in the `.bat`.
+- **`-ExecutionPolicy Bypass` was not tightened, because there was nothing to tighten.** The flag only
+  applies to the PowerShell process it starts and to that process's children. It writes no persistent
+  setting, a Group Policy overrides it, and the policy does not govern `-Command` text anyway:
+  `tests/test_guest_launcher.py::test_execution_policy_stays_a_process_flag` and
+  `tests/test_guest_launcher.py::test_windows_execution_policy_is_unchanged_after_a_run`.
+- **The check has run on PowerShell 7 under Linux only.** `set /p`, `certutil` and PowerShell 5.1 are first
+  exercised by the `win32` block:
+  `tests/test_guest_launcher.py::test_windows_wrong_code_stops_before_the_game`.
+
 ## Processes (P5)
 
 - **Resuming a suspended server** goes through `NtResumeProcess`, stable but undocumented, with a fallback

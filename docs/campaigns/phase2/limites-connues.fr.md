@@ -120,6 +120,45 @@ réelle est le bloc `win32` de `tests/test_guest_launcher.py`.
 - **Un invité sous Linux** n'a pas de `.bat` et rejoint à la main (H2) :
   `tests/test_share.py::test_manual_block_stays_for_a_linux_guest`.
 
+## Code de vérification du `.bat` invité (P19F3)
+
+L'invitation est **prévue pour un réseau de confiance**. Le lien est en HTTP simple, comme l'impose AC37,
+et le `.bat` exécute PowerShell : quelqu'un sur le chemin réseau peut remplacer la réponse, et ce qu'il
+sert s'exécute alors sous le compte de l'invité. Les SHA-256 du `.bat` ne lient que ses fichiers embarqués
+entre eux. **Le code est la seule protection contre un fichier remplacé.**
+
+- **Ce qu'est le code** : les 12 premiers caractères hexadécimaux du SHA-256 de tout le `.bat`, tel que
+  servi. Le lobby l'affiche à côté de l'invitation, et l'hôte le lit à l'invité, jamais à côté du lien :
+  `tests/test_share.py::test_shown_code_comes_from_the_very_bytes_served` et
+  `tests/test_share.py::test_changed_byte_no_longer_matches_the_code_and_the_check_refuses`.
+- **Seule une comparaison faite avant d'ouvrir le fichier arrête un attaquant.** L'invité lance
+  `certutil -hashfile pz-duel-join.bat SHA256`, et le résultat doit commencer par le code. Un fichier
+  remplacé donne un autre résultat, et l'invité refuse de l'ouvrir :
+  `tests/test_guest_launcher.py::test_windows_code_matches_what_certutil_prints`.
+- **Le contrôle interne au `.bat` ne protège pas d'un attaquant.** Il refuse un code qui ne correspond pas
+  au fichier, avant toute installation :
+  `tests/test_guest_launcher.py::test_embedded_check_refuses_the_right_code_on_a_changed_byte` et
+  `tests/test_guest_launcher.py::test_windows_changed_byte_is_refused_with_the_code_of_the_host`. Mais il
+  s'exécute dans le fichier qu'il contrôle : un `.bat` remplacé peut l'omettre, accepter n'importe quel
+  code ou lancer d'abord ses propres commandes. Il n'arrête qu'un fichier abîmé, ou une modification qui
+  laisse le contrôle en place.
+- **Un invité qui saute `certutil` n'est pas protégé**, et rien dans PZ Duel ne peut l'y obliger.
+- **Le code protège le fichier, pas le secret de l'invitation.** Le mot de passe circule toujours en
+  clair. Qui lit le trafic peut s'en servir, quoi que dise le code.
+- **48 bits** : un fichier remplacé de même code reste possible, pour environ 2^48 calculs. C'est des
+  heures de GPU, bien plus que la durée habituelle d'un lobby, mais ce n'est pas hors de portée.
+- **Le code couvre le mot de passe**, puisqu'il couvre tout le fichier, mais il ne révèle rien que le
+  `.bat` ne donne déjà à l'invité. `host_password` n'est pas dans le `.bat`.
+- **`-ExecutionPolicy Bypass` n'a pas été resserré, car il n'y avait rien à resserrer.** L'option ne vaut
+  que pour le processus PowerShell qu'elle démarre et pour ses enfants. Elle n'écrit aucun réglage
+  persistant, une stratégie de groupe l'emporte, et la stratégie ne régit de toute façon pas le texte de
+  `-Command` :
+  `tests/test_guest_launcher.py::test_execution_policy_stays_a_process_flag` et
+  `tests/test_guest_launcher.py::test_windows_execution_policy_is_unchanged_after_a_run`.
+- **Le contrôle n'a tourné que sur PowerShell 7 sous Linux.** `set /p`, `certutil` et PowerShell 5.1 ne
+  sont exercés que par le bloc `win32` :
+  `tests/test_guest_launcher.py::test_windows_wrong_code_stops_before_the_game`.
+
 ## Processus (P5)
 
 - **La reprise d'un serveur suspendu** passe par `NtResumeProcess`, stable mais non documenté, avec un

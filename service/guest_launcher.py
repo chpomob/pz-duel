@@ -13,6 +13,13 @@ que la journalisation des blocs de script de Windows conserverait.
 
 Disposition : `cmd` lit l'en-tête et s'arrête à `exit /b`. Tout ce qui suit n'est lu que par
 PowerShell, entre des marqueurs qui occupent seuls leur ligne.
+
+Code de vérification : le `.bat` voyage en `http://`, un intermédiaire peut donc le remplacer. Le
+code est le début du SHA-256 de tout le fichier, lu à l'oral par l'hôte. Il ne peut pas figurer dans
+le fichier, qui le ferait changer. Il est en hexadécimal pour que l'invité le compare AVANT d'ouvrir
+le fichier, avec `certutil` : c'est le seul contrôle qui tienne contre un attaquant. Celui du `.bat`
+s'exécute dans le fichier contrôlé, et un `.bat` substitué n'a qu'à l'omettre ; il n'arrête qu'un
+fichier altéré qui garde ce contrôle, et le code n'est jamais affiché par le lanceur.
 """
 
 from __future__ import annotations
@@ -30,6 +37,9 @@ MAX_LINE_BYTES = 8000
 MAX_LAUNCHER_BYTES = 256 * 1024
 BASE64_LINE_CHARS = 6000
 MAX_PORT = 65535
+# 48 bits : un faux fichier au même code coûte des heures de GPU, bien plus que la vie d'un lobby.
+# Le PowerShell écrit la même valeur dans `$CodeChars`.
+LAUNCHER_CODE_CHARS = 12
 
 PASSWORD_ALLOWED = re.compile(r"[A-Za-z0-9._-]+")
 HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
@@ -41,6 +51,7 @@ ADDRESS_REFUSED = "address refused: it must be an IPv4 address or a host name gu
 PORT_REFUSED = "port refused: it must be a whole number from 1 to 65535"
 PASSWORD_REFUSED = "password refused: only letters, digits, '.', '_' and '-' are allowed"
 MOD_REFUSED = "mod refused: the folder holds no file"
+MOD_UNREADABLE = "mod refused: its files could not be read"
 FORMAT_REFUSED = "launcher refused: it would not fit the size limits of a .bat file"
 
 SCRIPT_MARK = "::PZDUEL-SCRIPT"
@@ -51,9 +62,20 @@ FILE_MARK = "::PZDUEL-FILE"
 
 # Le chemin complet : `cmd` essaierait sinon `powershell.exe` dans le dossier de téléchargement.
 # Pas de `%` dans la commande, et rien que des apostrophes dedans : elle est entre guillemets.
+# `-ExecutionPolicy Bypass` ne vaut que pour ce processus et ses enfants : rien n'est écrit dans le
+# registre, aucun réglage ne survit, et une stratégie de groupe l'emporte. Il n'y a rien à resserrer.
+# Il ne protège ni n'expose rien ici : la stratégie vise les fichiers de script, pas `-Command`.
+# `PZDUEL_TYPED` est vidé d'abord (`set /p` garderait sinon une valeur héritée sur une ligne vide),
+# et jamais développé par `cmd` : la saisie est libre, seul PowerShell la lit, comme une donnée.
 BATCH = rf"""@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 set "PZDUEL_SELF=%~f0"
+echo pz-duel: this invitation is meant for a trusted network.
+echo The code the host reads to you is the only protection against a replaced file.
+echo It must be compared before this file is run: certutil -hashfile "this file" SHA256
+echo must print a value that starts with that code. If it was not, close this window now.
+set "PZDUEL_TYPED="
+set /p "PZDUEL_TYPED=Type the code the host read to you, then press Enter: "
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$l=[IO.File]::ReadAllLines($env:PZDUEL_SELF,[Text.Encoding]::ASCII);$b=[Array]::IndexOf($l,'{SCRIPT_MARK}');$e=[Array]::IndexOf($l,'{DATA_MARK}');& ([ScriptBlock]::Create($l[($b+1)..($e-1)] -join [Environment]::NewLine)) $l"
 set "PZDUEL_CODE=%ERRORLEVEL%"
 if not "%PZDUEL_CODE%"=="0" echo pz-duel: the launcher failed. If no cause is shown above, PowerShell is probably blocked on this PC.
@@ -67,6 +89,15 @@ $ErrorActionPreference = 'Stop'
 $ClientName = 'ProjectZomboid64.exe'
 $ModId = 'duelcore'
 $Damaged = 'This launcher file is damaged. Ask the host for a new one.'
+$CodeChars = 12
+$CodeRefused = 'This is not the code of this file. Do not use it: ask the host for a new launcher.'
+
+function Test-Code([string]$Path, [string]$Typed) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Path)))
+    $code = $hash.Replace('-', '').Substring(0, $CodeChars).ToLowerInvariant()
+    ($Typed -replace '\s', '').ToLowerInvariant() -ceq $code
+}
 
 function Get-Libraries([string]$Steam) {
     try {
@@ -191,6 +222,12 @@ function Start-Client([string]$Client, [string[]]$Join) {
     [void][Diagnostics.Process]::Start($info)
 }
 
+if (-not (Test-Code $env:PZDUEL_SELF $env:PZDUEL_TYPED)) {
+    Write-Host ('ERROR: ' + $CodeRefused) -ForegroundColor Red
+    Write-Host 'The game was not started and the installed mod was not changed.'
+    exit 1
+}
+
 $stage = $null
 $keepStage = $false
 $code = 1
@@ -283,7 +320,10 @@ def _mod_lines(mod_src: str | os.PathLike[str]) -> list[str]:
         raise LauncherRefused(MOD_REFUSED)
     lines = [f"{MOD_MARK} {len(files)}"]
     for name in sorted(files):
-        content = files[name].read_bytes()
+        try:
+            content = files[name].read_bytes()
+        except OSError as failure:
+            raise LauncherRefused(MOD_UNREADABLE) from failure
         encoded_name = base64.b64encode(name.encode("utf-8")).decode("ascii")
         lines.append(f"{FILE_MARK} {hashlib.sha256(content).hexdigest()} {encoded_name}")
         encoded = base64.b64encode(content).decode("ascii")
@@ -292,6 +332,11 @@ def _mod_lines(mod_src: str | os.PathLike[str]) -> list[str]:
             for start in range(0, len(encoded), BASE64_LINE_CHARS)
         ]
     return lines
+
+
+def launcher_code(launcher: bytes) -> str:
+    """Rend le code que l'hôte lit à l'invité : le début du SHA-256 des octets servis."""
+    return hashlib.sha256(launcher).hexdigest()[:LAUNCHER_CODE_CHARS]
 
 
 def build_launcher(
