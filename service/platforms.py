@@ -132,11 +132,11 @@ class Platform:
 
     def server_program(self, game_dir: str | os.PathLike[str]) -> str:
         """Programme à lancer pour un serveur : le script fournisseur s'il est là, sinon le JRE."""
-        folder = Path(game_dir)
-        script = folder / self.server_script
+        raw = os.fspath(game_dir)
+        script = Path(raw) / self.server_script
         if self.server_java_parts and not script.is_file():
-            return self.join(os.fspath(folder), *self.server_java_parts)
-        return self.join(os.fspath(folder), self.server_script)
+            return self.join(raw, *self.server_java_parts)
+        return self.join(raw, self.server_script)
 
     def server_requirement_names(self, game_dir: str | os.PathLike[str]) -> tuple[str, ...]:
         """Les mêmes exigences en noms affichables, pour un message à l'utilisateur."""

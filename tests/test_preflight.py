@@ -195,7 +195,12 @@ def test_each_failure_is_named(ready, zomboid_home, runtime, tmp_path):
     no_script = tmp_path / "sans_script"
     no_script.mkdir()
     (failure,) = ready(pz_dir=no_script).failures
-    assert current().server_script in failure and str(no_script) in failure
+    assert str(no_script) in failure
+    if current().posix_modes:
+        assert current().server_script in failure
+    else:
+        # Sans le script fournisseur, c'est le JRE du jeu que le message doit nommer.
+        assert "java.exe" in failure and current().server_jar in failure
 
     port = runtime["ports"]["A"]["game"]
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as held:

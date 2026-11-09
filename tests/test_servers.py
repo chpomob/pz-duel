@@ -273,8 +273,9 @@ def test_write_sandbox_refuses_missing_key(sandbox, runtime):
 )
 def test_launch_arguments(launch_cfg, tmp_path, side, name, game, udp):
     command = launch_command(side, launch_cfg)
-    assert command[0] == str(tmp_path / current().server_script)
-    options = dict(zip(command[1::2], command[2::2]))
+    assert command[0] == current().server_program(tmp_path)
+    tail = command[-8:]
+    options = dict(zip(tail[0::2], tail[1::2]))
     assert options == {
         "-servername": name,
         "-port": game,
