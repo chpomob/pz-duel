@@ -19,6 +19,27 @@ sur `windows-latest`.
   pour ce qu'un runner peut montrer.
 - **Exécutions de CI (AC49)** : leurs URL sont dans cette même section.
 
+## Suivi des builds du jeu (au 2026-11-09)
+
+42.22.2 est devenue la stable le 2026-11-09 et Steam a mis à jour l'installation locale ; le mod a été
+re-prouvé sur ce build par exécution, pas par lecture. Rien dans le code ne fige un build : le mod est
+livré en `mods/duelcore/42.21/` avec `versionMin=42.21.0`, que le jeu lit comme un **plancher** — le même
+dossier se charge donc sur un build plus récent — et `caps` sur 42.22.2 annonce `build=42.22.2` avec les
+mêmes 13 hooks, 4 fonctions, 5 atomes et 7 effets que sur 42.21.0.
+
+- `tests/test_integration_pz.py::test_caps_from_real_mod` — le build attendu est celui que le serveur
+  annonce dans son propre log, plus un `>= versionMin` lu dans le `mod.info` livré ; aucun build n'est
+  écrit dans le test (la constante `42.21.0` est exactement ce qui est passé au rouge à la mise à jour).
+- `tests/test_integration_pz.py::test_version_floor_is_read_from_the_shipped_mod` — le plancher est lu,
+  donc le prochain patch du jeu ne peut pas périmer ce test.
+- `tests/test_integration_pz.py::test_real_servers_boot_contract_stop` — `verify(caps) == []`, qui
+  compare déjà `caps.build` au build lu dans le log de chaque serveur.
+
+Un nouveau build ne prouve jamais que les hooks **tirent**. 42.22.2 déplace le calcul des dégâts
+multijoueur côté serveur, soit précisément la zone de `OnBeingHitByZombie` et `OnPlayerGetDamage` — les
+deux signaux derrière `damage_taken`. On ne tient que l'enregistrement ; seule une session avec un vrai
+joueur tranche le tir.
+
 ## Durabilité disque sous Windows (au 2026-11-07)
 
 Un vrai match ne s'arrête plus à la préparation des mondes : depuis P18F1, `service/snapshots.py`

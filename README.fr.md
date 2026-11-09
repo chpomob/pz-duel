@@ -49,8 +49,9 @@ indépendante de cette idée, sans lien avec lui ; l'idée, elle, est la sienne.
 > C'est le parcours visé ; les [limites connues de la phase 2](docs/campaigns/phase2/limites-connues.fr.md)
 > disent ce qui est prouvé.
 
-Aucun terminal n'est nécessaire. Les deux joueurs ont besoin de Project Zomboid **42.21** sur Steam,
-sous Windows. L'hôte fait tourner les deux serveurs et a besoin d'environ 6 Go de RAM disponible.
+Aucun terminal n'est nécessaire. Les deux joueurs ont besoin de Project Zomboid **42.22 ou plus récent**
+sur Steam, sous Windows — le mod déclare `versionMin=42.21.0` et refuse donc un build plus ancien.
+L'hôte fait tourner les deux serveurs et a besoin d'environ 6 Go de RAM disponible.
 
 ### Hôte
 
@@ -140,7 +141,8 @@ Parcours : `Configurer un duel` → preset **Démo 90 s** → `Launch duel` → 
 
 ## Mode réel depuis les sources
 
-Il faut Project Zomboid **42.21** (le lanceur serveur est livré avec le jeu), 6 ports libres
+Il faut Project Zomboid **42.22 ou plus récent** (le lanceur serveur est livré avec le jeu ; le mod
+déclare `versionMin=42.21.0`), 6 ports libres
 (jeu 17261/17271, UDP 17262/17272, RCON 27015/27016) et environ 6 Go de RAM disponible — chaque
 serveur en prend 2.
 
@@ -185,7 +187,8 @@ Latence typique d'un événement, du kill en jeu à la commande écrite chez l'a
 
 ## Ce qui est prouvé, et ce qui ne l'est pas
 
-Prouvé, sur cette installation (build 42.21.0), par `pytest -m pz_integration` :
+Prouvé, sur cette installation (build **42.22.2**, la stable du 09/11/2026 ; la même suite passait déjà
+sur 42.21.0 avant cette mise à jour), par `pytest -m pz_integration` :
 
 - deux serveurs réels démarrent, le mod `duelcore` se charge, `caps` est publié et le contrat est
   vérifié intégralement (`verify(caps) == []`) ;

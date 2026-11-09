@@ -17,6 +17,26 @@ each name exists. A name in a `win32` block only proves something once it has ru
   [Real CI and release runs (P18)](#real-ci-and-release-runs-p18) on, for what a runner can show.
 - **CI runs (AC49)**: their URLs are in that same section.
 
+## Game build tracking (as of 2026-11-09)
+
+42.22.2 became the stable build on 2026-11-09 and Steam updated the local install; the mod was re-proved
+on it by execution, not by reading. Nothing in the code pins a build: the mod ships as
+`mods/duelcore/42.21/` with `versionMin=42.21.0`, which the game reads as a **floor**, so the same folder
+loads on a newer build, and `caps` on 42.22.2 announces `build=42.22.2` with the same 13 hooks, 4
+functions, 5 atoms and 7 effects as on 42.21.0.
+
+- `tests/test_integration_pz.py::test_caps_from_real_mod` — the expected build is the one the server
+  announces in its own log, plus `>= versionMin` read from the shipped `mod.info`; no build is written in
+  the test any more (the `42.21.0` constant is exactly what went red on the update).
+- `tests/test_integration_pz.py::test_version_floor_is_read_from_the_shipped_mod` — the floor is parsed,
+  so the next patch of the game cannot make this test stale.
+- `tests/test_integration_pz.py::test_real_servers_boot_contract_stop` — `verify(caps) == []`, which
+  already compares `caps.build` with the build read in each server's log.
+
+A new build never proves that the hooks **fire**. 42.22.2 moved multiplayer damage calculation
+server-side, which is the area of `OnBeingHitByZombie` and `OnPlayerGetDamage` — the two signals behind
+`damage_taken`. Registration is all we hold; only a session with a real player settles the firing.
+
 ## Disk durability on Windows (as of 2026-11-07)
 
 A real match no longer stops when worlds are prepared: since P18F1, `service/snapshots.py` calls

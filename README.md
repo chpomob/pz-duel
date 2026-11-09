@@ -48,7 +48,8 @@ implementation of that idea, not affiliated with him; the idea itself is his.
 > intended path; the [known limits of phase 2](docs/campaigns/phase2/limites-connues.md) say what is
 > proven.
 
-You never need a terminal. Both players need Project Zomboid **42.21** from Steam, on Windows. The host
+You never need a terminal. Both players need Project Zomboid **42.22 or newer** from Steam, on Windows —
+the mod declares `versionMin=42.21.0`, so an older build refuses it. The host
 runs both servers and needs about 6 GB of free RAM.
 
 ### Host
@@ -133,7 +134,8 @@ Flow: `Configurer un duel` → preset **Démo 90 s** → `Launch duel` → in th
 
 ## Real mode from source
 
-Requires Project Zomboid **42.21** (the headless server launcher ships with the game), six free
+Requires Project Zomboid **42.22 or newer** (the headless server launcher ships with the game; the mod
+declares `versionMin=42.21.0`), six free
 ports (game 17261/17271, UDP 17262/17272, RCON 27015/27016) and about 6 GB of free RAM — each
 server takes 2.
 
@@ -180,7 +182,8 @@ Typical event latency, from a kill in game to the command written on the other s
 
 ## What is proven, and what is not
 
-Proven on this machine (build 42.21.0) by `pytest -m pz_integration`:
+Proven on this machine (build **42.22.2**, the stable of 09/11/2026; the same suite passed on 42.21.0
+before that update) by `pytest -m pz_integration`:
 
 - two real servers boot, the `duelcore` mod loads, `caps` is published and the contract is fully
   verified (`verify(caps) == []`);
