@@ -1427,6 +1427,49 @@ if sys.platform != "win32":
 
         assert json.loads(args_file.read_text(encoding="utf-8")) == arguments
 
+    def test_double_keeps_only_the_settings_of_a_jre_command(tmp_path):
+        """Un lancement par le JRE passe options et classe devant : le double les écarte."""
+        args_file = tmp_path / "args.json"
+        script = install_fake_server(tmp_path, {"args_file": str(args_file), "exit_code": 0}, LINUX)
+        settings = [
+            "-servername", "duelA", "-port", "1", "-udpport", "2", "-adminpassword", "a b",
+        ]  # fmt: skip
+        command = [
+            script,
+            "-cp", ".;projectzomboid.jar",
+            "-Xms2048m",
+            "zombie/network/GameServer",
+            *settings,
+        ]  # fmt: skip
+
+        subprocess.run(command, check=True, timeout=SUBPROCESS_TIMEOUT_S)
+
+        assert json.loads(args_file.read_text(encoding="utf-8")) == settings
+
+    @pytest.mark.parametrize(
+        "middle",
+        [
+            ["-cp", ".;projectzomboid.jar"],
+            ["-cp", ".;projectzomboid.jar", "-bogus"],
+            ["-cp", ".;projectzomboid.jar", "zombie/autre/Classe"],
+        ],
+        ids=["sans-classe", "option-inconnue", "classe-inconnue"],
+    )
+    def test_double_refuses_a_jre_command_it_cannot_understand(tmp_path, middle):
+        args_file = tmp_path / "args.json"
+        script = install_fake_server(tmp_path, {"args_file": str(args_file), "exit_code": 0}, LINUX)
+
+        done = subprocess.run(
+            [script, *middle, "-servername", "duelA", "-port", "1"],
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT_S,
+        )
+
+        assert done.returncode == 2
+        assert "fake server:" in done.stderr
+        assert not args_file.exists()
+
     @pytest.fixture
     def marked_secrets(monkeypatch):
         drawn = cycle((ADMIN_MARKER, RCON_MARKER))

@@ -58,6 +58,10 @@ CHILD_FLAG = "--fake-child"
 SERVER_ARGS_START = 3
 # La classe principale du serveur, celle que le JRE reçoit avant les réglages du jeu.
 MAIN_CLASS = "zombie/network/GameServer"
+# Le premier réglage du jeu : il sépare les options de JVM de ce que le serveur reçoit.
+FIRST_GAME_OPTION = "-servername"
+# Formes d'option qu'un lancement par le JRE place devant la classe principale.
+JVM_PREFIXES = ("-D", "-X", "-XX", "--")
 REPLIES = {"save": "World saved"}
 WINDOWS_HOST = "win32"
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -400,29 +404,55 @@ def run_child(life_s: str, depth: str) -> int:
     return 0
 
 
-def server_arguments() -> list[str]:
-    """Les arguments d'un vrai serveur, ceux qui suivent `--scenario <chemin>`.
+class BadCommand(Exception):
+    """Commande qui ne ressemble ni au script fournisseur ni au JRE du jeu."""
 
-    Un lancement par le JRE ajoute ses options et sa classe principale devant : elles ne font
-    pas partie de ce que le serveur reçoit comme réglages.
+
+def server_arguments() -> list[str]:
+    """Les réglages du jeu, ceux qui suivent `--scenario <chemin>` ou la classe principale.
+
+    Un lancement par le JRE ajoute ses options puis sa classe principale devant : elles ne font
+    pas partie de ce que le serveur reçoit. Le double refuse le reste plutôt que de démarrer sur
+    une commande qu'un vrai serveur rejetterait — sinon un lancement cassé passerait pour vert.
     """
-    arguments = sys.argv[1:]
-    if MAIN_CLASS in arguments:
-        return arguments[arguments.index(MAIN_CLASS) + 1 :]
-    return sys.argv[SERVER_ARGS_START:]
+    tail = sys.argv[SERVER_ARGS_START:]
+    if MAIN_CLASS in tail:
+        split = tail.index(MAIN_CLASS)
+        options, game = tail[:split], tail[split + 1 :]
+        index = 0
+        while index < len(options):
+            option = options[index]
+            if option == "-cp":
+                index += 2
+                continue
+            if not option.startswith(JVM_PREFIXES):
+                raise BadCommand(f"option inconnue avant la classe principale : {option!r}")
+            index += 1
+    else:
+        game = tail
+    if not game or game[0] != FIRST_GAME_OPTION:
+        raise BadCommand(f"réglages du jeu absents ou dans le désordre : {game[:3]!r}")
+    return game
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--scenario", required=True)
+    # Le vrai serveur a des valeurs par défaut : le double ne les exige pas, il vérifie la forme
+    # de la commande dans `server_arguments`.
     for name in ("-servername", "-port", "-udpport", "-adminpassword"):
-        parser.add_argument(name, required=True)
-    # Le vrai serveur tolère des options de JVM avant sa classe principale : le double aussi.
+        parser.add_argument(name)
+    # Le vrai serveur tolère des options de JVM avant sa classe principale : le double aussi,
+    # mais il vérifie leur forme et la frontière des réglages.
     args, _ = parser.parse_known_args()
     scenario = json.loads(Path(args.scenario).read_text(encoding="utf-8"))
+    try:
+        received = server_arguments()
+    except BadCommand as exc:
+        print(f"fake server: {exc}", file=sys.stderr)
+        return 2
     if "args_file" in scenario:
-        received = json.dumps(server_arguments())
-        Path(scenario["args_file"]).write_text(received, encoding="utf-8")
+        Path(scenario["args_file"]).write_text(json.dumps(received), encoding="utf-8")
 
     if scenario.get("announce_pids"):
         print_line(f"fake script pid={os.getppid()}")
