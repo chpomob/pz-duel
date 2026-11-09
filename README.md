@@ -281,6 +281,13 @@ The important ones:
   abruptly, no token on the local API.
 - **No anti-cheat**: the player owns their files. A leaderboard only means anything among friends.
 
+## Thanks
+
+**Naylo** was the first person to run this on a Windows desktop with the real game installed — and the
+first to break it usefully: his Setup card named a `StartServer64.bat` that a healthy 42.22 install does
+not ship. That report is why the service now starts the servers with the JRE the game embeds instead of
+requiring that script. He is a contributor to this project, not a footnote to it.
+
 ## Licence
 
 WTFPL v2 — see [`LICENSE`](LICENSE). Credits for the mods and authors this project draws on are in

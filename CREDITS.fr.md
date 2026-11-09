@@ -39,3 +39,10 @@ crédité pour l'idée ; ce dépôt en est une implémentation indépendante, sa
 ## Remerciements
 
 À la communauté du modding PZ (forum The Indie Stone, PZ Modding Discord), aux auteurs ci-dessus, et à The Indie Stone pour une API Lua assez ouverte pour rendre ce genre de projet possible.
+
+### Testeurs
+
+- **Naylo** — premier testeur sur un vrai poste Windows (42.22.2). Son premier rapport, une carte Setup
+  réclamant un `StartServer64.bat` qu'une installation saine ne livre pas, est la raison pour laquelle le
+  service lance désormais les serveurs avec le JRE embarqué dans le jeu (`jre64\bin\java.exe`) et traite
+  le script fournisseur comme optionnel quand il existe.

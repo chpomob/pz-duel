@@ -45,3 +45,10 @@ implementation, not affiliated with him.
 
 To the PZ modding community (The Indie Stone forum, PZ Modding Discord), to the authors above, and to
 The Indie Stone for a Lua API open enough to make this kind of project possible.
+
+### Testers
+
+- **Naylo** — first tester on a real Windows desktop (42.22.2). His first report, a Setup card asking
+  for a `StartServer64.bat` his healthy install did not ship, is why the service now starts the servers
+  with the JRE the game embeds (`jre64\bin\java.exe`) and treats the supplied script as optional when it
+  exists.

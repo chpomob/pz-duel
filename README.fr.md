@@ -287,6 +287,14 @@ Les plus importantes :
   l'arbitre meurt brutalement, pas de jeton sur l'API locale.
 - **Pas d'anti-triche** : le joueur possède ses fichiers. Le classement n'a de sens qu'entre amis.
 
+## Merci
+
+**Naylo** est la première personne à avoir lancé ce projet sur un vrai poste Windows avec le jeu
+installé — et la première à l'avoir cassé utilement : sa carte Setup réclamait un `StartServer64.bat`
+qu'une installation 42.22 saine ne livre pas. C'est ce rapport qui a fait passer le service au JRE
+embarqué dans le jeu pour lancer les serveurs, au lieu d'exiger ce script. Il est contributeur de ce
+projet, pas une note de bas de page.
+
 ## Licence
 
 WTFPL v2 — voir [`LICENSE`](LICENSE). Les crédits des mods et auteurs dont ce projet s'inspire sont
