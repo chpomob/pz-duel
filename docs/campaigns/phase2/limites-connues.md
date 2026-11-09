@@ -279,6 +279,7 @@ Everything below was produced by GitHub Actions on the public repository, not lo
   **pre-release**, with exactly two assets: `pz-duel.exe` (10 351 421 bytes) and
   `pz-duel.exe.sha256`. The downloaded binary matches its checksum:
   `db754a39e7a8d6a2b2bea76514ae90916ee76d5a459efcf9e8bf7e1a4b6a7608`.
+
 - **The Windows jobs are the reference for anything platform-specific.** They caught five waves of
   defects that 2 000+ Linux tests could not see, each fixed by its own reviewed step: `os.sync`
   missing on Windows (P18F1), ten failures in the process-tree and stop-stage doubles (P18F2), two
@@ -291,3 +292,17 @@ Everything below was produced by GitHub Actions on the public repository, not lo
   `v0.0.0-*` tag, contains an unsigned binary, and exists to prove `release.yml` end to end.
 - **No Windows machine was ever touched by hand.** All Windows evidence comes from
   `windows-latest` runners; a real desktop was never used to play a duel.
+
+### Second test release, after the launcher change (2026-11-09)
+
+- [42700447429](https://github.com/chpomob/pz-duel/actions/runs/42700447429) — `tests.yml` on
+  `5b52580`, **seven jobs, seven success**: Linux 3.12/3.13/3.14, `pytest-windows` on the same three,
+  `build-windows`. The previous run on `d2ab05a` was red on two Windows jobs (four failures, all
+  `server_program` composing a returned path with the HOST's `Path`); that red run is kept
+  [here](https://github.com/chpomob/pz-duel/actions/runs/42696642743).
+- [42703757876](https://github.com/chpomob/pz-duel/actions/runs/42703757876) — `release.yml` on tag
+  `v0.0.0-phase2-test2` created
+  [v0.0.0-phase2-test2](https://github.com/chpomob/pz-duel/releases/tag/v0.0.0-phase2-test2), marked
+  **pre-release**, two assets: `pz-duel.exe` (10 361 773 bytes) and `pz-duel.exe.sha256`; the
+  downloaded binary is a `PE32+ GUI x86-64` and matches its checksum
+  `2ab66d41534917efea6245004daf532c34a0f7e497a0ccaa8faf9fcf6935cccb`.

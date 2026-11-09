@@ -307,3 +307,18 @@ Tout ce qui suit a été produit par GitHub Actions sur le dépôt public, pas e
   `release.yml` de bout en bout.
 - **Aucune machine Windows n'a été touchée à la main.** Toute la preuve Windows vient des runners
   `windows-latest` ; aucun poste réel n'a servi à jouer un duel.
+
+### Deuxième préversion de test, après le changement de lanceur (2026-11-09)
+
+- [42700447429](https://github.com/chpomob/pz-duel/actions/runs/42700447429) — `tests.yml` sur
+  `5b52580`, **sept jobs, sept succès** : Linux 3.12/3.13/3.14, `pytest-windows` sur les mêmes trois,
+  `build-windows`. L'exécution précédente sur `d2ab05a` était rouge sur deux jobs Windows (quatre
+  échecs, tous dus à `server_program` composant un chemin rendu avec le `Path` de l'HÔTE) ; cette
+  exécution rouge est conservée
+  [ici](https://github.com/chpomob/pz-duel/actions/runs/42696642743).
+- [42703757876](https://github.com/chpomob/pz-duel/actions/runs/42703757876) — `release.yml` sur le tag
+  `v0.0.0-phase2-test2` a créé la préversion
+  [v0.0.0-phase2-test2](https://github.com/chpomob/pz-duel/releases/tag/v0.0.0-phase2-test2), avec deux
+  pièces jointes : `pz-duel.exe` (10 361 773 octets) et `pz-duel.exe.sha256` ; le binaire téléchargé est
+  un `PE32+ GUI x86-64` et correspond à son empreinte
+  `2ab66d41534917efea6245004daf532c34a0f7e497a0ccaa8faf9fcf6935cccb`.
