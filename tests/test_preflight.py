@@ -64,13 +64,25 @@ def zomboid_home(zomboid_home, monkeypatch):
     return zomboid_home
 
 
-def make_install(folder: Path, mode: int = 0o755, platform=None) -> Path:
-    """Installation de `platform`, celle de l'hôte par défaut : son script s'y exécute."""
+def make_install(folder: Path, mode: int = 0o755, platform=None, *, script: bool = True,
+                 jre: bool = False) -> Path:
+    """Installation de `platform`, celle de l'hôte par défaut : son script s'y exécute.
+
+    `script=False` joue une installation 42.22 sans `StartServer64.bat` ; `jre=True` y pose le
+    JRE et le jar que le jeu embarque, seuls recours pour lancer un serveur dans ce cas.
+    """
     platform = current() if platform is None else platform
     folder.mkdir(parents=True)
-    script = folder / platform.server_script
-    script.write_text("#!/bin/sh\n" if platform.posix_modes else "@echo off\r\n", encoding="utf-8")
-    script.chmod(mode)
+    if script:
+        script_path = folder / platform.server_script
+        body = "#!/bin/sh\n" if platform.posix_modes else "@echo off\r\n"
+        script_path.write_text(body, encoding="utf-8")
+        script_path.chmod(mode)
+    if jre:
+        java = folder.joinpath("jre64", "bin", "java.exe")
+        java.parent.mkdir(parents=True)
+        java.write_bytes(b"MZ")
+        (folder / platform.server_jar).write_bytes(b"PK")
     if platform.client_in_game_dir:
         (folder / platform.client_program).write_bytes(b"MZ")
     return folder
@@ -539,13 +551,31 @@ def test_windows_default_steam_folder_is_found(tmp_path):
     assert (found.status, found.path) == (PRESENT, game)
 
 
-@pytest.mark.parametrize("removed", [WINDOWS.client_program, WINDOWS.server_script])
+@pytest.mark.parametrize("removed", [WINDOWS.client_program])
 def test_windows_folder_needs_both_files(tmp_path, removed):
     game = make_install(default_steam(tmp_path) / STEAM_GAME_DIR, platform=WINDOWS)
     (game / removed).unlink()
     detection = detect_on_windows(tmp_path)
     assert (detection.status, detection.path) == (ABSENT, None)
     assert removed in detection.message
+
+
+def test_windows_folder_without_the_script_uses_the_bundled_jre(tmp_path):
+    """42.22 peut ne pas livrer `StartServer64.bat` : le JRE du jeu suffit à servir."""
+    game = make_install(
+        default_steam(tmp_path) / STEAM_GAME_DIR, platform=WINDOWS, script=False, jre=True
+    )
+    detection = detect_on_windows(tmp_path)
+    assert (detection.status, detection.path) == (PRESENT, game)
+
+
+def test_windows_folder_without_script_nor_jre_names_the_jre(tmp_path):
+    game = make_install(
+        default_steam(tmp_path) / STEAM_GAME_DIR, platform=WINDOWS, script=False
+    )
+    detection = detect_on_windows(tmp_path)
+    assert detection.status == ABSENT
+    assert "java.exe" in detection.message and WINDOWS.server_script not in detection.message
 
 
 def test_windows_explicit_folder_names_the_missing_file(tmp_path):

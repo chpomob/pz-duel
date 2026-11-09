@@ -189,17 +189,26 @@ def mods_setting(table: Mapping[str, Any]) -> str:
     return MODS_SEPARATOR.join(table["mods"])
 
 
+DEFAULT_SERVER_HEAP_MB = 2048
+# Classe principale du serveur dédié, celle que `start-server.sh` passe au JRE du jeu.
+SERVER_MAIN_CLASS = "zombie/network/GameServer"
+
+
 def launch_command(
     side: str, cfg: Mapping[str, Any], platform: Platform | None = None
 ) -> list[str]:
-    """Commande d'un serveur. `cfg` porte `pz_dir`, `ports` et `admin_password`.
+    """Commande d'un serveur. `cfg` porte `pz_dir`, `ports`, `admin_password` et le tas.
 
-    Elle contient le mot de passe admin : à ne journaliser qu'à travers un `Redactor`.
+    `cfg` contient le mot de passe admin : à ne journaliser qu'à travers un `Redactor`.
+
+    Sous Windows, le serveur se lance avec le JRE que le jeu embarque, sans `StartServer64.bat` :
+    une installation 42.22 peut ne pas livrer ce script, et `ProjectZomboid64.exe -server` ne
+    démarre pas de serveur (sa classe principale vient de son `.json`). Les drapeaux sont ceux du
+    `start-server.sh` du jeu, mesurés sur 42.22.2 : la même commande écoute 15 s après le départ.
     """
     platform = current() if platform is None else platform
     ports = cfg["ports"][side]
-    return [
-        platform.join(cfg["pz_dir"], platform.server_script),
+    options = [
         "-servername",
         server_name(side),
         "-port",
@@ -208,6 +217,28 @@ def launch_command(
         str(ports["udp"]),
         "-adminpassword",
         cfg["admin_password"],
+    ]
+    program = platform.server_program(cfg["pz_dir"])
+    if platform.server_files(cfg["pz_dir"]) == ((platform.server_script,),):
+        return [program, *options]
+    heap = int(cfg.get("server_heap_mb", DEFAULT_SERVER_HEAP_MB))
+    separator = platform.classpath_separator
+    return [
+        platform.server_program(cfg["pz_dir"]),
+        "-cp",
+        f".{separator}{platform.server_jar}",
+        "-Djava.awt.headless=true",
+        "--enable-native-access=ALL-UNNAMED",
+        "--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
+        f"-Xms{heap}m",
+        f"-Xmx{heap}m",
+        "-XX:+UseZGC",
+        "-Dzomboid.steam=0",
+        "-Dzomboid.znetlog=1",
+        f"-Djava.library.path=.{separator}natives",
+        "-XX:-OmitStackTraceInFastThrow",
+        SERVER_MAIN_CLASS,
+        *options,
     ]
 
 

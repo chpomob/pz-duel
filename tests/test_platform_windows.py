@@ -962,12 +962,13 @@ def launch_cfg(runtime: dict, pz_dir: str, admin: str = ADMIN_MARKER) -> dict:
 
 @pytest.mark.parametrize("side", SIDES)
 def test_windows_command_keeps_its_eight_arguments(runtime, side):
+    """Le serveur part du JRE du jeu : aucun `StartServer64.bat` n'est requis (42.22 peut l'omettre)."""
     ports = runtime["ports"][side]
 
     command = launch_command(side, launch_cfg(runtime, GAME_DIR), WINDOWS)
 
-    assert command == [
-        GAME_DIR + r"\StartServer64.bat",
+    assert command[0] == ntpath.join(GAME_DIR, "jre64", "bin", "java.exe")
+    assert command[-8:] == [
         "-servername",
         server_name(side),
         "-port",
@@ -977,6 +978,15 @@ def test_windows_command_keeps_its_eight_arguments(runtime, side):
         "-adminpassword",
         ADMIN_MARKER,
     ]
+    main = command.index("zombie/network/GameServer")
+    assert command[main + 1 :] == command[-8:]
+    vm_args = command[:main]
+    assert ".;projectzomboid.jar" in command
+    assert "-Dzomboid.steam=0" in vm_args
+    assert f"-Xms{runtime['server_heap_mb']}m" in vm_args
+    assert f"-Xmx{runtime['server_heap_mb']}m" in vm_args
+    assert "-Djava.library.path=.;natives" in vm_args
+    assert not any(part.endswith(".bat") for part in command)
 
 
 def test_linux_command_uses_the_linux_script(runtime):
@@ -984,6 +994,16 @@ def test_linux_command_uses_the_linux_script(runtime):
 
     assert command[0] == "/opt/pz/start-server.sh"
     assert len(command[1:]) == 8
+
+
+def test_windows_command_prefers_the_supplied_script(tmp_path, runtime):
+    """Le script du fournisseur, quand il est là, garde la main : c'est lui qui fait foi."""
+    (tmp_path / WINDOWS.server_script).write_text("@echo off\r\n", encoding="utf-8")
+
+    command = launch_command("A", launch_cfg(runtime, str(tmp_path)), WINDOWS)
+
+    assert command[0] == ntpath.join(str(tmp_path), WINDOWS.server_script)
+    assert len(command) == 9
 
 
 def test_server_popen_options_follow_the_platform():
@@ -1039,7 +1059,7 @@ def test_interpreted_password_is_refused_without_being_cited(runtime, character)
     password = f"secret{character}marker"
     command = launch_command("A", launch_cfg(runtime, GAME_DIR, password), WINDOWS)
 
-    with pytest.raises(UnsafeArgument, match="argument 8") as caught:
+    with pytest.raises(UnsafeArgument, match=f"argument {command.index(password)}") as caught:
         WINDOWS.check_arguments(command)
 
     assert "secret" not in str(caught.value)
@@ -1062,7 +1082,7 @@ def test_refused_argument_never_reaches_popen(tmp_path, runtime, monkeypatch):
         "A", cfg, tmp_path / "match", Redactor(()), platform=WINDOWS, kernel=PosixKernel()
     )
 
-    with pytest.raises(OSError, match="cmd.exe"):
+    with pytest.raises(OSError, match="command line would interpret"):
         server.start()
 
     assert launch.calls == []

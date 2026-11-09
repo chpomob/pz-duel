@@ -146,13 +146,16 @@ def _folder_hint(from_terminal: str) -> str:
     return FOLDER_HINT_FROZEN if paths.is_frozen() else from_terminal
 
 
-def _accept(script: Path, platform: platforms.Platform) -> PzDetection:
-    if platform.posix_modes and not os.access(script, os.X_OK):
-        hint = EXECUTABLE_HINT_FROZEN if paths.is_frozen() else "corrigez avec `chmod +x`"
-        return _absent(f"{script} n'est pas exécutable ; {hint}.")
-    # Absolu : le serveur se lance avec ce dossier pour `cwd` et pour préfixe de son script.
-    folder = script.parent.resolve()
-    return PzDetection(PRESENT, folder, f"PZ présent : {folder}")
+def _accept(folder: Path, platform: platforms.Platform) -> PzDetection:
+    """Le dossier accepté est celui du jeu : il porte le programme client et de quoi servir."""
+    if platform.posix_modes:
+        script = folder / platform.server_script
+        if not os.access(script, os.X_OK):
+            hint = EXECUTABLE_HINT_FROZEN if paths.is_frozen() else "corrigez avec `chmod +x`"
+            return _absent(f"{script} n'est pas exécutable ; {hint}.")
+    # Absolu : le serveur se lance avec ce dossier pour `cwd` et pour racine de ses fichiers.
+    resolved = folder.resolve()
+    return PzDetection(PRESENT, resolved, f"PZ présent : {resolved}")
 
 
 def parse_library_folders(text: str) -> tuple[str, ...]:
@@ -225,8 +228,18 @@ def _read_libraries(root: Path) -> tuple[str, ...]:
 
 
 def _missing_files(folder: Path, platform: platforms.Platform) -> list[str]:
-    required = (platform.server_script, platform.client_program)
-    return [name for name in required if not os.path.isfile(folder / name)]
+    """Les fichiers qui manquent VRAIMENT, en noms affichables.
+
+    Le client est toujours exigé : l'hôte joue sur la même machine. Le lancement serveur vient
+    ensuite de la plateforme : le script fournisseur quand il est là, sinon le JRE que le jeu
+    embarque (`server_files`).
+    """
+    required = ((platform.client_program,), *platform.server_files(folder))
+    return [
+        platform.path.join(*parts)
+        for parts in required
+        if not os.path.isfile(folder.joinpath(*parts))
+    ]
 
 
 def _search_windows(
@@ -242,13 +255,12 @@ def _search_windows(
         folder = steam / STEAM_GAME_DIR
         missing = _missing_files(folder, platform)
         if not missing:
-            return _accept(folder / platform.server_script, platform)
+            return _accept(folder, platform)
         if incomplete is None and len(missing) == 1:
             incomplete = f"{missing[0]} missing from {folder}"
-    reason = incomplete or (
-        f"{platform.server_script} and {platform.client_program} "
-        "not found in the known Steam folders"
-    )
+    required_folder = (roots[0] if roots else Path(".")) / STEAM_GAME_DIR
+    names = (*platform.server_requirement_names(required_folder), platform.client_program)
+    reason = incomplete or f"{' and '.join(names)} not found in the known Steam folders"
     hint = _folder_hint(f"set the game folder with --pz-dir or {ENV_VAR}")
     return _absent(f"{reason}; {hint}.")
 
@@ -260,10 +272,10 @@ def _check_explicit(folder: Path, label: str, platform: platforms.Platform) -> P
             return _absent(
                 f"{' and '.join(missing)} missing from {folder}; {_folder_hint(f'fix {label}')}."
             )
-        return _accept(folder / platform.server_script, platform)
+        return _accept(folder, platform)
     for candidate in (folder / GAME_SUBDIR / SCRIPT, folder / SCRIPT):
         if os.path.isfile(candidate):
-            return _accept(candidate, platform)
+            return _accept(candidate.parent, platform)
     return _absent(
         f"{SCRIPT} introuvable dans {folder} ni dans son sous-dossier {GAME_SUBDIR}/ ; "
         f"{_folder_hint(f'corrigez {label}')}."
@@ -303,7 +315,7 @@ def detect_pz(
     for root in STEAM_ROOTS:
         candidate = Path(home) / root / STEAM_GAME_DIR / GAME_SUBDIR / SCRIPT
         if os.path.isfile(candidate):
-            return _accept(candidate, platform)
+            return _accept(candidate.parent, platform)
     hint = _folder_hint(f"indiquez le dossier du jeu avec --pz-dir ou {ENV_VAR}")
     return _absent(f"{SCRIPT} introuvable dans les chemins Steam connus ; {hint}.")
 

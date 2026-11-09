@@ -6,6 +6,7 @@
   "share_port": 17280,
   "share_connections_per_peer": 6,
   "server_start_timeout_s": 300,
+  "server_heap_mb": 2048,
   "stop_timeout_s": 30,
   "kill_grace_s": 10,
   "rcon_timeout_s": 5,

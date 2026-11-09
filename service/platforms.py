@@ -96,6 +96,11 @@ class Platform:
     game_subdir: str
     posix_modes: bool
     stop_signals: tuple[str, ...]
+    # Le serveur peut se lancer sans script fournisseur, avec le JRE que le jeu embarque :
+    # `server_java_parts` donne ce programme par composants, vide quand le script suffit.
+    server_java_parts: tuple[str, ...]
+    server_jar: str
+    classpath_separator: str
     path: ModuleType = field(repr=False)
 
     def join(self, *parts: str | os.PathLike[str]) -> str:
@@ -112,6 +117,30 @@ class Platform:
         """Le fichier de `client_path` sur l'hôte : c'est lui qu'on sonde et qu'on lance."""
         folder = game_dir if self.client_in_game_dir else game_dir.parent
         return folder / self.client_program
+
+    def server_files(self, game_dir: str | os.PathLike[str]) -> tuple[tuple[str, ...], ...]:
+        """Ce que le lancement serveur exige dans `game_dir`, par composants.
+
+        Le script fournisseur quand il est là ; sinon le JRE et le jar que le jeu embarque.
+        Des composants, pas des chemins : `Path.joinpath` les résout sur le système de l'hôte,
+        donc un dossier Windows simulé sous Linux reste sondable.
+        """
+        folder = Path(game_dir)
+        if self.server_java_parts and not folder.joinpath(self.server_script).is_file():
+            return ((self.server_jar,), self.server_java_parts)
+        return ((self.server_script,),)
+
+    def server_program(self, game_dir: str | os.PathLike[str]) -> str:
+        """Programme à lancer pour un serveur : le script fournisseur s'il est là, sinon le JRE."""
+        folder = Path(game_dir)
+        script = folder / self.server_script
+        if self.server_java_parts and not script.is_file():
+            return self.join(os.fspath(folder), *self.server_java_parts)
+        return self.join(os.fspath(folder), self.server_script)
+
+    def server_requirement_names(self, game_dir: str | os.PathLike[str]) -> tuple[str, ...]:
+        """Les mêmes exigences en noms affichables, pour un message à l'utilisateur."""
+        return tuple(self.path.join(*parts) for parts in self.server_files(game_dir))
 
     def server_popen_kwargs(self) -> dict[str, Any]:
         """Lancement d'un serveur. Sous Windows, il attend suspendu d'entrer dans son arbre."""
@@ -133,21 +162,23 @@ class Platform:
         return ({"start_new_session": True},)
 
     def check_arguments(self, command: Sequence[str]) -> None:
-        """Refuse sous Windows ce que `cmd` interpréterait dans la commande d'un script.
+        """Refuse sous Windows ce qu'une ligne de commande interpréterait dans le programme lancé.
 
-        `CreateProcess` confie un `.bat` à `cmd`, pour lequel `list2cmdline` n'échappe rien.
-        Un argument n'est entre guillemets que s'il porte un blanc, comme le décide cette
-        fonction : `"` étant refusé, ces guillemets restent équilibrés.
+        `CreateProcess` confie un `.bat` à `cmd`, pour lequel `list2cmdline` n'échappe rien ; le
+        JRE du jeu, lui, échappe correctement. La règle reste la même pour les deux : un secret
+        qui porte un de ces caractères n'est jamais transmis. `"` étant refusé, les guillemets
+        que pose `list2cmdline` restent équilibrés.
         """
         if self.name != WINDOWS.name:
             return
+        program = self.path.basename(command[0]) if command else self.server_script
         for position, argument in enumerate(command):
             quoted = " " in argument or "\t" in argument
             live = CMD_LIVE_ANYWHERE if quoted else CMD_LIVE_ANYWHERE | CMD_LIVE_UNQUOTED
             if not live.isdisjoint(argument):
                 raise UnsafeArgument(
-                    f"Refused to launch {self.server_script}: "
-                    f"argument {position} holds a character cmd.exe would interpret."
+                    f"Refused to launch {program}: "
+                    f"argument {position} holds a character a command line would interpret."
                 )
 
     def process_tree(
@@ -167,6 +198,9 @@ LINUX = Platform(
     game_subdir="projectzomboid",
     posix_modes=True,
     stop_signals=("SIGINT", "SIGTERM"),
+    server_java_parts=(),
+    server_jar="projectzomboid.jar",
+    classpath_separator=":",
     path=posixpath,
 )
 WINDOWS = Platform(
@@ -177,6 +211,11 @@ WINDOWS = Platform(
     game_subdir="",
     posix_modes=False,
     stop_signals=("SIGINT", "SIGBREAK"),
+    # Une installation du jeu contient `jre64\\bin\\java.exe` et `projectzomboid.jar` : le serveur
+    # se lance donc sans `StartServer64.bat`, absent de certaines installations 42.22.
+    server_java_parts=("jre64", "bin", "java.exe"),
+    server_jar="projectzomboid.jar",
+    classpath_separator=";",
     path=ntpath,
 )
 

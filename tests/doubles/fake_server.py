@@ -56,6 +56,8 @@ DEFAULT_CHILD_LIFE_S = 60
 CHILD_FLAG = "--fake-child"
 # `--scenario <chemin>` précède les arguments d'un vrai serveur.
 SERVER_ARGS_START = 3
+# La classe principale du serveur, celle que le JRE reçoit avant les réglages du jeu.
+MAIN_CLASS = "zombie/network/GameServer"
 REPLIES = {"save": "World saved"}
 WINDOWS_HOST = "win32"
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -299,6 +301,11 @@ class WindowsLaunchOnPosix:
         program = command[0]
         if name == WINDOWS.server_script:
             program = str(Path(folder) / LINUX.server_script)
+        elif name == "java.exe":
+            # Le JRE du jeu est le programme du serveur : le double POSIX tient sa place dans
+            # le dossier du jeu, deux niveaux au-dessus de `jre64\bin`.
+            game_dir = Path(folder.replace("\\", "/")).parent.parent
+            program = str(game_dir / LINUX.server_script)
         return self._real([program, *command[1:]], start_new_session=True, **options)
 
 
@@ -393,15 +400,28 @@ def run_child(life_s: str, depth: str) -> int:
     return 0
 
 
+def server_arguments() -> list[str]:
+    """Les arguments d'un vrai serveur, ceux qui suivent `--scenario <chemin>`.
+
+    Un lancement par le JRE ajoute ses options et sa classe principale devant : elles ne font
+    pas partie de ce que le serveur reçoit comme réglages.
+    """
+    arguments = sys.argv[1:]
+    if MAIN_CLASS in arguments:
+        return arguments[arguments.index(MAIN_CLASS) + 1 :]
+    return sys.argv[SERVER_ARGS_START:]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--scenario", required=True)
     for name in ("-servername", "-port", "-udpport", "-adminpassword"):
         parser.add_argument(name, required=True)
-    args = parser.parse_args()
+    # Le vrai serveur tolère des options de JVM avant sa classe principale : le double aussi.
+    args, _ = parser.parse_known_args()
     scenario = json.loads(Path(args.scenario).read_text(encoding="utf-8"))
     if "args_file" in scenario:
-        received = json.dumps(sys.argv[SERVER_ARGS_START:])
+        received = json.dumps(server_arguments())
         Path(scenario["args_file"]).write_text(received, encoding="utf-8")
 
     if scenario.get("announce_pids"):
