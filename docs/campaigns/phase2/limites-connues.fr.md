@@ -40,6 +40,31 @@ multijoueur côté serveur, soit précisément la zone de `OnBeingHitByZombie` e
 deux signaux derrière `damage_taken`. On ne tient que l'enregistrement ; seule une session avec un vrai
 joueur tranche le tir.
 
+## Lanceurs sous Windows (au 2026-11-09)
+
+L'installation Windows de 42.22 peut être livrée **sans `StartServer64.bat`** — le dossier d'un vrai
+testeur contenait `ProjectZomboid64.exe` et aucun script, ce que le binaire publié a rapporté comme
+« `StartServer64.bat` manquant ». Deux conséquences, toutes deux dans le code :
+
+- **La détection accepte les deux dispositions** : le client et le script fournisseur, ou le client,
+  `projectzomboid.jar` et `jre64\bin\java.exe` — le JRE que le jeu embarque.
+  `tests/test_preflight.py::test_windows_folder_without_the_script_uses_the_bundled_jre` et
+  `tests/test_preflight.py::test_windows_folder_without_script_nor_jre_names_the_jre`.
+- **Le lancement ne dépend plus du script** : quand il est absent, le service compose la commande du
+  JRE lui-même (`-cp .;projectzomboid.jar … zombie/network/GameServer`, tas lu dans `server_heap_mb`),
+  exactement ce que fait `start-server.sh` sous Linux. Le script fournisseur garde la main quand il
+  existe : `tests/test_platform_windows.py::test_windows_command_prefers_the_supplied_script` et
+  `tests/test_platform_windows.py::test_windows_command_keeps_its_eight_arguments`.
+
+La commande du JRE a été mesurée sous Linux 42.22.2 : `server is listening on port …` 15 s après le
+départ, avec `-Xms2048m`. **`ProjectZomboid64.exe -server` n'est pas un serveur** : le lanceur prend sa
+classe principale dans `ProjectZomboid64.json` et lui transmet les arguments inconnus, donc ce raccourci
+n'est jamais utilisé.
+
+Ce que cela ne prouve pas : que la même commande fonctionne depuis `jre64\bin\java.exe` sur un vrai
+bureau Windows (DLL manquantes, gestion de la console, objet Job enveloppant un JVM et non `cmd`). Seule
+une exécution réelle sous Windows le dira — c'est le rôle du testeur.
+
 ## Durabilité disque sous Windows (au 2026-11-07)
 
 Un vrai match ne s'arrête plus à la préparation des mondes : depuis P18F1, `service/snapshots.py`

@@ -37,6 +37,30 @@ A new build never proves that the hooks **fire**. 42.22.2 moved multiplayer dama
 server-side, which is the area of `OnBeingHitByZombie` and `OnPlayerGetDamage` — the two signals behind
 `damage_taken`. Registration is all we hold; only a session with a real player settles the firing.
 
+## Launchers on Windows (as of 2026-11-09)
+
+The Windows install of 42.22 may ship **without `StartServer64.bat`** — a real tester's folder had
+`ProjectZomboid64.exe` and no script at all, which the shipped binary reported as `StartServer64.bat
+missing`. Two consequences, both in the code now:
+
+- **Detection accepts either layout**: the client plus the supplied script, or the client plus
+  `projectzomboid.jar` and `jre64\bin\java.exe` — the JRE the game embeds.
+  `tests/test_preflight.py::test_windows_folder_without_the_script_uses_the_bundled_jre` and
+  `tests/test_preflight.py::test_windows_folder_without_script_nor_jre_names_the_jre`.
+- **Launch works without the script**: when it is absent, the service builds the JRE command itself
+  (`-cp .;projectzomboid.jar … zombie/network/GameServer`, heap from `server_heap_mb`), which is what
+  `start-server.sh` does on Linux. The supplied script keeps the lead when present:
+  `tests/test_platform_windows.py::test_windows_command_prefers_the_supplied_script` and
+  `tests/test_platform_windows.py::test_windows_command_keeps_its_eight_arguments`.
+
+The JRE command was measured on Linux 42.22.2: `server is listening on port …` 15 s after start, with
+`-Xms2048m`. **`ProjectZomboid64.exe -server` is not a server**: the launcher takes its main class from
+`ProjectZomboid64.json` and forwards unknown arguments to it, so that shortcut is never used.
+
+What this does not prove: that the same command works from `jre64\bin\java.exe` on a real Windows
+desktop (missing DLLs, console handling, the Job object wrapping a JVM instead of `cmd`). Only a real
+Windows run settles it — the tester is the one.
+
 ## Disk durability on Windows (as of 2026-11-07)
 
 A real match no longer stops when worlds are prepared: since P18F1, `service/snapshots.py` calls

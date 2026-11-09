@@ -49,8 +49,9 @@ implementation of that idea, not affiliated with him; the idea itself is his.
 > proven.
 
 You never need a terminal. Both players need Project Zomboid **42.22 or newer** from Steam, on Windows —
-the mod declares `versionMin=42.21.0`, so an older build refuses it. The host
-runs both servers and needs about 6 GB of free RAM.
+the mod declares `versionMin=42.21.0`, so an older build refuses it. The host runs both servers and needs
+about 6 GB of free RAM. Nothing else to install: PZ Duel starts the two servers with the JRE the game
+ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is present.
 
 ### Host
 

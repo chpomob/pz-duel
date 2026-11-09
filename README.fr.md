@@ -51,7 +51,9 @@ indépendante de cette idée, sans lien avec lui ; l'idée, elle, est la sienne.
 
 Aucun terminal n'est nécessaire. Les deux joueurs ont besoin de Project Zomboid **42.22 ou plus récent**
 sur Steam, sous Windows — le mod déclare `versionMin=42.21.0` et refuse donc un build plus ancien.
-L'hôte fait tourner les deux serveurs et a besoin d'environ 6 Go de RAM disponible.
+L'hôte fait tourner les deux serveurs et a besoin d'environ 6 Go de RAM disponible. Rien d'autre à
+installer : PZ Duel lance les deux serveurs avec le JRE que le jeu embarque (`jre64\bin\java.exe`) et se
+sert de `StartServer64.bat` quand ce script existe.
 
 ### Hôte
 
