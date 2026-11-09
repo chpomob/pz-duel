@@ -49,7 +49,6 @@ from service.transport import CommandChannel, OutReader
 
 ROOT = Path(__file__).resolve().parent.parent
 
-EXPECTED_BUILD = "42.21.0"
 PRESET_ID = "duel_rapide"
 PLAYER_PASSWORD = "integration"
 HOST_PASSWORD = "integration-hote"
@@ -69,6 +68,33 @@ DAMAGE_ATOM = "damage_taken"
 KILL_ATOM = "zombie_kill"
 SPAWN_KIND = "spawn_pop"
 REFUSAL_REASONS = ("asleep", "in_vehicle")
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    """`"42.22.2"` → `(42, 22, 2)` ; refuse autre chose qu'une suite de nombres pointés.
+
+    Le build change à chaque patch du jeu : aucune version n'est écrite en dur dans ce fichier.
+    """
+    parts = text.strip().split(".")
+    if not parts or not all(part.isdigit() for part in parts):
+        raise ValueError(f"version illisible : {text!r}")
+    return tuple(int(part) for part in parts)
+
+
+def at_least(build: str, floor: str) -> bool:
+    """Compare deux versions de longueurs différentes en complétant par des zéros."""
+    high, low = version_tuple(build), version_tuple(floor)
+    width = max(len(high), len(low))
+    return high + (0,) * (width - len(high)) >= low + (0,) * (width - len(low))
+
+
+def mod_version_min() -> str:
+    """Le plancher déclaré par le mod livré, lu dans son `mod.info` : jamais une constante du test."""
+    info = MOD_SRC / load_runtime()["mod_version_dir"] / "mod.info"
+    for line in info.read_text(encoding="utf-8").splitlines():
+        if line.startswith("versionMin="):
+            return line.split("=", 1)[1].strip()
+    raise AssertionError(f"versionMin absent de {info}")
 
 
 @pytest.fixture
@@ -154,6 +180,25 @@ def lua_dir(match: RealMatch) -> Path:
     return match.zomboid_dir / "Lua"
 
 
+def test_version_floor_is_read_from_the_shipped_mod():
+    """Le plancher vient du `mod.info` livré : changer la version du jeu ne périme aucun test."""
+    floor = mod_version_min()
+    assert at_least(floor, floor)
+    major, minor = version_tuple(floor)[:2]
+    assert not at_least(f"{major}.{minor - 1}.0", floor)
+    assert at_least(f"{major}.{minor + 1}.0", floor)
+
+
+def test_version_comparison_pads_the_shorter_side():
+    assert at_least("42.22", "42.21.9")
+    assert not at_least("42.21.0", "42.22")
+
+
+def test_version_tuple_refuses_something_that_is_not_a_version():
+    with pytest.raises(ValueError):
+        version_tuple("42.x")
+
+
 @pytest.mark.pz_integration
 def test_detection_finds_install(pz_dir):
     assert os.access(pz_dir / SCRIPT, os.X_OK)
@@ -198,6 +243,7 @@ def test_caps_from_real_mod(real_match):
     real_match.prepare()
     boot(real_match)
     caps = real_match.wait_caps()
+    floor = mod_version_min()
 
     for side in SIDES:
         assert caps[side] is not None, real_match.pair.servers[side].log_tail()
@@ -206,7 +252,12 @@ def test_caps_from_real_mod(real_match):
         event = parse_event(first_line, real_match.effects)
         assert event["kind"] == "caps"
         assert event["src"] == side
-        assert event["data"]["build"] == EXPECTED_BUILD
+        # Le build attendu est celui que CE serveur annonce dans son log, plus le plancher du mod :
+        # une constante ici se périmerait à chaque patch du jeu (42.21 → 42.22.2, le 09/11/2026).
+        announced = real_match.pair.servers[side].build
+        assert announced is not None, real_match.pair.servers[side].log_tail()
+        assert event["data"]["build"] == announced
+        assert at_least(announced, floor), f"{announced} < versionMin {floor} du mod"
 
 
 @pytest.mark.pz_integration
