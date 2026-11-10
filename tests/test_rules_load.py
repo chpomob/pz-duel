@@ -448,3 +448,24 @@ def test_runtime_path_is_read_at_call_time(tmp_path, monkeypatch):
     path.write_text('{"tick_ms": 1}', encoding="utf-8")
     monkeypatch.setattr(rules, "RUNTIME_PATH", path)
     assert rules.load_runtime() == {"tick_ms": 1}
+
+
+def test_shipped_runtime_has_upnp_section(runtime):
+    """R7, R3 : la section `upnp` livrée porte ses 5 clés typées ; l'UPnP du jeu reste coupé."""
+    upnp = runtime["upnp"]
+    assert set(upnp) == {
+        "discovery_timeout_s",
+        "request_timeout_s",
+        "lease_s",
+        "description",
+        "max_response_bytes",
+    }
+    for key in ("discovery_timeout_s", "request_timeout_s"):
+        assert isinstance(upnp[key], (int, float)) and not isinstance(upnp[key], bool)
+        assert upnp[key] > 0
+    for key in ("lease_s", "max_response_bytes"):
+        assert isinstance(upnp[key], int) and not isinstance(upnp[key], bool)
+    assert 0 < upnp["lease_s"] <= 7200
+    assert upnp["max_response_bytes"] > 0
+    assert isinstance(upnp["description"], str) and upnp["description"]
+    assert runtime["managed_ini"]["UPnP"] == "false"

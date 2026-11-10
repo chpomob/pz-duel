@@ -58,6 +58,13 @@
     "warn_s": 0,
     "origin": {"rule": "probe_spawn"}
   },
+  "upnp": {
+    "discovery_timeout_s": 2,
+    "request_timeout_s": 3,
+    "lease_s": 7200,
+    "description": "PZ Duel",
+    "max_response_bytes": 65536
+  },
   "managed_ini": {
     "PauseEmpty": "false",
     "WorkshopItems": "",
