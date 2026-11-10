@@ -12,3 +12,4 @@ matches/
 docs/runs/
 /docs/campaigns/phase2/run/
 docs/campaigns/**/campaign.log
+/docs/campaigns/phase3/spec-run/
