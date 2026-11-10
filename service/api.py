@@ -353,6 +353,10 @@ class Handler(BaseHTTPRequestHandler):
     def _post_invite_address(self, payload: dict) -> None:
         self._state_answer(*self.engine.set_invite_address(payload.get("address")))
 
+    def _post_open_ports(self, payload: dict) -> None:
+        # Le corps n'est pas lu : l'ouverture vise toujours les trois mappings de la config.
+        self._state_answer(*self.engine.open_ports())
+
     def _setup_answer(self, ok: bool, message: str) -> None:
         self._json(200 if ok else 409, {"ok": ok, "message": message})
 
@@ -386,6 +390,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/setup/pz-dir": _post_pz_dir,
         "/api/quit": _post_quit,
         "/api/invite/address": _post_invite_address,
+        "/api/ports/open": _post_open_ports,
     }
 
 

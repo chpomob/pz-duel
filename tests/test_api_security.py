@@ -26,6 +26,9 @@ from service.api import (
 )
 from service.engine import ACTIONS, Engine, load_presets
 from service.share import ShareServer
+from test_contract import Lobby
+from test_snapshots import engine_rig  # noqa: F401 - fixture du banc moteur
+from test_upnp import igd, upnp_rig  # noqa: F401 - fixtures du faux IGD
 
 SECRET = "mot-de-passe-joueur"
 JSON_TYPE = "application/json"
@@ -88,6 +91,10 @@ class RecordingEngine:
 
     def set_invite_address(self, address: object) -> tuple[bool, str]:
         self.actions.append("set_invite_address")
+        return True, "ok"
+
+    def open_ports(self) -> tuple[bool, str]:
+        self.actions.append("open_ports")
         return True, "ok"
 
 
@@ -1396,3 +1403,105 @@ def test_share_listener_gives_no_cross_origin_grant(share, headers):
         response.read()
     finally:
         conn.close()
+
+
+# -- P6 : `POST /api/ports/open` passe par la même chaîne que toute route POST -----------------
+# Les balayages `POST_PATHS` la couvrent déjà (elle vient de la table) ; ces cas la nomment, et
+# le dernier vérifie qu'une requête refusée n'atteint ni le faux IGD, ni le réseau.
+
+PORTS_ROUTE = "/api/ports/open"
+PORTS_BODY = b"{}"
+
+
+def ports_refusals(port: int) -> list[tuple[int, dict, bytes]]:
+    """Chaque requête refusée sur la route : `(statut attendu, en-têtes, corps)` ; `None` = GET."""
+    local = {"Host": f"127.0.0.1:{port}", "Content-Type": JSON_TYPE}
+    cases = [(403, local | {"Origin": o.format(port=port)}, PORTS_BODY) for o in FOREIGN_ORIGINS]
+    cases += [(403, local | {"Host": h.format(port=port)}, PORTS_BODY) for h in FOREIGN_HOSTS]
+    for content_type in FOREIGN_TYPES:
+        headers = {"Host": f"127.0.0.1:{port}"}
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        cases.append((415, headers, PORTS_BODY))
+    cases.append((404, {"Host": f"127.0.0.1:{port}"}, None))
+    return cases
+
+
+def test_ports_route_is_in_the_table_and_outside_the_actions():
+    assert PORTS_ROUTE in POST_PATHS
+    assert "open_ports" not in ACTIONS
+    assert "/api/invite/address" in POST_PATHS
+
+
+@pytest.mark.parametrize("origin", FOREIGN_ORIGINS)
+def test_ports_route_refuses_a_foreign_origin(api, origin):
+    engine, port = api
+    status, answer = post(port, PORTS_ROUTE, PORTS_BODY, Origin=origin.format(port=port))
+    assert status == 403
+    assert "Origin" in answer["error"]
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("host", FOREIGN_HOSTS)
+def test_ports_route_refuses_a_foreign_host(api, host):
+    engine, port = api
+    status, answer = post(port, PORTS_ROUTE, PORTS_BODY, Host=host.format(port=port))
+    assert status == 403
+    assert "Host" in answer["error"]
+    assert engine.actions == []
+
+
+@pytest.mark.parametrize("content_type", FOREIGN_TYPES)
+def test_ports_route_requires_json_content_type(api, content_type):
+    engine, port = api
+    headers = {"Host": f"127.0.0.1:{port}"}
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    status, _ = send(port, PORTS_ROUTE, headers, PORTS_BODY)
+    assert status == 415
+    assert engine.actions == []
+
+
+def test_get_never_opens_ports(api):
+    engine, port = api
+    assert get_path(port, PORTS_ROUTE) == 404
+    assert engine.actions == []
+
+
+def test_ports_route_reaches_the_engine_from_the_local_interface(api):
+    engine, port = api
+    status, answer = post(port, PORTS_ROUTE, PORTS_BODY)
+    assert status == 200 and answer["ok"] is True
+    assert "state" in answer
+    assert engine.actions == ["open_ports"]
+
+
+def test_refused_ports_requests_reach_no_gateway(upnp_rig, igd, monkeypatch):
+    """Vrai `Engine` au lobby d'un duel réel, visant le faux IGD : seule la requête locale passe."""
+    datagrams: list[object] = []
+    sendto = socket.socket.sendto
+
+    def counted_sendto(self, data, *args):
+        datagrams.append(args[-1])
+        return sendto(self, data, *args)
+
+    monkeypatch.setattr(socket.socket, "sendto", counted_sendto)
+    lobby = Lobby(upnp_rig, "demo")
+    server = make_server(lobby.engine)
+    threading.Thread(target=server.serve_forever, args=(POLL_S,), daemon=True).start()
+    port = server.server_address[1]
+    try:
+        for expected, headers, body in ports_refusals(port):
+            assert send(port, PORTS_ROUTE, headers, body)[0] == expected, headers
+        assert igd.msearches == [] and igd.calls == [] and igd.fetches == []
+        assert datagrams == []
+        assert lobby.engine.snapshot()["ports_opening"]["status"] == "idle"
+
+        # Témoin : la même route, depuis l'interface locale, atteint bien l'IGD.
+        status, answer = post(port, PORTS_ROUTE, PORTS_BODY)
+        assert status == 200 and answer["ok"] is True, answer
+        eventually(lambda: lobby.engine.snapshot()["ports_opening"]["status"] == "mapped")
+        assert igd.msearches and igd.calls and datagrams
+    finally:
+        server.shutdown()
+        server.server_close()

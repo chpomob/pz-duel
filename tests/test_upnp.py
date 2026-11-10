@@ -993,7 +993,7 @@ from test_match import Duel  # noqa: E402
 from test_modes import FastClock, settle, wait_phase  # noqa: E402
 from test_servers import stopped_for_good  # noqa: E402
 from test_share import LAN_ADDRESS, detect  # noqa: E402
-from test_snapshots import engine_rig, free_port  # noqa: E402,F401
+from test_snapshots import PLAYER_PASSWORD, engine_rig, free_port  # noqa: E402,F401
 from service.engine import Engine  # noqa: E402
 
 PUBLIC = "5.6.7.8"
@@ -1466,3 +1466,175 @@ def test_shutdown_first_delete_silent_still_tries_the_others(upnp_rig, igd, capl
     for port, protocol in retained[1:]:
         assert f"{port}/{protocol}" not in warnings[0]
     assert PUBLIC not in caplog.text
+
+
+# -- P6 : la route `POST /api/ports/open` et l'arrêt du service ----------------------------
+# AC6 par HTTP sur le vrai `Engine` servi par `make_server` ; AC22, seconde variante, sur
+# `service.main` lancé par `tests/doubles/run_service.py` et visant le faux IGD du test.
+
+import os  # noqa: E402
+import signal  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+from urllib.request import Request, urlopen  # noqa: E402
+
+from service.main import STOP_SIGNALS  # noqa: E402
+from test_servers import PROCESS_TIMEOUT_S, REPO_ROOT, RUN_SERVICE, SERVICE_URL_PREFIX  # noqa: E402
+from test_share import api_port, request  # noqa: E402,F401
+
+PORTS_ROUTE = "/api/ports/open"
+if sys.platform == "win32":
+    # `SIGBREAK` de `STOP_SIGNALS` : seul `CTRL_BREAK_EVENT` atteint un groupe de processus à part.
+    STOP_SIGNAL = signal.CTRL_BREAK_EVENT
+    SERVICE_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP
+else:
+    STOP_SIGNAL = STOP_SIGNALS[-1]
+    SERVICE_FLAGS = 0
+
+
+def _open_by_http(port: int) -> tuple[int, dict]:
+    status, _, body = request(port, "POST", PORTS_ROUTE, {})
+    return status, json.loads(body)
+
+
+def test_ac6_http_accepts_in_a_real_lobby(upnp_rig, igd, api_port):
+    lobby = Lobby(upnp_rig, "demo")
+    port = api_port(lobby.engine)
+    status, answer = _open_by_http(port)
+    assert status == 200 and answer["ok"] is True, answer
+    assert answer["state"]["ports_opening"]["status"] in ("in_progress", "mapped")
+    assert _wait_opening(lobby.engine)["status"] == "mapped"
+    assert igd.msearches and igd.calls
+    assert sorted(igd.couples("AddPortMapping")) == sorted(_engine_ports(upnp_rig))
+
+
+def test_ac6_http_refuses_outside_a_real_lobby(upnp_rig, igd, api_port, socket_guard):
+    engine = upnp_rig.build()
+    status, answer = _open_by_http(api_port(engine))
+    assert status == 409 and answer["ok"] is False
+    assert answer["message"] == "only in the lobby, phase idle"
+    assert answer["state"]["ports_opening"]["status"] == "idle"
+
+    duel = Duel(upnp_rig)
+    port = api_port(duel.engine)
+    duel.start_match()
+    for phase in ("running", "over"):
+        if phase == "over":
+            duel.at_match(duel.state()["config"]["duration_s"])
+            duel.finish()
+        status, answer = _open_by_http(port)
+        assert status == 409 and answer["message"] == f"only in the lobby, phase {phase}"
+    assert igd.msearches == [] and igd.calls == [] and igd.fetches == []
+    assert _ssdp_sends(socket_guard) == []
+    assert duel.state()["ports_opening"]["status"] == "idle"
+
+
+def test_ac6_http_refuses_in_simulated_mode(mock_engine, igd, api_port, socket_guard):
+    port = api_port(mock_engine)
+    assert mock_engine.action("start", {"preset": "demo"})[0]
+    wait_phase(mock_engine, "lobby")
+    status, answer = _open_by_http(port)
+    assert status == 409 and answer["message"] == "not available in simulated mode"
+    assert igd.msearches == [] and igd.calls == []
+    assert _ssdp_sends(socket_guard) == []
+    assert mock_engine.action("simulate_join")[0]
+    wait_phase(mock_engine, "over")
+    settle(mock_engine)
+
+
+class UpnpService:
+    """`service.main` dans son processus, sur le double du banc, visant le faux IGD."""
+
+    def __init__(self, rig, igd: FakeIGD) -> None:
+        config = rig.pz_dir.parent / "service.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "zomboid_dir": str(rig.zomboid),
+                    "matches_dir": str(rig.matches),
+                    "runtime": rig.runtime,
+                    "upnp_target": list(igd.ssdp_target),
+                    # Le banc remplace `local_ip` ; l'enfant n'en hérite pas, on la fixe ici.
+                    "local_ip": LAN_ADDRESS,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.process = subprocess.Popen(
+            [
+                sys.executable, str(RUN_SERVICE), str(config),
+                "--mode", "real", "--no-browser", "--port", "0", "--pz-dir", str(rig.pz_dir),
+            ],
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            creationflags=SERVICE_FLAGS,
+        )  # fmt: skip
+        self.url = self._read_url()
+
+    def _read_url(self) -> str:
+        for line in self.process.stdout:
+            if SERVICE_URL_PREFIX in line:
+                return line.split(SERVICE_URL_PREFIX)[1].strip()
+        raise AssertionError("le service est sorti sans publier son URL")
+
+    def state(self) -> dict:
+        with urlopen(f"{self.url}api/state", timeout=PROCESS_TIMEOUT_S) as response:
+            return json.load(response)
+
+    def post(self, path: str, payload: dict) -> dict:
+        headers = {"Content-Type": "application/json"}
+        req = Request(f"{self.url}{path.lstrip('/')}", json.dumps(payload).encode(), headers)
+        with urlopen(req, timeout=PROCESS_TIMEOUT_S) as response:
+            return json.load(response)
+
+    def until(self, condition) -> dict:
+        deadline = time.monotonic() + ENGINE_WAIT_S
+        while time.monotonic() < deadline:
+            state = self.state()
+            if condition(state):
+                return state
+            time.sleep(0.05)
+        raise AssertionError(f"état jamais atteint : {self.state()}")
+
+    def kill(self) -> None:
+        """Filet d'un test en échec : le service ne survit pas au test."""
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.communicate(timeout=PROCESS_TIMEOUT_S)
+
+
+def _quit_by_http(service: UpnpService) -> None:
+    assert service.post("/api/quit", {})["ok"] is True
+
+
+def _stop_signal(service: UpnpService) -> None:
+    service.process.send_signal(STOP_SIGNAL)
+
+
+@pytest.mark.parametrize("stop", [_quit_by_http, _stop_signal], ids=["api-quit", "stop-signal"])
+def test_ac22_service_stop_deletes_the_three_mappings(upnp_rig, igd, stop):
+    upnp_rig.build()
+    service = UpnpService(upnp_rig, igd)
+    try:
+        service.post("/api/action", {"action": "start", "preset": "demo", "password": PLAYER_PASSWORD})
+        state = service.until(lambda s: s["phase"] in ("lobby", "error"))
+        assert state["phase"] == "lobby", state["error"]
+        assert state["invite"]["ip"] == LAN_ADDRESS
+        answer = service.post(PORTS_ROUTE, {})
+        assert answer["ok"] is True, answer
+        opened = service.until(lambda s: s["ports_opening"]["status"] != "in_progress")
+        assert opened["ports_opening"]["status"] == "mapped", opened["ports_opening"]
+        assert len(igd.mappings) == 3
+        seen = len(igd.actions("DeletePortMapping"))
+
+        stop(service)
+        service.process.communicate(timeout=PROCESS_TIMEOUT_S)
+
+        assert service.process.returncode == 0
+        assert sorted(_deletes_after(igd, seen)) == sorted(_engine_ports(upnp_rig))
+        assert igd.mappings == {}
+    finally:
+        service.kill()
