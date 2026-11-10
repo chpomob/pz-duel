@@ -1318,7 +1318,24 @@ def test_ac20_public_address_never_logged_nor_journaled(upnp_rig, igd, socket_gu
 # -- AC22 / AC23 / AC24 : arrêt ------------------------------------------------------------
 def _retained(engine: Engine) -> list[tuple[int, str]]:
     """Couples retenus pour l'arrêt, toutes box confondues, dans leur ordre d'insertion."""
-    return [couple for _, couple in engine._upnp_retained]
+    return [lease.couple for lease in engine._ports_ledger.entries()]
+
+
+def _held(engine: Engine) -> list:
+    """Entrées du registre des mappings (P9F3) : vide une fois tout retiré."""
+    return engine._ports_ledger.entries()
+
+
+def _lease_deadline(engine: Engine) -> float:
+    """Échéance (horloge du registre) de la dernière proposition `mapped`."""
+    deadline = engine._ports_ledger._proposal_deadline
+    assert deadline is not None
+    return deadline
+
+
+def _at(engine: Engine, when: float) -> None:
+    """Fige l'horloge monotone du registre, seule juge des échéances (P9F3, revue A2/I2)."""
+    engine._ports_ledger.clock = lambda: when
 
 
 def _deletes_after(igd: FakeIGD, count: int) -> list[tuple[int, str]]:
@@ -1334,7 +1351,7 @@ def test_ac22_shutdown_deletes_the_three_mappings(upnp_rig, igd):
     assert sorted(_deletes_after(igd, seen)) == sorted(_engine_ports(upnp_rig))
     assert igd.mappings == {}
     assert len(igd.msearches) == msearches
-    assert lobby.engine._upnp_retained == {}
+    assert _held(lobby.engine) == []
 
 
 def test_ac23_mute_gateway_at_shutdown_is_bounded(upnp_rig, igd, caplog):
@@ -1374,7 +1391,7 @@ def test_ac24_nothing_active_sends_nothing_at_shutdown(upnp_rig, igd, socket_gua
     assert engine.shutdown()
     assert _traffic(igd, socket_guard)[:3] == before[:3]
     assert _ssdp_sends(socket_guard) == ssdp
-    assert engine._upnp_retained == {}
+    assert _held(engine) == []
 
 
 # -- AC25 : valeurs de la copie de runtime ---------------------------------------------------
@@ -1456,7 +1473,7 @@ def test_retention_is_cleared_by_a_confirmed_rollback(upnp_rig, igd):
     opening = _click(lobby.engine)[0]
     assert opening["status"] == "refused" and opening["error_code"] == 718
     assert opening["still_active"] == []
-    assert lobby.engine._upnp_retained == {}
+    assert _held(lobby.engine) == []
     seen = len(igd.actions("DeletePortMapping"))
     assert lobby.engine.shutdown()
     assert _deletes_after(igd, seen) == []
@@ -1661,6 +1678,8 @@ def test_ac22_service_stop_deletes_the_three_mappings(upnp_rig, igd, stop):
 # Chaque test tombe si la correction de son constat est retirée (mutation vérifiée).
 
 NOT_IGD = f"{DEVICE}MediaServer:1"
+# Une seconde box est un second hôte de la boucle locale (P9F3).
+SECOND_BOX = "127.0.0.2"
 
 
 def _wait_for(condition, timeout_s: float = ENGINE_WAIT_S) -> None:
@@ -1693,13 +1712,13 @@ def test_c1_opening_merged_after_the_shutdown_copy_removes_its_own_mappings(upnp
     stopper = threading.Thread(target=engine.shutdown, daemon=True)
     stopper.start()
     _wait_for(lambda: engine._ports_released)
-    assert engine._upnp_retained == {}
+    assert _held(engine) == []
     gate.set()
     stopper.join(ENGINE_WAIT_S)
     assert not stopper.is_alive()
     assert sorted(_deletes_after(igd, seen)) == sorted(ports)
     assert igd.mappings == {}
-    assert engine._upnp_retained == {}
+    assert _held(engine) == []
 
 
 # C2 : une ouverture sur une autre box ne fait pas oublier les mappings de la première.
@@ -1708,15 +1727,16 @@ def test_c2_retention_is_indexed_by_gateway_and_couple(upnp_rig, igd):
     engine = lobby.engine
     ports = _engine_ports(upnp_rig)
     assert _click(engine)[0]["status"] == "mapped"
-    with FakeIGD() as other:
+    # Une autre box est un autre hôte (P9F3 : la box est identifiée par son hôte).
+    with FakeIGD(host=SECOND_BOX) as other:
         engine._upnp_target = other.ssdp_target
         assert _click(engine)[0]["status"] == "mapped"
         assert set(igd.mappings) == set(ports) and set(other.mappings) == set(ports)
-        assert len(engine._upnp_retained) == 2 * len(ports)
+        assert len(_held(engine)) == 2 * len(ports)
         assert engine.shutdown()
         assert igd.mappings == {}
         assert other.mappings == {}
-    assert engine._upnp_retained == {}
+    assert _held(engine) == []
 
 
 # C3 : identité IGD vérifiée avant toute écriture SOAP.
@@ -1796,9 +1816,9 @@ def test_c5_expired_mapping_is_neither_shown_nor_proposed(upnp_rig, igd):
     engine = lobby.engine
     opening, _, _ = _click(engine)
     assert opening["status"] == "mapped" and opening["address"] == PUBLIC
-    engine._clock = lambda: opening["expires_at"] - 1
+    _at(engine, _lease_deadline(engine) - 1)
     assert engine.snapshot()["ports_opening"]["status"] == "mapped"
-    engine._clock = lambda: opening["expires_at"]
+    _at(engine, _lease_deadline(engine))
     view = engine.snapshot()["ports_opening"]
     assert view == {
         "status": "idle",
@@ -1819,7 +1839,7 @@ def test_c6_expiry_is_a_conservative_bound(upnp_rig, igd):
     adds = igd.actions("AddPortMapping")
     assert len(adds) == 3
     assert opening["expires_at"] <= min(call.at for call in adds) + lease
-    assert {expires for _, expires in lobby.engine._upnp_retained.values()} == {opening["expires_at"]}
+    assert {lease.expires_at for lease in _held(lobby.engine)} == {opening["expires_at"]}
 
 
 # C7 : aucune exception ne sort, même sur des entrées malformées.
@@ -1866,8 +1886,13 @@ def test_c7_delete_mappings_never_raises_on_malformed_mappings():
         assert upnp.delete_mappings(gateway, None, 0.5, max_bytes=max_bytes) == []  # type: ignore[arg-type]
         bad = ["x", (1,), ([], "UDP"), (0, "UDP"), None]
         failures = upnp.delete_mappings(gateway, [PORTS[0], *bad], 0.5, max_bytes=max_bytes)
-        assert failures == bad
+        # Revue A6 : les échecs ne portent que des couples ; un élément malformé n'est pas envoyé.
+        assert failures == []
         assert igd.couples("DeletePortMapping") == [PORTS[0]]
+        igd.configure(silent=True)
+        failures = upnp.delete_mappings(gateway, [*bad, PORTS[1]], 0.5, max_bytes=max_bytes)
+        assert failures == [PORTS[1]]
+        assert all(isinstance(p, int) and isinstance(t, str) for p, t in failures)
 
 
 # C8 : `MX` borné à 1–5, fenêtre de découverte d'au moins une seconde.
@@ -1886,17 +1911,19 @@ def test_c8_discovery_window_under_one_second_is_invalid_config(window, socket_g
     assert upnp.validate(_cfg(discovery_timeout_s=1)) is None
 
 
-# M1 : un mapping retenu dont le bail est échu n'est plus supprimé à l'arrêt.
-def test_m1_expired_retained_mapping_is_not_deleted_at_shutdown(upnp_rig, igd):
+# M1, repris par P9F3 : un mapping échu n'est supprimé qu'après que la box l'a dit encore à nous.
+def test_m1_expired_retained_mapping_is_verified_before_its_delete(upnp_rig, igd):
     lobby = Lobby(upnp_rig, "demo")
     engine = lobby.engine
     opening, _, _ = _click(engine)
     assert opening["status"] == "mapped"
     seen = len(igd.actions("DeletePortMapping"))
-    engine._clock = lambda: opening["expires_at"]
+    _at(engine, _lease_deadline(engine))
     assert engine.shutdown()
-    assert _deletes_after(igd, seen) == []
-    assert engine._upnp_retained == {}
+    calls = [c.action for c in igd.calls if c.action != "AddPortMapping"][-6:]
+    assert calls == ["GetSpecificPortMappingEntry", "DeletePortMapping"] * 3
+    assert len(_deletes_after(igd, seen)) == 3
+    assert _held(engine) == []
 
 
 # --- P9F2 : revue de P9F1 -------------------------------------------------------------------
@@ -1959,7 +1986,7 @@ def test_p9f2_c1_merge_delayed_beyond_both_waits_is_abandoned_with_its_couples_n
     assert returned.wait(ENGINE_WAIT_S)
     engine._ports_thread.join(ENGINE_WAIT_S)
     assert not engine._ports_thread.is_alive()
-    assert engine._upnp_retained == {} and engine._ports_handoff == []
+    assert _held(engine) == []
     assert len(igd.actions("DeletePortMapping")) == deletes_at_return
 
 
@@ -1984,26 +2011,29 @@ def test_p9f2_c1_merge_during_the_second_wait_is_removed_before_shutdown_returns
     assert gate.is_set()
     assert sorted(_deletes_after(igd, seen)) == sorted(ports)
     assert igd.mappings == {}
-    assert engine._upnp_retained == {} and engine._ports_handoff == []
+    assert _held(engine) == []
     assert not any("abandoned" in entry["msg"] for entry in engine.snapshot()["logs"])
 
 
-# Item 3 (M1) : l'échéance relue immédiatement avant chaque suppression, retrait tardif compris.
-def test_p9f2_m1_mapping_expiring_during_the_first_deletes_is_not_deleted(upnp_rig, igd):
+# Item 3 (M1) : l'état relu immédiatement avant chaque suppression, retrait tardif compris.
+def test_p9f2_m1_mapping_expiring_during_the_first_deletes_is_verified_first(upnp_rig, igd):
     lobby = Lobby(upnp_rig, "demo")
     engine = lobby.engine
     opening, _, _ = _click(engine)
     assert opening["status"] == "mapped"
     seen = len(igd.actions("DeletePortMapping"))
-    expires_at = opening["expires_at"]
-    # Le bail court jusqu'à la première suppression de l'arrêt, puis s'achève.
-    engine._clock = lambda: expires_at - 1 if len(igd.actions("DeletePortMapping")) == seen else expires_at
+    deadline = _lease_deadline(engine)
+    # Le bail court jusqu'à la première suppression de l'arrêt, puis s'achève : les deux
+    # suivantes passent d'abord par la vérification auprès de la box.
+    engine._ports_ledger.clock = lambda: deadline - 1 if len(igd.actions("DeletePortMapping")) == seen else deadline
     assert engine.shutdown()
-    assert len(_deletes_after(igd, seen)) == 1
-    assert engine._upnp_retained == {}
+    assert len(_deletes_after(igd, seen)) == 3
+    assert len(igd.actions("GetSpecificPortMappingEntry")) == 2
+    assert igd.mappings == {}
+    assert _held(engine) == []
 
 
-def test_p9f2_m1_late_merge_after_expiry_deletes_nothing(upnp_rig, igd, monkeypatch):
+def test_p9f2_m1_late_merge_after_expiry_is_verified_before_its_deletes(upnp_rig, igd, monkeypatch):
     gate = threading.Event()
     engine, _ = _mapped_by_a_gated_opening(upnp_rig, igd, monkeypatch, gate)
     seen = len(igd.actions("DeletePortMapping"))
@@ -2012,17 +2042,19 @@ def test_p9f2_m1_late_merge_after_expiry_deletes_nothing(upnp_rig, igd, monkeypa
 
     def expire_then_merge(message, *args):
         if message == "port opening still running at shutdown":
-            # Le bail échoit avant la fusion tardive : le retrait ne doit rien supprimer.
-            later = engine._clock() + 2 * lease
-            engine._clock = lambda: later
+            # Le bail échoit avant la fusion tardive : le retrait vérifie chaque couple d'abord.
+            later = engine._ports_ledger.clock() + 2 * lease
+            _at(engine, later)
             gate.set()
         return warning(message, *args)
 
     monkeypatch.setattr(engine_module.LOGGER, "warning", expire_then_merge)
     assert engine.shutdown()
     assert gate.is_set()
-    assert _deletes_after(igd, seen) == []
-    assert engine._upnp_retained == {} and engine._ports_handoff == []
+    assert len(igd.actions("GetSpecificPortMappingEntry")) == 3
+    assert sorted(_deletes_after(igd, seen)) == sorted(_engine_ports(upnp_rig))
+    assert igd.mappings == {}
+    assert _held(engine) == []
 
 
 # Item 6 (C5) : l'échéance de la proposition survit à un nouvel essai en échec.
@@ -2034,9 +2066,9 @@ def test_p9f2_c5_proposal_expiry_survives_a_failed_retry(upnp_rig, igd):
     igd.configure(ssdp_reply=False)
     retry, _, _ = _click(engine)
     assert retry["status"] == "no_gateway" and "expired" not in retry
-    engine._clock = lambda: opening["expires_at"] - 1
+    _at(engine, _lease_deadline(engine) - 1)
     assert "expired" not in engine.snapshot()["ports_opening"]
-    engine._clock = lambda: opening["expires_at"]
+    _at(engine, _lease_deadline(engine))
     view = engine.snapshot()["ports_opening"]
     assert view["status"] == "no_gateway" and view["expired"] is True
     assert PUBLIC not in json.dumps(view)
@@ -2044,9 +2076,10 @@ def test_p9f2_c5_proposal_expiry_survives_a_failed_retry(upnp_rig, igd):
 
 # Item 2 (C3/C4) : sélection explicite entre deux IGD valides, dans les deux ordres.
 def _two_igds(first_ip: str | None, second_ip: str | None):
-    """Deux faux IGD valides ; la réponse SSDP de `second` arrive avant celle de `first`."""
-    first, second = FakeIGD(external_ip=first_ip).start(), FakeIGD(external_ip=second_ip).start()
-    first.configure(ssdp_before=[second.ssdp_answer()])
+    """Deux box valides, sur deux hôtes ; la réponse SSDP de `second` arrive avant celle de `first`."""
+    first = FakeIGD(external_ip=first_ip).start()
+    second = FakeIGD(external_ip=second_ip, host=SECOND_BOX).start()
+    first.configure(ssdp_before=[second])
     return first, second
 
 
@@ -2250,3 +2283,381 @@ def test_p9f2_c4_endless_ignored_replies_stop_at_the_absolute_deadline(monkeypat
     # Aucun tour de réception après l'échéance absolue de la fenêtre, fixée avant le premier tour.
     calls = _EndlessSocket.calls
     assert calls and max(calls) <= min(calls) + cfg["discovery_timeout_s"]
+
+
+# --- P9F3 : suivi de vie des mappings et sélection de passerelle comme primitive unique ---------
+# Chaque test tombe si la reprise est retirée ; la mutation est citée en tête de chaque test.
+
+OTHER_CLIENT = "127.0.0.9"
+EXTRA_DESC = "/igd2.xml"
+EXTRA_CONTROL = "/ctl/wan2"
+
+
+# Majeur I1 : une box qui publie deux descriptions IGD est une seule passerelle.
+def test_p9f3_one_box_with_two_descriptions_is_one_gateway(socket_guard):
+    """Mutation : dédupliquer sur la `Gateway` entière (retirer le `continue` sur `_box_of` et la
+    clé `gateway.box`) rend `ambiguous_gateway` sans écriture ; retirer seulement le `continue`
+    fait lire la seconde description."""
+    with FakeIGD(extra_descriptions={EXTRA_DESC: EXTRA_CONTROL}) as igd:
+        result, gateway, _ = _open(igd)
+        assert result["status"] == "mapped" and result["address"] == "5.6.7.8"
+        assert gateway is not None and gateway.box == "127.0.0.1"
+        assert gateway.control_path == "/ctl/wan"
+        # Les deux LOCATION sont arrivées ; seule la première description de la box est lue.
+        assert igd.fetches == ["/desc.xml"]
+        assert len(igd.actions("AddPortMapping")) == 3
+        # Pas de sélection entre « deux » passerelles : une seule lecture d'adresse, après les ajouts.
+        assert [c.action for c in igd.calls].count("GetExternalIPAddress") == 1
+        assert igd.calls[-1].action == "GetExternalIPAddress"
+        assert set(igd.mappings) == set(PORTS)
+
+
+def test_p9f3_second_description_of_a_box_is_used_if_the_first_is_not_valid(socket_guard):
+    """Mutation : marquer la box dès sa première réponse (et non à sa validation) : `no_gateway`."""
+    with FakeIGD(extra_descriptions={EXTRA_DESC: EXTRA_CONTROL}) as igd:
+        broken = FakeIGD(device_type=NOT_IGD).start()
+        try:
+            # La première LOCATION de l'hôte décrit un appareil qui n'est pas un IGD.
+            igd.configure(ssdp_before=[broken.ssdp_answer()], ssdp_reply=True)
+            result, gateway, _ = _open(igd)
+        finally:
+            broken.close()
+        assert result["status"] == "mapped" and gateway is not None
+        assert gateway.port == igd.http_port and gateway.control_path == "/ctl/wan"
+        assert igd.fetches == ["/desc.xml"]
+
+
+def test_p9f3_ledger_keeps_one_entry_per_box_and_couple_across_descriptions():
+    """Majeur I1 côté arrêt (review.md, Y7) : deux ouvertures sur la même box, jointe par deux
+    descriptions, retiennent 3 mappings et non 6. Mutation : clé `(host, port, control_path)`."""
+    ledger = upnp.Ledger(clock=lambda: 0.0)
+    first = upnp.Gateway("127.0.0.1", 1, "/ctl/wan", "WANIPConnection:1")
+    second = upnp.Gateway("127.0.0.1", 2, EXTRA_CONTROL, "WANIPConnection:2")
+    mapped = {"status": "mapped", "ports": _dicts(PORTS)}
+    terms = {"started": 0.0, "expires_at": 0.0, "lease_s": 10, "description": "d"}
+    ledger.record(mapped, first, [], **terms)
+    ledger.record(mapped, second, [], **terms)
+    entries = ledger.entries()
+    assert [lease.couple for lease in entries] == PORTS
+    assert {lease.box for lease in entries} == {"127.0.0.1"}
+    # La box est jointe par la dernière description qui l'a servie.
+    assert {lease.gateway for lease in entries} == {second}
+
+
+def test_p9f3_two_hosts_remain_two_boxes():
+    """Mutation : identifier la box par autre chose que l'hôte (ex. le service) : une entrée perdue."""
+    ledger = upnp.Ledger(clock=lambda: 0.0)
+    terms = {"started": 0.0, "expires_at": 0.0, "lease_s": 10, "description": "d"}
+    for host in ("127.0.0.1", SECOND_BOX):
+        gateway = upnp.Gateway(host, 1, "/ctl/wan", "WANIPConnection:1")
+        ledger.record({"status": "mapped", "ports": _dicts(PORTS)}, gateway, [], **terms)
+    assert len(ledger.entries()) == 2 * len(PORTS)
+
+
+def test_p9f3_engine_one_box_two_descriptions_maps_and_removes_three(upnp_rig):
+    """Bout en bout : une box à deux descriptions, un clic, trois mappings retenus et retirés."""
+    with FakeIGD(extra_descriptions={EXTRA_DESC: EXTRA_CONTROL}) as box:
+        lobby = Lobby(upnp_rig, "demo")
+        engine = lobby.engine
+        engine._upnp_target = box.ssdp_target
+        opening = _click(engine)[0]
+        assert opening["status"] == "mapped" and opening["address"] == "5.6.7.8"
+        assert len(_held(engine)) == 3
+        assert engine.shutdown()
+        assert box.mappings == {}
+        assert len(box.actions("DeletePortMapping")) == 6  # 3 avant les ajouts, 3 à l'arrêt
+
+
+# Majeur A1 : une box qui ignore le bail ne garde pas le mapping pour toujours.
+def test_p9f3_lease_ignored_by_the_router_is_still_removed_at_shutdown(upnp_rig, igd, caplog):
+    """Le faux IGD n'expire jamais rien (bail ignoré). Mutation : `_release_one` qui rend `GONE`
+    (ne tente rien) pour une entrée `MAYBE_THIRD_PARTY` — les trois mappings restent sur la box."""
+    caplog.set_level(logging.DEBUG)
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    assert _click(engine)[0]["status"] == "mapped"
+    seen = len(igd.actions("DeletePortMapping"))
+    _at(engine, _lease_deadline(engine) + 10 * upnp_rig.runtime["upnp"]["lease_s"])
+    assert all(engine._ports_ledger.state(lease) == upnp.MAYBE_THIRD_PARTY for lease in _held(engine))
+    assert engine.shutdown()
+    assert sorted(_deletes_after(igd, seen)) == sorted(_engine_ports(upnp_rig))
+    assert igd.mappings == {}
+    assert "could not remove" not in caplog.text
+    assert PUBLIC not in caplog.text
+
+
+def test_p9f3_expired_couple_taken_by_another_device_is_left_in_place(upnp_rig, igd, caplog):
+    """Un tiers a repris un couple après l'échéance : la box le dit, il n'est pas supprimé.
+    Mutation : supprimer sans `_owner` (ou `_owner` qui rend toujours `STILL_OURS`)."""
+    caplog.set_level(logging.DEBUG)
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+    assert _click(engine)[0]["status"] == "mapped"
+    with igd.lock:
+        igd.mappings[ports[0]] = {**igd.mappings[ports[0]], "NewInternalClient": OTHER_CLIENT}
+        igd.mappings[ports[1]] = {**igd.mappings[ports[1]], "NewPortMappingDescription": "Other app"}
+    seen = len(igd.actions("DeletePortMapping"))
+    _at(engine, _lease_deadline(engine))
+    assert engine.shutdown()
+    assert _deletes_after(igd, seen) == [ports[2]]
+    assert set(igd.mappings) == set(ports[:2])
+    named = f"{ports[0][0]}/{ports[0][1]}, {ports[1][0]}/{ports[1][1]}"
+    assert any(f"left in place at shutdown: {named}" in e["msg"] for e in engine.snapshot()["logs"])
+    assert OTHER_CLIENT not in caplog.text and OTHER_CLIENT not in json.dumps(engine.snapshot()["logs"])
+
+
+def test_p9f3_expired_couple_already_gone_sends_no_delete(upnp_rig, igd):
+    """La box a honoré le bail : 714 à la vérification, aucune suppression, aucun échec.
+    Mutation : traiter 714 comme un échec (le message « could not remove » apparaît)."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    assert _click(engine)[0]["status"] == "mapped"
+    with igd.lock:
+        igd.mappings.clear()
+    seen = len(igd.actions("DeletePortMapping"))
+    _at(engine, _lease_deadline(engine))
+    assert engine.shutdown()
+    assert _deletes_after(igd, seen) == []
+    assert len(igd.actions("GetSpecificPortMappingEntry")) == 3
+    logs = json.dumps(engine.snapshot()["logs"])
+    assert "could not remove" not in logs and "port mappings removed" in logs
+
+
+def test_p9f3_expired_couple_the_box_cannot_vouch_for_is_named_not_deleted(upnp_rig, igd):
+    """Vérification refusée (501) : on ne sait pas à qui est le couple — pas de suppression, échec
+    nommé. Mutation : supprimer quand `_owner` rend une erreur."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+    assert _click(engine)[0]["status"] == "mapped"
+    igd.configure(errors={"GetSpecificPortMappingEntry": 501})
+    seen = len(igd.actions("DeletePortMapping"))
+    _at(engine, _lease_deadline(engine))
+    assert engine.shutdown()
+    assert _deletes_after(igd, seen) == []
+    assert set(igd.mappings) == set(ports)
+    named = ", ".join(f"{p}/{t}" for p, t in ports)
+    assert any(f"could not remove port mappings at shutdown: {named}" in e["msg"] for e in engine.snapshot()["logs"])
+
+
+def test_p9f3_lease_still_running_is_deleted_without_asking():
+    """Mutation : vérifier même une entrée `OURS` (une lecture de plus par mapping, R6)."""
+    with FakeIGD() as igd:
+        gateway = _gateway(igd)
+        ledger = upnp.Ledger(clock=lambda: 0.0)
+        ledger.record(
+            {"status": "mapped", "ports": _dicts(PORTS)},
+            gateway,
+            [],
+            started=0.0,
+            expires_at=0.0,
+            lease_s=10,
+            description=_cfg()["description"],
+        )
+        released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(1.5))
+        assert (released.tried, released.failed, released.foreign) == (PORTS, [], [])
+        assert [c.action for c in igd.calls] == ["DeletePortMapping"] * 3
+
+
+# Mineur A2/I2 : les décisions ne suivent pas l'heure murale.
+def test_p9f3_wall_clock_jump_changes_no_decision(upnp_rig, igd):
+    """Mutation : `upnp.Ledger(self._clock)` dans le moteur — l'heure murale sautée en avant
+    ferait passer le `mapped` pour échu et vérifier chaque couple à l'arrêt."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    opening = _click(engine)[0]
+    assert opening["status"] == "mapped"
+    lease = upnp_rig.runtime["upnp"]["lease_s"]
+    engine._clock = lambda: opening["expires_at"] + 10 * lease
+    view = engine.snapshot()["ports_opening"]
+    assert view["status"] == "mapped" and view["address"] == PUBLIC and "expired" not in view
+    seen = len(igd.actions("DeletePortMapping"))
+    assert engine.shutdown()
+    assert igd.actions("GetSpecificPortMappingEntry") == []
+    assert len(_deletes_after(igd, seen)) == 3
+
+
+# Mineurs A4/I4 et review.md Y7 : une seule échéance pour tout le retrait, toutes box confondues.
+def test_p9f3_release_of_two_mute_boxes_fits_in_three_request_timeouts(upnp_rig, igd, caplog):
+    """Deux box (deux hôtes), six mappings retenus, toutes deux muettes à l'arrêt. Mutation :
+    `ledger.release` sans échéance commune (chaque requête à `request_timeout_s`) — 6 × 0,5 s."""
+    caplog.set_level(logging.DEBUG)
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+    assert _click(engine)[0]["status"] == "mapped"
+    with FakeIGD(host=SECOND_BOX) as other:
+        engine._upnp_target = other.ssdp_target
+        assert _click(engine)[0]["status"] == "mapped"
+        assert len(_held(engine)) == 6
+        igd.configure(silent=True)
+        other.configure(silent=True)
+        started = time.monotonic()
+        engine.shutdown()
+        elapsed = time.monotonic() - started
+    assert elapsed <= SHUTDOWN_BOUND_S
+    assert stopped_for_good(upnp_rig)
+    (message,) = [r.getMessage() for r in caplog.records if "could not remove" in r.getMessage()]
+    for port, protocol in ports:
+        assert message.count(f"{port}/{protocol}") == 2
+    assert PUBLIC not in caplog.text
+
+
+def test_p9f3_mapping_reached_after_the_release_deadline_is_not_tried():
+    """Mutation : tenter la requête même sans reste d'échéance."""
+    with FakeIGD() as igd:
+        ledger = upnp.Ledger(clock=lambda: 0.0)
+        ledger.retain(_gateway(igd), PORTS, started=0.0, expires_at=0.0, lease_s=10, description="d")
+        released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(0))
+        assert released.failed == PORTS and released.tried == PORTS
+        assert igd.calls == []
+        assert ledger.entries() == []
+
+
+# Mineur I3 : une fusion qui lève ne bloque pas l'ouverture et ne perd aucun mapping.
+def test_p9f3_merge_failure_publishes_a_terminal_status_and_retains_the_couples(upnp_rig, igd, monkeypatch):
+    """Mutation : retirer le `try/except` autour de `_merge_opening` — l'état reste `in_progress`."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+    real_log = engine.state.log
+
+    def failing_log(message, *args):
+        if message.startswith("port opening: "):
+            raise RuntimeError("simulated")
+        return real_log(message, *args)
+
+    monkeypatch.setattr(engine.state, "log", failing_log)
+    opening = _click(engine)[0]
+    assert opening["status"] == "refused" and opening["failure"] == "unreadable"
+    assert opening["still_active"] == _dicts(ports)
+    assert set(_retained(engine)) == set(ports)
+    ok, message = engine.open_ports()
+    assert ok, message  # l'hôte peut réessayer
+    _wait_opening(engine)
+    seen = len(igd.actions("DeletePortMapping"))
+    monkeypatch.setattr(engine.state, "log", real_log)
+    assert engine.shutdown()
+    assert sorted(_deletes_after(igd, seen)) == sorted(ports)
+    assert igd.mappings == {}
+
+
+# Nit I6 : un port explicite à 0 n'est pas le port 80.
+@pytest.mark.parametrize("url", ["http://127.0.0.1:0/desc.xml", "http://127.0.0.1:0"])
+def test_p9f3_explicit_port_zero_is_refused(url):
+    """Mutation : `parts.port or http.client.HTTP_PORT` rend `(127.0.0.1, 80, ...)`."""
+    assert upnp._same_host(url, "127.0.0.1") is None
+    assert upnp._same_host("http://127.0.0.1/desc.xml", "127.0.0.1") == ("127.0.0.1", 80, "/desc.xml")
+
+
+# --- P9F3, revue 1 ----------------------------------------------------------------------------
+
+
+def _expired_ledger(igd: FakeIGD, description: str) -> upnp.Ledger:
+    """Registre dont chaque couple de `PORTS` est retenu, bail échu : l'arrêt vérifie d'abord."""
+    ledger = upnp.Ledger(clock=lambda: 100.0)
+    ledger.retain(_gateway(igd), PORTS, started=0.0, expires_at=0.0, lease_s=1, description=description)
+    return ledger
+
+
+def _seed(igd: FakeIGD, couple, **fields: str) -> None:
+    with igd.lock:
+        igd.mappings[couple] = dict(fields)
+
+
+# A1 : le filet d'une fusion en échec ne présume aucun couple à nous.
+def test_p9f3_r1_a1_suspected_couples_are_verified_and_foreign_ones_left():
+    """Mutation : `suspect` qui retient les couples sous un bail courant (`OURS`)."""
+    with FakeIGD() as igd:
+        ledger = upnp.Ledger(clock=lambda: 0.0)
+        ledger.suspect(_gateway(igd), PORTS, expires_at=0.0, description="d")
+        assert all(ledger.state(lease) == upnp.MAYBE_THIRD_PARTY for lease in ledger.entries())
+        for couple in PORTS:
+            _seed(igd, couple, NewInternalClient="10.9.9.9", NewInternalPort=str(couple[0]),
+                  NewPortMappingDescription="other")
+        released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(5))
+        assert sorted(released.foreign) == sorted(PORTS) and released.failed == []
+        assert igd.actions("DeletePortMapping") == []
+        assert set(igd.mappings) == set(PORTS)
+
+
+def test_p9f3_r1_a1_suspect_keeps_an_entry_already_recorded():
+    """Mutation : `suspect` qui écrase une entrée `OURS` déjà retenue."""
+    with FakeIGD() as igd:
+        gateway = _gateway(igd)
+        ledger = upnp.Ledger(clock=lambda: 0.0)
+        ledger.retain(gateway, PORTS[:1], started=0.0, expires_at=0.0, lease_s=10, description="d")
+        ledger.suspect(gateway, PORTS, expires_at=0.0, description="d")
+        states = {lease.couple: ledger.state(lease) for lease in ledger.entries()}
+        assert states[PORTS[0]] == upnp.OURS
+        assert all(states[c] == upnp.MAYBE_THIRD_PARTY for c in PORTS[1:])
+
+
+def test_p9f3_r1_a1_merge_failure_before_record_verifies_before_deleting(upnp_rig, igd, monkeypatch):
+    """Mutation : `_merge_failed` qui appelle `retain` — les retraits partent sans vérification,
+    et le couple repris par un autre appareil est supprimé."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+
+    def failing_record(*args, **kwargs):
+        raise RuntimeError("simulated")
+
+    monkeypatch.setattr(engine._ports_ledger, "record", failing_record)
+    opening = _click(engine)[0]
+    assert opening["status"] == "refused" and opening["failure"] == "unreadable"
+    assert set(_retained(engine)) == set(ports)
+    taken = ports[-1]
+    with igd.lock:
+        igd.mappings[taken]["NewInternalClient"] = "10.9.9.9"
+    seen = len(igd.actions("DeletePortMapping"))
+    assert engine.shutdown()
+    assert len(igd.actions("GetSpecificPortMappingEntry")) == 3
+    assert sorted(_deletes_after(igd, seen)) == sorted(ports[:-1])
+    assert set(igd.mappings) == {taken}
+
+
+# A2 : une description entourée de blancs reste reconnue après le bail.
+def test_p9f3_r1_a2_description_with_surrounding_blanks_is_still_ours():
+    """Mutation : comparer `lease.description` sans la normaliser comme la réponse."""
+    with FakeIGD() as igd:
+        ledger = _expired_ledger(igd, " PZ Duel ")
+        for couple in PORTS:
+            _seed(igd, couple, NewInternalClient="127.0.0.1", NewInternalPort=str(couple[0]),
+                  NewPortMappingDescription=" PZ Duel ")
+        released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(5))
+        assert released.foreign == [] and released.failed == []
+        assert igd.mappings == {}
+
+
+# A3 : une réponse sans les champs du propriétaire n'est pas un autre client.
+def test_p9f3_r1_a3_ownership_answer_without_fields_is_a_failure_not_foreign():
+    """Mutation : rendre `OTHER_OWNER` quand les champs du propriétaire manquent."""
+    with FakeIGD() as igd:
+        ledger = _expired_ledger(igd, "d")
+        for couple in PORTS:
+            _seed(igd, couple)
+        released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(5))
+        assert released.foreign == [] and sorted(released.failed) == sorted(PORTS)
+        assert igd.actions("DeletePortMapping") == []
+
+
+# A3 (revue 2) : des champs du propriétaire présents mais mal formés ne prouvent pas un tiers.
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"NewInternalClient": "not-an-ip", "NewInternalPort": "PORT", "NewPortMappingDescription": "d"},
+        {"NewInternalClient": "127.0.0.1", "NewInternalPort": "abc", "NewPortMappingDescription": "d"},
+        {"NewInternalClient": "127.0.0.1", "NewInternalPort": "0", "NewPortMappingDescription": "d"},
+    ],
+)
+def test_p9f3_r2_a3_malformed_ownership_answer_is_a_failure_not_foreign(fields):
+    """Mutation : accepter un client ou un port interne mal formé comme preuve d'un tiers."""
+    with FakeIGD() as igd:
+        ledger = _expired_ledger(igd, "d")
+        for couple in PORTS:
+            _seed(igd, couple, **{k: (str(couple[0]) if v == "PORT" else v) for k, v in fields.items()})
+        released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(5))
+        assert released.foreign == [] and sorted(released.failed) == sorted(PORTS)
+        assert igd.actions("DeletePortMapping") == []

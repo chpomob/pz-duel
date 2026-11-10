@@ -4,12 +4,19 @@ Double de la phase 3 (R9). Il n'adhère à aucun groupe multicast et n'émet que
 demandeur, sur `127.0.0.1` : le client UPnP le vise en lui passant `ssdp_target` à la place
 de `(SSDP_GROUP, SSDP_PORT)`.
 
-- SSDP : socket UDP liée à `127.0.0.1:0` ; une M-SEARCH reçue est notée dans `msearches`,
+- `host` : adresse de boucle locale où le faux IGD écoute en SSDP comme en HTTP (par défaut
+  `127.0.0.1`) ; deux box différentes sont deux hôtes, `127.0.0.2` pour la seconde (P9F3).
+- `extra_descriptions` : `{chemin de description: chemin de contrôle}` publiés en plus de
+  `/desc.xml` par la même box ; la réponse SSDP est alors envoyée une fois par description, avec
+  sa propre `LOCATION` (une box qui publie deux descriptions IGD, P9F3).
+- SSDP : socket UDP liée à `<host>:0` ; une M-SEARCH reçue est notée dans `msearches`,
   et la réponse unicast porte `LOCATION: http://<location_host>:<http_port>/desc.xml`
   (`location_host` vaut `127.0.0.1` ; `127.0.0.2` ou un nom pour AC4 ; `location` remplace
   l'URL entière). `ssdp_reply=False` ne répond pas (aucune passerelle). `ssdp_st` remplace le
   `ST` de la réponse (par défaut, celui de la demande) ; `ssdp_before` liste des réponses brutes
-  envoyées, dans l'ordre, avant la sienne, depuis la même socket : d'autres répondeurs (P9F1, C4).
+  envoyées, dans l'ordre, avant la sienne, depuis la même socket : d'autres répondeurs (P9F1, C4) ;
+  un élément `FakeIGD` y fait répondre cet autre faux IGD depuis sa propre socket, donc son
+  propre hôte (P9F3).
   `ssdp_flood` liste des réponses brutes renvoyées en boucle au demandeur, après la sienne,
   pendant `ssdp_flood_s` secondes : un flux continu de paquets à ignorer (P9F2).
 - `device_type` : type du périphérique racine de la description (par défaut l'IGD) ;
@@ -20,7 +27,8 @@ de `(SSDP_GROUP, SSDP_PORT)`.
   `None` (aucun service compatible) ; `description="malformed"` rend un XML cassé,
   `description="oversized"` un XML valide de `oversize_bytes` octets (par défaut
   `upnp.max_response_bytes + 1` de `service/runtime.json`). `POST` sur `control_path` traite
-  `DeletePortMapping`, `AddPortMapping`, `GetExternalIPAddress`.
+  `DeletePortMapping`, `AddPortMapping`, `GetExternalIPAddress`, et
+  `GetSpecificPortMappingEntry` (le mapping tel que le tableau le tient, ou 714).
 - Chaque appel SOAP est noté dans `calls` (`order` global à partir de 1, `index` dans son
   action à partir de 1, `action`, `args`, `at` l'heure murale `time.time()` de réception)
   **avant** toute décision : un appel muet est donc
@@ -61,7 +69,9 @@ SERVICE_PREFIX = "urn:schemas-upnp-org:service:"
 SOAP_ENV = "http://schemas.xmlsoap.org/soap/envelope/"
 DESC_PATH = "/desc.xml"
 CONTROL_PATH = "/ctl/wan"
-ACTIONS = ("DeletePortMapping", "AddPortMapping", "GetExternalIPAddress")
+ACTIONS = ("DeletePortMapping", "AddPortMapping", "GetExternalIPAddress", "GetSpecificPortMappingEntry")
+# Champs rendus par `GetSpecificPortMappingEntry`, pris dans les arguments de l'ajout.
+ENTRY_FIELDS = ("NewInternalPort", "NewInternalClient", "NewEnabled", "NewPortMappingDescription", "NewLeaseDuration")
 ERROR_TEXTS = {
     401: "Invalid Action",
     402: "Invalid Args",
@@ -133,6 +143,8 @@ class FakeIGD:
         control_url: str | None = None,
         device_type: str = IGD_TYPE,
         wan_in_root: bool = False,
+        host: str = LOOPBACK,
+        extra_descriptions: dict[str, str] | None = None,
         **rules: Any,
     ) -> None:
         if description not in ("ok", "malformed", "oversized"):
@@ -140,7 +152,9 @@ class FakeIGD:
         self.service_type = service_type
         self.description = description
         self.oversize_bytes = oversize_bytes
-        self.location_host = location_host
+        self.host = host
+        self.location_host = host if location_host == LOOPBACK else location_host
+        self.extra_descriptions = dict(extra_descriptions or {})
         self._location = location
         self.control_path = control_path
         self.control_url = control_url if control_url is not None else control_path
@@ -170,10 +184,10 @@ class FakeIGD:
         class Handler(_Handler):
             owner = igd
 
-        self._http = ThreadingHTTPServer((LOOPBACK, 0), Handler)
+        self._http = ThreadingHTTPServer((self.host, 0), Handler)
         self._http.daemon_threads = True
         self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._udp.bind((LOOPBACK, 0))
+        self._udp.bind((self.host, 0))
         self._udp.settimeout(POLL_S)
         for name, target in (("fake-igd-http", self._serve_http), ("fake-igd-ssdp", self._serve_ssdp)):
             thread = threading.Thread(target=target, name=name, daemon=True)
@@ -232,7 +246,7 @@ class FakeIGD:
     @property
     def ssdp_target(self) -> tuple[str, int]:
         assert self._udp is not None, "FakeIGD non démarré"
-        return (LOOPBACK, self._udp.getsockname()[1])
+        return (self.host, self._udp.getsockname()[1])
 
     @property
     def location(self) -> str:
@@ -255,13 +269,13 @@ class FakeIGD:
 
     # --- SSDP -------------------------------------------------------------------
 
-    def ssdp_answer(self, st: str = IGD_TYPE) -> bytes:
+    def ssdp_answer(self, st: str = IGD_TYPE, location: str | None = None) -> bytes:
         """Réponse SSDP de ce faux IGD ; à glisser dans `ssdp_before` d'un autre (C4)."""
         return (
             "HTTP/1.1 200 OK\r\n"
             "CACHE-CONTROL: max-age=120\r\n"
             "EXT:\r\n"
-            f"LOCATION: {self.location}\r\n"
+            f"LOCATION: {location or self.location}\r\n"
             "SERVER: FakeIGD/1.0 UPnP/1.1\r\n"
             f"ST: {st}\r\n"
             f"USN: uuid:fake-igd::{st}\r\n"
@@ -295,12 +309,19 @@ class FakeIGD:
                 flood, flood_s = list(self.rules.ssdp_flood), self.rules.ssdp_flood_s
             try:
                 for other in before:
-                    sock.sendto(other, peer)
+                    if isinstance(other, FakeIGD):
+                        assert other._udp is not None, "FakeIGD non démarré"
+                        other._udp.sendto(other.ssdp_answer(st), peer)
+                    else:
+                        sock.sendto(other, peer)
             except OSError:
                 return
             if reply:
                 try:
                     sock.sendto(self.ssdp_answer(st), peer)
+                    for path in self.extra_descriptions:
+                        location = f"http://{self.location_host}:{self.http_port}{path}"
+                        sock.sendto(self.ssdp_answer(st, location), peer)
                 except OSError:
                     return
             if flood and flood_s > 0:
@@ -329,7 +350,8 @@ class FakeIGD:
         assert self._http is not None
         self._http.serve_forever(poll_interval=POLL_S)
 
-    def description_body(self) -> bytes:
+    def description_body(self, path: str = DESC_PATH) -> bytes:
+        control_url = self.extra_descriptions.get(path, self.control_url)
         if self.description == "malformed":
             return b'<?xml version="1.0"?><root><device><serviceList><service>'
         services = (
@@ -344,7 +366,7 @@ class FakeIGD:
                 "<service>"
                 f"<serviceType>{SERVICE_PREFIX}{self.service_type}</serviceType>"
                 "<serviceId>urn:upnp-org:serviceId:WANConn1</serviceId>"
-                f"<controlURL>{self.control_url}</controlURL>"
+                f"<controlURL>{control_url}</controlURL>"
                 "<eventSubURL>/evt/wan</eventSubURL><SCPDURL>/wan.xml</SCPDURL></service>"
             )
         elif self.service_type is not None:
@@ -353,7 +375,7 @@ class FakeIGD:
                 "<serviceList><service>"
                 f"<serviceType>{SERVICE_PREFIX}{self.service_type}</serviceType>"
                 "<serviceId>urn:upnp-org:serviceId:WANConn1</serviceId>"
-                f"<controlURL>{self.control_url}</controlURL>"
+                f"<controlURL>{control_url}</controlURL>"
                 "<eventSubURL>/evt/wan</eventSubURL><SCPDURL>/wan.xml</SCPDURL>"
                 "</service></serviceList></device>"
             )
@@ -393,7 +415,10 @@ class FakeIGD:
             return call, snapshot, self._wake
 
     def _apply(self, call: Call) -> int | None:
-        """Applique l'appel au tableau ; rend un code d'erreur UPnP ou `None`."""
+        """Applique l'appel au tableau ; rend un code d'erreur UPnP ou `None`.
+
+        `GetSpecificPortMappingEntry` ne change rien : il rend 714 pour un couple absent.
+        """
         args = call.args
         try:
             key = (int(args.get("NewExternalPort", "")), args.get("NewProtocol", ""))
@@ -410,7 +435,19 @@ class FakeIGD:
                 if key not in self.mappings and self.rules.strict_deletes:
                     return 714
                 self.mappings.pop(key, None)
+            elif call.action == "GetSpecificPortMappingEntry":
+                if key is None:
+                    return 402
+                if key not in self.mappings:
+                    return 714
         return None
+
+    @staticmethod
+    def _key(call: Call) -> tuple[int, str] | None:
+        try:
+            return (int(call.args.get("NewExternalPort", "")), call.args.get("NewProtocol", ""))
+        except ValueError:
+            return None
 
     def _answer(self, call: Call, rules: _Rules) -> tuple[int, bytes]:
         error = rules.errors.get((call.action, call.index), rules.errors.get(call.action))
@@ -428,6 +465,10 @@ class FakeIGD:
         out = ""
         if call.action == "GetExternalIPAddress":
             out = f"<NewExternalIPAddress>{rules.external_ip}</NewExternalIPAddress>"
+        elif call.action == "GetSpecificPortMappingEntry":
+            with self.lock:
+                entry = dict(self.mappings.get(self._key(call) or (0, ""), {}))
+            out = "".join(f"<{name}>{entry.get(name, '')}</{name}>" for name in ENTRY_FIELDS)
         stype = SERVICE_PREFIX + (self.service_type or "WANIPConnection:1")
         return 200, _envelope(f'<u:{call.action}Response xmlns:u="{stype}">{out}</u:{call.action}Response>')
 
@@ -490,17 +531,19 @@ class _Handler(BaseHTTPRequestHandler):
         with igd.lock:
             igd.fetches.append(self.path)
             delay_s = igd.rules.delay_s
-        if self.path != DESC_PATH:
+        if self.path != DESC_PATH and self.path not in igd.extra_descriptions:
             self._send(404, b"")
             return
         if self._delay(delay_s):
-            self._send(200, igd.description_body())
+            # `/desc.xml` sans argument : un test peut remplacer `description_body` par un appel sans paramètre.
+            body = igd.description_body() if self.path == DESC_PATH else igd.description_body(self.path)
+            self._send(200, body)
 
     def do_POST(self) -> None:  # noqa: N802 - nom imposé par http.server
         igd = self.owner
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(min(max(length, 0), MAX_SOAP_BODY))
-        if self.path != igd.control_path:
+        if self.path != igd.control_path and self.path not in igd.extra_descriptions.values():
             self._send(404, b"")
             return
         action, args = _parse_soap(self.headers.get("SOAPAction", ""), body)

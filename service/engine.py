@@ -1630,11 +1630,6 @@ class RealMatch:
             self._journal = None
 
 
-def _box(gateway: upnp.Gateway) -> tuple[str, int, str]:
-    """Identité d'une box : hôte, port et chemin de contrôle (le service n'y change rien)."""
-    return (gateway.host, gateway.port, gateway.control_path)
-
-
 class Engine:
     """Un duel à la fois. `clock` rend l'heure murale en secondes, `monotonic` cadence le match."""
 
@@ -1714,26 +1709,20 @@ class Engine:
         self._ports_cancel = threading.Event()
         # Section `upnp` lue au clic qui a lancé la dernière ouverture : l'arrêt la reprend.
         self._ports_cfg: dict[str, Any] | None = None
-        # Un enregistrement par box ET par couple (port, protocole), fusionné d'une ouverture à
-        # l'autre (finding P1, C2) : la passerelle qui l'a posé et l'échéance de son bail (M1),
-        # borne conservatrice (voir `_merge_opening`). Une entrée échue n'est jamais supprimée :
-        # le couple a pu être repris par un tiers sur la box.
-        self._upnp_retained: dict[
-            tuple[tuple[str, int, str], tuple[int, str]], tuple[upnp.Gateway, float]
-        ] = {}
-        # Vrai dès que l'arrêt a pris sa copie des mappings retenus : une ouverture qui fusionne
-        # plus tard dépose ses mappings dans `_ports_handoff`, que l'arrêt retire lui-même avant
-        # de rendre la main (C1, P9F2).
+        # Suivi de vie des mappings posés (P9F3) : `upnp.Ledger` en est l'unique propriétaire —
+        # box, couple, échéance sur l'horloge monotone, état « à nous / peut-être à un tiers »,
+        # proposition encore valable, retrait de l'arrêt. Le moteur ne fait que lui passer les
+        # résultats et lui demander la vue et le retrait.
+        self._ports_ledger = upnp.Ledger(self._monotonic)
+        # Vrai dès que l'arrêt a commencé son retrait : une ouverture qui fusionne plus tard
+        # dépose ses mappings dans le registre, que l'arrêt vide une seconde fois avant de rendre
+        # la main (C1, P9F2).
         self._ports_released = False
-        self._ports_handoff: list[tuple[upnp.Gateway, tuple[int, str], float]] = []
         # Les couples de l'ouverture en cours, du clic à la fusion de son résultat ; vide sinon.
         self._ports_pending: list[tuple[int, str]] = []
         # Vrai quand l'arrêt a rendu la main sans cette fusion, en nommant ses couples : plus rien
         # de cette ouverture n'est fusionné ensuite (C1, P9F2).
         self._ports_abandoned = False
-        # Échéance de la dernière proposition `mapped`, gardée quel que soit le résultat suivant :
-        # un nouvel essai en échec ne fait pas oublier qu'elle expire (C5, P9F2).
-        self._ports_proposal_expires: float | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -2032,18 +2021,18 @@ class Engine:
     def _ports_view(self) -> dict[str, Any]:
         """Copie de l'état d'ouverture ; le neutre nomme les ports et le bail avant le clic (R8).
 
-        Un `mapped` dont l'échéance est passée redevient la forme neutre, marquée `expired`,
-        sans l'adresse qu'il proposait (C5) : ni ports annoncés ouverts, ni pré-remplissage.
-        Quel que soit le dernier résultat (un nouvel essai en échec, une ouverture en cours), la
-        vue porte `expired` dès que la dernière proposition `mapped` est échue, pour que l'UI la
-        retire du champ (C5, P9F2).
+        Le registre (`upnp.Ledger`) dit si la dernière proposition `mapped` vaut encore, sur son
+        horloge monotone (P9F3) : échue, un `mapped` redevient la forme neutre, marquée `expired`,
+        sans l'adresse qu'il proposait (C5) ; quel que soit le dernier résultat (un nouvel essai
+        en échec, une ouverture en cours), la vue porte `expired`, pour que l'UI la retire du
+        champ (C5, P9F2). `expires_at` (heure murale) n'est que l'heure affichée.
         """
         view = copy.deepcopy(self._ports_opening)
-        now = self._clock()
-        if view["status"] == upnp.MAPPED and now >= view["expires_at"]:
-            view = {"status": PORTS_IDLE, "expired": True}
-        elif self._ports_proposal_expires is not None and now >= self._ports_proposal_expires:
-            view["expired"] = True
+        if self._ports_ledger.proposal() == upnp.PROPOSAL_EXPIRED:
+            if view["status"] == upnp.MAPPED:
+                view = {"status": PORTS_IDLE, "expired": True}
+            else:
+                view["expired"] = True
         if view["status"] in (PORTS_IDLE, PORTS_IN_PROGRESS):
             cfg = self.runtime.get("upnp")
             view.setdefault("ports", [{"port": p, "protocol": t} for p, t in self._upnp_ports()])
@@ -2074,7 +2063,7 @@ class Engine:
             self._ports_cfg = dict(cfg)
             self._ports_opening = {"status": PORTS_IN_PROGRESS}
             self._ports_pending = list(ports)
-            click = self._clock()
+            click = (self._clock(), self._ports_ledger.clock())
             self.state.log("port opening requested")
             self._ports_thread = threading.Thread(
                 target=self._run_opening,
@@ -2085,8 +2074,16 @@ class Engine:
             self._ports_thread.start()
         return True, "opening ports"
 
-    def _run_opening(self, cfg: dict, ports: list[tuple[int, str]], click: float) -> None:
-        """Corps du fil `ports-open` : le réseau hors du verrou, la fusion sous le verrou."""
+    def _run_opening(
+        self, cfg: dict, ports: list[tuple[int, str]], click: tuple[float, float]
+    ) -> None:
+        """Corps du fil `ports-open` : le réseau hors du verrou, la fusion sous le verrou.
+
+        `click` porte l'heure murale (affichée) et l'heure du registre (décisions) du clic. Une
+        fusion qui lève ne laisse ni l'ouverture bloquée en `in_progress` ni ses mappings oubliés
+        (revue I3) : `_merge_failed` retient tous ses couples, à vérifier avant tout retrait, et
+        publie un statut terminal.
+        """
         try:
             result, gateway, cleared = upnp.open_ports(
                 cfg, ports, self._upnp_target, self._ports_cancel
@@ -2101,110 +2098,130 @@ class Engine:
             }
             gateway, cleared = None, []
         with self.lock:
-            self._merge_opening(result, gateway, cleared, click + cfg["lease_s"])
+            try:
+                self._merge_opening(result, gateway, cleared, cfg, click)
+            except Exception as exc:  # noqa: BLE001 - dernier filet : jamais d'ouverture bloquée
+                LOGGER.warning("port opening result could not be merged (%s)", type(exc).__name__)
+                self._merge_failed(ports, gateway, cfg, click)
+
+    def _lease_terms(self, cfg: dict, click: tuple[float, float]) -> dict[str, Any]:
+        wall, started = click
+        return {
+            "started": started,
+            "expires_at": wall + cfg["lease_s"],
+            "lease_s": cfg["lease_s"],
+            "description": cfg["description"],
+        }
 
     def _merge_opening(
         self,
         result: dict,
         gateway: upnp.Gateway | None,
         cleared: Sequence[tuple[int, str]],
-        expires_at: float,
+        cfg: dict,
+        click: tuple[float, float],
     ) -> None:
-        """Publie le résultat et fusionne les mappings retenus, sans jamais les remplacer (P1).
+        """Publie le résultat et le confie au registre des mappings (P9F3).
 
         Appelé sous `self.lock`. Le journal d'état ne reçoit que le statut, jamais l'adresse (R5).
-        Si l'arrêt a déjà pris sa copie, les couples actifs vont dans `_ports_handoff`, que l'arrêt
-        retire lui-même ; s'il a déjà rendu la main en abandonnant cette ouverture (couples
-        nommés), rien n'est fusionné (C1, P9F2).
+        Le registre est servi en premier : quoi qu'il arrive ensuite, les mappings actifs sont
+        retenus. S'il a déjà commencé son retrait, l'arrêt le videra une seconde fois ; s'il a déjà
+        rendu la main en abandonnant cette ouverture (couples nommés), rien n'est fusionné (C1).
 
         `expires_at` vaut heure du clic + `lease_s` : une borne conservatrice (C6), jamais
         postérieure à l'expiration réelle d'un mapping, puisque chaque bail ne commence qu'à son
-        `AddPortMapping`, après la découverte et les requêtes précédentes. C'est l'heure affichée,
-        et celle après laquelle l'arrêt ne supprime plus ce mapping (M1).
+        `AddPortMapping`, après la découverte et les requêtes précédentes. C'est l'heure affichée ;
+        les décisions, elles, se prennent sur l'horloge monotone du registre.
         """
         if self._ports_abandoned:
             return
+        terms = self._lease_terms(cfg, click)
+        self._ports_ledger.record(result, gateway, cleared, **terms)
         self._ports_pending = []
         status = result.get("status")
         view = dict(result)
         if status == upnp.MAPPED:
-            view["expires_at"] = expires_at
-            self._ports_proposal_expires = expires_at
+            view["expires_at"] = terms["expires_at"]
         self._ports_opening = view
-        if gateway is not None:
-            box = _box(gateway)
-            for couple in cleared:
-                self._upnp_retained.pop((box, tuple(couple)), None)
-            if status == upnp.MAPPED:
-                active = result.get("ports", [])
-            elif status == upnp.REFUSED:
-                active = result.get("still_active", [])
-            else:
-                active = []
-            for item in active:
-                couple = (item["port"], item["protocol"])
-                if self._ports_released:
-                    self._ports_handoff.append((gateway, couple, expires_at))
-                else:
-                    self._upnp_retained[(box, couple)] = (gateway, expires_at)
         level = "info" if status == upnp.MAPPED else "warn"
         self.state.log(f"port opening: {status}", level)
 
-    def _report_release(self, failed: Sequence[tuple[int, str]]) -> None:
+    def _merge_failed(
+        self,
+        ports: list[tuple[int, str]],
+        gateway: upnp.Gateway | None,
+        cfg: dict,
+        click: tuple[float, float],
+    ) -> None:
+        """Filet d'une fusion en échec (revue I3), sous `self.lock`, sans rien qui puisse lever.
+
+        Avec une box, les trois couples sont retenus comme possiblement posés, et le statut
+        terminal est un `refused` illisible qui les nomme ; sans box, `no_gateway`. L'issue réelle
+        de l'ouverture étant inconnue, ces couples ne sont jamais présumés à nous (revue P9F3 A1) :
+        `Ledger.suspect` les fait vérifier auprès de la box avant toute suppression à l'arrêt, et
+        laisse intacts ceux qu'une fusion partielle a déjà retenus.
+        """
+        if self._ports_abandoned:
+            return
+        self._ports_pending = []
+        dicts = [{"port": p, "protocol": t} for p, t in ports]
+        if gateway is not None:
+            terms = self._lease_terms(cfg, click)
+            self._ports_ledger.suspect(
+                gateway, ports, expires_at=terms["expires_at"], description=terms["description"]
+            )
+            self._ports_opening = {
+                "status": upnp.REFUSED,
+                "failure": upnp.UNREADABLE,
+                "ports": dicts,
+                "still_active": list(dicts),
+                "manual": upnp.manual_instruction(ports),
+            }
+        else:
+            self._ports_opening = {
+                "status": upnp.NO_GATEWAY,
+                "reason": upnp.UNREADABLE,
+                "ports": dicts,
+                "manual": upnp.manual_instruction(ports),
+            }
+
+    def _report_release(self, released: upnp.Released) -> None:
         """Consigne l'issue d'un retrait : port et protocole seulement, jamais d'adresse (R6)."""
         with self.lock:
-            if failed:
-                named = ", ".join(f"{port}/{protocol}" for port, protocol in failed)
+            if released.foreign:
+                named = ", ".join(f"{port}/{protocol}" for port, protocol in released.foreign)
+                message = (
+                    f"port mappings left in place at shutdown: {named} "
+                    "now belong to another device on the network"
+                )
+                LOGGER.info(message)
+                self.state.log(message)
+            if released.failed:
+                named = ", ".join(f"{port}/{protocol}" for port, protocol in released.failed)
                 message = f"could not remove port mappings at shutdown: {named}"
                 LOGGER.warning(message)
                 self.state.log(message, "warn")
-            else:
+            elif not released.foreign:
                 self.state.log("port mappings removed")
 
-    def _remove(
-        self, entries: Sequence[tuple[upnp.Gateway, tuple[int, str], float]], cfg: dict
-    ) -> list[tuple[int, str]]:
-        """Une tentative par entrée encore sous bail ; rend les couples dont le retrait a échoué.
-
-        L'échéance de chaque entrée est relue **immédiatement avant** sa tentative (M1, P9F2) :
-        une entrée échue pendant les suppressions précédentes n'est pas supprimée, son couple a
-        pu être repris par un tiers. Les entrées retirées ou échues quittent `_upnp_retained`.
-        """
-        groups: dict[tuple[str, int, str], tuple[upnp.Gateway, dict[tuple[int, str], float]]] = {}
-        for gateway, couple, expires_at in entries:
-            groups.setdefault(_box(gateway), (gateway, {}))[1][couple] = expires_at
-        failed: list[tuple[int, str]] = []
-        for box, (gateway, expiries) in groups.items():
-            missed = upnp.delete_mappings(
-                gateway,
-                list(expiries),
-                cfg["request_timeout_s"],
-                max_bytes=cfg["max_response_bytes"],
-                alive=lambda couple, expiries=expiries: self._clock() < expiries[couple],
-            )
-            failed.extend(missed)
-            with self.lock:
-                for couple in expiries:
-                    if couple not in missed:
-                        self._upnp_retained.pop((box, couple), None)
-        return failed
-
     def _release_ports(self) -> None:
-        """Arrêt (R6) : arrête l'ouverture en cours, puis retire chaque mapping retenu, une fois.
+        """Arrêt (R6) : arrête l'ouverture en cours, puis fait retirer par le registre ce qu'il retient.
 
-        Ni découverte ni description : la passerelle est celle gardée de l'ouverture. Une
-        suppression sans réponse n'empêche pas les suivantes (finding P2). Rien n'est envoyé
-        quand aucun mapping n'est retenu (AC24), ni pour un mapping dont le bail est échu au
-        moment de sa tentative (M1). Les échecs ne nomment que port et protocole.
+        Ni découverte ni description : le registre joint chaque box par la passerelle gardée de
+        son ouverture, et décide seul, mapping par mapping, s'il supprime directement (à nous) ou
+        s'il vérifie d'abord (peut-être à un tiers). Rien n'est envoyé quand rien n'est retenu
+        (AC24). Toutes les requêtes du retrait, toutes box et les deux passes confondues, tiennent
+        dans `MAPPING_COUNT` délais de requête (R6, revue A4/I4) : le temps passé à attendre le
+        fil d'ouverture n'en est pas décompté. Les échecs ne nomment que port et protocole.
 
         C1 (P9F2) : l'arrêt ne rend pas la main avant d'avoir retiré ce que l'ouverture en cours a
-        posé, ou d'avoir abandonné cette ouverture en nommant ses couples. Après la décision de
-        retrait (`_ports_released`), une fusion ne touche plus `_upnp_retained` : elle dépose ses
-        mappings dans `_ports_handoff`, que cet arrêt retire lui-même. Une ouverture qui n'a pas
-        fusionné après la seconde attente est abandonnée sous le verrou (`_ports_abandoned`) : ce
-        qu'elle rendra ensuite n'est plus fusionné, et ses couples sont nommés comme possiblement
-        encore ouverts jusqu'à la fin de leur bail. Les attentes sont bornées : la découverte et
-        une requête, puis une requête encore en vol.
+        posé, ou d'avoir abandonné cette ouverture en nommant ses couples. Une fusion qui arrive
+        après le premier retrait dépose ses mappings dans le registre, que la seconde passe vide.
+        Une ouverture qui n'a pas fusionné après la seconde attente est abandonnée sous le verrou
+        (`_ports_abandoned`) : ce qu'elle rendra ensuite n'est plus fusionné, et ses couples sont
+        nommés comme possiblement encore ouverts. Attentes bornées : la découverte et une requête,
+        puis une requête encore en vol. Pire cas : `discovery_timeout_s` + (`MAPPING_COUNT` + 2)
+        × `request_timeout_s`.
         """
         self._ports_cancel.set()
         with self.lock:
@@ -2215,35 +2232,27 @@ class Engine:
             thread.join(cfg["discovery_timeout_s"] + cfg["request_timeout_s"])
         with self.lock:
             self._ports_released = True
-            now = self._clock()
-            retained = [
-                (gateway, couple, expires_at)
-                for (_, couple), (gateway, expires_at) in self._upnp_retained.items()
-                if now < expires_at
-            ]
-            for key, (_, expires_at) in list(self._upnp_retained.items()):
-                if now >= expires_at:
-                    del self._upnp_retained[key]
             pending = bool(self._ports_pending)
         if cfg is None:
             return
-        attempted = bool(retained)
-        failed = self._remove(retained, cfg) if retained else []
+        timeout_s, max_bytes = cfg["request_timeout_s"], cfg["max_response_bytes"]
+        deadline = upnp.deadline_in(upnp.MAPPING_COUNT * timeout_s)
+        released = self._ports_ledger.release(timeout_s, max_bytes, deadline)
         if pending and thread is not None:
             LOGGER.warning("port opening still running at shutdown")
-            # Une requête encore en vol, puis la fusion sous le verrou.
-            thread.join(cfg["request_timeout_s"])
+            # Une requête encore en vol, puis la fusion sous le verrou ; cette attente ne mange
+            # pas le budget des suppressions.
+            waited = time.monotonic()
+            thread.join(timeout_s)
+            deadline += time.monotonic() - waited
         with self.lock:
-            handoff, self._ports_handoff = self._ports_handoff, []
             abandoned = list(self._ports_pending)
             if abandoned:
                 self._ports_abandoned = True
                 self._ports_pending = []
-        if handoff:
-            attempted = True
-            failed.extend(self._remove(handoff, cfg))
-        if attempted:
-            self._report_release(failed)
+        released.extend(self._ports_ledger.release(timeout_s, max_bytes, deadline))
+        if released.tried:
+            self._report_release(released)
         if abandoned:
             named = ", ".join(f"{port}/{protocol}" for port, protocol in abandoned)
             message = (

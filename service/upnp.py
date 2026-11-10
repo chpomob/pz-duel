@@ -41,9 +41,17 @@ Ouverture (`open_ports`, R3) : pour chacun des trois couples passés par l'appel
 `DeletePortMapping` (toute erreur UPnP ignorée) puis `AddPortMapping`, puis
 `GetExternalIPAddress`. La première requête dont le délai expire arrête l'ouverture ; le
 retrait (`_rollback`) qui suit fait au plus une suppression par mapping possiblement posé et
-s'arrête lui aussi à la première expiration. Le retrait de l'arrêt (`delete_mappings`, R6),
-lui, tente chaque mapping retenu une fois, quoi qu'il soit arrivé aux précédents : les deux
-chemins ne partagent aucun drapeau.
+s'arrête lui aussi à la première expiration.
+
+Suivi de vie (P9F3) : `Ledger` est l'unique propriétaire des mappings retenus — une entrée par
+box (`Gateway.box`, l'hôte qui a répondu : deux descriptions d'une même box sont une seule box)
+et par couple, avec son échéance sur une horloge monotone et son état « à nous » (bail en cours)
+ou « peut-être à un tiers » (bail échu). La vue (proposition encore valable) et le retrait de
+l'arrêt (R6) se décident par lui. Ce retrait tente chaque mapping retenu une fois, quoi qu'il soit
+arrivé aux précédents, sous une échéance unique : supprimé directement s'il est à nous ; s'il est
+peut-être à un tiers, supprimé seulement si la box (`GetSpecificPortMappingEntry`) le rend encore
+pointé vers nous avec notre description — une box qui ignore le bail ne garde donc pas le mapping
+pour toujours, et un couple repris par un tiers n'est pas touché.
 
 L'adresse publique lue n'est placée que dans le résultat rendu ; ce module ne la consigne
 jamais (R5).
@@ -166,6 +174,15 @@ class Gateway:
     port: int
     control_path: str
     service_type: str
+
+    @property
+    def box(self) -> str:
+        """Identité stable de la box : l'hôte qui a répondu (P9F3).
+
+        Le port et le chemin de contrôle ne disent que par où la joindre : une même box qui
+        publie deux descriptions (IGD:1 et IGD:2, deux appareils racine) reste une seule box.
+        """
+        return self.host
 
 
 @dataclass
@@ -301,7 +318,10 @@ def _same_host(location: str, responder_ip: str) -> tuple[str, int, str] | None:
         responder = _ip_literal(responder_ip)
         if host is None or responder is None or host != responder:
             return None
-        port = parts.port or http.client.HTTP_PORT
+        # Un port explicite à 0 n'est pas « absent » : il rend l'URL inutilisable (revue I6).
+        port = http.client.HTTP_PORT if parts.port is None else parts.port
+        if port not in PORT_RANGE:
+            return None
         path = parts.path or "/"
         if parts.query:
             path = f"{path}?{parts.query}"
@@ -530,6 +550,12 @@ def _no_gateway(reason: str) -> tuple[None, dict]:
     return None, {"status": NO_GATEWAY, "reason": reason}
 
 
+def _box_of(responder_ip: str) -> str:
+    """La box d'un répondeur SSDP : son adresse IP canonique, celle que portera `Gateway.box`."""
+    ip = _ip_literal(responder_ip)
+    return responder_ip if ip is None else str(ip)
+
+
 def _candidate(
     responder_ip: str, location: str, timeout_s: float, max_bytes: int
 ) -> tuple[Gateway | None, str]:
@@ -575,9 +601,10 @@ def _collect(
 def _select(
     gateways: list[Gateway], cfg: dict, budget_end: float, cancel: threading.Event | None
 ) -> tuple[Gateway | None, dict | None]:
-    """Choisit entre plusieurs passerelles validées, avant toute écriture (P9F2, C3/C4).
+    """Choisit entre plusieurs box validées, avant toute écriture (P9F2, C3/C4).
 
-    Règle : l'adresse externe de chacune est lue (lecture seule) ; est retenue l'unique
+    `gateways` porte une passerelle par box (`Gateway.box`, P9F3) : seules des box réellement
+    différentes, jamais deux descriptions d'une même box, sont départagées ici. Règle : l'adresse externe de chacune est lue (lecture seule) ; est retenue l'unique
     passerelle dont l'adresse est publique, si celle de chacune des autres a été lue — IPv4
     pointée valide — et n'est pas publique. Une adresse absente, vide ou mal formée n'est pas lue. Sinon l'ambiguïté n'est pas résolue : `no_gateway` (`ambiguous_gateway`).
     Les adresses lues ne sont ni rendues ni consignées (R5).
@@ -631,10 +658,14 @@ def find_gateway(
         budget_end = window_end + cfg["request_timeout_s"]
         found = _collect(target, cfg, window_end, cancel)
         reason = "no_reply"
-        gateways: list[Gateway] = []
+        # Une passerelle par box (P9F3) : une fois une description d'un hôte validée, les autres
+        # descriptions du même hôte ne sont ni lues ni comptées comme une seconde passerelle.
+        gateways: dict[str, Gateway] = {}
         for responder_ip, location in found:
             if _stopped(cancel):
                 return _no_gateway(CANCELLED)
+            if _box_of(responder_ip) in gateways:
+                continue
             remaining = budget_end - time.monotonic()
             if remaining <= 0:
                 if gateways:
@@ -643,15 +674,15 @@ def find_gateway(
             gateway, reason = _candidate(
                 responder_ip, location, min(cfg["request_timeout_s"], remaining), cfg["max_response_bytes"]
             )
-            if gateway is not None and gateway not in gateways:
-                gateways.append(gateway)
+            if gateway is not None:
+                gateways.setdefault(gateway.box, gateway)
         if _stopped(cancel):
             return _no_gateway(CANCELLED)
         if not gateways:
             return _no_gateway(reason)
         if len(gateways) == 1:
-            return gateways[0], None
-        return _select(gateways, cfg, budget_end, cancel)
+            return next(iter(gateways.values())), None
+        return _select(list(gateways.values()), cfg, budget_end, cancel)
     except (*PARSE_ERRORS, TypeError) as exc:
         return _no_gateway(type(exc).__name__)
 
@@ -797,6 +828,8 @@ class Answer:
     code: int | None = None
     text: str = ""
     values: dict[str, str] = field(default_factory=dict)
+    # Adresse locale de la socket de la requête : celle que la box voit comme client (P9F3).
+    local: str | None = None
 
     @property
     def gone(self) -> bool:
@@ -859,7 +892,9 @@ def _soap(gateway: Gateway, action: str, args: Args, timeout_s: float, max_bytes
             max_bytes,
             headers,
         )
-        return _read_answer(action, reply)
+        answer = _read_answer(action, reply)
+        answer.local = reply.local_address
+        return answer
     except (*PARSE_ERRORS, TypeError) as exc:
         log.info("upnp: %s failed (%s)", action, type(exc).__name__)
         return Answer(UNREADABLE)
@@ -1039,16 +1074,287 @@ def open_ports(
     return result, gateway, cleared
 
 
-# --- arrêt -----------------------------------------------------------------------------
+# --- suivi de vie des mappings (P9F3) ----------------------------------------------------
+#
+# `Ledger` est le seul propriétaire du suivi de vie d'un mapping posé par le service : ce qui est
+# retenu, sur quelle box, jusqu'à quand il est sûrement à nous, ce que la vue peut encore
+# proposer, et comment il est retiré à l'arrêt. Le moteur ne recopie aucune de ces conditions :
+# il lui passe le résultat d'une ouverture, puis lui demande la vue et le retrait.
+
+OURS = "ours"
+MAYBE_THIRD_PARTY = "maybe_third_party"
+PROPOSAL_NONE = "none"
+PROPOSAL_LIVE = "live"
+PROPOSAL_EXPIRED = "expired"
+# Issues de la vérification d'un mapping peut-être repris par un tiers.
+STILL_OURS = "still_ours"
+GONE = "gone"
+OTHER_OWNER = "other_owner"
 
 
-def _still_ours(alive: Callable[[Couple], bool] | None, couple: Couple) -> bool:
-    if alive is None:
-        return True
+@dataclass
+class Lease:
+    """Un mapping retenu : sa box, son couple, par où la joindre, et son échéance.
+
+    `deadline` (horloge monotone du registre) borne l'intervalle où le mapping est sûrement à
+    nous : heure du clic + `lease_s`, jamais postérieure à l'expiration réelle (C6), et insensible
+    aux sauts de l'heure murale (revue A2/I2). `expires_at` (heure murale) ne sert qu'à l'affichage.
+    `description` est celle posée par l'ajout : elle sert à reconnaître le mapping comme le nôtre.
+    """
+
+    box: str
+    couple: Couple
+    gateway: Gateway
+    deadline: float
+    expires_at: float
+    description: str
+
+
+@dataclass
+class Released:
+    """Issue d'un retrait : couples tentés, en échec, et laissés à un autre client de la box."""
+
+    tried: list[Couple] = field(default_factory=list)
+    failed: list[Couple] = field(default_factory=list)
+    foreign: list[Couple] = field(default_factory=list)
+
+    def extend(self, other: Released) -> None:
+        self.tried.extend(other.tried)
+        self.failed.extend(other.failed)
+        self.foreign.extend(other.foreign)
+
+
+def deadline_in(seconds: float) -> float:
+    """Échéance réseau (monotone, celle des requêtes de ce module) dans `seconds` secondes."""
+    return time.monotonic() + seconds
+
+
+def _is_address(value: str | None) -> bool:
     try:
-        return bool(alive(couple))
-    except Exception:  # noqa: BLE001 - sans preuve que le bail court, on ne supprime pas
+        ipaddress.ip_address(value or "")
+    except ValueError:
         return False
+    return True
+
+
+def _is_port(value: str | None) -> bool:
+    return bool(value) and value.isascii() and value.isdigit() and 0 < int(value) < 65536
+
+
+def _owner(gateway: Gateway, lease: Lease, timeout_s: float, max_bytes: int) -> str:
+    """Demande à la box à qui est le couple de `lease` : `STILL_OURS`, `GONE`, `OTHER_OWNER`,
+    ou l'échec de la requête (`timeout`, `unreadable`, `upnp_error`).
+
+    Lecture seule (`GetSpecificPortMappingEntry`). Le mapping est encore le nôtre si la box le
+    rend pointé sur l'adresse locale de cette requête (celle qu'elle voit pour nous, comme
+    `NewInternalClient` de l'ajout), au même port interne, avec notre description.
+    """
+    port, protocol = lease.couple
+    args = [("NewRemoteHost", ""), ("NewExternalPort", port), ("NewProtocol", protocol)]
+    answer = _soap(gateway, "GetSpecificPortMappingEntry", lambda _local: args, timeout_s, max_bytes)
+    if answer.failure == UPNP_ERROR and answer.code == NO_SUCH_ENTRY:
+        return GONE
+    if answer.failure is not None:
+        return answer.failure
+    values = answer.values
+    client = values.get("NewInternalClient")
+    internal = values.get("NewInternalPort")
+    description = values.get("NewPortMappingDescription")
+    # Une réponse qui ne nomme pas le propriétaire, ou le nomme mal (client qui n'est pas une
+    # adresse, port interne qui n'est pas un port), ne prouve pas un autre client : elle compte
+    # comme un échec, sans suppression (revue P9F3 A3).
+    if answer.local is None or not _is_address(client) or not _is_port(internal) or description is None:
+        return UNREADABLE
+    # `_read_answer` retire les blancs autour de chaque champ : la description retenue est
+    # comparée de même (revue P9F3 A2), sinon un mapping à nous passerait pour celui d'un tiers.
+    ours = (
+        client == answer.local
+        and internal == str(port)
+        and description == lease.description.strip()
+    )
+    return STILL_OURS if ours else OTHER_OWNER
+
+
+class Ledger:
+    """Registre des mappings posés par le service : l'unique primitive de leur suivi de vie.
+
+    Une entrée par box (`Gateway.box`, l'hôte de la passerelle) et par couple (port, protocole) :
+    une ouverture sur une autre box n'efface pas les mappings de la première (C2), et deux
+    descriptions d'une même box ne font qu'une box (P9F3). Chaque entrée est dans l'un de deux
+    états, lu sur l'horloge monotone `clock` :
+
+    - `OURS` : avant son échéance, le bail que nous avons demandé court encore ; la box ne peut
+      pas avoir rendu le couple à un tiers. L'arrêt le supprime directement ;
+    - `MAYBE_THIRD_PARTY` : passé l'échéance, deux cas sont indiscernables sans la box — elle a
+      honoré le bail et un tiers a pu reprendre le couple, ou elle l'a ignoré et le mapping est
+      toujours le nôtre, ouvert pour toujours. L'arrêt ne renonce pas : il demande à la box
+      (`GetSpecificPortMappingEntry`) et ne supprime que si elle le rend encore pointé vers nous
+      avec notre description ; absent, il n'y a rien à faire ; à un autre client, il est laissé ;
+      une réponse qui ne permet pas de trancher compte comme un échec, nommé, sans suppression.
+
+    `record` fusionne une ouverture, `proposal` dit si sa proposition `mapped` vaut encore, et
+    `release` retire tout ce qui est retenu sous une échéance réseau unique (R6). Sûr entre fils.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, Couple], Lease] = {}
+        self._proposal_deadline: float | None = None
+
+    # -- lecture -------------------------------------------------------------------------
+    def state(self, lease: Lease) -> str:
+        return OURS if self.clock() < lease.deadline else MAYBE_THIRD_PARTY
+
+    def entries(self) -> list[Lease]:
+        with self._lock:
+            return list(self._entries.values())
+
+    def proposal(self) -> str:
+        """`PROPOSAL_NONE` sans ouverture `mapped`, sinon si la dernière vaut encore."""
+        with self._lock:
+            deadline = self._proposal_deadline
+        if deadline is None:
+            return PROPOSAL_NONE
+        return PROPOSAL_LIVE if self.clock() < deadline else PROPOSAL_EXPIRED
+
+    # -- écriture ------------------------------------------------------------------------
+    def record(
+        self,
+        result: dict,
+        gateway: Gateway | None,
+        cleared: Iterable[Sequence[object]],
+        *,
+        started: float,
+        expires_at: float,
+        lease_s: float,
+        description: str,
+    ) -> None:
+        """Fusionne l'issue d'une ouverture ; ne remplace jamais une autre box (C2).
+
+        `started` est l'heure du clic sur `clock`, `expires_at` l'heure murale affichée. Les
+        couples dont l'ouverture a confirmé l'absence (`cleared`) quittent la box ; ceux encore
+        réputés actifs (`mapped` : les trois ; `refused` : `still_active`) y entrent. Un
+        résultat `mapped` devient la proposition courante, quel que soit le résultat suivant.
+        """
+        status = result.get("status")
+        deadline = started + lease_s
+        if status == MAPPED:
+            active = result.get("ports", [])
+        elif status == REFUSED:
+            active = result.get("still_active", [])
+        else:
+            active = []
+        couples: list[Couple] = []
+        for item in active if isinstance(active, list) else []:
+            if isinstance(item, dict):
+                couples.extend(_couples([(item.get("port"), item.get("protocol"))]) or [])
+        with self._lock:
+            if status == MAPPED:
+                self._proposal_deadline = deadline
+            if gateway is None:
+                return
+            for item in cleared:
+                for couple in _couples([item]) or []:
+                    self._entries.pop((gateway.box, couple), None)
+            for couple in couples:
+                if _couple_ok(couple):
+                    self._entries[(gateway.box, couple)] = Lease(
+                        gateway.box, couple, gateway, deadline, expires_at, description
+                    )
+
+    def retain(
+        self,
+        gateway: Gateway,
+        couples: Iterable[Sequence[object]],
+        *,
+        started: float,
+        expires_at: float,
+        lease_s: float,
+        description: str,
+    ) -> None:
+        """Retient `couples` comme possiblement posés sur `gateway` (filet d'une fusion en échec)."""
+        dicts = [{"port": c[0], "protocol": c[1]} for c in _couples(couples) or []]
+        self.record(
+            {"status": REFUSED, "still_active": dicts},
+            gateway,
+            [],
+            started=started,
+            expires_at=expires_at,
+            lease_s=lease_s,
+            description=description,
+        )
+
+    def suspect(
+        self,
+        gateway: Gateway,
+        couples: Iterable[Sequence[object]],
+        *,
+        expires_at: float,
+        description: str,
+    ) -> None:
+        """Retient `couples` comme peut-être posés sur `gateway`, sans jamais les présumer à nous.
+
+        Filet d'une fusion en échec (revue P9F3 A1) : l'issue réelle de l'ouverture est inconnue,
+        et un couple jamais touché peut appartenir à un autre appareil. Chaque couple entre donc
+        déjà échu (`MAYBE_THIRD_PARTY`) : l'arrêt demande à la box à qui il est avant de le
+        supprimer. Un couple déjà retenu (par exemple par un `record` passé avant l'échec) garde
+        son entrée.
+        """
+        with self._lock:
+            for couple in _couples(couples) or []:
+                key = (gateway.box, couple)
+                if _couple_ok(couple) and key not in self._entries:
+                    self._entries[key] = Lease(
+                        gateway.box, couple, gateway, -math.inf, expires_at, description
+                    )
+
+    def release(self, request_timeout_s: float, max_bytes: int, deadline: float) -> Released:
+        """Retrait de l'arrêt (R6) : prend tout ce qui est retenu, une tentative par mapping.
+
+        Ni découverte ni description : chaque box est jointe par la passerelle gardée de son
+        ouverture. Une expiration n'arrête pas les mappings suivants (finding P2), mais toutes les
+        requêtes, toutes box confondues, tiennent sous `deadline` (monotone, `deadline_in`) :
+        chacune est bornée par `min(request_timeout_s, reste)`, et un mapping atteint après
+        l'échéance n'est pas tenté et compte parmi les échecs. Aucune exception ne sort.
+        """
+        with self._lock:
+            taken = list(self._entries.values())
+            self._entries.clear()
+        outcome = Released()
+        for lease in taken:
+            outcome.tried.append(lease.couple)
+            try:
+                verdict = self._release_one(lease, request_timeout_s, max_bytes, deadline)
+            except Exception as exc:  # noqa: BLE001 - l'arrêt ne doit jamais lever
+                log.info("upnp: shutdown delete failed (%s)", type(exc).__name__)
+                verdict = UNREADABLE
+            if verdict == OTHER_OWNER:
+                outcome.foreign.append(lease.couple)
+            elif verdict != GONE:
+                outcome.failed.append(lease.couple)
+        return outcome
+
+    def _release_one(self, lease: Lease, request_timeout_s: float, max_bytes: int, deadline: float) -> str:
+        def budget() -> float | None:
+            remaining = deadline - time.monotonic()
+            return None if remaining <= 0 else min(request_timeout_s, remaining)
+
+        timeout_s = budget()
+        if timeout_s is None:
+            return TIMEOUT
+        if self.state(lease) == MAYBE_THIRD_PARTY:
+            owner = _owner(lease.gateway, lease, timeout_s, max_bytes)
+            if owner != STILL_OURS:
+                return owner
+            timeout_s = budget()
+            if timeout_s is None:
+                return TIMEOUT
+        answer = _delete(lease.gateway, lease.couple, timeout_s, max_bytes)
+        return GONE if answer.gone else (answer.failure or UNREADABLE)
+
+
+# --- arrêt -----------------------------------------------------------------------------
 
 
 def delete_mappings(
@@ -1057,37 +1363,31 @@ def delete_mappings(
     request_timeout_s: float,
     *,
     max_bytes: int,
-    alive: Callable[[Couple], bool] | None = None,
 ) -> list[Couple]:
-    """Retrait de l'arrêt (R6) : une tentative par mapping retenu ; rend les couples en échec.
+    """Retrait R6 de `mappings`, tous réputés à nous, par le `Ledger` : rend les couples en échec.
 
-    Ni découverte ni description : la passerelle est celle gardée de l'ouverture. Contrairement
-    au retrait R3, une expiration (ou une erreur UPnP, ou une réponse illisible) sur un mapping
-    est notée et le mapping suivant est tenté quand même. `alive`, consulté **immédiatement
-    avant** chaque tentative, dit si le bail de ce couple court encore ; faux (ou en erreur), le
-    couple n'est pas supprimé, puisqu'il a pu être repris par un tiers sur la box (M1), et il ne
-    compte pas parmi les échecs. Aucune exception ne sort.
+    Une tentative par couple, une expiration n'arrêtant pas les suivants, sous une échéance
+    unique d'une expiration de requête par couple. Un élément qui n'est pas un couple valide
+    n'est jamais envoyé et ne figure pas parmi les échecs, qui ne portent que des couples
+    `(port, protocole)` (revue A6) : il est seulement consigné. Aucune exception ne sort.
     """
-    failures: list[Couple] = []
     try:
         items = list(mappings)
     except Exception:  # noqa: BLE001 - l'arrêt ne doit jamais lever
         log.info("upnp: shutdown delete given no mappings")
-        return failures
+        return []
+    couples: list[Couple] = []
     for item in items:
-        couples = _couples([item])
-        if not couples or not _couple_ok(couples[0]):
-            # Un couple malformé ne part pas : il compte parmi les échecs (C7).
-            failures.append(item)  # type: ignore[arg-type]
-            continue
-        couple = couples[0]
-        if not _still_ours(alive, couple):
-            continue
-        try:
-            answer = _delete(gateway, couple, request_timeout_s, max_bytes)
-        except Exception as exc:  # noqa: BLE001 - l'arrêt ne doit jamais lever
-            log.info("upnp: shutdown delete failed (%s)", type(exc).__name__)
-            answer = Answer(UNREADABLE)
-        if not answer.gone:
-            failures.append(couple)
-    return failures
+        found = _couples([item])
+        if found and _couple_ok(found[0]):
+            couples.append(found[0])
+        else:
+            log.info("upnp: malformed mapping ignored at shutdown")
+    ledger = Ledger(clock=lambda: 0.0)
+    ledger.retain(
+        gateway, couples, started=0.0, expires_at=0.0, lease_s=math.inf, description=""
+    )
+    released = ledger.release(
+        request_timeout_s, max_bytes, deadline_in(request_timeout_s * max(len(couples), 1))
+    )
+    return released.failed

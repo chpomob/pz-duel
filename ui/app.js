@@ -432,7 +432,7 @@ function prefillAddress() {
 function stillActiveText(po) {
   const still = (po.still_active || []).map((p) => `${p.port}/${p.protocol}`).join(', ');
   if (!still) return '';
-  return `<p class="err">Ports ${esc(still)} may still be open on your router: their removal was not confirmed. PZ Duel tries again when it stops; otherwise they close when their lease ends.</p>`;
+  return `<p class="err">Ports ${esc(still)} may still be open on your router: their removal was not confirmed. PZ Duel tries again when it stops; otherwise they close when their lease ends, if your router honours it.</p>`;
 }
 
 function portsBlock() {
