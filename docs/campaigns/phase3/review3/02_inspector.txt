@@ -1,0 +1,58 @@
+{
+  "read_files": ["/tmp/review-master-1"],
+  "read_nonce": "READ:b2b837e75119283d",
+  "scope_note": "HEAD == branch point 90e657c; all changes under review are uncommitted working-tree changes (12 modified + 6 untracked paths). Reviewed `git diff 90e657c` plus the untracked service/upnp.py, tests/doubles/fake_igd.py, tests/test_upnp.py. Ran tests/test_upnp.py, test_setup_flow.py, test_api_security.py, test_rules_load.py, test_modes.py with /usr/bin/python3 -m pytest: 882 passed in 205 s.",
+  "findings": [
+    {
+      "id": "I1",
+      "severity": "minor",
+      "file": "ui/app.js",
+      "line": 418,
+      "summary": "When the lease expires, the address draft is cleared even if the host already applied it",
+      "evidence": "prefillAddress() clears addressDraft when `po.expired && portsProposed !== null && addressDraft === portsProposed`. portsProposed is reset only by an `input` event on #f-address (app.js, input listener). Clicking 'Use this address' (set-address) does not reset it. So if the host accepts the suggested address without typing, the invitation keeps that address on the server, but the field is emptied when the lease ends. The UI then shows an empty field while the invite still uses the expired router-reported address. The host gets no prompt to re-check it. This is inferred from the code paths. Confirm by mapping, clicking 'Use this address', advancing the ledger clock past lease_s, and comparing #f-address with S.invite.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "I2",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 816,
+      "summary": "A couple whose pre-delete was refused and whose add timed out is recorded as OURS, so shutdown deletes it without checking the owner",
+      "evidence": "In _open, a DeletePortMapping UPnP error other than 714 (e.g. 606) is neither `gone` nor TIMEOUT, so the add proceeds. If AddPortMapping then times out or is unreadable, abandon([*confirmed, couple]) rolls it back. When the rollback delete fails without a timeout, the couple goes into still_active. Ledger.record then stores it with deadline started+lease_s, so it is in the OURS state, and Ledger._release_one deletes OURS entries directly at shutdown without GetSpecificPortMappingEntry. The mapping on that couple may still belong to the third party whose delete was refused. Ledger.suspect exists for exactly this 'unknown outcome' case but is not used here. Impact is limited: a router that refused the first delete (secure mode) will normally refuse the shutdown delete too.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "I3",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 207,
+      "summary": "SSDP reply parser accepts only CRLF line endings",
+      "evidence": "_location splits on '\\r\\n' only. A responder that uses bare LF puts the whole reply on one line: lines[0].split() still yields 'HTTP/1.1 200', but the headers dict stays empty, so the IGD is silently dropped and the result is no_gateway/no_reply. UDA requires CRLF, so this only affects non-conforming devices. Splitting with splitlines() would accept them at no cost.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "I4",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1360,
+      "summary": "delete_mappings is used only by tests",
+      "evidence": "grep finds no production caller of upnp.delete_mappings or Ledger.retain; the engine uses Ledger.release directly (engine.py _release_ports). The function builds a throwaway Ledger with clock=lambda: 0.0 and lease_s=math.inf just so it can be tested. It duplicates the release path, and its R6 docstring claims a role it does not have at runtime.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "I5",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1088,
+      "summary": "Owner check compares the internal port and description as exact strings",
+      "evidence": "_owner requires `internal == str(port)` and `description == lease.description.strip()`. A router that zero-pads NewInternalPort or truncates/normalizes the description makes our own expired mapping look like OTHER_OWNER, so it is left in place at shutdown. If that router also ignores the lease, the mapping stays open indefinitely. The shutdown log records it as 'now belong to another device'. Comparing int(internal) == port would make the port check robust; description truncation cannot be handled.",
+      "confidence": "low",
+      "basis": "inference"
+    }
+  ],
+  "verdict": "APPROVE"
+}

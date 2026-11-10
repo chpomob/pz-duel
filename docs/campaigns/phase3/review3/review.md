@@ -1,0 +1,133 @@
+# review.md: Phase 3 UPnP port opening (working tree on top of 90e657c)
+
+## Verdict
+
+**APPROVE**
+
+There are no blocker or major findings. Both primary reviewers (Architect and Inspector) returned APPROVE, and neither cross-review round raised anything above minor. The two minor findings should be fixed in a follow-up step: one is a documentation error and one weakens shutdown cleanup in multi-router or slow-router cases. Neither one blocks the change.
+
+## Summary
+
+The change adds UPnP IGD port opening: the new `service/upnp.py`, engine integration in `service/engine.py`, a new POST route in `service/api.py`, UI in `ui/app.js`, and a fake IGD with tests. The core design looks sound. Lock order is consistent (engine.lock is taken before Ledger._lock, and the ledger never calls back into the engine). Network release I/O runs with no lock held. The new route goes through the shared Host, Origin and Content-Type checks. Most review2 items are closed: Y7 (the R6 time bound over several routers), I1/X1 (one router with two descriptions), the M1 monotonic clock, routers that ignore the lease, I6 (port 0) and A6 (malformed failures). The Inspector ran the five affected test modules: **882 passed in 205 s**. The Architect could not run tests, because the worktree has no venv.
+
+The most important remaining issue is in the **release path** (finding 1). All boxes, both passes and the ownership-check round trips share one `MAPPING_COUNT × request_timeout_s` budget, and nothing stops sending to a box after it has timed out. An earlier box that has gone silent, or one that is simply slow, can use up the whole budget. The mappings most likely to be live (the newest box's, and the in-flight opening's late merge) are then reported as `failed` without being tried, and they stay open until their lease ends (7200 s by default). The failure is safe, in that it never deletes a third party's mapping blindly, but it does not deliver the C1/R6 promise to remove what we opened. The second minor finding is that **both READMEs still describe the pre-P9F3 shutdown** ("only the latest router's mappings are removed", "one extra 3 s timeout", "replaces the same three mappings"). The real worst case is 2 + 5×3 = 17 s with the shipped `runtime.json`.
+
+Everything else is nit level. There is test-only dead code that bypasses the P9F3 ownership check (`delete_mappings`/`Ledger.retain`), plus a dead flag (`_ports_released`). `_merge_failed` is not exception-safe after it clears `_ports_pending`. There are small parser and comparison weaknesses (SSDP accepts CRLF only; the owner check compares the internal port as an exact string). There is a cosmetic UI mismatch after a lease expires. There is a spec-mandated blind delete in a very unlikely refused-delete + unanswered-add case. One inference-only concern remains (routers that silently shorten leases), and it needs corroboration.
+
+## Epistemic Distribution
+
+These counts cover the **10 retained findings after deduplication**. The pre-synthesis distribution supplied with the inputs (11 findings: 4 high/code, 4 medium/code, 3 low/inference) differs because A6/I4/X4/Y6 merged into one finding, Y7 merged into finding 1, and two Inspector findings were relabelled after cross-review supplied code evidence (explained below).
+
+| Confidence | Count |
+|---|---|
+| high | 5 |
+| medium | 4 |
+| low | 1 |
+
+| Basis | Count |
+|---|---|
+| spec | 0 |
+| code | 9 |
+| inference | 1 |
+| external | 0 |
+
+**Inference-only findings: 1** (finding 10, A3). It is listed last at its severity, marked as needing corroboration, and plays no part in the verdict. **The verdict would not change if it were excluded**: it would still be APPROVE.
+
+Label changes made during synthesis:
+- **Finding 1 (A2): medium/code → high/code.** Cross-review Y2 checked it independently with exact line references (upnp.py:1323-1356, 1309-1310; engine.py:2240-2255) and found further code-level aggravations.
+- **Finding 7 (I3): low/inference → high/code.** X3 confirmed the exact line (upnp.py:218, `text.split("\r\n")`) and traced the failure path. The defect is certain. Only its *trigger* (a non-conforming responder) is external to the code, which is why the severity stays nit.
+- **Finding 6 (I5): low/inference → medium/code.** X5 traced the misclassification in code: `_is_port` accepts `'08766'`, then `internal == str(port)` fails and the result is OTHER_OWNER (upnp.py:1141, 1172). The label is medium rather than high because the trigger (a router that zero-pads the port or truncates the description) is still inferred.
+- **Finding 10 (A3): kept at low/inference.** Y3 challenged it with `external` reasoning, but that reasoning cites the UPnP IGD:2 spec "from memory" with no version or date. That is not strong enough to relabel the finding as external, but it is enough to lower the severity (see below).
+- No input finding had a missing or invalid label, so none needed normalizing.
+
+## Critical Findings
+
+None at blocker or major severity. The two minor findings below are the most important to fix.
+
+### 1. [minor] Shared release budget lets one box starve the others; late-merged couples are named but never tried. `[high/code]`
+**Files:** `service/upnp.py:1338` (`Ledger.release` / `_release_one`), `service/engine.py:2240-2255` (`_release_ports`)
+**Sources:** A2 (Architect), validated and widened by Y2. Y7 (an ADD in cross-review 2) is merged here because it has the same root cause and the same fix.
+
+- `Ledger.release` walks the entries in insertion order, oldest box first. `_release_one` limits each request by a single shared deadline, `deadline_in(MAPPING_COUNT * timeout_s)`, and does not remember that a box has already timed out.
+- Box A (silent) followed by box B gives six entries against a budget of three timeouts. A's three deletes use the whole budget, so B's mappings are reported `failed` without being tried.
+- Y2 adds that a box that is slow but alive is enough. MAYBE_THIRD_PARTY leases cost two round trips (`_owner` + `_delete`). Couples added by `Ledger.suspect` always have deadline −inf, so they always take the two-round-trip path.
+- Y7 adds that pass 1 and pass 2 share the budget. The join wait is added back, but pass 1's own time is not. So the in-flight opening's late-merged couples, which are the most likely to be live, can hit `budget() is None` and be reported as failed. C1 ("retirer ce que l'ouverture en cours a posé") is then satisfied only by naming the couples.
+- **Risk level:** confirmed by code paths. It has not been reproduced with a test. Y7 suggests a FakeIGD that delays each delete by about `request_timeout_s` while an opening is in flight.
+- **Mitigating factor:** the failure is safe. Starved couples are reported, not deleted blindly, and they expire with their lease.
+- **Fix:** after the first TIMEOUT from a box, skip the rest of that box's leases, and process the newest box (or the late-merge set) first. This finishes the second half of the review2 finding-7 fix, which was not done.
+
+### 2. [minor] READMEs describe the pre-P9F3 shutdown behaviour. `[high/code]`
+**Files:** `README.md:319-322`, `README.md:121`, `README.fr.md:325-328` (plus the French counterpart of line 121, which is not yet located)
+**Sources:** A1, validated by Y1 (which corrected the location).
+
+- The READMEs say "only the latest router's mappings are removed at exit" and "one extra router request timeout (3 s)". In the code, the ledger is keyed by `(Gateway.box, couple)` and `release()` takes every entry. The `_release_ports` docstring gives the bound as `discovery_timeout_s + (MAPPING_COUNT + 2) × request_timeout_s`, which is **17 s** with the shipped config.
+- Y1's correction is valid: "Clicking again replaces the same three mappings" is at **README.md:121**, not near line 319. A fix limited to lines 319-322 would miss it. The French equivalent of line 121 still needs to be found.
+- This was open from review2 finding 4. It was out of scope for P9F3 because the READMEs were not in that step's allowed-files list. It must be in the allowed files of the next step.
+
+## Minor Findings
+
+Ranked by severity, then by epistemic weight. All are nits.
+
+### 3. [nit] `_merge_failed` can raise after clearing `_ports_pending`. `[medium/code]`
+`service/engine.py:2165-2170` (called from the `except` in `_run_opening`, engine.py:2096-2100). Sources: A4, validated by Y4.
+The method sets `_ports_pending = []` first, then calls `_lease_terms` (`cfg['lease_s']`, `cfg['description']`), `Ledger.suspect` and `manual_instruction`. Nothing catches an exception from those calls. If one raises, the opening thread dies, the status stays `in_progress` (which may block new clicks), and `_release_ports` sees no pending couples, so they are neither released nor named. That contradicts the C1 docstring. It is very unlikely because cfg is validated at click time, but the guarantee is not structural. **Fix:** clear pending last, or wrap the body so that it falls back to naming the couples.
+
+### 4. [nit] `delete_mappings` / `Ledger.retain` are test-only and bypass the P9F3 ownership check. `[high/code]`
+`service/upnp.py:1360` (retain call at :1387). Sources: A6, I4, X4 and Y6 (merged; all validated).
+No production caller exists; tests reference it 14 times. It builds a throwaway `Ledger(clock=lambda: 0.0)` with `lease_s=math.inf` and `description=''`, so every lease is OURS and is deleted without `GetSpecificPortMappingEntry`. Y6 adds that its time budget is `request_timeout_s × len(couples)`, not the R6 bound. That makes it a second R6 path with different ownership semantics and a different time bound, behind a misleading docstring. **Fix:** remove it, or make it explicitly private to tests.
+
+### 5. [nit] `_ports_released` is written but never read. `[high/code]`
+`service/engine.py:1720` (init) and `:2234` (set). Sources: A5, validated by Y5.
+The comment at engine.py:1716-1719 implies that the flag gates late merges. In fact `_ports_abandoned` does, and the second release pass runs unconditionally. **Fix:** remove the field, or move the comment to the second pass.
+
+### 6. [nit] Owner check compares the internal port and description as exact strings. `[medium/code]` (relabelled from low/inference)
+`service/upnp.py:1172` (`_is_port` at :1141). Sources: I5, validated and made more specific by X5.
+A zero-padded `NewInternalPort` passes `_is_port` and is then classified OTHER_OWNER, so the shutdown log wrongly says the mapping belongs to another device. This only applies to MAYBE_THIRD_PARTY leases, which are past `lease_s`, so a conforming router has already expired the mapping. The failure is safe: the delete is skipped. **Fix:** compare `int(internal) == port`, which costs nothing. Description truncation cannot be handled.
+
+### 7. [nit] The SSDP reply parser accepts CRLF only. `[high/code]` (relabelled from low/inference)
+`service/upnp.py:218` (I3 cited :207; X3 corrected the line to :218). Sources: I3, validated by X3.
+On a reply with bare LF line endings, the status line still parses, but LOCATION/ST are never found, so the gateway is dropped silently (no_gateway). UDA requires CRLF, so this only affects non-conforming devices. **Fix:** use `text.splitlines()`.
+
+### 8. [nit] The address field is cleared when the lease expires, even after the host has applied the address. `[medium/code]` (downgraded from minor)
+`ui/app.js:418-422` (set-address handler at :644, input listener at :667). Sources: I1, challenged by X1.
+**Challenge outcome: valid.** The mechanism is real: `portsProposed` is reset only by the `input` event, not by "Use this address". However, `inviteCard()` (app.js:461-490) still shows the live server-side address through `inv.link` and `inv.ip:inv.port`, and R5 says the invite changes only on an explicit click. Lease expiry closes ports. It does not make the public IP stale. What remains is a cosmetic mismatch. **Fix:** set `portsProposed = null` in the set-address handler.
+
+### 9. [nit] A refused pre-delete followed by an unanswered add is recorded as OURS and deleted at shutdown without an owner check. `[medium/code]` (downgraded from minor)
+`service/upnp.py:1009-1023` (I2 cited :816), and `Ledger.record`/`_release_one` at :1236-1286 and :1346-1356. Sources: I2, challenged by X2.
+**Challenge outcome: valid.** The code path is as described, but spec R3/R6 and **AC33** (exactly one `DeletePortMapping` at shutdown for a couple whose add went unanswered) require this behaviour. Routing the couple through `Ledger.suspect` would put a `GetSpecificPortMappingEntry` first and could break AC33. The trigger needs three router behaviours in a row: refuse our delete with a non-714 error, leave the add unanswered instead of rejecting it with 718, then refuse the rollback without a timeout. That is unlikely and limits itself. The label stays `code`, although X2's evidence for the downgrade is spec-based. **Action:** if anything, amend R3/R6 in the spec. Do not change the code in isolation.
+
+### 10. [nit] The OURS window assumes the router keeps the mapping for the full lease we requested. `[low/inference]`: needs corroboration (downgraded from minor)
+`service/upnp.py:1206-1207` (`Ledger.state`) and :1347-1357. Sources: A3, challenged by Y3.
+While `clock() < started + lease_s`, entries are deleted without an ownership check. A router that accepts the add (200 OK), silently shortens the lease, and then hands the external port to another LAN host before our shutdown would have that host's forward deleted.
+**Challenge outcome: valid.** IGD:2 lets a router cap the lease at 604800 s, well above `lease_s=7200`. A router that supports only permanent leases answers 725, which never produces an OURS entry. The scenario therefore needs three independent deviations from the spec, and the harm is one port forward that the other host can re-add. Y3's spec citation is from memory and gives no version or date, so it supports the downgrade but does not confirm anything either way.
+**To confirm:** a capture from a real router that shortens leases. A conforming FakeIGD cannot settle the question. **Action:** document the assumption next to the M1 comment. This finding does not affect the verdict.
+
+## Operational Risk Assessment
+
+- **Shutdown latency:** the worst-case exit time is `discovery_timeout_s + (MAPPING_COUNT + 2) × request_timeout_s`, which is 17 s with the shipped `runtime.json` (2 s + 5 × 3 s). The READMEs say 3 s (finding 2). Users or wrappers that kill the process after a few seconds will interrupt cleanup, and the mappings will then stay until their lease ends.
+- **Leftover open ports:** the shared release budget (finding 1) means that a silent or slow router, or several routers (laptop roaming, double NAT, reconnecting to a different box), can leave the current router's mappings open for up to `lease_s` (7200 s) after exit. Nothing is deleted wrongly, so the exposure is limited to "ports stay open longer than intended". It is still a security-relevant default for a game host's machine.
+- **Assumptions about router compliance:** several paths assume UDA/IGD-conforming devices: CRLF in SSDP replies (finding 7), exact string echo of the internal port and description (finding 6), leases honoured for their full length (finding 10), and 714/718/725 error semantics (finding 9). Consumer router firmware often deviates. The failure modes are mostly safe (a gateway not found, a delete skipped). The exception is finding 10, which would be unsafe, but it is unconfirmed.
+- **Thread robustness:** an exception inside `_merge_failed` (finding 3) would leave the opening stuck `in_progress` and its couples untracked. A validated config makes this unlikely, and nothing structural prevents it.
+- **Test coverage and environment:** 882 tests passed under the system python on Linux (Inspector run). The Architect could not run tests, because the worktree has no `.venv`. The suite exercises a FakeIGD, not real routers. No test covers a silent router with several boxes, a late merge during a slow release, or a router that shortens leases. Behaviour on Windows (socket binding, shutdown timing) was not exercised in this review.
+- **Process note:** the README fixes were out of scope for P9F3 (allowed-files list). The next fix step's allowed files must include `README.md` and `README.fr.md`, or this documentation error will be carried forward again.
+
+## Epistemic label distribution
+
+{
+  "basis": {
+    "code": 8,
+    "external": 0,
+    "inference": 3,
+    "spec": 0
+  },
+  "combined": {
+    "high/code": 4,
+    "low/inference": 3,
+    "medium/code": 4
+  },
+  "confidence": {
+    "high": 4,
+    "low": 3,
+    "medium": 4
+  }
+}

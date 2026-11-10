@@ -1,0 +1,521 @@
+{
+  "verdict": "APPROVE",
+  "status": "complete",
+  "summary": "# review.md: Phase 3 UPnP port opening (working tree on top of 90e657c)\n\n## Verdict\n\n**APPROVE**\n",
+  "findings": {
+    "minor": 5,
+    "nit": 6
+  },
+  "finding_details": [
+    {
+      "id": "A1",
+      "severity": "minor",
+      "file": "README.md",
+      "line": 319,
+      "summary": "Both READMEs still describe the pre-P9F3 shutdown: 'only the latest router's mappings are removed' and 'one extra router request timeout (3 s)'",
+      "evidence": "README.md:319-322 and README.fr.md:325-328 say that only the latest router's mappings are removed at exit and that quitting during an opening costs one extra 3 s timeout. The code no longer works that way. `upnp.Ledger` keys entries by (Gateway.box, couple) and never replaces another box (upnp.py:1178-1265). `Ledger.release` takes every entry (upnp.py:1312-1336). The `_release_ports` docstring itself gives the worst case as `discovery_timeout_s + (MAPPING_COUNT + 2) x request_timeout_s` (engine.py:2207-2226), which is 2 + 5x3 = 17 s with the shipped runtime.json, not 3 s. The README also says 'Clicking again replaces the same three mappings, it does not add new ones', which is false when the second click reaches a different box. This was finding 4 of review2 and is still open. P9F3's allowed-files list leaves out the READMEs, so it could not be fixed in that step.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 1338,
+      "summary": "Release has one global deadline but does not stop on a box after its first timeout, so a silent earlier box can use up the whole budget before the current box's mappings are tried",
+      "evidence": "`Ledger.release` walks `self._entries.values()` in insertion order, so the oldest box comes first. `_release_one` decides per lease: it does not remember that the same `lease.box` has already timed out (upnp.py:1312-1358). The whole release runs under `deadline_in(MAPPING_COUNT * timeout_s)` (engine.py:2240-2241). Scenario: the user clicks on box A and later on box B, which gives six entries. If A has gone silent, A's three deletes each wait `min(request_timeout_s, remaining)` and use the full 3 x timeout budget. B's three mappings, the ones most likely to be live, are then reported as `failed` without being tried, and they stay open until their lease ends. The R6 time bound holds now, which fixes the review2 Y7 major. But the second half of the review2 finding-7 fix ('stop deleting on a gateway after its first timeout') was not done. Fix: skip the remaining leases of a box once one of its requests returns TIMEOUT, or order the work so the newest box goes first.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 1206,
+      "summary": "The 'OURS' window assumes the router keeps the mapping at least as long as the lease we asked for; a router that silently shortens the lease would get a blind delete of a port a third party may have taken",
+      "evidence": "`Ledger.state` returns OURS while `clock() < started + lease_s` (upnp.py:1206-1207, 1237). For an OURS entry, `_release_one` sends `DeletePortMapping` without the `GetSpecificPortMappingEntry` ownership check (upnp.py:1347-1357). That is safe only if the box keeps the mapping for the whole lease we requested. It is not safe if the box accepts the add (200 OK) but caps or ignores the duration downward, then hands the couple to another LAN host before our deadline. The M1 argument in the code comments (C6: click time <= add time) covers when the lease starts, not a router that shortens it. Assumptions: some IGD implementations cap lease durations without returning error 725. To confirm or refute: a FakeIGD variant that expires mappings early and lets another client re-add one, with the shutdown happening inside our OURS window. A cheap mitigation within the R6 budget is not obvious, because it would double the round trips. At minimum, document the assumption next to M1.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "A4",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 2165,
+      "summary": "`_merge_failed` claims 'sans rien qui puisse lever' but can still raise after clearing `_ports_pending`, which leaves the opening stuck and its couples neither retained nor named",
+      "evidence": "`_merge_failed` first sets `self._ports_pending = []` (engine.py:2166). It then calls `_lease_terms(cfg, click)`, which indexes `cfg['lease_s']` and `cfg['description']`, then `Ledger.suspect` and `upnp.manual_instruction`. Nothing catches an exception in `_run_opening` (engine.py:2096-2100) after this fallback. If any of those raises, the status stays `in_progress`, the couples are not suspected, and `_release_ports` sees `pending == False`, so it does not report them as abandoned. With a validated cfg this is very unlikely, but the docstring's guarantee is not structural. Clearing pending after the ledger write would make it one.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A5",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 1720,
+      "summary": "`_ports_released` is written but never read: dead state behind a comment that describes behaviour it does not drive",
+      "evidence": "grep finds only the initialisation (engine.py:1720) and `self._ports_released = True` (engine.py:2234). No code reads it. Late merges reach the ledger and the second `release` pass empties it, whatever this flag says. The comment at engine.py:1716-1719 suggests the flag gates that behaviour, which misleads future maintainers. Remove it or make it meaningful.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A6",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1360,
+      "summary": "`delete_mappings` and `Ledger.retain` are no longer used by the service: a second shutdown path with different semantics (description '', infinite lease) kept alive only by tests",
+      "evidence": "In service/, `Ledger.retain` is called only from `delete_mappings` (upnp.py:1387), and `delete_mappings` is never called (grep over service/*.py). The engine releases only through `self._ports_ledger.release` (engine.py:2241, 2255). `delete_mappings` builds a throwaway ledger with `lease_s=math.inf` and `description=''`, so every couple is OURS and is deleted without an ownership check. If someone reuses it later, it would bypass the MAYBE_THIRD_PARTY verification that P9F3 built. This goes against P9F3's 'un seul module poss\u00e8de le suivi de vie' intent at the API surface. Remove it, or mark it test-only.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "I1",
+      "severity": "minor",
+      "file": "ui/app.js",
+      "line": 418,
+      "summary": "When the lease expires, the address draft is cleared even if the host already applied it",
+      "evidence": "prefillAddress() clears addressDraft when `po.expired && portsProposed !== null && addressDraft === portsProposed`. portsProposed is reset only by an `input` event on #f-address (app.js, input listener). Clicking 'Use this address' (set-address) does not reset it. So if the host accepts the suggested address without typing, the invitation keeps that address on the server, but the field is emptied when the lease ends. The UI then shows an empty field while the invite still uses the expired router-reported address. The host gets no prompt to re-check it. This is inferred from the code paths. Confirm by mapping, clicking 'Use this address', advancing the ledger clock past lease_s, and comparing #f-address with S.invite.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "I2",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 816,
+      "summary": "A couple whose pre-delete was refused and whose add timed out is recorded as OURS, so shutdown deletes it without checking the owner",
+      "evidence": "In _open, a DeletePortMapping UPnP error other than 714 (e.g. 606) is neither `gone` nor TIMEOUT, so the add proceeds. If AddPortMapping then times out or is unreadable, abandon([*confirmed, couple]) rolls it back. When the rollback delete fails without a timeout, the couple goes into still_active. Ledger.record then stores it with deadline started+lease_s, so it is in the OURS state, and Ledger._release_one deletes OURS entries directly at shutdown without GetSpecificPortMappingEntry. The mapping on that couple may still belong to the third party whose delete was refused. Ledger.suspect exists for exactly this 'unknown outcome' case but is not used here. Impact is limited: a router that refused the first delete (secure mode) will normally refuse the shutdown delete too.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "I3",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 207,
+      "summary": "SSDP reply parser accepts only CRLF line endings",
+      "evidence": "_location splits on '\\r\\n' only. A responder that uses bare LF puts the whole reply on one line: lines[0].split() still yields 'HTTP/1.1 200', but the headers dict stays empty, so the IGD is silently dropped and the result is no_gateway/no_reply. UDA requires CRLF, so this only affects non-conforming devices. Splitting with splitlines() would accept them at no cost.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "I4",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1360,
+      "summary": "delete_mappings is used only by tests",
+      "evidence": "grep finds no production caller of upnp.delete_mappings or Ledger.retain; the engine uses Ledger.release directly (engine.py _release_ports). The function builds a throwaway Ledger with clock=lambda: 0.0 and lease_s=math.inf just so it can be tested. It duplicates the release path, and its R6 docstring claims a role it does not have at runtime.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "I5",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1088,
+      "summary": "Owner check compares the internal port and description as exact strings",
+      "evidence": "_owner requires `internal == str(port)` and `description == lease.description.strip()`. A router that zero-pads NewInternalPort or truncates/normalizes the description makes our own expired mapping look like OTHER_OWNER, so it is left in place at shutdown. If that router also ignores the lease, the mapping stays open indefinitely. The shutdown log records it as 'now belong to another device'. Comparing int(internal) == port would make the port check robust; description truncation cannot be handled.",
+      "confidence": "low",
+      "basis": "inference"
+    }
+  ],
+  "epistemic_labels": {
+    "confidence": {
+      "high": 4,
+      "medium": 4,
+      "low": 3
+    },
+    "basis": {
+      "spec": 0,
+      "code": 8,
+      "inference": 3,
+      "external": 0
+    },
+    "combined": {
+      "high/code": 4,
+      "medium/code": 4,
+      "low/inference": 3
+    }
+  },
+  "epistemic_distribution": {
+    "confidence": {
+      "high": 4,
+      "medium": 4,
+      "low": 3
+    },
+    "basis": {
+      "spec": 0,
+      "code": 8,
+      "inference": 3,
+      "external": 0
+    },
+    "combined": {
+      "high/code": 4,
+      "medium/code": 4,
+      "low/inference": 3
+    }
+  },
+  "warnings": [],
+  "report": "docs/campaigns/phase3/review3/review.md",
+  "source_diff": true,
+  "context": {
+    "ok": true,
+    "reason": "ok",
+    "thresholds": {
+      "min_chars": 1,
+      "min_tokens": 1,
+      "required_sections": [],
+      "min_source_lines": 1
+    }
+  },
+  "thresholds": {
+    "min_chars": 1,
+    "min_tokens": 1,
+    "required_sections": [],
+    "min_source_lines": 1
+  },
+  "complexity": {
+    "score": 748622,
+    "level": "high",
+    "recommended_agents": 6,
+    "stats": {
+      "chars": 414332,
+      "files": 29,
+      "source_lines": 7636,
+      "hunks": 50,
+      "requirements": 0,
+      "modules": 29
+    },
+    "tier": "high",
+    "max_agents": 6,
+    "summary": "high: 414332 chars, 29 files, 7636 source lines, 50 hunks, 0 requirements, 29 modules"
+  },
+  "execution": {
+    "max_retries": 3,
+    "max_input_chars": 262144,
+    "max_output_chars": 131072,
+    "truncate_input": false,
+    "show_costs": false,
+    "concurrency": null,
+    "max_concurrency": 6,
+    "max_agents": 6
+  },
+  "parallel": {
+    "perspectives": [
+      "architect",
+      "inspector"
+    ],
+    "requested_concurrency": 6,
+    "max_concurrency": 6,
+    "effective_concurrency": 2
+  },
+  "attempts": [
+    {
+      "call": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 117.67121357377619,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1033,
+        "completion_tokens": 2259,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "call": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 334.0127601562999,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2786,
+        "completion_tokens": 1165,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "call": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 59.608806799165905,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1646,
+        "completion_tokens": 1507,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 53.59839193802327,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4283,
+        "completion_tokens": 2137,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "call": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "attempt": 1,
+      "returncode": 0,
+      "elapsed": 71.6276659173891,
+      "retryable": false,
+      "reason": "success",
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 7610,
+        "completion_tokens": 4085,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "cap_events": [],
+  "calls": [
+    {
+      "label": "01_architect",
+      "phase": "architect",
+      "persona": "architect",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1033,
+        "completion_tokens": 2259,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      }
+    },
+    {
+      "label": "02_inspector",
+      "phase": "inspector",
+      "persona": "inspector",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 2786,
+        "completion_tokens": 1165,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      }
+    },
+    {
+      "label": "03_cross_1",
+      "phase": "cross_review_1",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 1646,
+        "completion_tokens": 1507,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "04_cross_2",
+      "phase": "cross_review_2",
+      "persona": "cross_review",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 4283,
+        "completion_tokens": 2137,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      }
+    },
+    {
+      "label": "05_synthesis",
+      "phase": "synthesis",
+      "persona": "synthesis",
+      "ok": true,
+      "returncode": 0,
+      "usage": {
+        "model": "other",
+        "prompt_tokens": 7610,
+        "completion_tokens": 4085,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    }
+  ],
+  "failures": [],
+  "costs": {
+    "models": {
+      "other": {
+        "prompt_tokens": 17358,
+        "completion_tokens": 11153,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "phases": {
+      "architect": {
+        "prompt_tokens": 1033,
+        "completion_tokens": 2259,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "inspector": {
+        "prompt_tokens": 2786,
+        "completion_tokens": 1165,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_1": {
+        "prompt_tokens": 1646,
+        "completion_tokens": 1507,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review_2": {
+        "prompt_tokens": 4283,
+        "completion_tokens": 2137,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 7610,
+        "completion_tokens": 4085,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "personas": {
+      "architect": {
+        "prompt_tokens": 1033,
+        "completion_tokens": 2259,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "inspector": {
+        "prompt_tokens": 2786,
+        "completion_tokens": 1165,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "cross_review": {
+        "prompt_tokens": 5929,
+        "completion_tokens": 3644,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      },
+      "synthesis": {
+        "prompt_tokens": 7610,
+        "completion_tokens": 4085,
+        "est_cost_usd": 0.0,
+        "estimated": true
+      }
+    },
+    "total": {
+      "prompt_tokens": 17358,
+      "completion_tokens": 11153,
+      "est_cost_usd": 0.0
+    },
+    "records": [
+      {
+        "model": "other",
+        "prompt_tokens": 1033,
+        "completion_tokens": 2259,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "architect",
+        "persona": "architect"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 2786,
+        "completion_tokens": 1165,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "inspector",
+        "persona": "inspector"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 1646,
+        "completion_tokens": 1507,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_1",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 4283,
+        "completion_tokens": 2137,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "cross_review_2",
+        "persona": "cross_review"
+      },
+      {
+        "model": "other",
+        "prompt_tokens": 7610,
+        "completion_tokens": 4085,
+        "est_cost_usd": 0.0,
+        "estimated": true,
+        "phase": "synthesis",
+        "persona": "synthesis"
+      }
+    ]
+  },
+  "artifacts": {
+    "01_architect": "docs/campaigns/phase3/review3/01_architect.txt",
+    "02_inspector": "docs/campaigns/phase3/review3/02_inspector.txt",
+    "03_cross_1": "docs/campaigns/phase3/review3/03_cross_1.txt",
+    "04_cross_2": "docs/campaigns/phase3/review3/04_cross_2.txt",
+    "05_synthesis": "docs/campaigns/phase3/review3/05_synthesis.txt",
+    "review": "docs/campaigns/phase3/review3/review.md"
+  },
+  "cleanup_warnings": []
+}

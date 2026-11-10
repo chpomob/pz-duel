@@ -1,0 +1,66 @@
+```json
+{
+  "findings": [
+    {
+      "id": "X1",
+      "severity": "nit",
+      "original_id": "I1",
+      "action": "CHALLENGE",
+      "file": "ui/app.js",
+      "line": 419,
+      "summary": "The mechanism is real, but the host is not left without a view of the address in use",
+      "evidence": "The path exists. In ui/app.js:419-422, when `po.expired && portsProposed !== null && addressDraft === portsProposed`, the field is cleared. Only the `input` listener (app.js:667) resets portsProposed, so the set-address handler (app.js:644) leaves it as is. However, the claim that the host is not prompted to re-check overstates the impact. inviteCard() (app.js:461-490) still shows the live server-side address through `inv.link` and the manual-join line `${inv.ip}:${inv.port}`. The host can therefore still see which address the invite uses, even when #f-address is empty. The comment at app.js:413-414 says by design (R5) that the invite only changes when the host clicks 'Use this address'. Lease expiry closes ports and does not make the public IP stale, so keeping the invite address is consistent with R5. What is left is a cosmetic mismatch between an empty field and an invite that has an address. A one-line fix is to set `portsProposed = null` in the set-address handler. I would downgrade this from minor to nit.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X2",
+      "severity": "nit",
+      "original_id": "I2",
+      "action": "CHALLENGE",
+      "file": "service/upnp.py",
+      "line": 1023,
+      "summary": "The spec requires this path as written, and the scenario it relies on is unlikely",
+      "evidence": "The code path is correct as described. In _open (upnp.py:1009-1023), a non-714 pre-delete error is not `gone`, so the add proceeds. If the add then times out, abandon([*confirmed, couple]) is called. A rollback delete that fails goes into still_active. Ledger.record (upnp.py:1236-1286) stores it with deadline = started + lease_s, so state() returns OURS (upnp.py:1207), and _release_one deletes it without calling _owner. Two points weaken the finding, though. (1) The spec requires this behavior. spec.md R3 says: 'Un mapping dont la suppression n'est pas confirmée par la box reste « réputé actif » … retenu pour l'arrêt (R6)'. R6 says each such mapping 'est supprimé par DeletePortMapping … sans nouvelle découverte ni nouvelle lecture de description'. AC33 requires 'exactement 1 DeletePortMapping' at shutdown for a couple whose add went unanswered. Switching to Ledger.suspect would put a GetSpecificPortMappingEntry first, which could drop that delete and break AC33. Any change belongs in the spec, not in the code. (2) For a third party to own the mapping, the router must refuse our delete (e.g. 606), then neither accept nor reject our add but time out, and then refuse the rollback without a timeout. A router that protects a third-party mapping normally answers the add with 718, which goes through the UPNP_ERROR branch and excludes the couple. The original reviewer already noted the self-limiting impact. The refinement worth adding is that the only lever is to amend R3/R6 so that 'pre-delete not confirmed + add unanswered' goes to suspect. I would downgrade this to nit or a spec note.",
+      "confidence": "medium",
+      "basis": "spec"
+    },
+    {
+      "id": "X3",
+      "severity": "nit",
+      "original_id": "I3",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 218,
+      "summary": "Confirmed: the SSDP parser splits only on CRLF",
+      "evidence": "upnp.py:218 has `lines = text.split(\"\\r\\n\")`. On an LF-only reply, the status line still parses, but the headers loop sees one long line. LOCATION/ST are never matched, so the function returns None. This is non-conforming to UDA. `text.splitlines()` is safe here and also accepts LF. The 'nit' severity is appropriate.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X4",
+      "severity": "nit",
+      "original_id": "I4",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 1360,
+      "summary": "Confirmed: delete_mappings and Ledger.retain are only reached from tests",
+      "evidence": "`grep -rn 'delete_mappings\\|\\.retain(' service` finds only the definition at upnp.py:1360 and its own call to ledger.retain at upnp.py:1387. The engine's fallback after a failed merge uses `self._ports_ledger.suspect(` (engine.py:2170), not retain. tests/test_upnp.py references delete_mappings 14 times. This is test-only API surface with a misleading R6 docstring. Retain is also a second route that records couples as OURS, which runs against the P9F3 A1 rationale in Ledger.suspect's docstring. A future caller could pick it up by mistake.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X5",
+      "severity": "nit",
+      "original_id": "I5",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 1172,
+      "summary": "Confirmed and made more specific: a zero-padded port passes _is_port, so it is classified OTHER_OWNER, not UNREADABLE",
+      "evidence": "_is_port (upnp.py:1141) accepts '08766' because isdigit() and int() succeed, so the response is not classed as UNREADABLE. Then `internal == str(port)` (upnp.py:1172) fails and the result is OTHER_OWNER. The shutdown log will say the mapping belongs to another device, which is wrong. The impact is smaller than 'indefinitely open'. This check runs only for MAYBE_THIRD_PARTY leases (upnp.py:1346), which are past the deadline started + lease_s. Every add sends NewLeaseDuration = lease_s (upnp.py:921, runtime.json lease_s 7200), so a conforming router has already expired the mapping. The residual risk is limited to routers that ignore the lease, as the original noted. The failure is fail-safe: it skips a delete and does not delete a third party's mapping. Comparing `int(internal) == port` is a free fix.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}
+```

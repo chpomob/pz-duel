@@ -1,0 +1,90 @@
+```json
+{
+  "findings": [
+    {
+      "id": "Y1",
+      "severity": "minor",
+      "original_id": "A1",
+      "action": "VALIDATE",
+      "file": "README.md",
+      "line": 319,
+      "summary": "Confirmed. One location is wrong: 'Clicking again replaces the same three mappings' is at README.md:121, not near 319",
+      "evidence": "README.md:319-322 still says 'only the latest router's mappings are removed at exit' and 'one extra router request timeout (3 s by default)'. Ledger._entries is keyed by (gateway.box, couple) (upnp.py:1203), and release() takes every entry (upnp.py:1323-1325), so both statements are false. The _release_ports docstring (engine.py:2222-2224) gives the worst case as discovery_timeout_s + (MAPPING_COUNT + 2) x request_timeout_s. The sentence about replacing the same three mappings is at README.md:121 ('again replaces the same three mappings, it does not add new ones'), so a fix limited to 319-322 would miss it. The architect cites README.fr.md:325-328 but gives no line for the French counterpart of the line-121 sentence, so that one needs checking too. Severity minor is right: the docs are wrong, the behaviour is not.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y2",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 1338,
+      "summary": "Confirmed, and it is wider than a silent box: the budget is MAPPING_COUNT request timeouts no matter how many entries or round trips there are",
+      "evidence": "release() walks `taken` in dict insertion order (upnp.py:1323-1335). _release_one bounds each request by budget(), computed from the one shared deadline (upnp.py:1338-1356). Nothing remembers that a box has already timed out. _release_ports sets deadline = deadline_in(MAPPING_COUNT * timeout_s) for both passes together (engine.py:2240-2255). Two more aggravating points. (1) A MAYBE_THIRD_PARTY lease costs up to two round trips (_owner, then _delete; upnp.py:1346-1356). Entries that _merge_failed adds through Ledger.suspect have deadline -inf (upnp.py:1309-1310), so they are always MAYBE_THIRD_PARTY. Three suspected couples on a box that is slow but alive (each answer near the timeout) can therefore use up the budget before the third delete is sent. (2) With two boxes there are six entries against a budget of three timeouts. Even with no silent box, one slow box starves the other. The proposed fix holds: skip a box after its first TIMEOUT, and try the newest box first. The fail-safe direction is preserved, because starved couples are reported as failed and are not deleted blindly.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y3",
+      "severity": "nit",
+      "original_id": "A3",
+      "action": "CHALLENGE",
+      "file": "service/upnp.py",
+      "line": 1206,
+      "summary": "The trigger needs a non-conforming router: standard lease capping does not apply at lease_s=7200",
+      "evidence": "The mechanism is real. state() is OURS while clock() < deadline (upnp.py:1206-1207), and an OURS lease is deleted with no _owner check (upnp.py:1346-1356). However, IGD:2 only allows a device to cap NewLeaseDuration at 604800 s. The shipped lease_s is 7200 (runtime.json), far below that cap, so a conforming IGDv2 router keeps the mapping for the full lease. An IGDv1 router that does not support finite leases answers 725 OnlyPermanentLeasesSupported. It does not shorten the lease silently, and 725 goes through the UPNP_ERROR branch, so the couple is never recorded as OURS. That leaves a router which (a) accepts a 7200 s lease with 200 OK, (b) silently expires it early, and (c) lets another LAN host map the same external port, all before our shutdown. Those are three independent deviations from the spec. Even then the harm is one deleted port forward, which the other host can re-add. I agree with documenting the assumption next to M1, and I would downgrade this to nit. Basis: UPnP IGD:2 WANIPConnection:2 AddPortMapping, NewLeaseDuration semantics (604800 s cap) and error 725, from memory of the UPnP Forum spec. A conforming FakeIGD cannot confirm or refute this. It would take a capture from a real router that cuts leases short.",
+      "confidence": "medium",
+      "basis": "external"
+    },
+    {
+      "id": "Y4",
+      "severity": "nit",
+      "original_id": "A4",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 2165,
+      "summary": "Confirmed. The failure is also unhandled at thread level: the exception escapes _run_opening and the opening thread dies",
+      "evidence": "_merge_failed is called inside the `except` of _run_opening (engine.py:2096-2100), and there is no handler around it. If _lease_terms (cfg['lease_s'] / cfg['description'], engine.py:2109-2114), suspect or manual_instruction raises after `self._ports_pending = []` (engine.py:2166), the exception leaves the thread as a chained exception, and `with self.lock` releases the lock on the way out. Then: _ports_opening stays in_progress, which blocks a new click if the route refuses while in_progress. _release_ports finds pending == False, so `abandoned` is empty (engine.py:2249-2252), and the couples are neither released nor named. That contradicts the C1 guarantee in the docstring at engine.py:2217-2221. The likelihood is very low because cfg is validated and captured at click time. The fix is the one the architect proposes: clear pending last, or wrap the body in try/except and fall back to naming the couples.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "Y5",
+      "severity": "nit",
+      "original_id": "A5",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 1720,
+      "summary": "Confirmed: _ports_released is written twice and never read",
+      "evidence": "Grepping service/*.py for `_ports_released` returns only engine.py:1720 (init) and engine.py:2234 (set True). The second release pass (engine.py:2255) runs unconditionally, and a late merge reaches the ledger without consulting the flag. The comment at engine.py:1716-1719 describes the second pass, not a gate. The only flag that actually stops a late merge is _ports_abandoned. Remove the field, or move the comment to the second pass.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y6",
+      "severity": "nit",
+      "original_id": "A6",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 1360,
+      "summary": "Duplicate of round-1 X4/I4, already validated there. One extra point: delete_mappings uses a different clock from the bound it claims",
+      "evidence": "Already established: the only callers of delete_mappings are in tests, and the only caller of retain is upnp.py:1387. New point: delete_mappings builds Ledger(clock=lambda: 0.0) with lease_s=math.inf (upnp.py:1386-1389). Every lease is therefore OURS and skips the ownership check that P9F3 added. Its budget is also request_timeout_s x len(couples) (upnp.py:1391), not MAPPING_COUNT x request_timeout_s. That makes it a second R6 path with a different time bound as well as different ownership semantics. This strengthens the case for removing it or making it private to tests.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y7",
+      "severity": "nit",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/engine.py",
+      "line": 2246,
+      "summary": "The deadline is extended by the join wait, but pass 1 has already run, so the 'two joins outside the bound' framing undercounts pass 1's own time",
+      "evidence": "Pass 1 runs on the original deadline (engine.py:2241). The join that follows (engine.py:2246-2248) adds its wait to the deadline, so pass 2 gets back only that wait. Pass 1 and pass 2 still share MAPPING_COUNT x timeout. If pass 1 uses the budget (as in Y2), the couples from the late merge in pass 2 get budget() is None, return TIMEOUT and are reported as failed without being tried. Those are exactly the couples the opening in flight has just placed, and they are the most likely to be live. This is consistent with R6's single bound, but the C1 promise to 'retirer ce que l'ouverture en cours a posé' is satisfied only in name: the couples are named as failed, not removed. Confirm with a FakeIGD that delays every delete by about request_timeout_s while an opening is in flight at shutdown.",
+      "confidence": "medium",
+      "basis": "code"
+    }
+  ]
+}
+```

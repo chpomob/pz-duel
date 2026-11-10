@@ -1,0 +1,79 @@
+```json
+{
+  "read_files": ["/tmp/review-master-1"],
+  "read_nonce": "READ:b2b837e75119283d",
+  "scope_note": "HEAD == 90e657c; the reviewed changes are the uncommitted working tree (git diff 90e657c plus untracked service/upnp.py, tests/test_upnp.py, tests/doubles/fake_igd.py, docs/campaigns/phase3/{fixes,review,review2}). Tests were not run: there is no .venv in this worktree and the system python has no pytest.",
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "minor",
+      "file": "README.md",
+      "line": 319,
+      "summary": "Both READMEs still describe the pre-P9F3 shutdown: 'only the latest router's mappings are removed' and 'one extra router request timeout (3 s)'",
+      "evidence": "README.md:319-322 and README.fr.md:325-328 say that only the latest router's mappings are removed at exit and that quitting during an opening costs one extra 3 s timeout. The code no longer works that way. `upnp.Ledger` keys entries by (Gateway.box, couple) and never replaces another box (upnp.py:1178-1265). `Ledger.release` takes every entry (upnp.py:1312-1336). The `_release_ports` docstring itself gives the worst case as `discovery_timeout_s + (MAPPING_COUNT + 2) x request_timeout_s` (engine.py:2207-2226), which is 2 + 5x3 = 17 s with the shipped runtime.json, not 3 s. The README also says 'Clicking again replaces the same three mappings, it does not add new ones', which is false when the second click reaches a different box. This was finding 4 of review2 and is still open. P9F3's allowed-files list leaves out the READMEs, so it could not be fixed in that step.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 1338,
+      "summary": "Release has one global deadline but does not stop on a box after its first timeout, so a silent earlier box can use up the whole budget before the current box's mappings are tried",
+      "evidence": "`Ledger.release` walks `self._entries.values()` in insertion order, so the oldest box comes first. `_release_one` decides per lease: it does not remember that the same `lease.box` has already timed out (upnp.py:1312-1358). The whole release runs under `deadline_in(MAPPING_COUNT * timeout_s)` (engine.py:2240-2241). Scenario: the user clicks on box A and later on box B, which gives six entries. If A has gone silent, A's three deletes each wait `min(request_timeout_s, remaining)` and use the full 3 x timeout budget. B's three mappings, the ones most likely to be live, are then reported as `failed` without being tried, and they stay open until their lease ends. The R6 time bound holds now, which fixes the review2 Y7 major. But the second half of the review2 finding-7 fix ('stop deleting on a gateway after its first timeout') was not done. Fix: skip the remaining leases of a box once one of its requests returns TIMEOUT, or order the work so the newest box goes first.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 1206,
+      "summary": "The 'OURS' window assumes the router keeps the mapping at least as long as the lease we asked for; a router that silently shortens the lease would get a blind delete of a port a third party may have taken",
+      "evidence": "`Ledger.state` returns OURS while `clock() < started + lease_s` (upnp.py:1206-1207, 1237). For an OURS entry, `_release_one` sends `DeletePortMapping` without the `GetSpecificPortMappingEntry` ownership check (upnp.py:1347-1357). That is safe only if the box keeps the mapping for the whole lease we requested. It is not safe if the box accepts the add (200 OK) but caps or ignores the duration downward, then hands the couple to another LAN host before our deadline. The M1 argument in the code comments (C6: click time <= add time) covers when the lease starts, not a router that shortens it. Assumptions: some IGD implementations cap lease durations without returning error 725. To confirm or refute: a FakeIGD variant that expires mappings early and lets another client re-add one, with the shutdown happening inside our OURS window. A cheap mitigation within the R6 budget is not obvious, because it would double the round trips. At minimum, document the assumption next to M1.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "A4",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 2165,
+      "summary": "`_merge_failed` claims 'sans rien qui puisse lever' but can still raise after clearing `_ports_pending`, which leaves the opening stuck and its couples neither retained nor named",
+      "evidence": "`_merge_failed` first sets `self._ports_pending = []` (engine.py:2166). It then calls `_lease_terms(cfg, click)`, which indexes `cfg['lease_s']` and `cfg['description']`, then `Ledger.suspect` and `upnp.manual_instruction`. Nothing catches an exception in `_run_opening` (engine.py:2096-2100) after this fallback. If any of those raises, the status stays `in_progress`, the couples are not suspected, and `_release_ports` sees `pending == False`, so it does not report them as abandoned. With a validated cfg this is very unlikely, but the docstring's guarantee is not structural. Clearing pending after the ledger write would make it one.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A5",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 1720,
+      "summary": "`_ports_released` is written but never read: dead state behind a comment that describes behaviour it does not drive",
+      "evidence": "grep finds only the initialisation (engine.py:1720) and `self._ports_released = True` (engine.py:2234). No code reads it. Late merges reach the ledger and the second `release` pass empties it, whatever this flag says. The comment at engine.py:1716-1719 suggests the flag gates that behaviour, which misleads future maintainers. Remove it or make it meaningful.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A6",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1360,
+      "summary": "`delete_mappings` and `Ledger.retain` are no longer used by the service: a second shutdown path with different semantics (description '', infinite lease) kept alive only by tests",
+      "evidence": "In service/, `Ledger.retain` is called only from `delete_mappings` (upnp.py:1387), and `delete_mappings` is never called (grep over service/*.py). The engine releases only through `self._ports_ledger.release` (engine.py:2241, 2255). `delete_mappings` builds a throwaway ledger with `lease_s=math.inf` and `description=''`, so every couple is OURS and is deleted without an ownership check. If someone reuses it later, it would bypass the MAYBE_THIRD_PARTY verification that P9F3 built. This goes against P9F3's 'un seul module possède le suivi de vie' intent at the API surface. Remove it, or mark it test-only.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ],
+  "resolved_from_review2": [
+    "Y7 (R6/AC23 bound with several boxes): closed in structure. Every release request, across all boxes and both passes, runs under one `deadline_in(MAPPING_COUNT * request_timeout_s)` (engine.py:2240-2255; upnp.py:1338-1345). The time the opening thread waits is added back on purpose (engine.py:2246-2248). The two joins stay outside the bound, as the docstring says.",
+    "I1/X1 (one box with two descriptions treated as ambiguous): closed. `Gateway.box` is the host (upnp.py:179-186). `find_gateway` skips more descriptions from a responder whose box has already been validated (upnp.py:668-671), and keys gateways by box. There is a test at tests/test_upnp.py:2297 and an engine test at :2357.",
+    "M1 wall clock: closed. Decisions use the ledger's injected monotonic clock (`upnp.Ledger(self._monotonic)`, engine.py:1717). `expires_at` is only for display.",
+    "Lease-ignoring router: handled. Past the deadline, entries become MAYBE_THIRD_PARTY and are deleted only after `GetSpecificPortMappingEntry` shows the mapping still points at our socket address, internal port and description (upnp.py:1144-1175, 1347-1352).",
+    "Merge exception (I3): mostly closed, through `_merge_failed` and `Ledger.suspect`, which uses an expired deadline. A4 notes the remaining gap.",
+    "Port 0 (I6) and malformed failures (A6): closed (upnp.py:319-322, 1376-1384)."
+  ],
+  "architecture_notes": "Lock order is consistent: engine.lock is taken before Ledger._lock (`snapshot` -> `_ports_view` -> `proposal`; `_merge_opening` -> `record`). The ledger never calls back into the engine, and `release` does its network I/O with neither lock held, so I found no deadlock path. The opening thread does no network I/O under engine.lock (AC16). The new POST route goes through the shared Host, Origin and Content-Type checks (api.py:305-343) and is covered in test_api_security.py.",
+  "verdict": "APPROVE"
+}
+```
