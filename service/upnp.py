@@ -6,9 +6,17 @@ maximale d'une réponse) viennent de la section `upnp` de `service/runtime.json`
 l'appelant ; les deux seules constantes du protocole SSDP sont nommées ci-dessous, une fois.
 
 Garde-fous :
-- seule une réponse SSDP `200` dont le `ST` désigne une passerelle IGD est candidate ; les
-  candidats sont essayés dans leur ordre d'arrivée, jusqu'au premier qui se valide, dans un
-  budget global de `discovery_timeout_s + request_timeout_s` (C4) ;
+- seule une réponse SSDP `200` dont le `ST` désigne une passerelle IGD est candidate. La
+  réception s'arrête à une échéance absolue (`discovery_timeout_s`), vérifiée avec l'annulation à
+  chaque tour, même pour un paquet ignoré (P9F2). Les candidats reçus sont ensuite essayés dans
+  leur ordre d'arrivée, le tout dans un budget global de `discovery_timeout_s +
+  request_timeout_s` (C4) ;
+- sélection explicite de la passerelle (P9F2, C3/C4) : une seule passerelle validée est retenue ;
+  avec plusieurs, l'adresse externe de chacune est lue (`GetExternalIPAddress`, lecture seule) et
+  seule est retenue l'unique passerelle dont l'adresse est publique, à condition que celle de
+  chacune des autres ait été lue et ne le soit pas. Tout autre cas (aucune publique, plusieurs,
+  une lecture manquée, un candidat laissé sans essai faute de budget) est une ambiguïté non
+  résolue : `no_gateway` (`ambiguous_gateway`), sans aucune écriture ;
 - une passerelle n'est retenue, avant toute écriture SOAP, que si sa description est celle d'un
   IGD : périphérique racine `InternetGatewayDevice`, et service WAN compatible rangé sous
   `WANDevice` puis `WANConnectionDevice` (C3). Rien de plus ne l'authentifie : un hôte du réseau
@@ -22,8 +30,9 @@ Garde-fous :
 - une description portant `<!DOCTYPE` ou `<!ENTITY` (en ASCII) est refusée avant toute analyse
   XML, et l'analyseur lui-même refuse toute déclaration de DTD ou d'entité, quel que soit
   l'encodage du document (UTF-16…) ; un encodage inconnu rend `no_gateway` ;
-- aucune exception ne sort du module, même sur des entrées malformées : chaque échec devient
-  un résultat.
+- aucune exception ne sort du module, même sur des entrées malformées ou des valeurs numériques
+  qu'une socket ne sait pas représenter : `validate` les refuse, les tailles passées aux sockets
+  sont bornées par le protocole, et une erreur numérique restante devient un résultat (P9F2).
 
 L'adresse locale vue par la socket de la requête (`getsockname`) sert de `NewInternalClient`,
 jamais une adresse saisie par l'utilisateur (AC10).
@@ -48,6 +57,7 @@ import ipaddress
 import logging
 import math
 import socket
+import sys
 import time
 import urllib.parse
 import threading
@@ -59,6 +69,14 @@ from xml.sax.saxutils import escape
 
 SSDP_PORT = 1900
 SSDP_GROUP = "239.255.255.250"
+
+# Plus grand datagramme IPv4 (champ « longueur totale » sur 16 bits) : la réception SSDP n'a
+# jamais besoin d'un tampon plus grand, quelle que soit `max_response_bytes` (P9F2).
+UDP_MAX_DATAGRAM = 65535
+# Plus grand délai accepté pour chacune des deux attentes : leur somme, la plus longue attente
+# du moteur sur le fil d'ouverture, reste représentable par `Thread.join` comme par
+# `socket.settimeout` (P9F2, R1/C7). Une limite de la plateforme, pas une valeur opérationnelle.
+MAX_WAIT_S = threading.TIMEOUT_MAX / 2
 
 # Bornes de `MX` fixées par le protocole SSDP (UDA 1.1 : de 1 à 5 secondes). La fenêtre de
 # découverte ne peut pas être plus courte que l'attente minimale annoncée (C8).
@@ -83,6 +101,7 @@ NO_GATEWAY = "no_gateway"
 MAPPED = "mapped"
 REFUSED = "refused"
 INVALID_CONFIG = "invalid_config"
+AMBIGUOUS = "ambiguous_gateway"
 
 SOAP_ENV = "http://schemas.xmlsoap.org/soap/envelope/"
 SOAP_ENCODING = "http://schemas.xmlsoap.org/soap/encoding/"
@@ -119,7 +138,16 @@ NOT_PUBLIC_NETS = tuple(
     )
 )
 
-ERRORS = (OSError, socket.timeout, http.client.HTTPException, ET.ParseError, ValueError, UnicodeError)
+# `ArithmeticError` (dont `OverflowError`) : une erreur numérique devient un résultat (P9F2).
+ERRORS = (
+    OSError,
+    socket.timeout,
+    http.client.HTTPException,
+    ET.ParseError,
+    ValueError,
+    UnicodeError,
+    ArithmeticError,
+)
 # Un encodage XML inconnu lève `LookupError` dans l'analyseur ; `KeyError` en hérite.
 PARSE_ERRORS = (*ERRORS, LookupError, expat.ExpatError)
 
@@ -185,30 +213,38 @@ def _location(data: bytes) -> str | None:
     return headers["LOCATION"]
 
 
-def _replies(target: tuple[str, int], timeout_s: float, deadline: float, max_bytes: int) -> Iterator[tuple[str, str]]:
+def _replies(
+    target: tuple[str, int],
+    timeout_s: float,
+    deadline: float,
+    max_bytes: int,
+    cancel: threading.Event | None = None,
+) -> Iterator[tuple[str, str]]:
     """Envoie une M-SEARCH, puis rend chaque `(répondeur, LOCATION)` compatible, une fois.
 
-    Jusqu'à `deadline` (monotone), l'attente bloque ; au-delà, seules les réponses déjà
-    arrivées sont encore lues, sans attendre. Un datagramme illisible (trop long, ICMP renvoyé
-    en erreur par Windows) ou incompatible est ignoré. Les erreurs de socket remontent à
-    l'appelant, qui les convertit.
+    `deadline` (monotone) est absolue : chaque tour de réception, y compris celui d'un paquet
+    ignoré (incompatible, en double, illisible), vérifie d'abord l'annulation puis l'échéance, et
+    rien n'est plus reçu au-delà (P9F2). Un flux continu de réponses ignorées ne retient donc
+    jamais la découverte plus longtemps que sa fenêtre. Le tampon de réception est borné par
+    `UDP_MAX_DATAGRAM`. Les erreurs de socket remontent à l'appelant, qui les convertit.
     """
     seen: set[tuple[str, str]] = set()
+    size = min(max_bytes, UDP_MAX_DATAGRAM)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.sendto(_msearch(target, timeout_s), target)
         while True:
+            if _stopped(cancel):
+                return
             remaining = deadline - time.monotonic()
-            if remaining > 0:
-                sock.settimeout(remaining)
-            else:
-                sock.setblocking(False)
+            if remaining <= 0:
+                return
+            sock.settimeout(remaining)
             try:
-                data, peer = sock.recvfrom(max_bytes)
-            except (BlockingIOError, socket.timeout, TimeoutError):
+                data, peer = sock.recvfrom(size)
+            except (socket.timeout, TimeoutError):
                 return
             except OSError:
-                if remaining <= 0:
-                    return
+                # datagramme trop long, ICMP renvoyé en erreur par Windows : tour suivant
                 continue
             location = _location(data)
             if location is None or (peer[0], location) in seen:
@@ -230,7 +266,7 @@ def discover(
     Aucune exception ne sort.
     """
     try:
-        replies = _replies(target, timeout_s, time.monotonic() + timeout_s, max_bytes)
+        replies = _replies(target, timeout_s, time.monotonic() + timeout_s, max_bytes, None)
         try:
             return next(replies, None)
         finally:
@@ -383,7 +419,8 @@ def _fetch(
             return Reply(UNREADABLE, response.status, local_address=local)
         data = b""
         while not response.isclosed():
-            chunk = response.read1(max_bytes + 1 - len(data))
+            # Jamais plus d'un tampon par lecture : `read1` alloue la taille demandée (P9F2).
+            chunk = response.read1(min(io.DEFAULT_BUFFER_SIZE, max_bytes + 1 - len(data)))
             if not chunk:
                 break
             data += chunk
@@ -516,6 +553,63 @@ def _candidate(
     return Gateway(host, port, control_path, service_type), ""
 
 
+def _collect(
+    target: tuple[str, int], cfg: dict, window_end: float, cancel: threading.Event | None
+) -> list[tuple[str, str]]:
+    """Réponses compatibles reçues jusqu'à `window_end`, dans leur ordre d'arrivée.
+
+    Une erreur de socket arrête la réception ; ce qui a été reçu avant est gardé.
+    """
+    found: list[tuple[str, str]] = []
+    replies = _replies(target, cfg["discovery_timeout_s"], window_end, cfg["max_response_bytes"], cancel)
+    try:
+        for reply in replies:
+            found.append(reply)
+    except ERRORS as exc:
+        log.info("upnp: discovery failed (%s)", type(exc).__name__)
+    finally:
+        replies.close()
+    return found
+
+
+def _select(
+    gateways: list[Gateway], cfg: dict, budget_end: float, cancel: threading.Event | None
+) -> tuple[Gateway | None, dict | None]:
+    """Choisit entre plusieurs passerelles validées, avant toute écriture (P9F2, C3/C4).
+
+    Règle : l'adresse externe de chacune est lue (lecture seule) ; est retenue l'unique
+    passerelle dont l'adresse est publique, si celle de chacune des autres a été lue — IPv4
+    pointée valide — et n'est pas publique. Une adresse absente, vide ou mal formée n'est pas lue. Sinon l'ambiguïté n'est pas résolue : `no_gateway` (`ambiguous_gateway`).
+    Les adresses lues ne sont ni rendues ni consignées (R5).
+    """
+    public: list[Gateway] = []
+    for gateway in gateways:
+        if _stopped(cancel):
+            return _no_gateway(CANCELLED)
+        remaining = budget_end - time.monotonic()
+        if remaining <= 0:
+            return _no_gateway(AMBIGUOUS)
+        answer = _soap(
+            gateway,
+            "GetExternalIPAddress",
+            lambda _local: [],
+            min(cfg["request_timeout_s"], remaining),
+            cfg["max_response_bytes"],
+        )
+        if answer.failure is not None:
+            return _no_gateway(AMBIGUOUS)
+        # Une adresse absente, vide ou mal formée n'est pas lue : elle ne classe pas la passerelle
+        # comme non publique, l'ambiguïté reste non résolue (P9F2, revue A1).
+        value = answer.values.get("NewExternalIPAddress", "")
+        if _ipv4(value) is None:
+            return _no_gateway(AMBIGUOUS)
+        if _public(value):
+            public.append(gateway)
+    if len(public) != 1:
+        return _no_gateway(AMBIGUOUS)
+    return public[0], None
+
+
 def find_gateway(
     cfg: dict,
     target: tuple[str, int] = (SSDP_GROUP, SSDP_PORT),
@@ -523,44 +617,41 @@ def find_gateway(
 ) -> tuple[Gateway | None, dict | None]:
     """Découvre la box et lit sa description : `(Gateway, None)` ou `(None, résultat no_gateway)`.
 
-    `cfg` est la section `upnp` de `runtime.json`. Les réponses SSDP compatibles sont essayées
-    dans leur ordre d'arrivée, jusqu'à la première passerelle validée (C4) ; le tout tient dans
-    `discovery_timeout_s + request_timeout_s`, chaque lecture de description étant aussi bornée
-    par `request_timeout_s`. Sans passerelle, la raison est celle du dernier candidat essayé, ou
-    `no_reply`. `cancel`, levé, empêche la lecture de toute description (raison `cancelled`).
-    Aucune exception ne sort.
+    `cfg` est la section `upnp` de `runtime.json`. Les réponses SSDP compatibles sont reçues
+    jusqu'à l'échéance absolue de la fenêtre de découverte, puis essayées dans leur ordre
+    d'arrivée (C4) ; le tout tient dans `discovery_timeout_s + request_timeout_s`, chaque requête
+    étant aussi bornée par `request_timeout_s`. Une passerelle validée seule est retenue ;
+    plusieurs passent par `_select`, et un candidat laissé sans essai faute de budget rend
+    l'ambiguïté non résolue (P9F2). Sans passerelle, la raison est celle du dernier candidat
+    essayé, ou `no_reply`. `cancel`, levé, arrête la réception et empêche toute requête suivante
+    (raison `cancelled`). Aucune exception ne sort.
     """
     try:
-        timeout_s = cfg["discovery_timeout_s"]
-        request_timeout_s = cfg["request_timeout_s"]
-        max_bytes = cfg["max_response_bytes"]
-        window_end = time.monotonic() + timeout_s
-        budget_end = window_end + request_timeout_s
+        window_end = time.monotonic() + cfg["discovery_timeout_s"]
+        budget_end = window_end + cfg["request_timeout_s"]
+        found = _collect(target, cfg, window_end, cancel)
         reason = "no_reply"
-        replies = _replies(target, timeout_s, window_end, max_bytes)
-        try:
-            while True:
-                try:
-                    found = next(replies, None)
-                except ERRORS as exc:
-                    log.info("upnp: discovery failed (%s)", type(exc).__name__)
-                    found = None
-                if found is None:
-                    break
-                responder_ip, location = found
-                if _stopped(cancel):
-                    return _no_gateway(CANCELLED)
-                remaining = budget_end - time.monotonic()
-                if remaining <= 0:
-                    break
-                gateway, reason = _candidate(
-                    responder_ip, location, min(request_timeout_s, remaining), max_bytes
-                )
-                if gateway is not None:
-                    return gateway, None
-        finally:
-            replies.close()
-        return _no_gateway(reason)
+        gateways: list[Gateway] = []
+        for responder_ip, location in found:
+            if _stopped(cancel):
+                return _no_gateway(CANCELLED)
+            remaining = budget_end - time.monotonic()
+            if remaining <= 0:
+                if gateways:
+                    return _no_gateway(AMBIGUOUS)
+                break
+            gateway, reason = _candidate(
+                responder_ip, location, min(cfg["request_timeout_s"], remaining), cfg["max_response_bytes"]
+            )
+            if gateway is not None and gateway not in gateways:
+                gateways.append(gateway)
+        if _stopped(cancel):
+            return _no_gateway(CANCELLED)
+        if not gateways:
+            return _no_gateway(reason)
+        if len(gateways) == 1:
+            return gateways[0], None
+        return _select(gateways, cfg, budget_end, cancel)
     except (*PARSE_ERRORS, TypeError) as exc:
         return _no_gateway(type(exc).__name__)
 
@@ -622,9 +713,14 @@ def _positive_number(value: object) -> bool:
         return False
 
 
+def _wait(value: object) -> bool:
+    # Représentable par les sockets et par `Thread.join`, même additionné à l'autre (P9F2).
+    return _positive_number(value) and value <= MAX_WAIT_S  # type: ignore[operator]
+
+
 def _discovery_window(value: object) -> bool:
     # Une fenêtre plus courte que `MX_MIN` se fermerait avant les réponses différées (C8).
-    return _positive_number(value) and value >= MX_MIN  # type: ignore[operator]
+    return _wait(value) and value >= MX_MIN  # type: ignore[operator]
 
 
 def _positive_int(value: object) -> bool:
@@ -635,7 +731,8 @@ def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) 
     """`None` si la section `upnp` est utilisable, sinon le résultat `invalid_config` (R3, AC13).
 
     Aucun trafic : section absente ou d'un autre type → clé `upnp` ; clé absente ou mal typée,
-    bail hors de ]0, MAX_LEASE_S], ou fenêtre de découverte de moins de `MX_MIN` seconde → clé
+    bail hors de ]0, MAX_LEASE_S], fenêtre de découverte de moins de `MX_MIN` seconde, délai
+    au-delà de `MAX_WAIT_S` ou taille au-delà de `sys.maxsize` (non représentables) → clé
     `upnp.<nom>`. Avec `ports`, le résultat porte la
     consigne manuelle (R4).
     """
@@ -643,10 +740,11 @@ def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) 
         return _invalid("upnp", ports)
     checks: dict[str, Callable[[object], bool]] = {
         "discovery_timeout_s": _discovery_window,
-        "request_timeout_s": _positive_number,
+        "request_timeout_s": _wait,
         "lease_s": lambda v: _positive_int(v) and v <= MAX_LEASE_S,  # type: ignore[operator]
         "description": lambda v: isinstance(v, str) and bool(v.strip()),
-        "max_response_bytes": _positive_int,
+        # Représentable comme taille C (`Py_ssize_t`) : au-delà, toute API de lecture lève (P9F2).
+        "max_response_bytes": lambda v: _positive_int(v) and v <= sys.maxsize,  # type: ignore[operator]
     }
     for key in CONFIG_KEYS:
         if key not in upnp_cfg or not checks[key](upnp_cfg[key]):
@@ -669,15 +767,21 @@ def _ports_ok(couples: list | None) -> bool:
 # --- adresse publique ---------------------------------------------------------------
 
 
-def _public(addr: object) -> bool:
-    """Vrai seulement pour une IPv4 pointée, globale, hors des blocs de `NOT_PUBLIC_NETS` (R5)."""
+def _ipv4(addr: object) -> ipaddress.IPv4Address | None:
+    """L'IPv4 pointée canonique que `addr` écrit exactement, ou `None` (vide, absente, mal formée)."""
     if not isinstance(addr, str) or not addr or addr.strip() != addr:
-        return False
+        return None
     try:
         ip = ipaddress.IPv4Address(addr)
     except ValueError:
-        return False
-    if str(ip) != addr or not ip.is_global or ip.is_multicast or ip.is_reserved:
+        return None
+    return ip if str(ip) == addr else None
+
+
+def _public(addr: object) -> bool:
+    """Vrai seulement pour une IPv4 pointée, globale, hors des blocs de `NOT_PUBLIC_NETS` (R5)."""
+    ip = _ipv4(addr)
+    if ip is None or not ip.is_global or ip.is_multicast or ip.is_reserved:
         return False
     return not any(ip in net for net in NOT_PUBLIC_NETS)
 
@@ -926,6 +1030,7 @@ def open_ports(
             return result, None, []
         result, cleared = _open(gateway, cfg, couples, cancel)
     except (*PARSE_ERRORS, TypeError, KeyError) as exc:
+        # `PARSE_ERRORS` couvre `ArithmeticError` : une erreur numérique devient un résultat.
         log.info("upnp: opening failed (%s)", type(exc).__name__)
         result = {"status": NO_GATEWAY, "reason": UNREADABLE, "ports": _as_dicts(couples)}
         result["manual"] = manual_instruction(couples)
@@ -937,14 +1042,31 @@ def open_ports(
 # --- arrêt -----------------------------------------------------------------------------
 
 
+def _still_ours(alive: Callable[[Couple], bool] | None, couple: Couple) -> bool:
+    if alive is None:
+        return True
+    try:
+        return bool(alive(couple))
+    except Exception:  # noqa: BLE001 - sans preuve que le bail court, on ne supprime pas
+        return False
+
+
 def delete_mappings(
-    gateway: Gateway, mappings: Iterable[Sequence[object]], request_timeout_s: float, *, max_bytes: int
+    gateway: Gateway,
+    mappings: Iterable[Sequence[object]],
+    request_timeout_s: float,
+    *,
+    max_bytes: int,
+    alive: Callable[[Couple], bool] | None = None,
 ) -> list[Couple]:
     """Retrait de l'arrêt (R6) : une tentative par mapping retenu ; rend les couples en échec.
 
     Ni découverte ni description : la passerelle est celle gardée de l'ouverture. Contrairement
     au retrait R3, une expiration (ou une erreur UPnP, ou une réponse illisible) sur un mapping
-    est notée et le mapping suivant est tenté quand même. Aucune exception ne sort.
+    est notée et le mapping suivant est tenté quand même. `alive`, consulté **immédiatement
+    avant** chaque tentative, dit si le bail de ce couple court encore ; faux (ou en erreur), le
+    couple n'est pas supprimé, puisqu'il a pu être repris par un tiers sur la box (M1), et il ne
+    compte pas parmi les échecs. Aucune exception ne sort.
     """
     failures: list[Couple] = []
     try:
@@ -959,6 +1081,8 @@ def delete_mappings(
             failures.append(item)  # type: ignore[arg-type]
             continue
         couple = couples[0]
+        if not _still_ours(alive, couple):
+            continue
         try:
             answer = _delete(gateway, couple, request_timeout_s, max_bytes)
         except Exception as exc:  # noqa: BLE001 - l'arrêt ne doit jamais lever

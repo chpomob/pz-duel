@@ -13,7 +13,7 @@ let folderDraft = '';         // dossier du jeu en cours de saisie
 let addressDraft = '';        // adresse publique en cours de saisie
 let portsLease = null;        // dernier bail annonce par `ports_opening`, pour le libelle du bouton
 let portsPrefilled = null;    // `expires_at` du resultat `mapped` deja propose dans `#f-address`
-let portsProposed = null;     // address put in `#f-address` by the last `mapped` result, until it expires
+let portsProposed = null;     // address the prefill wrote into an empty `#f-address`, until it expires or the host types
 let shown = null;             // dernier contenu posé dans `#app`
 let quitting = false;         // la sortie est demandée : plus aucun autre écran
 let stopped = false;          // le service ne répond plus après cette demande
@@ -413,6 +413,7 @@ function portsReason(po) {
 // Une proposition par resultat `mapped`, jamais par-dessus une saisie : l'invitation ne change
 // qu'au clic sur "Use this address" (R5).
 // Once the lease has ended (`expired`), a proposal left untouched in the field is taken back (C5).
+// Only a value the prefill wrote into an empty field is a proposal; any typing drops that mark.
 function prefillAddress() {
   const po = S && S.ports_opening;
   if (po && po.expired && portsProposed !== null) {
@@ -422,8 +423,9 @@ function prefillAddress() {
   }
   if (!po || po.status !== 'mapped' || !po.address || po.expires_at === portsPrefilled) return;
   portsPrefilled = po.expires_at;
-  if (addressDraft === '') addressDraft = po.address;
-  if (addressDraft === po.address) portsProposed = po.address;
+  if (addressDraft !== '') return;
+  addressDraft = po.address;
+  portsProposed = po.address;
 }
 
 // Mappings whose removal the router did not confirm after a failed opening (M2).
@@ -661,6 +663,8 @@ document.addEventListener('click', async (ev) => {
 document.addEventListener('input', (ev) => {
   if (ev.target.id === 'f-folder') folderDraft = ev.target.value;
   if (ev.target.id === 'f-address') addressDraft = ev.target.value;
+  // Typed by the host: no longer a proposal, even if equal to the reported address (P9F2).
+  if (ev.target.id === 'f-address') portsProposed = null;
 });
 
 $('#logstoggle').addEventListener('click', () => $('#logsbox').classList.toggle('collapsed'));

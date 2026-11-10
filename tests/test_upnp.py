@@ -875,21 +875,24 @@ def test_cancel_before_opening_sends_nothing(socket_guard):
     assert socket_guard.sends == []
 
 
-class _CancelAfter:
-    """Annulation levée après `n` consultations : simule l'arrêt pendant l'ouverture."""
+class _CancelWhen:
+    """Annulation levée dès que `condition()` est vraie : simule l'arrêt pendant l'ouverture.
 
-    def __init__(self, n: int) -> None:
-        self.n = n
+    Une condition sur le trafic reçu par le faux IGD, et non un nombre de consultations : la
+    découverte consulte l'annulation à chaque tour de réception (P9F2), un nombre variable de fois.
+    """
+
+    def __init__(self, condition) -> None:
+        self.condition = condition
 
     def is_set(self) -> bool:
-        self.n -= 1
-        return self.n < 0
+        return bool(self.condition())
 
 
 def test_cancel_during_opening_stops_at_next_request():
-    # consultations : avant la découverte, avant la description, avant D1, avant A1, avant D2 → levée
+    # levée après D1 et A1 reçus : D2 n'est jamais envoyé
     with FakeIGD() as igd:
-        result, gateway, _ = _open(igd, _CancelAfter(4))
+        result, gateway, _ = _open(igd, _CancelWhen(lambda: len(igd.calls) >= 2))
         assert result["status"] == "refused" and result["failure"] == "cancelled"
         assert result["still_active"] == _dicts(PORTS[:1])
         assert [c.action for c in igd.calls] == ["DeletePortMapping", "AddPortMapping"]
@@ -899,7 +902,7 @@ def test_cancel_during_opening_stops_at_next_request():
 def test_cancel_during_discovery_skips_description():
     """Annulation levée pendant la découverte : la description n'est pas lue (frontière R6)."""
     with FakeIGD() as igd:
-        result, gateway, cleared = _open(igd, _CancelAfter(1))
+        result, gateway, cleared = _open(igd, _CancelWhen(lambda: len(igd.msearches) >= 1))
         assert result["status"] == "no_gateway" and result["reason"] == "cancelled"
         assert (gateway, cleared) == (None, [])
         assert len(igd.msearches) == 1
@@ -1783,7 +1786,8 @@ def test_c4_candidates_are_tried_within_a_global_budget():
     assert gateway is None and failure == {"status": "no_gateway", "reason": "timeout"}
     assert elapsed <= cfg["discovery_timeout_s"] + cfg["request_timeout_s"] + 0.4
     tried = sum(len(d.fetches) for d in decoys)
-    assert 2 <= tried < len(decoys)
+    # la réception tient toute la fenêtre, puis les descriptions se partagent le reste du budget
+    assert 1 <= tried < len(decoys)
 
 
 # C5 : un `mapped` échu ne s'affiche plus comme actif et ne propose plus l'adresse.
@@ -1893,3 +1897,356 @@ def test_m1_expired_retained_mapping_is_not_deleted_at_shutdown(upnp_rig, igd):
     assert engine.shutdown()
     assert _deletes_after(igd, seen) == []
     assert engine._upnp_retained == {}
+
+
+# --- P9F2 : revue de P9F1 -------------------------------------------------------------------
+
+from service import engine as engine_module  # noqa: E402
+
+PRIVATE = "10.0.0.1"
+# Plus longue attente de l'arrêt sur le fil d'ouverture : la découverte et une requête, puis une
+# requête encore en vol (P9F2, C1), plus une seconde de marge.
+ABANDON_BOUND_S = FAST["discovery_timeout_s"] + 2 * FAST["request_timeout_s"] + 1
+
+
+def _gated_open(monkeypatch, gate: threading.Event):
+    """Remplace `upnp.open_ports` : le réseau est fait, puis la fusion attend `gate`."""
+    real_open = upnp.open_ports
+    returned = threading.Event()
+
+    def late_open(cfg, couples, target, cancel):
+        outcome = real_open(cfg, couples, target, None)
+        gate.wait(4 * ENGINE_WAIT_S)
+        returned.set()
+        return outcome
+
+    monkeypatch.setattr(upnp, "open_ports", late_open)
+    return returned
+
+
+def _mapped_by_a_gated_opening(upnp_rig, igd, monkeypatch, gate):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    returned = _gated_open(monkeypatch, gate)
+    assert engine.open_ports()[0]
+    _wait_for(lambda: len(igd.actions("GetExternalIPAddress")) == 1)
+    assert set(igd.mappings) == set(_engine_ports(upnp_rig))
+    return engine, returned
+
+
+# Item 1 (bloquant, C1) : une fusion retardée au-delà des deux attentes de l'arrêt.
+def test_p9f2_c1_merge_delayed_beyond_both_waits_is_abandoned_with_its_couples_named(
+    upnp_rig, igd, monkeypatch, caplog
+):
+    caplog.set_level(logging.WARNING)
+    gate = threading.Event()
+    engine, returned = _mapped_by_a_gated_opening(upnp_rig, igd, monkeypatch, gate)
+    ports = _engine_ports(upnp_rig)
+    seen = len(igd.actions("DeletePortMapping"))
+    started = time.monotonic()
+    assert engine.shutdown()
+    assert time.monotonic() - started <= ABANDON_BOUND_S
+    # L'arrêt a rendu la main sans la fusion : il nomme chacun des couples abandonnés.
+    (message,) = [r.getMessage() for r in caplog.records if "abandoned at shutdown" in r.getMessage()]
+    for port, protocol in ports:
+        assert f"{port}/{protocol}" in message
+    assert any("abandoned at shutdown" in entry["msg"] for entry in engine.snapshot()["logs"])
+    assert PUBLIC not in message
+    deletes_at_return = len(igd.actions("DeletePortMapping"))
+    assert deletes_at_return == seen
+    # La fusion arrive enfin : rien n'est plus fusionné, et rien ne part après l'arrêt.
+    gate.set()
+    assert returned.wait(ENGINE_WAIT_S)
+    engine._ports_thread.join(ENGINE_WAIT_S)
+    assert not engine._ports_thread.is_alive()
+    assert engine._upnp_retained == {} and engine._ports_handoff == []
+    assert len(igd.actions("DeletePortMapping")) == deletes_at_return
+
+
+def test_p9f2_c1_merge_during_the_second_wait_is_removed_before_shutdown_returns(
+    upnp_rig, igd, monkeypatch
+):
+    gate = threading.Event()
+    engine, _ = _mapped_by_a_gated_opening(upnp_rig, igd, monkeypatch, gate)
+    ports = _engine_ports(upnp_rig)
+    seen = len(igd.actions("DeletePortMapping"))
+    warning = engine_module.LOGGER.warning
+
+    def opening_still_running(message, *args):
+        # Ce message précède la seconde attente : la fusion arrive pendant celle-ci.
+        if message == "port opening still running at shutdown":
+            gate.set()
+        return warning(message, *args)
+
+    monkeypatch.setattr(engine_module.LOGGER, "warning", opening_still_running)
+    assert engine.shutdown()
+    # Au retour de l'arrêt, et non plus tard par le fil démon : les trois retraits ont eu lieu.
+    assert gate.is_set()
+    assert sorted(_deletes_after(igd, seen)) == sorted(ports)
+    assert igd.mappings == {}
+    assert engine._upnp_retained == {} and engine._ports_handoff == []
+    assert not any("abandoned" in entry["msg"] for entry in engine.snapshot()["logs"])
+
+
+# Item 3 (M1) : l'échéance relue immédiatement avant chaque suppression, retrait tardif compris.
+def test_p9f2_m1_mapping_expiring_during_the_first_deletes_is_not_deleted(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    opening, _, _ = _click(engine)
+    assert opening["status"] == "mapped"
+    seen = len(igd.actions("DeletePortMapping"))
+    expires_at = opening["expires_at"]
+    # Le bail court jusqu'à la première suppression de l'arrêt, puis s'achève.
+    engine._clock = lambda: expires_at - 1 if len(igd.actions("DeletePortMapping")) == seen else expires_at
+    assert engine.shutdown()
+    assert len(_deletes_after(igd, seen)) == 1
+    assert engine._upnp_retained == {}
+
+
+def test_p9f2_m1_late_merge_after_expiry_deletes_nothing(upnp_rig, igd, monkeypatch):
+    gate = threading.Event()
+    engine, _ = _mapped_by_a_gated_opening(upnp_rig, igd, monkeypatch, gate)
+    seen = len(igd.actions("DeletePortMapping"))
+    lease = upnp_rig.runtime["upnp"]["lease_s"]
+    warning = engine_module.LOGGER.warning
+
+    def expire_then_merge(message, *args):
+        if message == "port opening still running at shutdown":
+            # Le bail échoit avant la fusion tardive : le retrait ne doit rien supprimer.
+            later = engine._clock() + 2 * lease
+            engine._clock = lambda: later
+            gate.set()
+        return warning(message, *args)
+
+    monkeypatch.setattr(engine_module.LOGGER, "warning", expire_then_merge)
+    assert engine.shutdown()
+    assert gate.is_set()
+    assert _deletes_after(igd, seen) == []
+    assert engine._upnp_retained == {} and engine._ports_handoff == []
+
+
+# Item 6 (C5) : l'échéance de la proposition survit à un nouvel essai en échec.
+def test_p9f2_c5_proposal_expiry_survives_a_failed_retry(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    opening, _, _ = _click(engine)
+    assert opening["status"] == "mapped" and opening["address"] == PUBLIC
+    igd.configure(ssdp_reply=False)
+    retry, _, _ = _click(engine)
+    assert retry["status"] == "no_gateway" and "expired" not in retry
+    engine._clock = lambda: opening["expires_at"] - 1
+    assert "expired" not in engine.snapshot()["ports_opening"]
+    engine._clock = lambda: opening["expires_at"]
+    view = engine.snapshot()["ports_opening"]
+    assert view["status"] == "no_gateway" and view["expired"] is True
+    assert PUBLIC not in json.dumps(view)
+
+
+# Item 2 (C3/C4) : sélection explicite entre deux IGD valides, dans les deux ordres.
+def _two_igds(first_ip: str | None, second_ip: str | None):
+    """Deux faux IGD valides ; la réponse SSDP de `second` arrive avant celle de `first`."""
+    first, second = FakeIGD(external_ip=first_ip).start(), FakeIGD(external_ip=second_ip).start()
+    first.configure(ssdp_before=[second.ssdp_answer()])
+    return first, second
+
+
+def _writes(igd: FakeIGD) -> list[str]:
+    return [c.action for c in igd.calls if c.action != "GetExternalIPAddress"]
+
+
+@pytest.mark.parametrize("public_first", [True, False])
+def test_p9f2_c3_c4_the_igd_with_a_public_address_is_chosen_in_both_orders(public_first, socket_guard):
+    first, second = _two_igds(PRIVATE, PUBLIC) if public_first else _two_igds(PUBLIC, PRIVATE)
+    chosen, other = (second, first) if public_first else (first, second)
+    try:
+        result, gateway, _ = _open(first)
+        assert result["status"] == "mapped" and result["address"] == PUBLIC
+        assert gateway is not None and gateway.port == chosen.http_port
+        assert len(chosen.actions("AddPortMapping")) == 3
+        # L'autre IGD n'a reçu que la lecture de son adresse : aucune écriture.
+        assert _writes(other) == [] and other.mappings == {}
+        assert [c.action for c in other.calls] == ["GetExternalIPAddress"]
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize(
+    ("first_ip", "second_ip"),
+    [
+        (PUBLIC, "5.6.7.9"),
+        (PRIVATE, "192.168.1.1"),
+        (PUBLIC, None),
+        (None, PUBLIC),
+        (PUBLIC, ""),
+        ("", PUBLIC),
+        (PUBLIC, "not-an-ip"),
+        ("010.0.0.1", PUBLIC),
+    ],
+    ids=[
+        "both-public",
+        "none-public",
+        "first-unread",
+        "second-unread",
+        "first-empty",
+        "second-empty",
+        "first-malformed",
+        "second-malformed",
+    ],
+)
+def test_p9f2_c3_c4_unresolved_ambiguity_is_refused_without_writes(first_ip, second_ip, socket_guard):
+    first, second = _two_igds(first_ip, second_ip)
+    try:
+        result, gateway, cleared = _open(first)
+        assert result["status"] == "no_gateway" and result["reason"] == "ambiguous_gateway"
+        assert (gateway, cleared) == (None, [])
+        _assert_manual(result)
+        assert _writes(first) == [] and _writes(second) == []
+    finally:
+        first.close()
+        second.close()
+
+
+# Item 4 (R1/C7) : une valeur numérique non représentable devient un résultat.
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("max_response_bytes", 10**400), ("request_timeout_s", 1e300), ("discovery_timeout_s", 1e300)],
+)
+def test_p9f2_c7_unrepresentable_setting_is_invalid_config(key, value, socket_guard):
+    result, gateway, cleared = upnp.open_ports(_cfg(**{key: value}), PORTS, ("127.0.0.1", 9))
+    assert result["status"] == "invalid_config" and result["key"] == f"upnp.{key}"
+    assert (gateway, cleared) == (None, [])
+    assert socket_guard.sends == [] and socket_guard.connects == []
+
+
+def test_p9f2_c7_largest_accepted_size_never_reaches_a_socket_unbounded():
+    import io
+    import sys
+
+    cfg = _cfg(**FAST, max_response_bytes=sys.maxsize)
+    assert upnp.validate(cfg) is None
+    # Une description plus longue que le tampon de lecture : le corps se lit en plusieurs `read1`.
+    with FakeIGD(description="oversized", oversize_bytes=4 * io.DEFAULT_BUFFER_SIZE) as igd:
+        result, gateway, _ = upnp.open_ports(cfg, PORTS, igd.ssdp_target)
+        assert result["status"] == "mapped" and gateway is not None
+        assert igd.fetches == ["/desc.xml"]
+
+
+def test_p9f2_c7_largest_accepted_size_reads_a_body_without_length():
+    """Sans `Content-Length`, `read1` reçoit la taille demandée : jamais plus d'un tampon."""
+    import io
+    import sys
+
+    body = b"x" * (4 * io.DEFAULT_BUFFER_SIZE)
+
+    def serve(server: socket.socket) -> None:
+        conn, _ = server.accept()
+        with conn:
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + body[:10])
+            time.sleep(0.1)
+            conn.sendall(body[10:])
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        thread = threading.Thread(target=serve, args=(server,), daemon=True)
+        thread.start()
+        reply = upnp._fetch("127.0.0.1", server.getsockname()[1], "/", None, 2, sys.maxsize)
+        thread.join(timeout=2)
+    assert reply.failure is None and reply.body == body
+
+
+def test_p9f2_c7_numeric_error_inside_the_module_is_a_result(monkeypatch):
+    def overflow(*_args, **_kwargs):
+        raise OverflowError("simulated")
+
+    with FakeIGD() as igd:
+        monkeypatch.setattr(upnp, "_fetch", overflow)
+        result, gateway, cleared = _open(igd)
+    assert result["status"] == "no_gateway" and (gateway, cleared) == (None, [])
+    _assert_manual(result)
+
+
+# Item 5 (C4) : échéance absolue et annulation à chaque tour de réception.
+FLOOD_S = 4
+
+
+@pytest.mark.parametrize("kind", ["incompatible", "duplicate"])
+def test_p9f2_c4_flood_of_ignored_replies_does_not_outlive_the_budget(kind):
+    with FakeIGD() as igd:
+        flood = igd.ssdp_answer(f"{DEVICE}MediaRenderer:1") if kind == "incompatible" else igd.ssdp_answer()
+        igd.configure(ssdp_flood=[flood], ssdp_flood_s=FLOOD_S)
+        cfg = _cfg(**FAST)
+        started = time.monotonic()
+        gateway, failure = upnp.find_gateway(cfg, igd.ssdp_target)
+        elapsed = time.monotonic() - started
+        assert gateway is not None and failure is None
+        assert elapsed <= cfg["discovery_timeout_s"] + cfg["request_timeout_s"] + 0.4 < FLOOD_S
+
+
+def test_p9f2_c4_cancel_is_seen_under_a_flood_of_ignored_replies():
+    with FakeIGD(ssdp_reply=False) as igd:
+        igd.configure(ssdp_flood=[igd.ssdp_answer(f"{DEVICE}MediaRenderer:1")], ssdp_flood_s=FLOOD_S)
+        cancel = threading.Event()
+        timer = threading.Timer(0.2, cancel.set)
+        started = time.monotonic()
+        timer.start()
+        try:
+            gateway, failure = upnp.find_gateway(_cfg(**FAST), igd.ssdp_target, cancel)
+        finally:
+            timer.cancel()
+        elapsed = time.monotonic() - started
+        assert gateway is None and failure == {"status": "no_gateway", "reason": "cancelled"}
+        assert elapsed < 0.2 + FAST["discovery_timeout_s"] / 2
+        assert igd.fetches == []
+
+
+class _EndlessSocket:
+    """Socket UDP factice dont la réception rend toujours, sans attendre, un paquet à ignorer.
+
+    Un flux plus rapide que tout traitement : chaque `recvfrom` est daté. Une sécurité lève
+    `OSError` après `stop_s` secondes, pour qu'un client fautif finisse quand même.
+    """
+
+    calls: list[float] = []
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.started = time.monotonic()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        pass
+
+    def sendto(self, data, address) -> int:
+        return len(data)
+
+    def settimeout(self, value) -> None:
+        pass
+
+    def setblocking(self, flag) -> None:
+        pass
+
+    def recvfrom(self, size):
+        now = time.monotonic()
+        if now - self.started > FLOOD_S:
+            raise OSError("flood safety stop")
+        type(self).calls.append(now)
+        packet = b"HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\nLOCATION: http://127.0.0.1:1/d.xml\r\n\r\n"
+        return packet, ("127.0.0.1", 1900)
+
+
+def test_p9f2_c4_endless_ignored_replies_stop_at_the_absolute_deadline(monkeypatch):
+    _EndlessSocket.calls = []
+    monkeypatch.setattr(upnp.socket, "socket", _EndlessSocket)
+    cfg = _cfg(**FAST)
+    started = time.monotonic()
+    gateway, failure = upnp.find_gateway(cfg, ("127.0.0.1", 9))
+    elapsed = time.monotonic() - started
+    assert gateway is None and failure == {"status": "no_gateway", "reason": "no_reply"}
+    assert elapsed <= cfg["discovery_timeout_s"] + 0.4
+    # Aucun tour de réception après l'échéance absolue de la fenêtre, fixée avant le premier tour.
+    calls = _EndlessSocket.calls
+    assert calls and max(calls) <= min(calls) + cfg["discovery_timeout_s"]

@@ -865,11 +865,10 @@ def test_phase3_ac28_prefill_manual_instruction_and_expiry_in_the_lobby():
 
     # Pre-remplissage : seulement un `mapped` avec adresse, une fois, et seulement si le champ est vide.
     assert "if (!po || po.status !== 'mapped' || !po.address || po.expires_at === portsPrefilled) return;" in prefill
-    assert "if (addressDraft === '') addressDraft = po.address;" in prefill
+    assert "if (addressDraft !== '') return;" in prefill
     assert [line.strip() for line in prefill.splitlines() if "addressDraft =" in line] == [
         "if (addressDraft === portsProposed) addressDraft = '';",
-        "if (addressDraft === '') addressDraft = po.address;",
-        "if (addressDraft === po.address) portsProposed = po.address;",
+        "addressDraft = po.address;",
     ]
     assert "api(" not in prefill  # l'invitation ne change qu'au clic sur "Use this address" (R5)
     assert '<input id="f-address" value="${esc(addressDraft)}"' in script
@@ -907,8 +906,69 @@ def test_p9f1_c5_expired_opening_is_shown_and_its_proposal_taken_back():
     head = prefill.index("if (po && po.expired && portsProposed !== null) {")
     assert head < prefill.index("if (addressDraft === portsProposed) addressDraft = '';")
     assert prefill.index("portsProposed = null;") < prefill.index("po.status !== 'mapped'")
-    assert "if (addressDraft === po.address) portsProposed = po.address;" in prefill
+    assert "portsProposed = po.address;" in prefill
     assert "let portsProposed = null;" in script
+
+
+def _run_prefill(script: str, steps: list[tuple[str, object]]) -> list[str]:
+    """Exécute `prefillAddress` et le gestionnaire de saisie de `ui/app.js` sous Node.
+
+    `steps` : `("state", ports_opening)` pose l'état puis appelle `prefillAddress()` comme `poll` ;
+    `("type", valeur)` simule une saisie dans `#f-address`. Rend `addressDraft` après chaque pas.
+    """
+    _, prefill, _ = lobby_ports_ui(script)
+    prefill = prefill[: prefill.index("function stillActiveText(")]
+    head = "document.addEventListener('input', (ev) => {"
+    handler = script[script.index(head) + len(head) :]
+    handler = handler[: handler.index("\n});")]
+    program = (
+        "let S = null, addressDraft = '', folderDraft = '', portsPrefilled = null, portsProposed = null;\n"
+        f"{prefill}\n"
+        f"function onInput(ev) {{{handler}\n}}\n"
+        f"const steps = {json.dumps(steps)};\n"
+        "const out = [];\n"
+        "for (const [kind, value] of steps) {\n"
+        "  if (kind === 'state') { S = { ports_opening: value }; prefillAddress(); }\n"
+        "  else onInput({ target: { id: 'f-address', value } });\n"
+        "  out.push(addressDraft);\n"
+        "}\n"
+        "process.stdout.write(JSON.stringify(out));\n"
+    )
+    node = shutil.which("node")
+    assert node is not None
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(done.stdout)
+
+
+def test_p9f2_prefill_marks_a_proposal_only_when_it_filled_an_empty_field():
+    """Item 7 : une saisie de l'hôte, même égale à l'adresse rapportée, survit à l'expiration."""
+    script = ui_script()
+    _, prefill, _ = lobby_ports_ui(script)
+    head = "document.addEventListener('input', (ev) => {"
+    handler = script[script.index(head) :]
+    handler = handler[: handler.index("\n});")]
+    # La provenance n'est posée que là où le champ vide vient d'être rempli, et toute saisie la retire.
+    filled = prefill[prefill.index("if (addressDraft !== '') return;") :]
+    assert filled.index("addressDraft = po.address;") < filled.index("portsProposed = po.address;")
+    assert "if (ev.target.id === 'f-address') addressDraft = ev.target.value;" in handler
+    assert "if (ev.target.id === 'f-address') portsProposed = null;" in handler
+    if shutil.which("node") is None:
+        return
+    mapped = {"status": "mapped", "address": "5.6.7.8", "expires_at": 1000}
+    expired = {"status": "no_gateway", "expired": True}
+    # Champ vide : la proposition le remplit, l'expiration la retire.
+    assert _run_prefill(script, [("state", mapped), ("state", expired)]) == ["5.6.7.8", ""]
+    # Adresse déjà tapée par l'hôte, identique à celle du routeur : elle survit à l'expiration.
+    assert _run_prefill(script, [("type", "5.6.7.8"), ("state", mapped), ("state", expired)]) == [
+        "5.6.7.8",
+        "5.6.7.8",
+        "5.6.7.8",
+    ]
+    # Proposition reprise par l'hôte (effacée puis retapée) : ce n'est plus une proposition.
+    steps = [("state", mapped), ("type", "5.6.7."), ("type", "5.6.7.8"), ("state", expired)]
+    assert _run_prefill(script, steps) == ["5.6.7.8", "5.6.7.", "5.6.7.8", "5.6.7.8"]
+    # Une autre saisie de l'hôte n'est jamais remplacée par la proposition.
+    assert _run_prefill(script, [("type", "198.51.100.9"), ("state", mapped)]) == ["198.51.100.9"] * 2
 
 
 def test_p9f1_m2_still_active_mappings_are_named_after_a_failure():

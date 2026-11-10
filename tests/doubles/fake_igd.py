@@ -10,6 +10,8 @@ de `(SSDP_GROUP, SSDP_PORT)`.
   l'URL entière). `ssdp_reply=False` ne répond pas (aucune passerelle). `ssdp_st` remplace le
   `ST` de la réponse (par défaut, celui de la demande) ; `ssdp_before` liste des réponses brutes
   envoyées, dans l'ordre, avant la sienne, depuis la même socket : d'autres répondeurs (P9F1, C4).
+  `ssdp_flood` liste des réponses brutes renvoyées en boucle au demandeur, après la sienne,
+  pendant `ssdp_flood_s` secondes : un flux continu de paquets à ignorer (P9F2).
 - `device_type` : type du périphérique racine de la description (par défaut l'IGD) ;
   `wan_in_root=True` range le service WAN dans la liste du périphérique racine au lieu de
   l'arborescence `WANDevice` / `WANConnectionDevice` (P9F1, C3).
@@ -68,6 +70,7 @@ ERROR_TEXTS = {
     718: "ConflictInMappingEntry",
 }
 POLL_S = 0.05
+FLOOD_PAUSE_S = 0.002
 MAX_SOAP_BODY = 1 << 16
 
 
@@ -103,6 +106,8 @@ class _Rules:
     ssdp_reply: bool = True
     ssdp_st: str | None = None
     ssdp_before: list[bytes] = field(default_factory=list)
+    ssdp_flood: list[bytes] = field(default_factory=list)
+    ssdp_flood_s: float = 0.0
 
 
 def _match(keys: Any, call: Call) -> bool:
@@ -287,18 +292,36 @@ class FakeIGD:
                 reply = self.rules.ssdp_reply
                 st = self.rules.ssdp_st or st
                 before = list(self.rules.ssdp_before)
+                flood, flood_s = list(self.rules.ssdp_flood), self.rules.ssdp_flood_s
             try:
                 for other in before:
                     sock.sendto(other, peer)
             except OSError:
                 return
-            if not reply:
-                continue
-            answer = self.ssdp_answer(st)
-            try:
-                sock.sendto(answer, peer)
-            except OSError:
-                return
+            if reply:
+                try:
+                    sock.sendto(self.ssdp_answer(st), peer)
+                except OSError:
+                    return
+            if flood and flood_s > 0:
+                thread = threading.Thread(
+                    target=self._flood, args=(peer, flood, flood_s), name="fake-igd-flood", daemon=True
+                )
+                thread.start()
+                self._threads.append(thread)
+
+    def _flood(self, peer: tuple[str, int], packets: list[bytes], flood_s: float) -> None:
+        """Renvoie `packets` en boucle à `peer` jusqu'à `flood_s` écoulées ou `close()`."""
+        end = time.monotonic() + flood_s
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind((LOOPBACK, 0))
+            while not self._closed.is_set() and time.monotonic() < end:
+                for packet in packets:
+                    try:
+                        sock.sendto(packet, peer)
+                    except OSError:
+                        pass
+                self._closed.wait(FLOOD_PAUSE_S)
 
     # --- HTTP -------------------------------------------------------------------
 
