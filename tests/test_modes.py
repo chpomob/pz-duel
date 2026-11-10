@@ -21,7 +21,7 @@ from test_preflight import free_ports, make_install, zomboid_home  # noqa: F401
 from service import engine as engine_module
 from service import main as main_module
 from service.api import make_server
-from service.engine import ACTIONS, DUEL_PHASES, Engine, load_presets
+from service.engine import ACTIONS, IDLE_QUIT_PHASES, Engine, load_presets
 from service.platforms import WINDOWS, current
 from service.preflight import MOD_SRC, detect_pz, install_mod
 from service.rules import TableError
@@ -398,6 +398,7 @@ def client_engine(zomboid_home, runtime, pz_dir: Path, launcher) -> Engine:
     engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir, client_launcher=launcher)
     engine.state.config = dict(HOST_CONFIG)
     engine.state.phase = "lobby"
+    engine.state.players["B"] = "invite"
     return engine
 
 
@@ -463,6 +464,7 @@ def test_open_game_runs_the_client_in_the_detected_game_folder(
     engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir)
     engine.state.config = dict(HOST_CONFIG)
     engine.state.phase = "lobby"
+    engine.state.players["B"] = "invite"
 
     assert engine.action("open_game")[0] is True
 
@@ -547,6 +549,48 @@ def test_open_game_is_refused_outside_the_lobby(zomboid_home, tmp_path, runtime,
     assert ok is False
     assert message == f"impossible d'ouvrir le jeu en phase {phase} : il s'ouvre au lobby"
     assert launcher.calls == []
+
+
+def test_open_game_waits_for_the_guest(zomboid_home, tmp_path, runtime):
+    """P9F5 (C2) : sans invité identifié, le client ne part pas, et le message dit pourquoi.
+
+    `PauseEmpty=true` fige le monde A tant que l'hôte n'y est pas : l'y connecter avant
+    l'invité le ferait tourner seul. Dès que B est identifié, le même appel passe.
+    Mutation : retirer le test de `players.B` de `_open_game` lance le client tout de suite.
+    """
+    pz_dir, _ = client_install(tmp_path)
+    launcher = Launcher()
+    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine.state.players["B"] = None
+
+    ok, message = engine.action("open_game")
+
+    assert ok is False
+    assert "l'adversaire n'est pas encore connecté" in message
+    assert launcher.calls == []
+
+    engine.state.players["B"] = "dupont"
+    assert engine.action("open_game")[0] is True
+    assert len(launcher.calls) == 1
+
+
+def test_open_game_waits_for_the_guest_in_mock_too(runtime):
+    """Mock : refusé au lobby vide, ouvert après `simulate_join`, sans autre manipulation.
+
+    Lobby posé sans le fil du moteur : il passerait au décompte dès l'invité entré."""
+    engine = Engine("mock", runtime=runtime, clock=FastClock())
+    engine.state.phase = "lobby"
+
+    ok, message = engine.action("open_game")
+    assert ok is False and "l'adversaire n'est pas encore connecté" in message
+
+    assert engine.action("simulate_join")[0]
+    assert engine.action("open_game")[0] is True
+
+
+def test_world_waits_while_nobody_plays_it(runtime):
+    """C2 : le monde de chaque camp s'arrête sans joueur. Mutation : `PauseEmpty` à `false`."""
+    assert runtime["managed_ini"]["PauseEmpty"] == "true"
 
 
 def test_open_game_is_refused_outside_the_lobby_in_mock_too(runtime):
@@ -813,23 +857,41 @@ def test_idle_quit_zero_never_fires(runtime):
     assert engine.snapshot()["idle_quit"]["armed"] is False
 
 
-def test_only_a_duel_in_progress_holds_the_idle_quit(runtime):
-    """La condition : `phase in DUEL_PHASES`, soit `countdown` et `running`, rien d'autre.
+@pytest.mark.parametrize("phase", list(PHASE_LABELS))
+def test_idle_quit_only_fires_when_nothing_is_under_way(runtime, phase):
+    """P9F5 (C4) : l'arrêt ne tire qu'en `idle`, `over` ou `error`, chaque phase vérifiée.
 
-    Mutation : retirer le test de phase fait tirer en plein duel ; y ajouter `lobby` ou
-    `error` les fait protéger.
+    Le premier duel réel a été coupé en `preflight`, sans onglet ouvert. Mutation : remettre la
+    condition large (`phase in ("countdown", "running")` protège, le reste tire) fait tirer
+    en `preflight`, `starting`, `contract`, `lobby` et `stopping`.
     """
-    assert DUEL_PHASES == ("countdown", "running")
-    held = []
-    for phase in PHASE_LABELS:
-        engine, clock = idle_engine(runtime)
+    assert IDLE_QUIT_PHASES == ("idle", "over", "error")
+    engine, clock = idle_engine(runtime)
+    engine.state.phase = phase
+    clock.now += 10 * IDLE_S
+    armed = phase in ("idle", "over", "error")
+    assert engine.idle_due() is armed
+    assert engine.snapshot()["idle_quit"]["armed"] is armed
+    assert engine.claim_idle_stop() is armed
+    assert engine._closing is armed
+
+
+def test_a_whole_launch_without_a_tab_is_never_stopped(runtime):
+    """De `preflight` à la fin du `lobby`, des heures sans battement ne coupent rien ; l'échec
+    du lancement rend ensuite le délai entier, pas un arrêt immédiat.
+
+    Mutation : ne pas renouveler le battement hors d'`IDLE_QUIT_PHASES` fait tirer dès `error`.
+    """
+    engine, clock = idle_engine(runtime)
+    for phase in ("preflight", "starting", "contract", "lobby"):
         engine.state.phase = phase
-        clock.now += 10 * IDLE_S
-        if not engine.idle_due():
-            held.append(phase)
-        assert engine.snapshot()["idle_quit"]["armed"] is (phase not in DUEL_PHASES)
-    assert held == ["countdown", "running"]
-    assert {"lobby", "error"} <= set(PHASE_LABELS)
+        clock.now += 3600
+        assert not engine.idle_due(), phase
+    engine.state.phase = "error"
+    clock.now += IDLE_S - 1
+    assert not engine.idle_due()
+    clock.now += 1
+    assert engine.idle_due()
 
 
 def test_the_delay_restarts_whole_when_the_duel_ends(runtime):
@@ -915,19 +977,28 @@ def test_a_beat_before_the_claim_holds_it(runtime):
 
 def test_claiming_the_idle_stop_is_refused_during_a_duel(runtime):
     engine, clock = idle_engine(runtime)
-    for phase in DUEL_PHASES:
+    for phase in ("countdown", "running"):
         engine.state.phase = phase
         clock.now += 10 * IDLE_S
         assert engine.claim_idle_stop() is False
     assert not engine._stop.is_set() and not engine._closing
 
 
-def test_an_idle_stop_claimed_in_the_mock_lobby_never_opens_a_duel(runtime):
-    """Mock : l'arrêt s'engage juste après que le lobby a vu l'adversaire, avant le décompte.
+def engage_stop(engine: Engine) -> None:
+    """Ce que `claim_idle_stop` engageait au lobby avant P9F5, et que `Quit` engage encore."""
+    with engine.lock:
+        engine._closing = True
+        engine._stop.set()
 
-    `claim_idle_stop` passe à la fin de l'attente qui précède ce constat : seul le test de
-    `_stop` sous `self.lock` retient le décompte. Mutation : le retirer de `_phase_lobby`
-    ouvre le décompte d'un service qui s'arrête.
+
+def test_a_stop_engaged_in_the_mock_lobby_never_opens_a_duel(runtime):
+    """Mock : un arrêt s'engage juste après que le lobby a vu l'adversaire, avant le décompte.
+
+    Depuis P9F5 l'arrêt sur inactivité ne peut plus s'y engager (`claim_idle_stop` refuse au
+    lobby, même des heures sans battement) ; un arrêt demandé, lui, le peut encore. Seul le
+    test de `_stop` sous `self.lock` retient alors le décompte. Mutations : le retirer de
+    `_phase_lobby` ouvre le décompte d'un service qui s'arrête ; rendre le lobby à l'arrêt
+    sur inactivité fait accepter le constat.
     """
     engine, clock = idle_engine(runtime)
     sleep, claimed = engine._sleep, []
@@ -935,8 +1006,9 @@ def test_an_idle_stop_claimed_in_the_mock_lobby_never_opens_a_duel(runtime):
     def sleep_then_claim(seconds: float) -> bool:
         slept = sleep(seconds)
         if slept and not claimed and engine.state.players.get("B"):
-            clock.now += IDLE_S
+            clock.now += 10 * IDLE_S
             claimed.append(engine.claim_idle_stop())
+            engage_stop(engine)
         return slept
 
     engine._sleep = sleep_then_claim
@@ -944,7 +1016,7 @@ def test_an_idle_stop_claimed_in_the_mock_lobby_never_opens_a_duel(runtime):
     wait_phase(engine, "lobby")
     assert engine.action("simulate_join")[0]
     state = settle(engine)
-    assert claimed == [True]
+    assert claimed == [False]
     # Le décompte ne dure qu'un instant avant l'annulation : son entrée se lit au journal.
     assert "décompte" not in [line["msg"] for line in engine.state.logs]
     assert state["phase"] == "idle"

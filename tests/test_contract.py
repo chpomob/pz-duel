@@ -88,7 +88,9 @@ def mods(zomboid, runtime, caps):
 
 
 def pause_empty(zomboid, runtime, caps):
-    alter_ini(zomboid, "A", PauseEmpty="true")
+    # L'inverse de la valeur gérée, `true` depuis P9F5 : le monde attend l'invité.
+    managed = runtime["managed_ini"]["PauseEmpty"]
+    alter_ini(zomboid, "A", PauseEmpty="false" if managed == "true" else "true")
 
 
 def rcon_port(zomboid, runtime, caps):
@@ -340,9 +342,10 @@ def state_entered_at(lobby: Lobby, phase: str) -> int:
 def test_an_idle_stop_claimed_as_the_countdown_is_decided_opens_no_duel(engine_rig, monkeypatch):
     """Revue A1 (P9F4) : l'arrêt engagé entre la décision du décompte et son entrée l'emporte.
 
-    `claim_idle_stop` passe dans la fenêtre même : après `_rules_refusal`, avant le changement
-    d'état. Mutation : retirer le test de `_stop` dans `_enter_countdown` ouvre le décompte
-    d'un service qui s'arrête.
+    Dans la fenêtre même, après `_rules_refusal` et avant le changement d'état, l'arrêt sur
+    inactivité est refusé depuis P9F5 (le lobby ne l'autorise plus) ; un arrêt engagé comme
+    `Quit` l'engage passe encore. Mutation : retirer le test de `_stop` dans
+    `_enter_countdown` ouvre le décompte d'un service qui s'arrête.
     """
     lobby = Lobby(engine_rig, None)
     engine, match = lobby.engine, lobby.engine._match
@@ -354,6 +357,9 @@ def test_an_idle_stop_claimed_as_the_countdown_is_decided_opens_no_duel(engine_r
         with engine.lock:
             engine._watched_at = float("-inf")
         claimed.append(engine.claim_idle_stop())
+        with engine.lock:
+            engine._closing = True
+            engine._stop.set()
         return refusal
 
     monkeypatch.setattr(match, "_rules_refusal", claim_in_the_window)
@@ -361,7 +367,7 @@ def test_an_idle_stop_claimed_as_the_countdown_is_decided_opens_no_duel(engine_r
     lobby.wait_for(lambda _: claimed, expected="l'arrêt engagé au moment du décompte")
 
     assert engine.shutdown()
-    assert claimed[0] is True
+    assert claimed[0] is False
     assert engine.snapshot()["phase"] not in ("countdown", "running")
     assert "countdown" not in lobby.phases()
 

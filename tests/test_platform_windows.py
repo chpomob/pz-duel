@@ -1564,6 +1564,7 @@ if sys.platform != "win32":
             assert server._cfg["stop_timeout_s"] == rig.runtime["stop_timeout_s"]
             assert server._cfg["kill_grace_s"] == rig.runtime["kill_grace_s"]
 
+        guest_here(engine)
         ok, message = engine.action("open_game")
         assert ok, message
         client, _ = launch.calls[-1]
@@ -1635,10 +1636,17 @@ if sys.platform != "win32":
         assert_no_password(engine, rig, caplog, engine.state.config["host_password"], state["error"])
 
 
+    def guest_here(engine) -> None:
+        """`open_game` attend l'invité (P9F5) : ces tests regardent le client, pas l'invité."""
+        with engine.lock:
+            engine.state.players["B"] = "invite"
+
+
     def in_lobby(rig) -> dict:
         rig.start()
         state = rig.wait("lobby", "error")
         assert state["phase"] == "lobby", state["error"]
+        guest_here(rig.engine)
         return state
 
 

@@ -1515,3 +1515,83 @@ def test_unexpected_failure_still_stops_servers(engine_rig, monkeypatch):
     assert "lancement impossible" in state["error"]
     assert REDACTED in state["error"]
     assert stopped_for_good(engine_rig)
+
+
+# -- P9F5 (C3) : le temps du duel, et la conversion de dérive qui en dépend -------------------
+
+PRESETS = Path(__file__).resolve().parent.parent / "service" / "presets"
+
+
+def shipped_preset(name: str) -> dict:
+    return json.loads((PRESETS / f"{name}.json").read_text(encoding="utf-8"))
+
+
+# Option `StartTime` de PZ 42 → heure de départ, relevée dans le `SandboxVars` qu'il génère.
+PZ_START_TIME_HOURS = {1: 7, 2: 9, 3: 12, 4: 14, 5: 17, 6: 21, 7: 0, 8: 2, 9: 5}
+
+
+def test_p9f5_duel_rapide_lasts_two_and_a_half_game_hours_by_day(runtime):
+    """240 min par jour : 25 min réelles font 2,5 h en jeu, à partir de 9 h.
+
+    `StartTime` est un indice d'option, pas une heure : le `SandboxVars` généré par PZ donne
+    `2 = 9 heures` et `9 = 5 heures`. Mutation : `day_length` remis à 1 donne 1,67 jour (faim et
+    soif immédiates), `StartTime` à 9 fait commencer à 5 h, avant le jour.
+    """
+    preset = shipped_preset("duel_rapide")
+    assert preset["day_length"] == 7
+    minutes = runtime["day_length_minutes"][str(preset["day_length"])]
+    assert minutes == 240
+    real_s_per_game_hour = minutes * 60 / 24
+    assert preset["duration_s"] / real_s_per_game_hour == 2.5
+    assert PZ_START_TIME_HOURS[runtime["sandbox_start"]["StartTime"]] == 9
+
+
+def test_p9f5_drift_factor_turns_world_hours_into_real_seconds(runtime):
+    """`day_length_minutes × 2,5` vaut les secondes réelles d'une heure de jeu, pour chaque clé."""
+    assert runtime["drift_factor"] == 60 / 24
+    for minutes in runtime["day_length_minutes"].values():
+        assert minutes * runtime["drift_factor"] == minutes * 60 / 24
+
+
+def drift_of(runtime: dict, day_length: int, gap_h: float) -> tuple[float, dict | None]:
+    """Juge un écart d'âge du monde `gap_h` par le vrai `RealMatch._drift_end`."""
+    from service.engine import RealMatch
+
+    match = SimpleNamespace(
+        _unavailable=set(),
+        _last_age={"A": gap_h, "B": 0.0},
+        _first_age={"A": 0.0, "B": 0.0},
+        _banked_gap=0.0,
+        runtime=runtime,
+        config={"day_length": day_length},
+        _drift_s=None,
+    )
+    match._age_gap = partial(RealMatch._age_gap, match)
+    end = RealMatch._drift_end(match)
+    return match._drift_s, end
+
+
+def test_p9f5_drift_stays_right_at_day_length_7(runtime):
+    """6 min de jeu d'avance valent 60 s réelles à 240 min par jour : la limite, sans plus.
+
+    Mutation : un facteur qui ne passe pas par `day_length_minutes` (la clé 7 prise pour
+    7 minutes, ou le facteur 2,5 oublié) juge autre chose que 60 s.
+    """
+    assert runtime["max_drift_s"] == 60
+    drift_s, end = drift_of(runtime, 7, 0.1)
+    assert drift_s == 60.0 and end is None
+    drift_s, end = drift_of(runtime, 7, 0.1001)
+    assert drift_s == 60.06 and end["outcome"] == "invalidated"
+    assert drift_of(runtime, 1, 0.1)[0] == 3.75
+
+
+def test_p9f5_managed_settings_write_the_new_values(tmp_path, sandbox, runtime):
+    """Le `.ini` reçoit `PauseEmpty=true`, le sandbox `StartTime = 2` (9 h) : ce que le contrat relit."""
+    ini = tmp_path / "duelA.ini"
+    ini.write_bytes(b"PauseEmpty=false\n")
+    write_ini(ini, runtime["managed_ini"])
+    assert read_ini(ini)["PauseEmpty"] == "true"
+    write_sandbox(sandbox, 7, runtime["sandbox_start"])
+    text = sandbox.read_text(encoding="utf-8")
+    assert "    DayLength = 7,\n" in text
+    assert "StartTime = 2, -- le matin" in text

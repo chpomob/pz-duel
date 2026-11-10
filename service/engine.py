@@ -182,9 +182,16 @@ SHARE_UNAVAILABLE_TEXT = (
     "The share link is unavailable: TCP port {port} could not be opened. "
     "Save the launcher and send it to your guest."
 )
-# Arrêt sur inactivité (P9F4) : un duel se joue dans ces phases, et l'hôte y regarde le jeu,
-# pas l'onglet. Elles seules interdisent l'arrêt ; `lobby`, `error` et toutes les autres non.
-DUEL_PHASES = ("countdown", "running")
+# Arrêt sur inactivité (P9F4, resserré en P9F5) : seules ces phases, où rien n'est en cours,
+# l'autorisent. De `preflight` à la fin du `lobby`, un lancement attend sans onglet ouvert (le
+# premier duel réel a été coupé en `preflight`) ; pendant un duel, l'hôte regarde le jeu.
+IDLE_QUIT_PHASES = ("idle", "over", "error")
+# `open_game` attend l'invité (P9F5) : le monde de l'hôte reste figé jusqu'à son arrivée.
+GUEST_SIDE = "B"
+GUEST_NOT_HERE = (
+    "impossible d'ouvrir le jeu : l'adversaire n'est pas encore connecté. Le jeu s'ouvre dès "
+    "que l'invité est identifié, pour que ton monde ne tourne pas seul en l'attendant."
+)
 # Le lobby s'ouvre depuis `contract` : l'écouteur naît juste avant lui, sans lui survivre.
 SHARE_PHASES = ("contract", "lobby")
 # Formes neutres de `ports_opening` ; les autres statuts viennent de `service/upnp.py`.
@@ -540,6 +547,8 @@ class RealMatch:
         # Écart d'âge A − B acquis avant les relances, et camps sans repère depuis la leur.
         self._banked_gap = 0.0
         self._rebasing: set[str] = set()
+        # Camps sans joueur ou muets : leur monde est figé (`PauseEmpty=true`), dérive suspendue.
+        self._paused: set[str] = set()
         self._drift_s: float | None = None
         self._threats: deque[float] = deque()
         # Commandes écrites sans `cmd_result` lu : ce qu'un redémarrage rendrait perdu.
@@ -938,6 +947,7 @@ class RealMatch:
             if silent:
                 self._suspects.add(side)
                 self.players[side] = None
+                self._suspend_drift(side)
                 status, detail = STATUS_SUSPECT, f"aucun heartbeat depuis {timeout_ms // MS_PER_S} s"
             else:
                 self._suspects.discard(side)
@@ -997,14 +1007,28 @@ class RealMatch:
         if len(self._last_age) == len(SIDES):
             self._banked_gap += self._age_gap()
 
+    def _suspend_drift(self, side: str) -> None:
+        """Suspend la dérive d'un camp sans joueur : `PauseEmpty=true` fige son monde.
+
+        L'autre monde continue de tourner : comparer leurs âges compterait l'absence comme
+        dérive, et la dérive finirait le match avant la grâce de reconnexion. L'écart acquis
+        est mis de côté, comme pour une relance, et un repère neuf s'ouvre au retour du
+        joueur. L'absence reste jugée par `_absence_end`, depuis le dernier joueur vu.
+        """
+        if self._core is None or side in self._paused:
+            return
+        self._paused.add(side)
+        self._bank_drift()
+        self._last_age.pop(side, None)
+
     def _track_age(self, side: str, age: float) -> None:
         """Suit l'âge du monde d'un camp, et repose le repère au retour d'une relance.
 
         Le monde relancé a perdu son temps d'arrêt et repart de sa dernière sauvegarde : son
-        âge ne se compare plus à l'ancien repère. Son premier heartbeat une fois disponible
-        ouvre donc un repère neuf, pris au dernier âge connu pour l'autre camp. Un serveur
-        vide tique (`PauseEmpty=false`) : ce heartbeat n'attend pas le retour du joueur, dont
-        la reconnexion se mesure comme le reste. La relance ne compte ainsi pas comme dérive.
+        âge ne se compare plus à l'ancien repère. Son premier heartbeat une fois disponible,
+        avec son joueur, ouvre donc un repère neuf, pris au dernier âge connu pour l'autre
+        camp : un serveur vide est figé (`PauseEmpty=true`, voir `_suspend_drift`). La relance
+        ne compte ainsi pas comme dérive.
         """
         if side in self._unavailable:
             return
@@ -1256,8 +1280,16 @@ class RealMatch:
         self._beat_ms[side] = now_ms
         if self.players[side] is not None:
             self._seen_ms[side] = now_ms
-        if self._core is not None:
-            self._track_age(side, data["age"])
+        if self._core is None:
+            return
+        if self.players[side] is None:
+            self._suspend_drift(side)
+            return
+        if side in self._paused:
+            # Le joueur revient : le monde repart d'où il s'était figé, sur un repère neuf.
+            self._paused.discard(side)
+            self._rebasing.add(side)
+        self._track_age(side, data["age"])
 
     def _identify(self, side: str, names: Sequence[str]) -> str | None:
         """Rend le joueur du camp : le premier nom admis s'y lie, et n'en sert aucun autre."""
@@ -1779,20 +1811,20 @@ class Engine:
     def _idle_left_s(self) -> float | None:
         """Secondes avant l'arrêt sur inactivité, `None` s'il ne peut pas tirer. Sous `self.lock`.
 
-        `None` quand `idle_quit_s` vaut 0, et pendant un duel (`DUEL_PHASES`) : le battement y
-        est alors renouvelé, si bien que le délai repart entier à la fin du duel, même sans
-        navigateur. Négatif ou nul : le délai est échu.
+        `None` quand `idle_quit_s` vaut 0, et hors d'`IDLE_QUIT_PHASES` (lancement, duel, arrêt) :
+        le battement y est alors renouvelé, si bien que le délai repart entier à la fin d'un
+        duel ou d'un lancement échoué, même sans navigateur. Négatif ou nul : le délai est échu.
         """
         if self._idle_quit_s == 0:
             return None
         now = self._monotonic()
-        if self.state.phase in DUEL_PHASES:
+        if self.state.phase not in IDLE_QUIT_PHASES:
             self._watched_at = now
             return None
         return self._idle_quit_s - (now - self._watched_at)
 
     def idle_due(self) -> bool:
-        """Vrai quand `maintenant - dernier battement >= idle_quit_s` hors d'un duel."""
+        """Vrai quand `maintenant - dernier battement >= idle_quit_s`, en `IDLE_QUIT_PHASES`."""
         with self.lock:
             left = self._idle_left_s()
             return left is not None and left <= 0
@@ -2016,7 +2048,8 @@ class Engine:
         return stopped and not self._stop_incomplete
 
     def _open_game(self) -> tuple[bool, str]:
-        """Ouvre le client depuis le lobby : ailleurs, A est arrêté ou la partie déjà jouée.
+        """Ouvre le client depuis le lobby, l'invité identifié : ailleurs, A est arrêté ou la
+        partie déjà jouée ; avant l'invité, le monde de l'hôte tournerait seul.
 
         Le verrou reste libre pendant que `launch_client` regarde le démarrage :
         `_client_starting` retient donc le second appel, jusqu'à ce que `_client` prenne le relais.
@@ -2025,6 +2058,10 @@ class Engine:
             phase = self.state.phase
             if phase != "lobby":
                 return False, f"impossible d'ouvrir le jeu en phase {phase} : il s'ouvre au lobby"
+            # P9F5 (C2) : `PauseEmpty=true` fige le monde A tant que l'hôte n'y est pas ; s'y
+            # connecter avant l'invité le ferait tourner seul. L'UI lit la même condition.
+            if not self.state.players.get(GUEST_SIDE):
+                return False, GUEST_NOT_HERE
             if not self.real:
                 self.state.log("lancement du client PZ demandé (simulé)")
                 return True, "client PZ lancé (simulé)"

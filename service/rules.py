@@ -44,6 +44,12 @@ PLAYER_DEATH = "player_death"
 RESTARTING = "restarting"
 # Absents de la commande : `target` devient le camp visé, `cap_per_min` reste au budget.
 NON_COMMAND_PARAMS = ("target", "cap_per_min")
+# Cadence des sprinters (P9F5) : le k-ième zombie d'un pop chez un camp devient un sprinter
+# quand `floor(k·pct/100)` passe un entier. Clé de table facultative : absente, aucun sprinter.
+SPRINTER_PERCENT = "sprinter_percent"
+PERCENT = 100
+POP_KIND = "spawn_pop"
+SPRINTER_KIND = "spawn_sprinter"
 
 TABLE_KEYS = (
     "id",
@@ -60,6 +66,7 @@ TABLE_KEYS = (
     "disconnect_grace_s",
     "summary",
 )
+OPTIONAL_TABLE_KEYS = (SPRINTER_PERCENT,)
 BOUNDED_PARAMS = {
     "n": (1, "max_n"),
     "warn_s": (0, "max_warn_s"),
@@ -249,8 +256,10 @@ def load_table(
     passée par `narrow_table`, peut alors n'avoir plus ni règle ni point, jamais plus d'atome.
     """
     where = "section table"
-    _check_keys(raw, where, "", TABLE_KEYS)
+    _check_keys(raw, where, "", TABLE_KEYS, OPTIONAL_TABLE_KEYS)
     _check_header(raw, where, file_stem)
+    if SPRINTER_PERCENT in raw:
+        _check_int(raw[SPRINTER_PERCENT], where, SPRINTER_PERCENT, 0, PERCENT)
     atoms = _check_atoms(raw["atoms"], catalog, active_atoms)
     _check_budget(raw["budget"], limits)
     narrowed = active_atoms is not None
@@ -582,6 +591,20 @@ def _exact(value: int | float) -> Fraction:
     return Fraction(str(value))
 
 
+def sprinter_ranks(first: int, count: int, percent: int) -> list[int]:
+    """Rangs `k` de `[first, first + count[` qui sont des sprinters, à `percent` %.
+
+    `k` est un sprinter quand `floor(k·pct/100) > floor((k−1)·pct/100)` : à 1 % le 100e, le
+    200e… ; à 3 % le 34e, le 67e, le 100e. L'arrondi se répartit au lieu de dériver, sans
+    tirage : la partie se rejoue à l'identique.
+    """
+    return [
+        k
+        for k in range(first, first + count)
+        if k * percent // PERCENT > (k - 1) * percent // PERCENT
+    ]
+
+
 def _opponent(side: str) -> str:
     return SIDES[1 - SIDES.index(side)]
 
@@ -785,6 +808,10 @@ class MatchCore:
         self._concurrent_effects = budget["concurrent_effects"]
         self._cooldown_ms = budget["per_effect_cooldown_s"] * MS_PER_S
         self._evaluators = {side: RuleEvaluator(table, side, self.scores) for side in SIDES}
+        # Cadence des sprinters (P9F5) : `None` sans la clé, et alors `rule_fired` reste tel quel.
+        self._sprinter_percent: int | None = table.get(SPRINTER_PERCENT)
+        # Zombies de pop admis par camp visé depuis le début du match : le dernier `k` donné.
+        self._popped = {side: 0 for side in SIDES}
         self._tick = -1
         self._events: list[Mapping[str, Any]] = []
         self._inputs: list[Callable[[], None]] = []
@@ -977,8 +1004,37 @@ class MatchCore:
             "multipliers": dict(fired.multipliers),
         }
         self._record("rule_fired", data, fired.side)
+        pops: list[tuple[int | None, int]] = []
         for rank, effect in enumerate(fired.effects):
-            self._enqueue(fired, effect, rank)
+            pops += self._enqueue(fired, effect, rank)
+        if self._sprinter_percent is not None and pops:
+            # Rempli après l'admission, que `cap_per_min` décide : l'enregistrement est déjà
+            # à sa place, avant tout `effect_capped` de la règle. `index` est le rang `k` du
+            # dernier zombie compté chez la cible, nul si `cap_per_min` a tout refusé.
+            data["sprinter"] = any(sprinters for _, sprinters in pops)
+            data["index"] = next((k for k, _ in reversed(pops) if k is not None), None)
+
+    def _counts_pops(self, params: Mapping[str, Any]) -> bool:
+        return self._sprinter_percent is not None and params["kind"] == POP_KIND
+
+    def _split_pop(
+        self, effect: FiredEffect, params: Mapping[str, Any], units: int
+    ) -> tuple[list[tuple[Mapping[str, Any], int]], list[tuple[int, int]]]:
+        """Répartit `units` zombies de pop entre `spawn_pop` et `spawn_sprinter`, total gardé.
+
+        Rend les parts non vides, `kind` réécrit, et `(k, sprinters)` pour le journal, `k`
+        étant le rang du dernier zombie compté chez la cible, ou rien hors de la cadence.
+        """
+        if not self._counts_pops(params):
+            return [(params, units)], []
+        first = self._popped[effect.target] + 1
+        self._popped[effect.target] += units
+        sprinters = len(sprinter_ranks(first, units, self._sprinter_percent))
+        parts = [
+            ({**params, "kind": POP_KIND}, units - sprinters),
+            ({**params, "kind": SPRINTER_KIND}, sprinters),
+        ]
+        return [part for part in parts if part[1]], [(self._popped[effect.target], sprinters)]
 
     def _admit(self, fired: FiredRule, effect: FiredEffect, rank: int, units: int) -> int:
         """Rend les unités admises par `cap_per_min` sur `]mt − 60, mt]`, journalise le reste.
@@ -998,22 +1054,46 @@ class MatchCore:
             self._record("effect_capped", data, effect.target)
         return taken
 
-    def _enqueue(self, fired: FiredRule, effect: FiredEffect, rank: int) -> None:
-        """Crée le lot de l'effet ou l'y cumule : `n` seul reste hors de la clé."""
+    def _enqueue(
+        self, fired: FiredRule, effect: FiredEffect, rank: int
+    ) -> list[tuple[int | None, int]]:
+        """Admet l'effet, puis en crée le lot ou l'y cumule : `n` seul reste hors de la clé.
+
+        `cap_per_min` porte sur le total du pop, sprinters compris : la part sprinter se
+        découpe dans les unités admises. Rend `(k, sprinters)` d'un pop compté, sinon rien.
+        """
         params = dict(effect.params)
         units = params.pop("n", None)
         if units is not None and effect.cap_per_min is not None:
             units = self._admit(fired, effect, rank, units)
             if units == 0:
-                return
+                return [(None, 0)] if self._counts_pops(params) else []
+        if units is None:
+            self._add_to_lot(fired, effect, params, None)
+            return []
+        parts, pops = self._split_pop(effect, params, units)
+        for part, part_units in parts:
+            self._add_to_lot(fired, effect, part, part_units)
+        return pops
+
+    def _add_to_lot(
+        self,
+        fired: FiredRule,
+        effect: FiredEffect,
+        params: Mapping[str, Any],
+        units: int | None,
+    ) -> None:
         key = json.dumps(params, sort_keys=True)
         lots = self._lots[effect.target]
         t_ms = fired.event["t_ms"]
         lot = lots.get(key)
         if lot is None:
-            lot_params = dict(effect.params)
-            if units is not None:
-                lot_params["n"] = units
+            # L'ordre des clés de l'effet est celui du journal : `n` y garde sa place.
+            lot_params = {
+                name: units if name == "n" else params[name]
+                for name in effect.params
+                if name in params or (name == "n" and units is not None)
+            }
             lots[key] = _Lot(lot_params, fired.rule, fired.event, t_ms)
             return
         lot.oldest_t_ms = min(lot.oldest_t_ms, t_ms)

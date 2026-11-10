@@ -1558,6 +1558,56 @@ def test_drift_decides_after_the_return(engine_rig, presets):
     assert duel.replays()
 
 
+def test_paused_world_of_an_absent_player_is_not_drift(engine_rig, presets):
+    """`PauseEmpty=true` fige le monde d'un joueur parti : son absence n'est pas une dérive.
+
+    A décroche 40 s, son monde reste à l'âge 0 pendant que B prend 1,7 h (63,75 s à
+    `day_length` 1). Sous la grâce de 120 s, le match continue ; au retour de A, la dérive
+    repart d'un repère neuf et juge de nouveau. Mutation : retirer `_suspend_drift` invalide
+    le match pendant l'absence, avant que la grâce n'expire.
+    """
+    edit_preset(presets, day_length=1, duration_s=RESTART_MATCH_S)
+    duel = Duel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.beat("A", age=0.0)
+    duel.beat("B", age=0.0)
+    engine_rig.until(lambda s: s["clock"]["drift_s"] == 0)
+
+    for now_s, age_b in ((11, 0.6), (21, 1.2), (31, 1.7)):
+        duel.at_match(now_s)
+        duel.mods["A"].beat(age=0.0, players=())
+        duel.read("A")
+        duel.beat("B", age=age_b)
+        state = duel.reach(now_s + 1)
+        assert state["phase"] == "running"
+        assert state["players"]["A"] is None
+        assert state["clock"]["drift_s"] == 0
+
+    duel.at_match(41)
+    duel.beat("A", age=0.0)
+    state = engine_rig.until(lambda s: s["players"]["A"] == PLAYERS["A"])
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
+
+    duel.at_match(51)
+    duel.beat("A", age=0.25)
+    duel.beat("B", age=1.95)
+    state = duel.reach(52)
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0
+
+    # Le repère neuf juge encore : 1,7 h d'avance prise par B après le retour invalide.
+    duel.at_match(61)
+    duel.beat("A", age=0.25)
+    duel.mods["B"].beat(age=3.65, players=(PLAYERS["B"],))
+    duel.at_match(duel.te_s + duel.step_s)
+    state = duel.finish()
+    assert state["result"]["outcome"] == "invalidated"
+    assert state["clock"]["drift_s"] == -63.75
+    assert duel.replays()
+
+
 def test_empty_server_double_ticks_and_beats_every_ten_seconds(tmp_path):
     """H3 contredite : avec `PauseEmpty=false`, un serveur vide tique et bat au rythme nominal."""
     mod = FakeMod(tmp_path, "A")
@@ -2275,7 +2325,7 @@ def test_withdrawal_moves_hash_announcement_and_journal_together(engine_rig):
     assert announced["config"]["rules_hash"] != preset_hash("duel_rapide")
     assert announced["capabilities"]["table"] == {
         "atoms": ["zombie_kill"],
-        "rules": ["kill_baseline", "kill_streak"],
+        "rules": ["kill_baseline"],
     }
     assert announced["capabilities"]["disabled_rules"] == ["hurt_supply"]
 

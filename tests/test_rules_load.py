@@ -5,12 +5,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from service import engine, rules
-from service.protocol import parse_event
+from service.protocol import dump_line, parse_event
 from service.rules import TableError, When, load_table, narrow_table, parse_when, rules_hash
 
 PRESETS_DIR = Path(rules.__file__).resolve().parent / "presets"
@@ -96,8 +97,8 @@ FORBIDDEN = {
     "atome_craft": (cite_atom("craft"), ("section atoms", "atoms[2]", "craft")),
     "source_client": (cite_atom("client_atom"), ("section atoms", "atoms[2]", "client")),
     "cle_racine": (lambda t: t.update(extra=1), ("section table", "« extra »")),
-    "distance_24": (
-        lambda t: kills_effect(t).update(distance=[24, 60]),
+    "distance_9": (
+        lambda t: kills_effect(t).update(distance=[9, 60]),
         ("règle « kills »", "effects[0].distance[0]"),
     ),
     "when_hors_grammaire": (
@@ -127,6 +128,26 @@ FORBIDDEN = {
             0, {"kind": "probe_spawn", "n": 1, "distance": [30, 60], "warn_s": 0}
         ),
         ("règle « kills »", "effects[0].kind", "probe_spawn"),
+    ),
+    "sprinter_moins_1": (
+        lambda t: t.update(sprinter_percent=-1),
+        ("section table", "« sprinter_percent »", "de 0 à 100"),
+    ),
+    "sprinter_101": (
+        lambda t: t.update(sprinter_percent=101),
+        ("section table", "« sprinter_percent »", "de 0 à 100"),
+    ),
+    "sprinter_flottant": (
+        lambda t: t.update(sprinter_percent=1.5),
+        ("section table", "« sprinter_percent »", "entier attendu"),
+    ),
+    "sprinter_booleen": (
+        lambda t: t.update(sprinter_percent=True),
+        ("section table", "« sprinter_percent »", "entier attendu"),
+    ),
+    "sprinter_texte": (
+        lambda t: t.update(sprinter_percent="1"),
+        ("section table", "« sprinter_percent »", "entier attendu"),
     ),
     "threats_manquant": (
         lambda t: t["budget"].pop("threats_per_minute"),
@@ -255,7 +276,8 @@ def effects_by_rule(preset: dict) -> dict[str, list[dict]]:
 
 def test_preset_migration_values():
     rapide = effects_by_rule(read_preset("duel_rapide"))
-    assert list(rapide) == ["kill_baseline", "kill_streak", "hurt_supply"]
+    # P9F5 : la cadence `sprinter_percent` remplace `kill_streak`, qui ajoutait un sprinter.
+    assert list(rapide) == ["kill_baseline", "hurt_supply"]
     assert rapide["hurt_supply"] == [
         {
             "kind": "supply_drop",
@@ -469,3 +491,255 @@ def test_shipped_runtime_has_upnp_section(runtime):
     assert upnp["max_response_bytes"] > 0
     assert isinstance(upnp["description"], str) and upnp["description"]
     assert runtime["managed_ini"]["UPnP"] == "false"
+
+
+# P9F5 : pop visible, cadence de sprinters déterministe, « 1 kill = 2 zombies » ------------
+
+MOD_LUA = (
+    Path(rules.__file__).resolve().parent.parent
+    / "mods/duelcore/42.21/media/lua/server/DuelCore.lua"
+)
+
+
+def test_shipped_pops_land_within_sight(runtime):
+    """C1 : 12 à 20 tuiles, là où le premier duel a vu les paquets. Mutation : un preset
+    resté à `[30, 60]` ou `[40, 70]`."""
+    for name in SHIPPED:
+        for rule in read_preset(name)["rules"]:
+            for effect in rule["effects"]:
+                if effect["kind"] in ("spawn_pop", "spawn_sprinter"):
+                    assert effect["distance"] == [12, 20], (name, rule["id"])
+
+
+def test_loader_floor_is_the_mod_floor(runtime):
+    """Le chargeur et le mod refusent sous le même rayon. Mutation : `MIN_DISTANCE` laissé à 25
+    dans le mod (il refuserait tout pop en `too_close`), ou `min_distance` laissé à 25."""
+    lua = MOD_LUA.read_text(encoding="utf-8")
+    (floor,) = re.findall(r"^local MIN_DISTANCE = (\d+)$", lua, flags=re.MULTILINE)
+    assert int(floor) == runtime["limits"]["min_distance"] == 10
+
+
+class LuaGame:
+    """Le vrai `DuelCore.lua` sous `mini_lua`, réduit à un joueur éveillé et à pied."""
+
+    def __init__(self) -> None:
+        from test_lua_attribution import Game
+
+        self.game = Game()
+        self.game.player.isAsleep = lambda: False
+        self.game.player.getVehicle = lambda: None
+
+    def reason(self, distance: list[int]) -> str | None:
+        command = {"v": 1, "seq": 1, "kind": "spawn_pop", "n": 2, "distance": distance}
+        self.game.commands = dump_line({**command, "warn_s": 0})
+        self.game.flush()
+        (result,) = self.game.lines("cmd_result")
+        return result["data"].get("reason")
+
+
+@pytest.mark.parametrize(
+    "distance, refused", [([9, 20], True), ([10, 20], False), ([12, 20], False)]
+)
+def test_mod_still_refuses_under_its_floor(distance, refused):
+    """Le refus reste possible : sous `MIN_DISTANCE`, `too_close`. Mutation : retirer le test
+    `cmd.distance[1] < MIN_DISTANCE` de `refusalReason` fait passer `[9, 20]` ; le laisser à 25
+    refuse `[12, 20]`, la distance livrée."""
+    assert (LuaGame().reason(distance) == "too_close") is refused
+
+
+@pytest.mark.parametrize(
+    "percent, last, expected",
+    [
+        (1, 300, [100, 200, 300]),
+        (2, 100, [50, 100]),
+        (3, 100, [34, 67, 100]),
+        (0, 1000, []),
+        (100, 5, [1, 2, 3, 4, 5]),
+        (33, 10, [4, 7, 10]),
+    ],
+)
+def test_sprinter_ranks_follow_the_floor_rule(percent, last, expected):
+    """`floor(k·pct/100) > floor((k−1)·pct/100)`. Mutation : un modulo `k % (100 // pct)`
+    donne 33, 66, 99 à 3 % ; un `>=` fait de chaque zombie un sprinter."""
+    assert rules.sprinter_ranks(1, last, percent) == expected
+
+
+@pytest.mark.parametrize("percent", range(0, 101))
+def test_sprinter_cadence_never_drifts(percent):
+    """Sur 100·m zombies, exactement pct·m sprinters, quel que soit le découpage en pops."""
+    whole = rules.sprinter_ranks(1, 1000, percent)
+    pieces = [k for first in range(1, 1001, 7) for k in rules.sprinter_ranks(first, 7, percent)]
+    assert len(whole) == 10 * percent
+    assert pieces[: len(whole)] == whole
+
+
+class Duel:
+    """Un `MatchCore` sur un preset livré, éventuellement retouché : kills datés, commandes."""
+
+    def __init__(self, runtime: dict, name: str = "duel_rapide", **changes) -> None:
+        raw = read_preset(name)
+        budget = changes.pop("budget", {})
+        raw["budget"].update(budget)
+        kill_effect = changes.pop("kill_effect", {})
+        kills_effect(raw).update(kill_effect)
+        raw.update(changes)
+        self.catalog = rules.load_effects()
+        table = load_table(raw, self.catalog, runtime["limits"], file_stem=name)
+        self.core = rules.MatchCore(table, runtime, self.catalog, T0_MS, raw["duration_s"])
+        self.records: list[dict] = []
+        self.seq = {"A": 0, "B": 0}
+
+    def kill(self, te_s: float, side: str = "A") -> None:
+        self.to(te_s - 0.25)
+        self.seq[side] += 1
+        line = {
+            "v": 1,
+            "boot": 1,
+            "seq": self.seq[side],
+            "t_ms": T0_MS + round(te_s * 1000),
+            "src": side,
+            "side": side,
+            "kind": "zombie_kill",
+            "data": {"origin": "world"},
+        }
+        self.core.submit_event(parse_event(line, self.catalog))
+        self.to(te_s)
+
+    def to(self, mt_s: float) -> None:
+        self.records += self.core.advance(T0_MS + round(mt_s * 1000))
+
+    def of_type(self, type: str) -> list[dict]:
+        return [record for record in self.records if record["type"] == type]
+
+    def units(self, target: str, kind: str) -> int:
+        return sum(
+            r["data"]["command"]["n"]
+            for r in self.of_type("command")
+            if r["side"] == target and r["data"]["command"]["kind"] == kind
+        )
+
+    def sent_at(self, mt_s: float) -> list[tuple[str, str, int]]:
+        return [
+            (r["side"], r["data"]["command"]["kind"], r["data"]["command"]["n"])
+            for r in self.of_type("command")
+            if r["mt"] == mt_s
+        ]
+
+
+def test_duel_rapide_ships_one_percent_and_two_per_kill():
+    preset = read_preset("duel_rapide")
+    assert preset["sprinter_percent"] == 1
+    assert kills_effect(preset)["n"] == 2 and kills_effect(preset)["kind"] == "spawn_pop"
+
+
+def test_one_kill_pops_exactly_two_zombies_at_the_opponent(runtime):
+    """Le contrat « 1 kill = 2 zombies », envoyé au tick même du kill : rien n'attend le budget.
+
+    Mutation : un sprinter ajouté au pop au lieu d'en remplacer un zombie donnerait 3 au
+    pop du 100e zombie (test suivant) ; ici, un `n` du preset changé donne autre chose que 2.
+    """
+    duel = Duel(runtime)
+    duel.kill(1)
+    assert duel.sent_at(1) == [("B", "spawn_pop", 2)]
+
+
+def test_the_hundredth_zombie_is_a_sprinter_in_place_of_one(runtime):
+    """À 1 %, le 50e kill porte les zombies 99 et 100 : un pop, un sprinter, deux en tout.
+
+    Kills espacés de 21 s : chacun part à son tick, hors du cooldown de 20 s. Mutation : un
+    sprinter ajouté (`n` gardé à 2 pour `spawn_pop`) envoie 3 zombies ; un tirage au hasard
+    ou une cadence par kill déplace le sprinter.
+    """
+    duel = Duel(runtime)
+    for kill in range(1, 51):
+        duel.kill(21 * kill)
+        expected = [("B", "spawn_pop", 2)]
+        if kill == 50:
+            expected = [("B", "spawn_pop", 1), ("B", "spawn_sprinter", 1)]
+        assert duel.sent_at(21 * kill) == expected, kill
+    fired = duel.of_type("rule_fired")
+    assert [r["data"]["index"] for r in fired] == list(range(2, 101, 2))
+    assert [r["data"]["sprinter"] for r in fired] == [False] * 49 + [True]
+
+
+@pytest.mark.parametrize("cooldown_s", [0, 20, 45])
+def test_every_kill_is_two_zombies_whatever_the_budget(runtime, cooldown_s):
+    """100 kills à 5 s d'écart donnent 200 zombies chez B, 198 pops et 2 sprinters, quel que
+    soit `per_effect_cooldown_s` : le budget regroupe les unités en lots, il n'en jette
+    aucune avant la fin du match. Mutation : un lot servi qui garde `n` au lieu de le cumuler.
+    """
+    duel = Duel(runtime, budget={"per_effect_cooldown_s": cooldown_s})
+    for kill in range(1, 101):
+        duel.kill(5 * kill)
+    duel.to(1400)
+    assert duel.units("B", "spawn_pop") == 198
+    assert duel.units("B", "spawn_sprinter") == 2
+    assert duel.of_type("effect_capped") == []
+    assert duel.units("A", "spawn_pop") == duel.units("A", "spawn_sprinter") == 0
+
+
+def test_the_sprinter_count_is_per_target_side(runtime):
+    """Chaque camp a son propre `k` : les kills de B ne rapprochent pas le sprinter de B.
+
+    Mutation : un compteur unique pour les deux camps place le premier sprinter au 25e kill
+    de chacun.
+    """
+    duel = Duel(runtime)
+    for kill in range(1, 51):
+        duel.kill(21 * kill, "A")
+        duel.kill(21 * kill + 10, "B")
+    fired = duel.of_type("rule_fired")
+    for side, target in (("A", "B"), ("B", "A")):
+        mine = [r["data"] for r in fired if r["side"] == side]
+        assert [data["index"] for data in mine] == list(range(2, 101, 2))
+        assert [data["sprinter"] for data in mine].index(True) == 49
+        assert duel.units(target, "spawn_sprinter") == 1
+
+
+def test_the_count_starts_again_with_each_match(runtime):
+    """`k` repart de 1 à chaque match : deux duels identiques ont le même sprinter."""
+    seen = []
+    for _ in range(2):
+        duel = Duel(runtime, sprinter_percent=50)
+        for kill in range(1, 4):
+            duel.kill(21 * kill)
+        duel.to(200)
+        seen.append([r["data"]["index"] for r in duel.of_type("rule_fired")])
+        assert duel.units("B", "spawn_sprinter") == 3
+    assert seen == [[2, 4, 6], [2, 4, 6]]
+
+
+@pytest.mark.parametrize("percent, sprinters", [(0, 0), (100, 2)])
+def test_zero_never_and_hundred_always(runtime, percent, sprinters):
+    duel = Duel(runtime, sprinter_percent=percent)
+    duel.kill(1)
+    assert duel.units("B", "spawn_sprinter") == sprinters
+    assert duel.units("B", "spawn_pop") == 2 - sprinters
+    assert duel.of_type("rule_fired")[0]["data"]["sprinter"] is bool(sprinters)
+
+
+def test_cap_per_min_counts_sprinters_in_the_total(runtime):
+    """40 kills dans la même seconde : 80 zombies demandés, 60 admis, tous sprinters à 100 %.
+
+    Mutation : découper la part sprinter avant `_admit`, ou la lui faire contourner, en
+    laisserait passer 80.
+    """
+    duel = Duel(runtime, sprinter_percent=100, budget={"per_effect_cooldown_s": 0})
+    for kill in range(40):
+        duel.kill(1 + kill * 0.001)
+    duel.to(120)
+    assert duel.units("B", "spawn_sprinter") == 60
+    assert duel.units("B", "spawn_pop") == 0
+    assert sum(r["data"]["units"] for r in duel.of_type("effect_capped")) == 20
+    fired = [r["data"] for r in duel.of_type("rule_fired")]
+    assert [data["index"] for data in fired] == list(range(2, 61, 2)) + [None] * 10
+    assert [data["sprinter"] for data in fired] == [True] * 30 + [False] * 10
+
+
+def test_tables_without_the_key_keep_their_journal(runtime):
+    """Sans `sprinter_percent`, `rule_fired` reste tel quel : aucun sprinter, aucun rang."""
+    duel = Duel(runtime, "demo")
+    duel.kill(1)
+    (fired,) = duel.of_type("rule_fired")
+    assert set(fired["data"]) == {"rule", "event", "multipliers"}
+    assert duel.sent_at(1) == [("B", "spawn_pop", 2)]

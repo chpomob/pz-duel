@@ -42,7 +42,7 @@
   },
   "limits": {
     "max_n": 30,
-    "min_distance": 25,
+    "min_distance": 10,
     "max_distance": 100,
     "max_warn_s": 30,
     "max_radius": 50,
@@ -67,7 +67,7 @@
     "max_response_bytes": 65536
   },
   "managed_ini": {
-    "PauseEmpty": "false",
+    "PauseEmpty": "true",
     "WorkshopItems": "",
     "UPnP": "false",
     "Public": "false",

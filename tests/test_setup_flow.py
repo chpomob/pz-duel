@@ -1053,7 +1053,13 @@ def test_phase3_ac29_added_ui_lines_are_english():
         added = ports.splitlines()
     else:
         before = set(base.splitlines())
-        added = [line for line in script.splitlines() if line not in before]
+        # P9F5 : `Ouvrir PZ` n'a gagné que son attribut `disabled`, pas de texte nouveau.
+        unchanged_text = (" ${guestHere ? '' : 'disabled'}", "")
+        added = [
+            line
+            for line in script.splitlines()
+            if line not in before and line.replace(*unchanged_text) not in before
+        ]
         assert all(line in added for line in block.splitlines() if line.strip() and line not in before)
         assert any("data-action=\"open-ports\"" in line for line in added)
     assert added
@@ -1077,3 +1083,110 @@ def test_quit_button_reaches_the_quit_route_and_its_end_screen():
     assert f"await api('{QUIT_ROUTE}', {{}})" in script
     assert "if (quitting) return renderQuit();" in script
     assert "PZ Duel has stopped" in script
+
+
+# -- P9F5 : le lobby ne confond plus les deux secrets, et `Ouvrir PZ` attend l'invité ---------
+
+LAUNCHER_CODE = "0123456789abcdef"
+GUEST_PASSWORD = "mot-invite-42"
+
+
+def _render_invite(players: dict, invite: dict | None = None) -> str:
+    """Rend `inviteCard()` de `ui/app.js` sous Node, avec un état de lobby réel."""
+    script = ui_script()
+    esc = script[script.index("const esc = ") : script.index("const durLabel")]
+    constants = script[
+        script.index("const LAUNCHER_CODE_LABEL") : script.index("// Tout vient de `invite`")
+    ]
+    card = script[script.index("function inviteCard()") : script.index("function renderLive()")]
+    invite = {
+        "ip": "192.168.1.20",
+        "port": 17271,
+        "password": GUEST_PASSWORD,
+        "code": "PZ-1234",
+        "address": "192.168.1.20",
+        "launcher_code": LAUNCHER_CODE,
+        "launcher_code_text": "Read this code aloud to your guest.",
+        "needs_address": False,
+        **(invite or {}),
+    }
+    state = {
+        "mode": "real",
+        "invite": invite,
+        "players": players,
+        "config": {"host_address": "127.0.0.1:17261", "host_password": "hote"},
+    }
+    program = (
+        f"{esc}\n{constants}\n"
+        "let addressDraft = '';\n"
+        "const portsBlock = () => '', playedTable = () => '';\n"
+        f"const S = {json.dumps(state)};\n"
+        f"{card}\n"
+        "process.stdout.write(inviteCard());\n"
+    )
+    node = shutil.which("node")
+    assert node is not None, "node est requis pour rendre l'écran"
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    return done.stdout
+
+
+def _block(html: str, block_id: str) -> str:
+    """Le bloc `block_id`, jusqu'au bloc suivant : un autre secret, la phrase ou les boutons."""
+    start = html.index(f'id="{block_id}"')
+    ends = [html.find(mark, start + 1) for mark in ('class="secret"', 'class="notice"', 'class="actions"')]
+    return html[start : min(end for end in ends if end != -1)]
+
+
+def _plain(html: str) -> str:
+    return html.replace("&#39;", "'").replace("&quot;", '"')
+
+
+def test_p9f5_c5_two_secrets_two_blocks_two_labels():
+    """C5 : le code du lanceur et le mot de passe du serveur, chacun dans son bloc, sous son
+    propre libellé, et une phrase qui dit que l'un n'est pas l'autre.
+
+    Mutation : remettre le mot de passe sous le code (un seul bloc), ou un libellé du code qui
+    dit « password » / « mot de passe », fait échouer ce test.
+    """
+    html = _plain(_render_invite({"A": None, "B": None}))
+    code_block, password_block = _block(html, "launcher-code"), _block(html, "server-password")
+
+    assert LAUNCHER_CODE in code_block and GUEST_PASSWORD not in code_block
+    assert GUEST_PASSWORD in password_block and LAUNCHER_CODE not in password_block
+    code_label = code_block.split('<p class="hint">')[1].split("</p>")[0]
+    password_label = password_block.split('<p class="hint">')[1].split("</p>")[0]
+    assert code_label != password_label
+    assert code_label.startswith("Launcher code:") and "read it aloud" in code_label
+    assert password_label.startswith("Server password:") and "by hand" in password_label
+    for word in ("password", "mot de passe"):
+        assert word not in code_label.lower()
+    assert "The launcher code is not the server password" in html
+    # Le mot de passe de l'invité ne s'affiche plus en évidence : seul le code est en gras.
+    assert f"<b>{GUEST_PASSWORD}</b>" not in html
+    assert f"<b>{LAUNCHER_CODE}</b>" in code_block
+
+
+def test_p9f5_c5_readmes_say_the_code_is_not_the_password():
+    for name, sentence in (
+        ("README.md", "The launcher code is not the server password"),
+        ("README.fr.md", "The launcher code is not the server password"),
+        ("README.fr.md", "Le code du lanceur n'est pas le mot de passe du"),
+    ):
+        text = (UI_DIR.parent / name).read_text("utf-8")
+        assert sentence in text, name
+
+
+def test_p9f5_c2_open_game_is_disabled_until_the_guest_is_here():
+    """C2 : bouton désactivé et raison affichée sans invité ; ouvert dès qu'il est identifié.
+
+    Mutation : retirer `${guestHere ? '' : 'disabled'}` laisse le bouton actif au lobby vide.
+    """
+    waiting = _plain(_render_invite({"A": None, "B": None}))
+    (button,) = [line for line in waiting.splitlines() if 'data-action="open-game"' in line]
+    assert "disabled" in button
+    assert "unlocks as soon as your opponent is connected" in waiting
+
+    here = _plain(_render_invite({"A": None, "B": "dupont"}))
+    (button,) = [line for line in here.splitlines() if 'data-action="open-game"' in line]
+    assert "disabled" not in button
+    assert "unlocks as soon as your opponent is connected" not in here

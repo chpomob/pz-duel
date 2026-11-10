@@ -501,11 +501,20 @@ function portsBlock() {
       </div>`;
 }
 
+// Two secrets the first real duel mixed up (P9F5): the guest typed the server password at the
+// launcher prompt. Each has its own block, label and use.
+const LAUNCHER_CODE_LABEL = 'Launcher code: read it aloud to your guest. Their launcher asks for it, to prove the file was not replaced.';
+const SERVER_PASSWORD_LABEL = 'Server password: only for a guest who types the address by hand in Project Zomboid.';
+const TWO_SECRETS_TEXT = 'The launcher code is not the server password: type the code into the launcher, and the password into Project Zomboid only when joining by hand.';
+// `open_game` waits for the guest (P9F5): the host's world stays frozen until they join.
+const OPEN_GAME_WAIT = 'The game button unlocks as soon as your opponent is connected: your world stays frozen until then.';
+
 // Tout vient de `invite` : le service décide de ce qui existe et le dit en anglais.
 function inviteCard() {
   const inv = S.invite || {};
   const real = S.mode === 'real';
   const canSave = real && inv.address && !inv.launcher_refused;
+  const guestHere = Boolean(S.players && S.players.B);
   return `
     <section class="card">
       <h2>Invitation</h2>
@@ -518,18 +527,24 @@ function inviteCard() {
         <div class="invite-body">
           ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
           <div class="code">${esc(inv.code || '')}</div>
-          ${inv.launcher_code ? `<p class="hint">Launcher code (their launcher asks for it):</p>
-          <div class="line"><b>${esc(inv.launcher_code)}</b></div>
-          <p class="hint">${esc(inv.launcher_code_text)}</p>` : ''}
-          ${inv.needs_address ? '' : `<p class="hint">Manual join, for a guest on Linux:</p>
-          <div class="line">${esc(inv.ip)}:${inv.port}</div>
-          <div class="line">mot de passe : <b>${esc(inv.password)}</b></div>`}
+          ${inv.launcher_code ? `<div class="secret" id="launcher-code">
+            <p class="hint">${esc(LAUNCHER_CODE_LABEL)}</p>
+            <div class="line"><b>${esc(inv.launcher_code)}</b></div>
+            <p class="hint">${esc(inv.launcher_code_text)}</p>
+          </div>` : ''}
+          ${inv.needs_address ? '' : `<div class="secret" id="server-password">
+            <p class="hint">${esc(SERVER_PASSWORD_LABEL)}</p>
+            <div class="line">${esc(inv.ip)}:${inv.port}</div>
+            <div class="line">server password: ${esc(inv.password)}</div>
+          </div>`}
+          ${inv.launcher_code && !inv.needs_address ? `<p class="notice">${esc(TWO_SECRETS_TEXT)}</p>` : ''}
           <div class="actions">
             ${inv.link ? '<button class="ghost" data-action="copy-link">Copy link</button>' : ''}
             ${canSave ? '<button class="ghost" data-action="save-launcher">Save launcher</button>' : ''}
-            <button class="ghost" data-action="open-game">Ouvrir PZ</button>
+            <button class="ghost" data-action="open-game" ${guestHere ? '' : 'disabled'}>Ouvrir PZ</button>
             ${S.mode === 'mock' ? '<button class="ghost" data-action="simulate">Simuler l\'adversaire</button>' : ''}
           </div>
+          ${guestHere ? '' : `<p class="hint" id="open-game-wait">${esc(OPEN_GAME_WAIT)}</p>`}
           ${real ? `<p class="hint" style="margin-top:10px">Ton accès, à garder pour toi : ${esc(S.config.host_address)}, mot de passe <b>${esc(S.config.host_password)}</b></p>` : ''}
           <p class="hint" style="margin-top:10px">Adversaire : ${S.players.B ? esc(S.players.B) : 'en attente…'}</p>
         </div>

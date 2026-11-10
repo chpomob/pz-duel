@@ -48,7 +48,7 @@ local ACK_MS = 5000
 local BEAT_MS = 10000
 
 -- Garde-fou de sécurité, pas un équilibrage : aucun effet sous ce rayon du joueur.
-local MIN_DISTANCE = 25
+local MIN_DISTANCE = 10
 local PLACE_ATTEMPTS = 32
 local RAIN_INTENSITY = 1.0
 local SPRINT_WALK_TYPE = "sprint1"

@@ -7,7 +7,7 @@
   "mods": ["duelcore"],
   "atoms": ["zombie_kill"],
   "rules": [
-    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "distance": [30, 60], "warn_s": 6, "cap_per_min": 60}]}
+    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "distance": [12, 20], "warn_s": 6, "cap_per_min": 60}]}
   ],
   "modifiers": {},
   "budget": {"threats_per_minute": 6, "concurrent_effects": 4, "per_effect_cooldown_s": 20},

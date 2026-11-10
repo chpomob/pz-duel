@@ -7,8 +7,8 @@
   "mods": ["duelcore"],
   "atoms": ["zombie_kill", "explosion", "vehicle_repair"],
   "rules": [
-    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 3, "distance": [30, 60], "warn_s": 6, "cap_per_min": 90}]},
-    {"id": "kill_streak", "when": "atom(zombie_kill).count(5).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 2, "distance": [40, 70], "warn_s": 10}]},
+    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 3, "distance": [12, 20], "warn_s": 6, "cap_per_min": 90}]},
+    {"id": "kill_streak", "when": "atom(zombie_kill).count(5).within(10s)", "effects": [{"kind": "spawn_sprinter", "n": 2, "distance": [12, 20], "warn_s": 10}]},
     {"id": "explosion_horde", "when": "atom(explosion)", "effects": [{"kind": "horde_area", "n": 30, "radius": 20, "distance": [50, 80], "warn_s": 12}]},
     {"id": "repair_noise", "when": "atom(vehicle_repair)", "effects": [{"kind": "noise", "radius": 40, "distance": [30, 60], "warn_s": 0}]}
   ],

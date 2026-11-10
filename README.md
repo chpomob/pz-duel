@@ -69,13 +69,21 @@ ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is pr
 6. **Invite your opponent** from the lobby: `Copy link`, or `Save launcher` to get
    `pz-duel-join.bat`. The lobby also shows a **verification code**: **read it aloud** to your guest,
    by voice, **separately from the link**, never in the same message as the link or the file. It is
-   the only protection against a file replaced on the way. Then `Ouvrir PZ` joins your own server.
+   the only protection against a file replaced on the way. The lobby shows two different secrets,
+   each in its own block: the **launcher code** (the start of the `.bat`'s SHA-256), that the guest
+   types when their launcher asks for it, and the **server password**, only for a guest who types
+   the address by hand in Project Zomboid. **The launcher code is not the server password**: typed
+   into the launcher, the password is refused (`This is not the code of this file`).
+   `Ouvrir PZ` stays greyed out until your opponent is connected: each world is frozen while nobody
+   plays in it (`PauseEmpty=true`), and joining yours earlier would let it run alone. As soon as the
+   guest is identified, `Ouvrir PZ` joins your own server.
 7. **Leave with `Quit`** in the page. If you just close the browser tab, PZ Duel closes by itself
    once nobody has looked at it for `idle_quit_s` (120 s by default, set in `service/runtime.json`;
    `0` turns it off): closing the tab is enough to start that countdown. It **never** happens during
-   a duel (countdown or match running), even with no tab open — you are watching the game, not the
-   page; the countdown starts over, whole, when the duel ends. The lobby and an error screen do not
-   hold it. An open page keeps PZ Duel running, even in the background, unless the browser puts the
+   a launch or a duel — from the checks (`preflight`) to the end of the lobby, then countdown and
+   match — even with no tab open: the first real duel was cut short in `preflight` for want of a tab.
+   It only fires at rest, after a duel, or on an error screen; the countdown starts over, whole, when
+   a duel or a launch ends. An open page keeps PZ Duel running, even in the background, unless the browser puts the
    tab to sleep: then, in the last 30 s, the page warns that PZ Duel is about to close for want of
    anyone watching, and a click anywhere in the page is enough to stay. It closes the same way as
    `Quit`: servers stopped and, if ports were opened, their mappings removed from the router.
@@ -274,7 +282,10 @@ Do not run it during a duel: the preflight would refuse the ports.
 ## In-game verdict procedure
 
 This is the only proof for the points above. It needs two people, the host on A and the guest on B,
-and the **Duel rapide** preset (`zombie_kill`, `damage_taken`, `spawn_pop` at 30-60 tiles).
+and the **Duel rapide** preset (`zombie_kill`, `damage_taken`, `spawn_pop` at 12-20 tiles, where the
+first real duel saw them; one zombie in 100 sent to a side is a sprinter, in place of a regular one:
+the 100th, the 200th…, set by `sprinter_percent`). A game day lasts 240 min (`day_length` 7) and the
+duel starts at 9 am, so 25 min of play are about 2.5 in-game hours, in daylight.
 
 1. Launch in `--mode real`, short duration, connect both players. Note whether the guest joins with
    the mod copied over, and whether a guest without the mod is refused.

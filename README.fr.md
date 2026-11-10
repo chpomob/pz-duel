@@ -72,14 +72,22 @@ sert de `StartServer64.bat` quand ce script existe.
 6. **Invitez votre adversaire** depuis le lobby : `Copy link`, ou `Save launcher` pour obtenir
    `pz-duel-join.bat`. Le lobby affiche aussi un **code de vérification** : **lisez-le à voix haute** à
    votre invité, **séparément du lien**, jamais dans le même message que le lien ou le fichier. C'est la
-   seule protection contre un fichier remplacé en route. Ensuite, `Ouvrir PZ` vous connecte à votre
-   propre serveur.
+   seule protection contre un fichier remplacé en route. Le lobby montre deux secrets différents,
+   chacun dans son bloc : le **code du lanceur** (le début du SHA-256 du `.bat`), que l'invité tape
+   quand son lanceur le lui demande, et le **mot de passe du serveur**, seulement pour un invité qui
+   saisit l'adresse à la main dans Project Zomboid. **Le code du lanceur n'est pas le mot de passe du
+   serveur** ; le lobby le dit en anglais : « The launcher code is not the server password ». Tapé
+   dans le lanceur, le mot de passe est refusé (`This is not the code of this file`).
+   `Ouvrir PZ` reste grisé tant que votre adversaire n'est pas connecté : chaque monde est figé tant
+   que personne n'y joue (`PauseEmpty=true`), et rejoindre le vôtre plus tôt le ferait tourner seul.
+   Dès que l'invité est identifié, `Ouvrir PZ` vous connecte à votre propre serveur.
 7. **Partez par `Quit`** dans la page. Si vous fermez simplement l'onglet du navigateur, PZ Duel se
    ferme seul quand plus personne ne l'a regardé depuis `idle_quit_s` (120 s par défaut, réglé dans
    `service/runtime.json` ; `0` le désactive) : fermer l'onglet suffit à déclencher ce compte à
-   rebours. Cela n'arrive **jamais** pendant un duel (décompte ou match en cours), même sans aucun
-   onglet ouvert — c'est le jeu que vous regardez, pas la page ; le compte repart en entier à la fin
-   du duel. Le lobby et un écran d'erreur ne le retiennent pas. Une page ouverte garde PZ Duel en
+   rebours. Cela n'arrive **jamais** pendant un lancement ou un duel — des vérifications
+   (`preflight`) à la fin du lobby, puis décompte et match — même sans aucun onglet ouvert : le premier
+   duel réel a été coupé en `preflight` faute d'onglet. Il ne tire qu'au repos, après un duel ou sur
+   un écran d'erreur ; le compte repart en entier à la fin d'un duel ou d'un lancement. Une page ouverte garde PZ Duel en
    marche, même en arrière-plan, sauf si le navigateur met l'onglet en veille : alors, dans les
    30 dernières secondes, la page prévient que PZ Duel va se fermer faute de spectateur, et un clic
    n'importe où dans la page suffit à rester. La fermeture est celle de `Quit` : serveurs arrêtés
@@ -281,7 +289,11 @@ mondes). Ne le lancez pas pendant un duel : le préflight refuserait les ports.
 ## Procédure de verdict en jeu
 
 C'est la seule preuve des points ci-dessus. Elle demande deux personnes, l'hôte sur A et l'invité
-sur B, et le preset **Duel rapide** (`zombie_kill`, `damage_taken`, `spawn_pop` à 30-60 cases).
+sur B, et le preset **Duel rapide** (`zombie_kill`, `damage_taken`, `spawn_pop` à 12-20 cases, là
+où le premier duel réel les a vus ; un zombie sur 100 envoyés chez un camp est un sprinter, à la
+place d'un zombie ordinaire : le 100e, le 200e…, réglé par `sprinter_percent`). Une journée de jeu
+dure 240 min (`day_length` 7) et le duel commence à 9 h : 25 min de partie font environ 2 h 30 en
+jeu, de jour.
 
 1. Lancer en `--mode real`, durée courte, connecter les deux joueurs. Noter si l'invité entre avec le
    mod copié, et si un invité sans le mod est refusé.
