@@ -8,6 +8,7 @@ bout : un échec finit en `error`, jamais dans le parcours simulé.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -28,7 +29,7 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any, NamedTuple
 
-from . import paths
+from . import paths, upnp
 from .guest_launcher import (
     ADDRESS_REFUSED,
     PASSWORD_ALLOWED,
@@ -182,6 +183,10 @@ SHARE_UNAVAILABLE_TEXT = (
 )
 # Le lobby s'ouvre depuis `contract` : l'écouteur naît juste avant lui, sans lui survivre.
 SHARE_PHASES = ("contract", "lobby")
+# Formes neutres de `ports_opening` ; les autres statuts viennent de `service/upnp.py`.
+PORTS_IDLE = "idle"
+PORTS_IN_PROGRESS = "in_progress"
+UDP, TCP = upnp.PROTOCOLS
 # Ce que `invite` ne dit que pendant le lobby (AC60).
 LOBBY_ONLY = (REMATCH_NOTE, SHARE_TEXT)
 INVITE_CLOSED = "invitation unavailable: it only exists in the lobby of a real duel"
@@ -1625,6 +1630,11 @@ class RealMatch:
             self._journal = None
 
 
+def _same_gateway(left: upnp.Gateway, right: upnp.Gateway) -> bool:
+    """Même box : même hôte, port et chemin de contrôle (le service n'y change rien)."""
+    return (left.host, left.port, left.control_path) == (right.host, right.port, right.control_path)
+
+
 class Engine:
     """Un duel à la fois. `clock` rend l'heure murale en secondes, `monotonic` cadence le match."""
 
@@ -1642,6 +1652,7 @@ class Engine:
         client_launcher: Callable[..., subprocess.Popen] | None = None,
         server_factory: Callable[..., ServerProcess] | None = None,
         platform: Platform | None = None,
+        upnp_target: tuple[str, int] | None = None,
     ) -> None:
         if mode not in MODES:
             raise ValueError(f"mode inconnu : {mode}")
@@ -1695,6 +1706,17 @@ class Engine:
         self._launcher_refusal = INVITE_CLOSED
         # Survit aux lobbys : la revanche garde l'adresse que l'hôte a saisie.
         self._entered_address: str | None = None
+        # Ouverture des ports (phase 3) : rien ne part sans un clic de l'hôte au lobby (R2).
+        # `None` vise le groupe SSDP ; les tests passent le faux IGD local.
+        self._upnp_target = upnp_target
+        self._ports_opening: dict[str, Any] = {"status": PORTS_IDLE}
+        self._ports_thread: threading.Thread | None = None
+        self._ports_cancel = threading.Event()
+        # Section `upnp` lue au clic qui a lancé la dernière ouverture : l'arrêt la reprend.
+        self._ports_cfg: dict[str, Any] | None = None
+        # Un enregistrement par couple (port, protocole), fusionné d'une ouverture à l'autre
+        # (finding P1) : trois au plus, chacun lié à la passerelle qui l'a posé (R6).
+        self._upnp_retained: dict[tuple[int, str], upnp.Gateway] = {}
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -1713,6 +1735,9 @@ class Engine:
             if state["phase"] != "lobby":
                 invite = state["invite"].items()
                 state["invite"] = {key: value for key, value in invite if key not in LOBBY_ONLY}
+            # Présent dans toutes les phases ; l'UI ne le montre qu'au lobby. `invite` n'en
+            # reçoit rien : l'adresse proposée reste dans `ports_opening.address` (R5).
+            state["ports_opening"] = self._ports_view()
             return state
 
     def presets(self) -> list[dict]:
@@ -1910,6 +1935,7 @@ class Engine:
         # la sortie du service couperait entre les deux renommages d'`install_mod`.
         with self._setup_lock:
             pass
+        self._release_ports()
         return stopped and not self._stop_incomplete
 
     def _open_game(self) -> tuple[bool, str]:
@@ -1973,6 +1999,156 @@ class Engine:
             return None
         script = self._platform.client_file(folder)
         return (script, folder) if os.access(script, os.X_OK) else None
+
+    # -- ouverture des ports (phase 3) ---------------------------------------
+    # Hors d'`ACTIONS`, comme l'invitation. Aucun appel réseau sous `self.lock` (AC16) : le fil
+    # `ports-open` fait les requêtes, puis reprend le verrou pour publier le résultat.
+    def _upnp_ports(self) -> list[tuple[int, str]]:
+        """Les trois couples de R3 : les deux UDP du camp B, le TCP de partage."""
+        guest = self.runtime["ports"][GUEST_SIDE]
+        return [
+            (guest["game"], UDP),
+            (guest["udp"], UDP),
+            (self.runtime["share_port"], TCP),
+        ]
+
+    def _ports_view(self) -> dict[str, Any]:
+        """Copie de l'état d'ouverture ; le neutre nomme les ports et le bail avant le clic (R8)."""
+        view = copy.deepcopy(self._ports_opening)
+        if view["status"] in (PORTS_IDLE, PORTS_IN_PROGRESS):
+            cfg = self.runtime.get("upnp")
+            view.setdefault("ports", [{"port": p, "protocol": t} for p, t in self._upnp_ports()])
+            view.setdefault("lease_s", cfg.get("lease_s") if isinstance(cfg, dict) else None)
+        return view
+
+    def open_ports(self) -> tuple[bool, str]:
+        """Lance l'ouverture des trois mappings, à la demande de l'hôte, au lobby d'un duel réel."""
+        with self.lock:
+            if not self.real:
+                return False, "not available in simulated mode"
+            if self._closing:
+                return False, "the service is stopping"
+            phase = self.state.phase
+            if phase != "lobby":
+                return False, f"only in the lobby, phase {phase}"
+            if self._ports_opening["status"] == PORTS_IN_PROGRESS:
+                return False, "an opening is already in progress"
+            ports = self._upnp_ports()
+            cfg = self.runtime.get("upnp")
+            invalid = upnp.validate(cfg, ports)
+            if invalid is not None:
+                # Aucun fil, aucun paquet : la configuration est refusée avant tout (AC13).
+                self._ports_opening = invalid
+                self.state.log(f"port opening: {upnp.INVALID_CONFIG}", "warn")
+                return False, f"invalid configuration: {invalid['key']}"
+            assert isinstance(cfg, dict)
+            self._ports_cfg = dict(cfg)
+            self._ports_opening = {"status": PORTS_IN_PROGRESS}
+            click = self._clock()
+            self.state.log("port opening requested")
+            self._ports_thread = threading.Thread(
+                target=self._run_opening,
+                args=(dict(cfg), ports, click),
+                name="ports-open",
+                daemon=True,
+            )
+            self._ports_thread.start()
+        return True, "opening ports"
+
+    def _run_opening(self, cfg: dict, ports: list[tuple[int, str]], click: float) -> None:
+        """Corps du fil `ports-open` : le réseau hors du verrou, la fusion sous le verrou."""
+        try:
+            result, gateway, cleared = upnp.open_ports(
+                cfg, ports, self._upnp_target, self._ports_cancel
+            )
+        except Exception as exc:  # noqa: BLE001 - `upnp` promet de ne rien lever ; dernier filet
+            LOGGER.warning("port opening failed (%s)", type(exc).__name__)
+            result = {
+                "status": upnp.NO_GATEWAY,
+                "reason": upnp.UNREADABLE,
+                "ports": [{"port": p, "protocol": t} for p, t in ports],
+                "manual": upnp.manual_instruction(ports),
+            }
+            gateway, cleared = None, []
+        with self.lock:
+            self._merge_opening(result, gateway, cleared, click)
+
+    def _merge_opening(
+        self,
+        result: dict,
+        gateway: upnp.Gateway | None,
+        cleared: Sequence[tuple[int, str]],
+        click: float,
+    ) -> None:
+        """Publie le résultat et fusionne les mappings retenus, sans jamais les remplacer (P1).
+
+        Appelé sous `self.lock`. Le journal d'état ne reçoit que le statut, jamais l'adresse (R5).
+        """
+        status = result.get("status")
+        view = dict(result)
+        if status == upnp.MAPPED:
+            view["expires_at"] = click + result["lease_s"]
+        self._ports_opening = view
+        if gateway is not None:
+            for couple in cleared:
+                kept = self._upnp_retained.get(couple)
+                if kept is not None and _same_gateway(kept, gateway):
+                    del self._upnp_retained[couple]
+            if status == upnp.MAPPED:
+                active = result.get("ports", [])
+            elif status == upnp.REFUSED:
+                active = result.get("still_active", [])
+            else:
+                active = []
+            for item in active:
+                self._upnp_retained[(item["port"], item["protocol"])] = gateway
+        level = "info" if status == upnp.MAPPED else "warn"
+        self.state.log(f"port opening: {status}", level)
+
+    def _release_ports(self) -> None:
+        """Arrêt (R6) : arrête l'ouverture en cours, puis retire chaque mapping retenu, une fois.
+
+        Ni découverte ni description : la passerelle est celle gardée de l'ouverture. Une
+        suppression sans réponse n'empêche pas les suivantes (finding P2). Rien n'est envoyé
+        quand aucun mapping n'est retenu (AC24). Les échecs ne nomment que port et protocole.
+        """
+        self._ports_cancel.set()
+        with self.lock:
+            thread, cfg = self._ports_thread, self._ports_cfg
+        if thread is not None and cfg is not None:
+            # L'ouverture s'arrête à sa frontière de requête suivante : au plus une requête,
+            # ou la découverte, encore en vol. Elle fusionne elle-même son résultat.
+            thread.join(cfg["discovery_timeout_s"] + cfg["request_timeout_s"])
+            if thread.is_alive():
+                LOGGER.warning("port opening still running at shutdown")
+        with self.lock:
+            retained = dict(self._upnp_retained)
+        if not retained or cfg is None:
+            return
+        groups: dict[upnp.Gateway, list[tuple[int, str]]] = {}
+        for couple, gateway in retained.items():
+            groups.setdefault(gateway, []).append(couple)
+        failed: list[tuple[int, str]] = []
+        for gateway, couples in groups.items():
+            failed.extend(
+                upnp.delete_mappings(
+                    gateway,
+                    couples,
+                    cfg["request_timeout_s"],
+                    max_bytes=cfg["max_response_bytes"],
+                )
+            )
+        with self.lock:
+            for couple in retained:
+                if couple not in failed:
+                    self._upnp_retained.pop(couple, None)
+            if failed:
+                named = ", ".join(f"{port}/{protocol}" for port, protocol in failed)
+                message = f"could not remove port mappings at shutdown: {named}"
+                LOGGER.warning(message)
+                self.state.log(message, "warn")
+            else:
+                self.state.log("port mappings removed")
 
     # -- invitation ------------------------------------------------------
     # Hors d'`ACTIONS`, comme le premier lancement (H6). Rien ici ne touche au réseau (AC58).

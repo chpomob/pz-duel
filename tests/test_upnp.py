@@ -35,6 +35,7 @@ class SocketGuard:
         self.connects: list[str] = []
         self.sends: list[str] = []
         self.resolutions: list[str] = []
+        self.send_targets: list[object] = []
         self.violations: list[str] = []
 
     def check(self, kind: str, host: object) -> None:
@@ -70,6 +71,7 @@ def socket_guard(monkeypatch):
     def guarded_sendto(self, data, *args):
         address = args[-1]
         guard.sends.append(str(host_of(address)))
+        guard.send_targets.append(address)
         guard.check("sendto", host_of(address))
         return sendto(self, data, *args)
 
@@ -979,3 +981,488 @@ def test_ac25_no_config_literal_in_upnp_module():
                 names = [t.id for t in node.targets if isinstance(t, ast.Name)]
                 assigned.setdefault(node.value.value, []).extend(names)
     assert assigned == {1900: ["SSDP_PORT"], "239.255.255.250": ["SSDP_GROUP"]}
+
+
+# -- Moteur (P5) : action, état, arrêt ----------------------------------------------------
+# Le banc de `tests/test_share.py` : vrai `Engine` réel sur les doubles de serveurs, `local_ip`
+# remplacé (`detect`), et le faux IGD visé par `upnp_target`. Le garde de socket reste actif.
+
+import test_snapshots  # noqa: E402
+from test_contract import Lobby  # noqa: E402
+from test_match import Duel  # noqa: E402
+from test_modes import FastClock, settle, wait_phase  # noqa: E402
+from test_servers import stopped_for_good  # noqa: E402
+from test_share import LAN_ADDRESS, detect  # noqa: E402
+from test_snapshots import engine_rig, free_port  # noqa: E402,F401
+from service.engine import Engine  # noqa: E402
+
+PUBLIC = "5.6.7.8"
+ENTERED = "198.51.100.9"
+ENGINE_WAIT_S = 10
+SHUTDOWN_BOUND_S = 3 * FAST["request_timeout_s"] + 1
+
+
+@pytest.fixture
+def igd():
+    with FakeIGD() as fake:
+        yield fake
+
+
+@pytest.fixture
+def upnp_rig(engine_rig, monkeypatch, igd):
+    """Banc moteur dont chaque `Engine` vise le faux IGD ; délais UPnP courts."""
+    rig = engine_rig
+    rig.runtime["share_port"] = free_port(socket.SOCK_STREAM)
+    rig.runtime["upnp"] = {**rig.runtime["upnp"], **FAST}
+    detect(monkeypatch, LAN_ADDRESS)
+    monkeypatch.setattr(test_snapshots, "Engine", _aimed(igd))
+    yield rig
+    if rig.engine is not None:
+        rig.engine.shutdown()
+
+
+def _aimed(igd: FakeIGD):
+    def build(*args, **kwargs) -> Engine:
+        return Engine(*args, upnp_target=igd.ssdp_target, **kwargs)
+
+    return build
+
+
+def _engine_ports(rig) -> list[tuple[int, str]]:
+    guest = rig.runtime["ports"]["B"]
+    return [(guest["game"], "UDP"), (guest["udp"], "UDP"), (rig.runtime["share_port"], "TCP")]
+
+
+def _wait_opening(engine: Engine, timeout_s: float = ENGINE_WAIT_S) -> dict:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        opening = engine.snapshot()["ports_opening"]
+        if opening["status"] != "in_progress":
+            return opening
+        time.sleep(0.02)
+    raise AssertionError(f"ouverture toujours en cours après {timeout_s} s")
+
+
+def _click(engine: Engine) -> tuple[dict, float, float]:
+    """Clic d'ouverture, attendu jusqu'au résultat : `(résultat, heure avant, heure après)`."""
+    before = engine._clock()
+    ok, message = engine.open_ports()
+    after = engine._clock()
+    assert ok, message
+    return _wait_opening(engine), before, after
+
+
+def _assert_engine_manual(result: dict, ports) -> None:
+    text = result["manual"]
+    for port, _ in ports:
+        assert str(port) in text
+    assert "UDP" in text and "TCP" in text
+
+
+def _traffic(igd: FakeIGD, guard) -> tuple[int, int, int, int]:
+    return len(igd.msearches), len(igd.calls), len(guard.sends), len(guard.connects)
+
+
+def _ssdp_sends(guard) -> list[object]:
+    return [
+        t for t in guard.send_targets
+        if isinstance(t, tuple) and (t[1] == upnp.SSDP_PORT or ipaddress.ip_address(t[0]).is_multicast)
+    ]
+
+
+@pytest.fixture
+def mock_engine(runtime, tmp_path, monkeypatch, igd):
+    detect(monkeypatch, LAN_ADDRESS)
+    engine = Engine(
+        "mock",
+        runtime=runtime,
+        clock=FastClock(),
+        matches_dir=tmp_path / "matches",
+        upnp_target=igd.ssdp_target,
+    )
+    yield engine
+    engine.shutdown()
+
+
+# -- AC6 / AC8 / AC13 : refus du moteur, sans trafic ----------------------------------------
+def test_ac6_engine_refuses_outside_a_real_lobby(upnp_rig, igd, socket_guard):
+    engine = upnp_rig.build()
+    ok, message = engine.open_ports()
+    assert not ok and "lobby" in message and "idle" in message
+    assert engine.snapshot()["ports_opening"]["status"] == "idle"
+
+    duel = Duel(upnp_rig)
+    duel.start_match()
+    for phase in ("running", "over"):
+        if phase == "over":
+            duel.at_match(duel.state()["config"]["duration_s"])
+            duel.finish()
+        before = _traffic(igd, socket_guard)
+        ok, message = duel.engine.open_ports()
+        after = _traffic(igd, socket_guard)
+        assert not ok and message == f"only in the lobby, phase {phase}"
+        # les connexions en boucle locale du rcon des doubles ne passent pas par l'IGD
+        assert after[:3] == before[:3]
+    assert igd.msearches == [] and igd.calls == [] and igd.fetches == []
+    assert duel.state()["ports_opening"]["status"] == "idle"
+
+
+def test_ac6_engine_refuses_in_simulated_mode(mock_engine, igd, socket_guard):
+    assert mock_engine.action("start", {"preset": "demo"})[0]
+    wait_phase(mock_engine, "lobby")
+    ok, message = mock_engine.open_ports()
+    assert not ok and message == "not available in simulated mode"
+    assert igd.msearches == [] and igd.calls == []
+    assert socket_guard.sends == [] and socket_guard.connects == []
+    assert mock_engine.snapshot()["ports_opening"]["status"] == "idle"
+    assert mock_engine.action("simulate_join")[0]
+    wait_phase(mock_engine, "over")
+    settle(mock_engine)
+
+
+def test_ac6_engine_accepts_in_a_real_lobby(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    ok, message = lobby.engine.open_ports()
+    assert ok, message
+    assert _wait_opening(lobby.engine)["status"] == "mapped"
+    assert igd.calls
+
+
+def test_ac8_second_click_in_progress_is_refused(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    igd.configure(delay_s=0.2)
+    assert lobby.engine.open_ports()[0]
+    assert lobby.state()["ports_opening"]["status"] == "in_progress"
+    ok, message = lobby.engine.open_ports()
+    assert not ok and message == "an opening is already in progress"
+    assert _wait_opening(lobby.engine)["status"] == "mapped"
+    assert len(igd.msearches) == 1
+    assert len(igd.actions("DeletePortMapping")) <= 3
+    assert len(igd.actions("AddPortMapping")) <= 3
+    assert len(igd.actions("GetExternalIPAddress")) <= 1
+    assert len(igd.calls) <= 7
+
+
+@pytest.mark.parametrize("lease", [7201, 0])
+def test_ac13_engine_invalid_lease_is_synchronous_and_silent(upnp_rig, igd, socket_guard, lease):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    engine.runtime = {**engine.runtime, "upnp": {**engine.runtime["upnp"], "lease_s": lease}}
+    before = _traffic(igd, socket_guard)
+    ok, message = engine.open_ports()
+    assert not ok and "upnp.lease_s" in message
+    assert engine._ports_thread is None
+    opening = lobby.state()["ports_opening"]
+    assert opening["status"] == "invalid_config" and opening["key"] == "upnp.lease_s"
+    assert "error_code" not in opening
+    _assert_engine_manual(opening, _engine_ports(upnp_rig))
+    assert _traffic(igd, socket_guard) == before
+    assert igd.msearches == [] and igd.calls == []
+
+
+# -- AC7 : aucun trafic sans clic ----------------------------------------------------------
+def test_ac7_start_lobby_rematch_lobby_sends_nothing(upnp_rig, igd, socket_guard):
+    duel = Duel(upnp_rig)
+    engine = duel.engine
+    duel.start_match()
+    duel.at_match(duel.state()["config"]["duration_s"])
+    duel.finish()
+    for mod in duel.mods.values():
+        mod.restart(1)
+        mod.seq = 1
+    assert engine.action("rematch")[0]
+    state = upnp_rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+    assert state["ports_opening"]["status"] == "idle"
+    assert igd.msearches == [] and igd.calls == [] and igd.fetches == []
+    assert _ssdp_sends(socket_guard) == []
+
+
+# -- AC15 / AC16 / AC17 : état rendu -------------------------------------------------------
+def test_ac15_mapped_state_carries_ports_and_expiry(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    opening, before, after = _click(lobby.engine)
+    lease = upnp_rig.runtime["upnp"]["lease_s"]
+    ports = _engine_ports(upnp_rig)
+    assert opening["status"] == "mapped"
+    assert opening["ports"] == _dicts(ports)
+    assert opening["lease_s"] == lease
+    assert before + lease - 2 <= opening["expires_at"] <= after + lease + 2
+    assert set(igd.mappings) == set(ports)
+
+
+def test_ac15_no_gateway_state_carries_manual_text(upnp_rig, igd):
+    igd.configure(ssdp_reply=False)
+    lobby = Lobby(upnp_rig, "demo")
+    opening, _, _ = _click(lobby.engine)
+    assert opening["status"] == "no_gateway"
+    _assert_engine_manual(opening, _engine_ports(upnp_rig))
+    assert "expires_at" not in opening
+    assert igd.calls == []
+
+
+def test_ac15_refused_718_state_carries_code_and_manual_text(upnp_rig, igd):
+    igd.configure(errors={("AddPortMapping", 3): 718})
+    lobby = Lobby(upnp_rig, "demo")
+    opening, _, _ = _click(lobby.engine)
+    assert opening["status"] == "refused" and opening["error_code"] == 718
+    assert opening["still_active"] == []
+    _assert_engine_manual(opening, _engine_ports(upnp_rig))
+    assert igd.mappings == {}
+
+
+def test_ac16_slow_gateway_leaves_state_and_duel_responsive(upnp_rig, igd):
+    rig = upnp_rig
+    rig.runtime["upnp"] = {**rig.runtime["upnp"], "request_timeout_s": 3}
+    duel = Duel(rig)
+    igd.configure(delay_s=2)
+    assert duel.engine.open_ports()[0]
+    started = time.monotonic()
+    state = duel.engine.snapshot()
+    assert time.monotonic() - started < 0.5
+    assert state["ports_opening"]["status"] == "in_progress"
+    # le duel se lance pendant l'ouverture : le verrou n'est jamais tenu pendant une requête
+    duel.start_match()
+    started = time.monotonic()
+    state = duel.engine.snapshot()
+    assert time.monotonic() - started < 0.5
+    assert state["phase"] == "running"
+    assert state["ports_opening"]["status"] == "in_progress"
+    igd.configure(delay_s=0)
+    assert _wait_opening(duel.engine)["status"] == "mapped"
+
+
+@pytest.mark.parametrize("failure", ["no_gateway", "refused"])
+def test_ac17_failed_opening_leaves_invite_and_duel_untouched(upnp_rig, igd, failure):
+    if failure == "no_gateway":
+        igd.configure(ssdp_reply=False)
+    else:
+        igd.configure(errors={("AddPortMapping", 3): 718})
+    duel = Duel(upnp_rig)
+    invite = duel.state()["invite"]
+    opening, _, _ = _click(duel.engine)
+    assert opening["status"] == failure
+    assert duel.state()["invite"] == invite
+    duel.start_match()
+    assert duel.state()["phase"] == "running"
+
+
+# -- AC18 / AC19 / AC20 : état neutre et adresse proposée ----------------------------------
+def test_ac18_state_without_click_only_adds_neutral_opening(upnp_rig, igd):
+    engine = upnp_rig.build()
+    neutral = {
+        "status": "idle",
+        "ports": _dicts(_engine_ports(upnp_rig)),
+        "lease_s": upnp_rig.runtime["upnp"]["lease_s"],
+    }
+    state = engine.snapshot()
+    assert state["ports_opening"] == neutral
+    lobby = Lobby(upnp_rig, "demo")
+    state = lobby.state()
+    assert state["ports_opening"] == neutral
+    # `invite` est celui de la phase 2 : celui du moteur, sans rien d'UPnP
+    with lobby.engine.lock:
+        assert state["invite"] == lobby.engine.state.invite
+    assert not any("port" in key and "open" in key for key in state["invite"])
+    assert igd.calls == [] and igd.msearches == []
+
+
+def test_ac19_public_address_is_proposed_not_applied(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    invite = lobby.state()["invite"]
+    opening, _, _ = _click(lobby.engine)
+    assert opening["status"] == "mapped" and opening["address"] == PUBLIC
+    state = lobby.state()
+    assert state["invite"] == invite
+    assert state["invite"]["address"] == LAN_ADDRESS
+    assert PUBLIC not in json.dumps(state["invite"])
+    assert lobby.engine.set_invite_address(PUBLIC)[0]
+    assert PUBLIC in lobby.state()["invite"]["link"]
+
+
+def test_ac20_public_address_never_logged_nor_journaled(upnp_rig, igd, socket_guard, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    rig = upnp_rig
+    duel = Duel(rig)
+    opening, _, _ = _click(duel.engine)
+    assert opening["address"] == PUBLIC
+    assert duel.engine.set_invite_address(PUBLIC)[0]
+    duel.start_match()
+    duel.at_match(duel.state()["config"]["duration_s"])
+    duel.finish()
+    logs = json.dumps(duel.state()["logs"])
+    assert duel.engine.shutdown()
+    logs += json.dumps(duel.engine.snapshot()["logs"])
+    assert PUBLIC not in logs
+    for path in rig.matches.rglob("*"):
+        if path.is_file():
+            assert PUBLIC.encode() not in path.read_bytes(), path
+    assert PUBLIC not in caplog.text
+    out, err = capsys.readouterr()
+    assert PUBLIC not in out and PUBLIC not in err
+    assert PUBLIC not in socket_guard.connects and PUBLIC not in socket_guard.sends
+
+
+# -- AC22 / AC23 / AC24 : arrêt ------------------------------------------------------------
+def _deletes_after(igd: FakeIGD, count: int) -> list[tuple[int, str]]:
+    return igd.couples("DeletePortMapping")[count:]
+
+
+def test_ac22_shutdown_deletes_the_three_mappings(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    seen = len(igd.actions("DeletePortMapping"))
+    msearches = len(igd.msearches)
+    assert lobby.engine.shutdown()
+    assert sorted(_deletes_after(igd, seen)) == sorted(_engine_ports(upnp_rig))
+    assert igd.mappings == {}
+    assert len(igd.msearches) == msearches
+    assert lobby.engine._upnp_retained == {}
+
+
+def test_ac23_mute_gateway_at_shutdown_is_bounded(upnp_rig, igd, caplog):
+    caplog.set_level(logging.DEBUG)
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    seen = len(igd.actions("DeletePortMapping"))
+    igd.configure(silent=True)
+    started = time.monotonic()
+    lobby.engine.shutdown()
+    elapsed = time.monotonic() - started
+    assert elapsed <= SHUTDOWN_BOUND_S
+    assert stopped_for_good(upnp_rig)
+    assert len(_deletes_after(igd, seen)) == 3
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("could not remove port mappings" in w for w in warnings)
+    assert PUBLIC not in caplog.text
+    assert PUBLIC not in json.dumps(lobby.engine.snapshot()["logs"])
+
+
+@pytest.mark.parametrize("case", ["no_opening", "no_gateway", "invalid_config", "refused_empty"])
+def test_ac24_nothing_active_sends_nothing_at_shutdown(upnp_rig, igd, socket_guard, case):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    if case == "no_gateway":
+        igd.configure(ssdp_reply=False)
+        assert _click(engine)[0]["status"] == "no_gateway"
+    elif case == "invalid_config":
+        engine.runtime = {**engine.runtime, "upnp": {**engine.runtime["upnp"], "lease_s": 0}}
+        assert not engine.open_ports()[0]
+    elif case == "refused_empty":
+        igd.configure(errors={("AddPortMapping", 3): 718})
+        opening = _click(engine)[0]
+        assert opening["status"] == "refused" and opening["still_active"] == []
+    before = _traffic(igd, socket_guard)
+    ssdp = _ssdp_sends(socket_guard)
+    assert engine.shutdown()
+    assert _traffic(igd, socket_guard)[:3] == before[:3]
+    assert _ssdp_sends(socket_guard) == ssdp
+    assert engine._upnp_retained == {}
+
+
+# -- AC25 : valeurs de la copie de runtime ---------------------------------------------------
+def test_ac25_runtime_copy_changes_the_arguments(upnp_rig, igd):
+    rig = upnp_rig
+    rig.runtime["share_port"] = free_port(socket.SOCK_STREAM)
+    rig.runtime["upnp"] = {**rig.runtime["upnp"], "lease_s": 3600, "description": "Other Duel"}
+    lobby = Lobby(rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    ports = _engine_ports(rig)
+    assert ports[2][0] == rig.runtime["share_port"]
+    assert sorted(igd.couples("AddPortMapping")) == sorted(ports)
+    for call in igd.actions("AddPortMapping"):
+        assert call.args["NewLeaseDuration"] == "3600"
+        assert call.args["NewPortMappingDescription"] == "Other Duel"
+
+
+# -- AC32 / AC33 : bout en bout jusqu'à l'arrêt --------------------------------------------
+def test_ac32_engine_retains_two_and_deletes_them_at_shutdown(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    ports = _engine_ports(upnp_rig)
+    igd.configure(errors={("AddPortMapping", 3): 718}, silent_from=7)
+    opening = _click(lobby.engine)[0]
+    assert opening["status"] == "refused" and opening["error_code"] == 718
+    assert opening["still_active"] == _dicts(ports[:2])
+    assert set(lobby.engine._upnp_retained) == set(ports[:2])
+    igd.set_responsive()
+    seen = len(igd.actions("DeletePortMapping"))
+    assert lobby.engine.shutdown()
+    assert sorted(_deletes_after(igd, seen)) == sorted(ports[:2])
+    assert igd.mappings == {}
+
+
+def test_ac33_engine_retries_the_possibly_placed_mapping_at_shutdown(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    ports = _engine_ports(upnp_rig)
+    igd.configure(silent_from=2)
+    opening = _click(lobby.engine)[0]
+    assert opening["status"] == "refused" and opening["failure"] == "timeout"
+    assert opening["still_active"] == _dicts(ports[:1])
+    assert igd.couples("DeletePortMapping") == [ports[0], ports[0]]
+    started = time.monotonic()
+    lobby.engine.shutdown()
+    assert time.monotonic() - started <= SHUTDOWN_BOUND_S
+    assert igd.couples("DeletePortMapping") == [ports[0]] * 3
+
+
+# -- Finding P1 : rétention d'une ouverture à l'autre ---------------------------------------
+def test_retention_survives_a_later_no_gateway(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    igd.configure(ssdp_reply=False)
+    assert _click(lobby.engine)[0]["status"] == "no_gateway"
+    seen = len(igd.actions("DeletePortMapping"))
+    assert lobby.engine.shutdown()
+    deletes = _deletes_after(igd, seen)
+    assert len(deletes) == 3 and sorted(deletes) == sorted(_engine_ports(upnp_rig))
+    assert igd.mappings == {}
+
+
+def test_retention_survives_a_later_invalid_config(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    assert _click(engine)[0]["status"] == "mapped"
+    engine.runtime = {**engine.runtime, "upnp": {**engine.runtime["upnp"], "lease_s": 0}}
+    assert not engine.open_ports()[0]
+    assert lobby.state()["ports_opening"]["status"] == "invalid_config"
+    seen = len(igd.actions("DeletePortMapping"))
+    assert engine.shutdown()
+    deletes = _deletes_after(igd, seen)
+    assert len(deletes) == 3 and sorted(deletes) == sorted(_engine_ports(upnp_rig))
+    assert igd.mappings == {}
+
+
+def test_retention_is_cleared_by_a_confirmed_rollback(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    igd.configure(errors={("AddPortMapping", 6): 718})
+    opening = _click(lobby.engine)[0]
+    assert opening["status"] == "refused" and opening["error_code"] == 718
+    assert opening["still_active"] == []
+    assert lobby.engine._upnp_retained == {}
+    seen = len(igd.actions("DeletePortMapping"))
+    assert lobby.engine.shutdown()
+    assert _deletes_after(igd, seen) == []
+    assert igd.mappings == {}
+
+
+# -- Finding P2 : une suppression muette n'empêche pas les suivantes -------------------------
+def test_shutdown_first_delete_silent_still_tries_the_others(upnp_rig, igd, caplog):
+    caplog.set_level(logging.DEBUG)
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    retained = list(lobby.engine._upnp_retained)
+    seen = len(igd.actions("DeletePortMapping"))
+    igd.configure(silent_on={("DeletePortMapping", seen + 1)})
+    started = time.monotonic()
+    lobby.engine.shutdown()
+    assert time.monotonic() - started <= SHUTDOWN_BOUND_S
+    deletes = _deletes_after(igd, seen)
+    assert deletes == retained
+    assert set(igd.mappings) == {retained[0]}
+    first = f"{retained[0][0]}/{retained[0][1]}"
+    warnings = [r.getMessage() for r in caplog.records if "could not remove port mappings" in r.getMessage()]
+    assert len(warnings) == 1 and first in warnings[0]
+    for port, protocol in retained[1:]:
+        assert f"{port}/{protocol}" not in warnings[0]
+    assert PUBLIC not in caplog.text

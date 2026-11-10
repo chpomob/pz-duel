@@ -46,7 +46,7 @@ STATE_KEYS = {
     "error",
     "logs",
 }
-NEW_STATE_KEYS = {"match_id", "capabilities", "result"}
+NEW_STATE_KEYS = {"match_id", "capabilities", "result", "ports_opening"}
 PRESET_KEYS = {"id", "label", "tagline", "summary", "duration_s", "day_length"}
 WAIT_S = 10
 JSON_HEADERS = {"Content-Type": "application/json"}
