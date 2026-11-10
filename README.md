@@ -105,6 +105,42 @@ their router to their PC:
 Then enter your public address in the lobby, under *Public address*, and click `Use this address`
 before sending anything. PZ Duel cannot test that address, and it provides no relay.
 
+#### Open ports from the lobby (UPnP)
+
+If your router supports UPnP, the lobby of a real duel can open these ports for you. It never does so
+on its own: only when the host clicks the button under *Public address*. Before the click, the button
+names what it will open and for how long, for example
+`Open ports 17271/UDP, 17272/UDP, 17280/TCP for 2 h`. It asks for exactly three port mappings and
+nothing else: 17271 and 17272 in UDP, to play, and the share port 17280 in TCP, for the link. No port
+range, no DMZ, no other port.
+
+- **The lease and its expiry.** Each mapping is opened for a bounded lease (2 h by default, never
+  more). After a successful opening the lobby shows `Ports … are open until` followed by the expiry
+  time. A duel lasts at most one hour, so if you stayed long in the lobby since the click, click again
+  before launching. Same thing at a rematch: the next lobby does not open anything by itself. Clicking
+  again replaces the same three mappings, it does not add new ones.
+- **No automatic renewal.** PZ Duel never extends the lease without you. When it runs out, the router
+  removes the mappings.
+- **Closing.** The mappings are removed when PZ Duel exits cleanly, with `Quit`. There is no separate
+  button to close them. If PZ Duel is killed or crashes, only the lease bounds them: they stay open on
+  the router until it runs out.
+- **The public address.** The router also reports its public address. When it is a real public
+  address, the lobby shows `Public address read from the router:` and puts it in the *Public address*
+  field, unless you already typed something there. It is only a suggestion: click
+  `Use this address` yourself, as above. The address stays on your PC: it is not written to the match
+  journal or the logs.
+- **A non-public address.** If the router reports an address that cannot be reached from the
+  Internet (a private address, or one from the `100.64.0.0/10` shared space), the lobby says so and
+  proposes nothing. Your router is itself behind another router (double NAT) or your provider shares
+  one public address between customers (CGNAT, carrier-grade NAT). The ports may be open on your
+  router, but a guest outside your network will likely not get in through it: ask your provider or
+  open the ports on the upstream router.
+- **When it fails.** If no compatible router answers, or the router refuses, the lobby shows
+  `Ports could not be opened automatically` with the reason, then the manual instruction: `Open these
+  ports by hand in your router's settings and forward them to this computer`, followed by the three
+  ports and protocols. Do that as described above, then enter your public address. A failed opening
+  never blocks the duel: you can still launch it.
+
 ### Never share the `.bat` publicly
 
 **Do not post or distribute the `.bat`.** It holds your address and the password of the guest's server,
@@ -280,6 +316,10 @@ The important ones:
 - **No automatic restart of a hung server**, no recovery of orphaned servers if the referee dies
   abruptly, no token on the local API.
 - **No anti-cheat**: the player owns their files. A leaderboard only means anything among friends.
+- **Opening ports (UPnP) and shutdown**: if you quit while an opening is still running, the exit
+  may take one extra router request timeout (3 s by default). If two openings in one session reach
+  two different routers, only the latest router's mappings are removed at exit; the other ones stay
+  until their lease runs out.
 
 ## Thanks
 

@@ -113,6 +113,42 @@ Saisissez ensuite votre adresse publique dans le lobby, sous *Public address*, e
 `Use this address` avant d'envoyer quoi que ce soit. PZ Duel ne peut pas tester cette adresse et ne
 fournit aucun relais.
 
+#### Ouvrir les ports depuis le lobby (UPnP)
+
+Si votre box gère l'UPnP, le lobby d'un duel réel peut ouvrir ces ports pour vous. Il ne le fait
+jamais de lui-même : seulement quand l'hôte clique sur le bouton placé sous *Public address*. Avant le
+clic, le bouton nomme ce qu'il va ouvrir et pour combien de temps, par exemple
+`Open ports 17271/UDP, 17272/UDP, 17280/TCP for 2 h`. Il demande exactement trois redirections et rien
+d'autre : 17271 et 17272 en UDP, pour jouer, et le port de partage 17280 en TCP, pour le lien. Ni plage
+de ports, ni DMZ, ni autre port.
+
+- **Le bail et son expiration.** Chaque redirection est ouverte pour un bail borné (2 h par défaut,
+  jamais plus). Après une ouverture réussie, le lobby affiche `Ports … are open until` suivi de l'heure
+  d'expiration. Un duel dure au plus une heure : si vous êtes resté longtemps au lobby depuis le clic,
+  cliquez de nouveau avant de lancer. De même à une revanche : le lobby suivant n'ouvre rien tout seul.
+  Un nouveau clic repose les trois mêmes redirections, il n'en ajoute pas.
+- **Pas de renouvellement automatique.** PZ Duel ne prolonge jamais le bail sans vous. À son terme, la
+  box retire les redirections.
+- **Fermeture.** Les redirections sont supprimées quand PZ Duel se ferme proprement, par `Quit`. Il n'y
+  a pas de bouton séparé pour les fermer. Si PZ Duel est tué ou plante, seul le bail les borne : elles
+  restent ouvertes sur la box jusqu'à son terme.
+- **L'adresse publique.** La box donne aussi son adresse publique. Quand c'en est vraiment une, le lobby
+  affiche `Public address read from the router:` et la place dans le champ *Public address*, sauf si
+  vous y avez déjà saisi quelque chose. Ce n'est qu'une proposition : cliquez vous-même sur
+  `Use this address`, comme ci-dessus. L'adresse reste sur votre PC : elle n'entre ni dans le journal
+  du match ni dans les logs.
+- **Une adresse non publique.** Si la box donne une adresse injoignable depuis Internet (une adresse
+  privée, ou une de l'espace partagé `100.64.0.0/10`), le lobby le dit et ne propose rien. Votre box
+  est elle-même derrière un autre routeur (double NAT), ou votre opérateur partage une adresse publique
+  entre plusieurs clients (CGNAT). Les ports ont pu être ouverts sur votre box, mais un invité hors de
+  votre réseau n'entrera sans doute pas par là : demandez à votre opérateur, ou ouvrez les ports sur
+  le routeur en amont.
+- **En cas d'échec.** Si aucune box compatible ne répond, ou si la box refuse, le lobby affiche
+  `Ports could not be opened automatically` avec la raison, puis la consigne manuelle : `Open these
+  ports by hand in your router's settings and forward them to this computer`, suivie des trois ports
+  et protocoles. Faites-le comme décrit ci-dessus, puis saisissez votre adresse publique. Un échec ne
+  bloque jamais le duel : vous pouvez le lancer quand même.
+
 ### Ne diffusez jamais le `.bat`
 
 **Ne publiez pas et ne diffusez pas le `.bat`.** Il contient votre adresse et le mot de passe du serveur
@@ -286,6 +322,10 @@ Les plus importantes :
 - **Pas de relance automatique d'un serveur figé**, pas de récupération des serveurs orphelins si
   l'arbitre meurt brutalement, pas de jeton sur l'API locale.
 - **Pas d'anti-triche** : le joueur possède ses fichiers. Le classement n'a de sens qu'entre amis.
+- **Ouverture des ports (UPnP) et arrêt** : si vous quittez pendant qu'une ouverture est en cours,
+  la sortie peut prendre un délai de requête de plus vers la box (3 s par défaut). Si deux ouvertures
+  d'une même session joignent deux box différentes, seules les redirections de la dernière box sont
+  supprimées à la sortie ; les autres restent jusqu'au terme de leur bail.
 
 ## Merci
 
