@@ -32,6 +32,8 @@ INSTANCE_LOCK = "instance.lock"
 INSTANCE_PORT = "instance.port"
 STATE_PATH = "/api/state"
 STATE_KEY = "phase"
+# Cadence du chien de garde de l'arrêt sur inactivité (P9F4) : relu à chaque tour.
+IDLE_CHECK_S = 1.0
 
 
 def log_line(text: str) -> None:
@@ -245,6 +247,26 @@ def stop_on_signal(engine: Engine, httpd: ThreadingHTTPServer) -> Callable[[], N
     return request_stop
 
 
+def watch_idle(
+    engine: Engine, request_stop: Callable[[], None], wait: Callable[[float], bool]
+) -> bool:
+    """Chien de garde de l'arrêt sur inactivité (P9F4). Rend vrai s'il a demandé l'arrêt.
+
+    Tous les `IDLE_CHECK_S`, demande au moteur d'engager l'arrêt si le délai est échu hors d'un
+    duel (`Engine.claim_idle_stop`) : constat et engagement se font sous le verrou du moteur,
+    si bien qu'aucun duel ne commence ni aucun battement ne se perd entre les deux. Si c'est
+    fait, il prend le chemin de `Quit` : `request_stop`, qui fait `engine.shutdown()` (serveurs
+    arrêtés, redirections retirées), puis l'arrêt du serveur HTTP.
+    `wait` rend vrai quand le service s'arrête par ailleurs : le chien se retire sans rien faire.
+    """
+    while not wait(IDLE_CHECK_S):
+        if engine.claim_idle_stop():
+            report("Nobody is watching PZ Duel: stopping (idle_quit_s)")
+            request_stop()
+            return True
+    return False
+
+
 def serve(
     args: argparse.Namespace,
     make_engine: Callable[..., Engine] | None,
@@ -264,6 +286,12 @@ def serve(
     # Avant toute requête : aucun serveur ne peut partir sans que le signal l'arrête. La sortie
     # par l'UI passe par le même fil : `engine.shutdown()` ne se fait pas depuis le fil du duel.
     httpd.on_quit = stop_on_signal(engine, httpd)
+    # Arrêt sur inactivité : `/api/state` bat, le chien de garde prend le chemin de `Quit`.
+    httpd.on_watch = engine.heartbeat
+    served = threading.Event()
+    threading.Thread(
+        target=watch_idle, args=(engine, httpd.on_quit, served.wait), name="duel-idle", daemon=True
+    ).start()
     port = httpd.server_address[1]
     if on_bound is not None:
         on_bound(port)
@@ -280,6 +308,7 @@ def serve(
     try:
         httpd.serve_forever()
     finally:
+        served.set()
         # Sur signal ou sortie par l'UI, attend le fil d'arrêt ; sur panne de la boucle, c'est
         # l'arrêt lui-même.
         stopped = engine.shutdown()

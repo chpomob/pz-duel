@@ -20,6 +20,11 @@ let stopped = false;          // le service ne répond plus après cette demande
 let quitArmed = false;        // premier clic sur « Quit » pendant un duel
 let pollTimer = null;
 let toastTimer = null;
+let lastSeen = 0;             // `Date.now()` of the last successful `/api/state`: the last heartbeat
+let idleStopped = false;      // the idle quit was due when the service went silent
+
+// Idle quit (P9F4): the warning shows during these last seconds.
+const IDLE_WARN_S = 30;
 
 const TOAST_MS = 2600;
 // `/api/setup` ne mesure qu'en `idle` ; hors de ces phases, il n'y a rien à relire.
@@ -46,10 +51,13 @@ async function poll() {
     // Un 403, un 500 ou le 503 de `turned_away` portent du JSON sans `phase` : `S` ne change pas.
     if (!state || typeof state.phase !== 'string') return unreachable();
     S = state;
+    lastSeen = Date.now();
     prefillAddress();
     $('#svc').textContent = 'service : ok';
     $('#svc').className = 'badge badge-ok';
   } catch (e) {
+    const left = idleLeft();
+    if (!quitting && left !== null && left <= 1) { quitting = true; idleStopped = true; }
     if (quitting) {
       stopped = true;
       clearInterval(pollTimer);
@@ -62,6 +70,40 @@ async function poll() {
   if (S.phase !== setupPhase && SETTLED_PHASES.includes(S.phase)) refreshSetup();
   setupPhase = S.phase;
   render();
+}
+
+// ---------------------------------------------------------------- idle quit
+// Seconds before the service closes for want of a viewer, or `null` when it cannot: the service
+// sends `armed` false when the idle quit is off or a duel is being played. Every successful
+// `/api/state` is a heartbeat: the countdown starts from the last one, and only runs when calls no
+// longer get through (tab frozen or put to sleep by the browser, network).
+function idleLeft() {
+  const idle = S && S.idle_quit;
+  if (!idle || !idle.armed || !lastSeen) return null;
+  return idle.after_s - (Date.now() - lastSeen) / 1000;
+}
+
+function renderIdle() {
+  let el = $('#idle-warning');
+  const left = quitting ? null : idleLeft();
+  if (left === null || left > IDLE_WARN_S) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'idle-warning';
+    el.setAttribute('role', 'alert');
+    el.style.cssText = 'position:fixed;left:50%;top:12px;transform:translateX(-50%);z-index:50;'
+      + 'max-width:min(560px,calc(100% - 32px));padding:10px 14px;border-radius:8px;'
+      + 'background:var(--panel);border:2px solid var(--amber);color:var(--amber);';
+    document.body.appendChild(el);
+  }
+  const ports = S.idle_quit.ports_open
+    ? ' The ports it opened on your router will be closed cleanly first.'
+    : '';
+  el.textContent = `Nobody is watching: PZ Duel will close in ${Math.max(0, Math.ceil(left))} s.`
+    + ports + ' Click anywhere on this page to stay.';
 }
 
 // Une mesure lie les ports et relit le mod : elle suit les changements de phase et les
@@ -181,6 +223,7 @@ const presetOf = (id) => presets.find((p) => p.id === id) || presets[0] || { sum
 
 // ---------------------------------------------------------------- vues
 function render() {
+  renderIdle();
   if (quitting) return renderQuit();
   if (!S) return;
   const mock = S.mode === 'mock';
@@ -586,9 +629,12 @@ function renderError() {
 
 // Écran de fin : il attend que le service ne réponde plus pour dire qu'il est arrêté.
 function renderQuit() {
+  const why = idleStopped
+    ? 'Nobody was watching it, so it closed by itself. '
+    : '';
   shell(stopped
     ? `<section class="card"><h2>PZ Duel has stopped</h2>
-        <p class="sub">You can close this tab. Start PZ Duel again for a new duel.</p>
+        <p class="sub">${why}You can close this tab. Start PZ Duel again for a new duel.</p>
       </section>`
     : `<section class="card"><h2>Shutting down</h2>
         <p class="sub">PZ Duel is stopping the servers. This can take a moment.</p>
@@ -621,6 +667,11 @@ function renderLogs() {
 }
 
 // ---------------------------------------------------------------- actions
+// A click anywhere is enough to stay: it makes an `/api/state` call, the service's heartbeat.
+document.addEventListener('click', () => {
+  if (!quitting && $('#idle-warning')) poll();
+}, true);
+
 document.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('[data-action]');
   if (!btn) return;
@@ -680,4 +731,6 @@ $('#logstoggle').addEventListener('click', () => $('#logsbox').classList.toggle(
   draft = newDraft();
   await poll();
   pollTimer = setInterval(poll, 700);
+  // The countdown runs even while `poll` hangs: the warning follows it.
+  setInterval(renderIdle, 1000);
 })();

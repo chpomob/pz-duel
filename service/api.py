@@ -269,7 +269,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and self._refused():
             return
         if path == "/api/state":
-            self._json(200, self.engine.snapshot())
+            state = self.engine.snapshot()
+            # Le battement de l'arrêt sur inactivité (P9F4) : cette route seule, aucune autre.
+            on_watch = self.server.on_watch
+            if on_watch is not None:
+                on_watch()
+            self._json(200, state)
             return
         if path == "/api/presets":
             self._json(200, {"presets": self.engine.presets()})
@@ -396,4 +401,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def make_server(engine, host: str = "127.0.0.1", port: int = 0) -> BoundedHTTPServer:
     handler = type("BoundHandler", (Handler,), {"engine": engine, "timeout": REQUEST_READ_S})
-    return BoundedHTTPServer((host, port), handler, connections_max=CONNECTIONS_MAX)
+    server = BoundedHTTPServer((host, port), handler, connections_max=CONNECTIONS_MAX)
+    # Posé par `main`, comme `on_quit` : chaque `/api/state` l'appelle, rien d'autre (P9F4).
+    server.on_watch = None
+    return server

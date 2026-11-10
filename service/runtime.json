@@ -30,6 +30,7 @@
   "replace_timeout_s": 5,
   "replace_retry_ms": 100,
   "instance_wait_s": 10,
+  "idle_quit_s": 120,
   "day_length_minutes": {
     "1": 15,
     "2": 30,

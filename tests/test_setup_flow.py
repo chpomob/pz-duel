@@ -711,6 +711,48 @@ def test_second_quit_answers_and_stops_once(run_main, runtime, tmp_path):
     assert len(run.shutdowns) == 1
 
 
+class StepClock:
+    """Horloge monotone avancée par le test : l'inactivité passe sans attendre."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_idle_quit_stops_main_by_the_quit_path(run_main, runtime, tmp_path, monkeypatch):
+    """P9F4 : sans `/api/state` depuis `idle_quit_s`, `main()` sort par le chemin de `Quit`.
+
+    `engine.shutdown()` (donc le retrait des redirections), puis l'arrêt du serveur HTTP, et un
+    code 0 : ni `os._exit`, ni processus tué. Mutation : ne plus lancer le fil `duel-idle` dans
+    `serve`, ou ne plus brancher `httpd.on_watch`, et le test échoue.
+    """
+    monkeypatch.setattr(main_module, "IDLE_CHECK_S", POLL_S)
+    clock = StepClock()
+    runtime["idle_quit_s"] = 120
+    engine = Engine("mock", runtime=runtime, matches_dir=tmp_path / "matches", monotonic=clock)
+    released = []
+    release = engine._release_ports
+    engine._release_ports = lambda: released.append(1) or release()
+    run = run_main(engine)
+    port = run.port
+
+    status, state = request(port, "/api/state")
+    assert status == 200
+    assert state["idle_quit"] == {"after_s": 120, "armed": True, "ports_open": False}
+    clock.now += 119
+    assert request(port, "/api/state")[0] == 200  # un battement, par `main` : le délai repart
+    clock.now += 119
+    assert not engine.idle_due()
+    clock.now += 1
+
+    assert run.wait() == 0
+    assert released == [1]
+    assert engine._stopped is True
+    assert len(run.shutdowns) == 1
+
+
 @pytest.mark.parametrize(
     "header", [{"Host": "evil.example"}, {"Origin": "http://evil.example"}], ids=["host", "origin"]
 )

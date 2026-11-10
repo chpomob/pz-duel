@@ -74,10 +74,26 @@ sert de `StartServer64.bat` quand ce script existe.
    votre invité, **séparément du lien**, jamais dans le même message que le lien ou le fichier. C'est la
    seule protection contre un fichier remplacé en route. Ensuite, `Ouvrir PZ` vous connecte à votre
    propre serveur.
-7. **Partez par `Quit`** dans la page. Fermer l'onglet du navigateur n'arrête pas PZ Duel.
+7. **Partez par `Quit`** dans la page. Si vous fermez simplement l'onglet du navigateur, PZ Duel se
+   ferme seul quand plus personne ne l'a regardé depuis `idle_quit_s` (120 s par défaut, réglé dans
+   `service/runtime.json` ; `0` le désactive) : fermer l'onglet suffit à déclencher ce compte à
+   rebours. Cela n'arrive **jamais** pendant un duel (décompte ou match en cours), même sans aucun
+   onglet ouvert — c'est le jeu que vous regardez, pas la page ; le compte repart en entier à la fin
+   du duel. Le lobby et un écran d'erreur ne le retiennent pas. Une page ouverte garde PZ Duel en
+   marche, même en arrière-plan, sauf si le navigateur met l'onglet en veille : alors, dans les
+   30 dernières secondes, la page prévient que PZ Duel va se fermer faute de spectateur, et un clic
+   n'importe où dans la page suffit à rester. La fermeture est celle de `Quit` : serveurs arrêtés
+   et, si des ports ont été ouverts, redirections retirées de la box.
 
 Si `Launch duel` finit sur une erreur, utilisez `Try again`. Si l'écran vous le demande, quittez et
 rouvrez PZ Duel.
+
+**Où sont les fichiers.** `pz-duel.exe` est un fichier unique : à chaque lancement, il déballe ce
+qu'il transporte, mod compris, dans un dossier temporaire `%LOCALAPPDATA%\Temp\_MEI…\`, effacé à une
+sortie normale (un arrêt forcé peut l'y laisser). Cette copie n'est pas le mod qu'utilise le jeu.
+`Install mod` la copie dans `%USERPROFILE%\Zomboid\mods\duelcore` : c'est le mod installé, le dossier
+que le jeu charge. `%LOCALAPPDATA%\PZDuel` ne contient que le journal de PZ Duel (`pz-duel.log`), le
+dossier `matches` et le verrou d'instance unique (avec le port où il écoute).
 
 ### Invité
 
@@ -126,10 +142,14 @@ de ports, ni DMZ, ni autre port.
   jamais plus). Après une ouverture réussie, le lobby affiche `Ports … are open until` suivi de l'heure
   d'expiration. Un duel dure au plus une heure : si vous êtes resté longtemps au lobby depuis le clic,
   cliquez de nouveau avant de lancer. De même à une revanche : le lobby suivant n'ouvre rien tout seul.
-  Un nouveau clic repose les trois mêmes redirections, il n'en ajoute pas.
+  Un nouveau clic sur la même box repose ses trois redirections, il n'en ajoute pas. Si, entre deux
+  clics, votre PC a changé de réseau et donc de box, le second clic ouvre aussi trois redirections
+  sur cette box-là : celles de la première ne sont pas remplacées, elles y restent jusqu'à ce que
+  PZ Duel se ferme proprement et les retire, ou jusqu'au terme de leur bail.
 - **Pas de renouvellement automatique.** PZ Duel ne prolonge jamais le bail sans vous. À son terme, la
   box retire les redirections.
-- **Fermeture.** Les redirections sont supprimées quand PZ Duel se ferme proprement, par `Quit`. Il n'y
+- **Fermeture.** Les redirections sont supprimées quand PZ Duel se ferme proprement, par `Quit` ou
+  seul après `idle_quit_s` sans personne qui regarde. Il n'y
   a pas de bouton séparé pour les fermer. Si PZ Duel est tué ou plante, seul le bail les borne : elles
   restent ouvertes sur la box jusqu'à son terme.
 - **L'adresse publique.** La box donne aussi son adresse publique. Quand c'en est vraiment une, le lobby

@@ -70,9 +70,24 @@ ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is pr
    `pz-duel-join.bat`. The lobby also shows a **verification code**: **read it aloud** to your guest,
    by voice, **separately from the link**, never in the same message as the link or the file. It is
    the only protection against a file replaced on the way. Then `Ouvrir PZ` joins your own server.
-7. **Leave with `Quit`** in the page. Closing the browser tab does not stop PZ Duel.
+7. **Leave with `Quit`** in the page. If you just close the browser tab, PZ Duel closes by itself
+   once nobody has looked at it for `idle_quit_s` (120 s by default, set in `service/runtime.json`;
+   `0` turns it off): closing the tab is enough to start that countdown. It **never** happens during
+   a duel (countdown or match running), even with no tab open — you are watching the game, not the
+   page; the countdown starts over, whole, when the duel ends. The lobby and an error screen do not
+   hold it. An open page keeps PZ Duel running, even in the background, unless the browser puts the
+   tab to sleep: then, in the last 30 s, the page warns that PZ Duel is about to close for want of
+   anyone watching, and a click anywhere in the page is enough to stay. It closes the same way as
+   `Quit`: servers stopped and, if ports were opened, their mappings removed from the router.
 
 If `Launch duel` ends on an error, use `Try again`. If the screen tells you to, quit and reopen PZ Duel.
+
+**Where the files are.** `pz-duel.exe` is a single file: at every launch it unpacks what it carries,
+mod included, into a temporary folder `%LOCALAPPDATA%\Temp\_MEI…\`, deleted when it exits normally (a
+forced stop can leave it behind). That copy is not the mod the game uses. `Install mod` copies it to
+`%USERPROFILE%\Zomboid\mods\duelcore`: that is the installed mod, the folder the game loads.
+`%LOCALAPPDATA%\PZDuel` only holds PZ Duel's log (`pz-duel.log`), the `matches` folder and the
+single-instance lock (with the port it listens on).
 
 ### Guest
 
@@ -118,10 +133,14 @@ range, no DMZ, no other port.
   more). After a successful opening the lobby shows `Ports … are open until` followed by the expiry
   time. A duel lasts at most one hour, so if you stayed long in the lobby since the click, click again
   before launching. Same thing at a rematch: the next lobby does not open anything by itself. Clicking
-  again replaces the same three mappings, it does not add new ones.
+  again on the same router replaces its three mappings, it does not add new ones. If, between two
+  clicks, your PC moved to another network and so to another router, the second click opens three
+  mappings on that router too: those of the first router are not replaced, they stay there until
+  PZ Duel exits cleanly and removes them, or until their lease runs out.
 - **No automatic renewal.** PZ Duel never extends the lease without you. When it runs out, the router
   removes the mappings.
-- **Closing.** The mappings are removed when PZ Duel exits cleanly, with `Quit`. There is no separate
+- **Closing.** The mappings are removed when PZ Duel exits cleanly, with `Quit` or when it closes by
+  itself after `idle_quit_s` with nobody watching. There is no separate
   button to close them. If PZ Duel is killed or crashes, only the lease bounds them: they stay open on
   the router until it runs out.
 - **The public address.** The router also reports its public address. When it is a real public

@@ -174,6 +174,32 @@ def load_runtime() -> dict:
         return json.load(fh)
 
 
+# Arrêt sur inactivité (P9F4) : la valeur livrée quand `runtime.json` ne la donne pas.
+IDLE_QUIT_KEY = "idle_quit_s"
+IDLE_QUIT_DEFAULT_S = 120
+
+
+def idle_quit_seconds(runtime: Mapping[str, Any]) -> float:
+    """Rend `idle_quit_s` validé : un nombre fini positif, ou exactement 0 (jamais d'arrêt).
+
+    Comme les autres durées : ni booléen, ni texte, ni `inf`/`NaN` (`1e999` se lit `inf`), ni
+    entier trop grand pour un flottant. Un négatif est refusé, il ne vaut pas « jamais ».
+    """
+    value = runtime.get(IDLE_QUIT_KEY, IDLE_QUIT_DEFAULT_S)
+    where = "runtime.json"
+    if type(value) is not int and type(value) is not float:
+        _fail(where, IDLE_QUIT_KEY, f"nombre attendu, reçu {value!r}")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        _fail(where, IDLE_QUIT_KEY, f"nombre fini attendu, reçu {value!r}")
+    if value < 0:
+        _fail(where, IDLE_QUIT_KEY, f"0 ou un nombre positif attendu, reçu {value}")
+    return float(value)
+
+
 def load_effects() -> dict:
     with open(EFFECTS_PATH, encoding="utf-8") as fh:
         return json.load(fh)

@@ -337,6 +337,35 @@ def state_entered_at(lobby: Lobby, phase: str) -> int:
     return next(r["ts_ms"] for r in lobby.records("state") if r["data"].get("phase") == phase)
 
 
+def test_an_idle_stop_claimed_as_the_countdown_is_decided_opens_no_duel(engine_rig, monkeypatch):
+    """Revue A1 (P9F4) : l'arrêt engagé entre la décision du décompte et son entrée l'emporte.
+
+    `claim_idle_stop` passe dans la fenêtre même : après `_rules_refusal`, avant le changement
+    d'état. Mutation : retirer le test de `_stop` dans `_enter_countdown` ouvre le décompte
+    d'un service qui s'arrête.
+    """
+    lobby = Lobby(engine_rig, None)
+    engine, match = lobby.engine, lobby.engine._match
+    rules_refusal = match._rules_refusal
+    claimed: list[bool] = []
+
+    def claim_in_the_window():
+        refusal = rules_refusal()
+        with engine.lock:
+            engine._watched_at = float("-inf")
+        claimed.append(engine.claim_idle_stop())
+        return refusal
+
+    monkeypatch.setattr(match, "_rules_refusal", claim_in_the_window)
+    lobby.join_and_resolve()
+    lobby.wait_for(lambda _: claimed, expected="l'arrêt engagé au moment du décompte")
+
+    assert engine.shutdown()
+    assert claimed[0] is True
+    assert engine.snapshot()["phase"] not in ("countdown", "running")
+    assert "countdown" not in lobby.phases()
+
+
 def test_lobby_does_not_wait_for_a_wound(engine_rig):
     """Sans preuve ni échec connus : décompte à `L`, table entière, aucun atome retiré."""
     lobby = Lobby(engine_rig, None)

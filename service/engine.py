@@ -62,6 +62,7 @@ from .rules import (
     RESTARTING,
     MatchCore,
     TableError,
+    idle_quit_seconds,
     load_effects,
     load_runtime,
     load_table,
@@ -181,6 +182,9 @@ SHARE_UNAVAILABLE_TEXT = (
     "The share link is unavailable: TCP port {port} could not be opened. "
     "Save the launcher and send it to your guest."
 )
+# Arrêt sur inactivité (P9F4) : un duel se joue dans ces phases, et l'hôte y regarde le jeu,
+# pas l'onglet. Elles seules interdisent l'arrêt ; `lobby`, `error` et toutes les autres non.
+DUEL_PHASES = ("countdown", "running")
 # Le lobby s'ouvre depuis `contract` : l'écouteur naît juste avant lui, sans lui survivre.
 SHARE_PHASES = ("contract", "lobby")
 # Formes neutres de `ports_opening` ; les autres statuts viennent de `service/upnp.py`.
@@ -1479,9 +1483,15 @@ class RealMatch:
         # La décision se publie avant la phase : `countdown` ne se lit jamais sans elle.
         self._publish(now_ms)
         countdown_s = self.runtime["countdown_s"]
-        self._countdown_end_ms = now_ms + countdown_s * MS_PER_S
+        entered = False
 
         def change(state: MatchState) -> None:
+            # Sous le verrou du moteur, comme `Engine.claim_idle_stop` : un arrêt engagé au
+            # lobby n'ouvre jamais de duel, et un duel ouvert n'est jamais tenu pour inactif.
+            nonlocal entered
+            if self._stop.is_set():
+                return
+            entered = True
             state.set_step(STEP_LOBBY, "ok", "les deux joueurs sont connectés")
             state.clock = {
                 "remaining_s": self.config["duration_s"],
@@ -1489,9 +1499,12 @@ class RealMatch:
                 "countdown": countdown_s,
             }
             state.log("décompte")
+            state.phase = "countdown"
 
         self._on_state(change)
-        self.enter_phase("countdown")
+        if entered:
+            self._countdown_end_ms = now_ms + countdown_s * MS_PER_S
+            self.record_phase("countdown")
         return None
 
     def _tick_countdown(self, left_ms: int) -> None:
@@ -1662,6 +1675,10 @@ class Engine:
         )
         self._clock = time.time if clock is None else clock
         self._monotonic = time.monotonic if monotonic is None else monotonic
+        # Arrêt sur inactivité (P9F4) : délai validé (0 = jamais), et le dernier battement, sur
+        # l'horloge monotone. Le démarrage en vaut un : sans navigateur, le délai court déjà.
+        self._idle_quit_s = idle_quit_seconds(self.runtime)
+        self._watched_at = self._monotonic()
         self._platform = current() if platform is None else platform
         self._client_launcher = (
             partial(launch_client, platform=self._platform)
@@ -1744,7 +1761,61 @@ class Engine:
             # Présent dans toutes les phases ; l'UI ne le montre qu'au lobby. `invite` n'en
             # reçoit rien : l'adresse proposée reste dans `ports_opening.address` (R5).
             state["ports_opening"] = self._ports_view()
+            # Rien qui varie d'un appel à l'autre : l'UI compte le délai depuis son dernier appel
+            # réussi, chacun étant un battement. `armed` est faux si l'arrêt ne peut pas tirer.
+            state["idle_quit"] = {
+                "after_s": self._idle_quit_s,
+                "armed": self._idle_left_s() is not None,
+                "ports_open": self._ports_held(),
+            }
             return state
+
+    # -- arrêt sur inactivité (P9F4) -----------------------------------------
+    def heartbeat(self) -> None:
+        """Quelqu'un regarde : seul `/api/state` l'appelle, par `main` (P9F4)."""
+        with self.lock:
+            self._watched_at = self._monotonic()
+
+    def _idle_left_s(self) -> float | None:
+        """Secondes avant l'arrêt sur inactivité, `None` s'il ne peut pas tirer. Sous `self.lock`.
+
+        `None` quand `idle_quit_s` vaut 0, et pendant un duel (`DUEL_PHASES`) : le battement y
+        est alors renouvelé, si bien que le délai repart entier à la fin du duel, même sans
+        navigateur. Négatif ou nul : le délai est échu.
+        """
+        if self._idle_quit_s == 0:
+            return None
+        now = self._monotonic()
+        if self.state.phase in DUEL_PHASES:
+            self._watched_at = now
+            return None
+        return self._idle_quit_s - (now - self._watched_at)
+
+    def idle_due(self) -> bool:
+        """Vrai quand `maintenant - dernier battement >= idle_quit_s` hors d'un duel."""
+        with self.lock:
+            left = self._idle_left_s()
+            return left is not None and left <= 0
+
+    def claim_idle_stop(self) -> bool:
+        """Engage l'arrêt sur inactivité s'il est dû : rend vrai si c'est fait (revue A1, P9F4).
+
+        Le constat et l'engagement se font sous un même `self.lock`, que prennent aussi
+        `heartbeat` et l'entrée en `countdown` : un battement arrivé avant compte, et un duel
+        ne peut plus commencer après. `_closing` refuse `start` et `rematch`, `_stop` fait
+        renoncer le fil du match au décompte ; l'appelant prend ensuite le chemin de `Quit`.
+        """
+        with self.lock:
+            left = self._idle_left_s()
+            if left is None or left > 0:
+                return False
+            self._closing = True
+            self._stop.set()
+            return True
+
+    def _ports_held(self) -> bool:
+        """Des redirections posées ou en cours de pose, que l'arrêt retirera. Sous `self.lock`."""
+        return bool(self._ports_ledger.entries()) or bool(self._ports_pending)
 
     def presets(self) -> list[dict]:
         return self._presets
@@ -2705,10 +2776,16 @@ class Engine:
             if not self._sleep(0.3):
                 return self._cancel_state()
         with self.lock:
-            self.state.set_step("lobby", "ok", "les deux joueurs sont connectés")
-            self.state.phase = "countdown"
-            self.state.clock = {"remaining_s": self.state.config["duration_s"], "drift_s": 0}
-            self.state.log("décompte")
+            # Même règle que `RealMatch._enter_countdown` : vu sous `self.lock`, un arrêt
+            # engagé (`claim_idle_stop`, `shutdown`) n'ouvre pas de duel.
+            stopping = self._stop.is_set()
+            if not stopping:
+                self.state.set_step("lobby", "ok", "les deux joueurs sont connectés")
+                self.state.phase = "countdown"
+                self.state.clock = {"remaining_s": self.state.config["duration_s"], "drift_s": 0}
+                self.state.log("décompte")
+        if stopping:
+            return self._cancel_state()
         for n in (3, 2, 1):
             with self.lock:
                 self.state.clock["countdown"] = n

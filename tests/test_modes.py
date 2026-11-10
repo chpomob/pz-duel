@@ -21,9 +21,10 @@ from test_preflight import free_ports, make_install, zomboid_home  # noqa: F401
 from service import engine as engine_module
 from service import main as main_module
 from service.api import make_server
-from service.engine import ACTIONS, Engine, load_presets
+from service.engine import ACTIONS, DUEL_PHASES, Engine, load_presets
 from service.platforms import WINDOWS, current
 from service.preflight import MOD_SRC, detect_pz, install_mod
+from service.rules import TableError
 from service.servers import ServerProcess
 from service.state import PHASE_LABELS
 
@@ -46,7 +47,7 @@ STATE_KEYS = {
     "error",
     "logs",
 }
-NEW_STATE_KEYS = {"match_id", "capabilities", "result", "ports_opening"}
+NEW_STATE_KEYS = {"match_id", "capabilities", "result", "ports_opening", "idle_quit"}
 PRESET_KEYS = {"id", "label", "tagline", "summary", "duration_s", "day_length"}
 WAIT_S = 10
 JSON_HEADERS = {"Content-Type": "application/json"}
@@ -738,3 +739,246 @@ def test_api_backward_compatible(mode, zomboid_home, runtime):
         server.shutdown()
         server.server_close()
         thread.join(WAIT_S)
+
+
+# Arrêt sur inactivité (P9F4) ------------------------------------------------------------------
+
+IDLE_S = 120
+
+
+class ManualClock:
+    """Horloge monotone que le test avance lui-même : aucun test ne dort."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def idle_engine(runtime: dict, idle_quit_s: float = IDLE_S) -> tuple[Engine, ManualClock]:
+    clock = ManualClock()
+    runtime["idle_quit_s"] = idle_quit_s
+    return Engine("mock", runtime=runtime, monotonic=clock), clock
+
+
+def test_shipped_idle_quit_is_120_s(runtime):
+    assert runtime["idle_quit_s"] == IDLE_S
+    assert Engine("mock", runtime=runtime).snapshot()["idle_quit"]["after_s"] == IDLE_S
+
+
+@pytest.mark.parametrize("value", [0, 0.5, 1, IDLE_S, 3600.0])
+def test_idle_quit_accepts_zero_or_a_finite_positive_number(value, runtime):
+    engine, _ = idle_engine(runtime, value)
+    assert engine.snapshot()["idle_quit"]["after_s"] == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, -0.001, float("inf"), float("-inf"), float("nan"), 10**400, True, "120", None, [120]],
+    ids=["-1", "-0.001", "inf", "-inf", "nan", "huge", "bool", "text", "null", "list"],
+)
+def test_idle_quit_refuses_negative_and_non_finite_values(value, runtime):
+    """Mutation : retirer le refus du négatif dans `idle_quit_seconds` fait passer `-1`."""
+    runtime["idle_quit_s"] = value
+    with pytest.raises(TableError, match="idle_quit_s"):
+        Engine("mock", runtime=runtime)
+
+
+def test_idle_quit_fires_exactly_at_idle_quit_s_without_a_beat(runtime):
+    """Mutation : `left <= 0` changé en `left < 0` ne tire pas à 120 s pile."""
+    engine, clock = idle_engine(runtime)
+    clock.now += IDLE_S - 0.001
+    assert not engine.idle_due()
+    clock.now += 0.001
+    assert engine.idle_due()
+
+
+def test_a_heartbeat_restarts_the_whole_delay(runtime):
+    """Mutation : `heartbeat` qui ne note plus l'instant laisse tirer à 120 s du démarrage."""
+    engine, clock = idle_engine(runtime)
+    clock.now += IDLE_S - 1
+    engine.heartbeat()
+    clock.now += IDLE_S - 1
+    assert not engine.idle_due()
+    clock.now += 1
+    assert engine.idle_due()
+
+
+def test_idle_quit_zero_never_fires(runtime):
+    """Mutation : sans le cas `idle_quit_s == 0`, le délai nul tire dès le premier tour."""
+    engine, clock = idle_engine(runtime, 0)
+    clock.now += 10**9
+    assert not engine.idle_due()
+    assert engine.snapshot()["idle_quit"]["armed"] is False
+
+
+def test_only_a_duel_in_progress_holds_the_idle_quit(runtime):
+    """La condition : `phase in DUEL_PHASES`, soit `countdown` et `running`, rien d'autre.
+
+    Mutation : retirer le test de phase fait tirer en plein duel ; y ajouter `lobby` ou
+    `error` les fait protéger.
+    """
+    assert DUEL_PHASES == ("countdown", "running")
+    held = []
+    for phase in PHASE_LABELS:
+        engine, clock = idle_engine(runtime)
+        engine.state.phase = phase
+        clock.now += 10 * IDLE_S
+        if not engine.idle_due():
+            held.append(phase)
+        assert engine.snapshot()["idle_quit"]["armed"] is (phase not in DUEL_PHASES)
+    assert held == ["countdown", "running"]
+    assert {"lobby", "error"} <= set(PHASE_LABELS)
+
+
+def test_the_delay_restarts_whole_when_the_duel_ends(runtime):
+    """L'hôte a regardé le jeu, pas l'onglet : la fin du duel ne coupe pas tout à l'instant.
+
+    Mutation : ne plus renouveler le battement pendant un duel fait tirer dès `over`.
+    """
+    engine, clock = idle_engine(runtime)
+    engine.state.phase = "running"
+    clock.now += 30 * 60
+    assert not engine.idle_due()
+    engine.state.phase = "over"
+    clock.now += IDLE_S - 1
+    assert not engine.idle_due()
+    clock.now += 1
+    assert engine.idle_due()
+
+
+def test_idle_view_says_when_ports_will_be_closed(runtime):
+    """Mutation : `ports_open` figé à faux, l'UI ne dirait plus que les ports seront refermés."""
+    engine, _ = idle_engine(runtime)
+    assert engine.snapshot()["idle_quit"] == {"after_s": IDLE_S, "armed": True, "ports_open": False}
+    engine._ports_pending = [(17271, "UDP")]
+    assert engine.snapshot()["idle_quit"]["ports_open"] is True
+
+
+def test_only_api_state_is_a_heartbeat(runtime):
+    """Mutation : le battement déplacé en tête de `do_GET`, ou retiré de `/api/state`."""
+    engine, clock = idle_engine(runtime)
+    server = make_server(engine)
+    server.on_watch = engine.heartbeat
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        clock.now += IDLE_S
+        for path in ("/", "/app.js", "/api/presets", "/api/setup"):
+            with urllib.request.urlopen(base + path, timeout=WAIT_S) as reply:
+                reply.read()
+        call(f"{base}/api/action", {"action": "cancel"})
+        assert engine.idle_due()
+        status, state = call(f"{base}/api/state")
+        assert status == 200 and state["idle_quit"]["armed"] is True
+        assert not engine.idle_due()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(WAIT_S)
+
+
+class IdleSpy:
+    def __init__(self, answers: list[bool]) -> None:
+        self.answers = answers
+        self.asked = 0
+
+    def claim_idle_stop(self) -> bool:
+        self.asked += 1
+        return self.answers.pop(0)
+
+
+def test_claiming_the_idle_stop_commits_it_under_the_lock(runtime):
+    """Revue A1 : le constat et l'engagement ne font qu'un. Engagé, plus rien ne démarre.
+
+    Mutation : un `claim_idle_stop` qui ne pose ni `_closing` ni `_stop` laisse `start` passer.
+    """
+    engine, clock = idle_engine(runtime)
+    assert engine.claim_idle_stop() is False
+    assert not engine._stop.is_set() and not engine._closing
+    clock.now += IDLE_S
+    assert engine.claim_idle_stop() is True
+    assert engine._stop.is_set() and engine._closing
+    assert engine.action("start", {"preset": "demo"})[0] is False
+
+
+def test_a_beat_before_the_claim_holds_it(runtime):
+    """Un battement pris sous le verrou avant le constat compte : rien n'est engagé."""
+    engine, clock = idle_engine(runtime)
+    clock.now += IDLE_S
+    engine.heartbeat()
+    assert engine.claim_idle_stop() is False
+    assert not engine._stop.is_set() and not engine._closing
+
+
+def test_claiming_the_idle_stop_is_refused_during_a_duel(runtime):
+    engine, clock = idle_engine(runtime)
+    for phase in DUEL_PHASES:
+        engine.state.phase = phase
+        clock.now += 10 * IDLE_S
+        assert engine.claim_idle_stop() is False
+    assert not engine._stop.is_set() and not engine._closing
+
+
+def test_an_idle_stop_claimed_in_the_mock_lobby_never_opens_a_duel(runtime):
+    """Mock : l'arrêt s'engage juste après que le lobby a vu l'adversaire, avant le décompte.
+
+    `claim_idle_stop` passe à la fin de l'attente qui précède ce constat : seul le test de
+    `_stop` sous `self.lock` retient le décompte. Mutation : le retirer de `_phase_lobby`
+    ouvre le décompte d'un service qui s'arrête.
+    """
+    engine, clock = idle_engine(runtime)
+    sleep, claimed = engine._sleep, []
+
+    def sleep_then_claim(seconds: float) -> bool:
+        slept = sleep(seconds)
+        if slept and not claimed and engine.state.players.get("B"):
+            clock.now += IDLE_S
+            claimed.append(engine.claim_idle_stop())
+        return slept
+
+    engine._sleep = sleep_then_claim
+    assert engine.action("start", {"preset": "demo"})[0]
+    wait_phase(engine, "lobby")
+    assert engine.action("simulate_join")[0]
+    state = settle(engine)
+    assert claimed == [True]
+    # Le décompte ne dure qu'un instant avant l'annulation : son entrée se lit au journal.
+    assert "décompte" not in [line["msg"] for line in engine.state.logs]
+    assert state["phase"] == "idle"
+
+
+def test_watchdog_takes_the_quit_path_once_due():
+    """Mutation : un chien qui ne rappelle pas `request_stop` laisse le service tourner."""
+    spy, stops = IdleSpy([False, False, True]), []
+    waits: list[float] = []
+
+    def wait(timeout_s: float) -> bool:
+        waits.append(timeout_s)
+        return False
+
+    assert main_module.watch_idle(spy, lambda: stops.append(1), wait) is True
+    assert stops == [1] and spy.asked == 3
+    assert waits == [main_module.IDLE_CHECK_S] * 3
+
+
+def test_watchdog_never_stops_a_duel(runtime):
+    """Un vrai moteur en `running`, sans aucun battement depuis des heures : aucun arrêt."""
+    engine, clock = idle_engine(runtime)
+    engine.state.phase = "running"
+    stops, turns = [], iter([False] * 5 + [True])
+
+    def wait(timeout_s: float) -> bool:
+        clock.now += 3600
+        return next(turns)
+
+    assert main_module.watch_idle(engine, lambda: stops.append(1), wait) is False
+    assert stops == []
+
+
+def test_watchdog_leaves_when_the_service_stops_otherwise():
+    spy, stops = IdleSpy([True]), []
+    assert main_module.watch_idle(spy, lambda: stops.append(1), lambda timeout_s: True) is False
+    assert stops == [] and spy.asked == 0
