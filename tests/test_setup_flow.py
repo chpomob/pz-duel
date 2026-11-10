@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import socket
+import subprocess
 import threading
 import time
 from contextlib import ExitStack
@@ -817,6 +818,106 @@ def test_error_screen_can_run_the_checks_again():
     error = script[script.index("function renderError()") : script.index("function renderQuit()")]
 
     assert 'data-action="rematch"' in error
+
+
+def lobby_ports_ui(script: str) -> tuple[str, str, str]:
+    """`(portsBlock, prefillAddress, inviteCard)` : les trois morceaux de l'ouverture des ports."""
+    block = script[script.index("function portsBlock()") : script.index("// Tout vient de `invite`")]
+    prefill = script[script.index("function prefillAddress()") : script.index("function portsBlock()")]
+    invite = script[script.index("function inviteCard()") : script.index("function renderLive()")]
+    return block, prefill, invite
+
+
+def test_phase3_ac27_lobby_has_the_open_ports_button_only_in_a_real_duel():
+    script = ui_script()
+    block, _, invite = lobby_ports_ui(script)
+
+    # Le libelle vient de l'API : ports, protocoles et bail de `ports_opening`.
+    named = script[script.index("function portsNamed(") : script.index("function leaseText(")]
+    assert "(po.ports || []).map((p) => `${p.port}/${p.protocol}`)" in named
+    assert "const po = S.ports_opening || {};" in block
+    assert "if (Number.isFinite(po.lease_s) && po.lease_s > 0) portsLease = po.lease_s;" in block
+    assert "`Open ports ${portsNamed(po)}${portsLease ? ` for ${leaseText(portsLease)}` : ''}`" in block
+    leases = script[script.index("function leaseText(") : script.index("// Heure locale")]
+    assert "`${s / 3600} h`" in leases
+    (button,) = [line for line in block.splitlines() if 'data-action="open-ports"' in line]
+    assert "${busy ? 'disabled' : ''}" in button and "${esc(label)}" in button
+    assert "const busy = po.status === 'in_progress';" in block
+    assert "busy ? 'Opening ports…'" in block
+    # Le bloc n'existe que dans la branche `real ?` du champ d'adresse : absent en mode simule.
+    branch = invite[invite.index("${real ? `<label class=\"field address\">") :]
+    branch = branch[: branch.index("` : ''}") + len("` : ''}")]
+    assert "${portsBlock()}" in branch
+    assert invite.count("portsBlock()") == 1
+    assert script.count("${portsBlock()}") == 1
+    assert "const real = S.mode === 'real';" in invite
+    # Le clic passe par le meme `api()` que `set-address`.
+    assert "if (a === 'open-ports') { return answered(await api('/api/ports/open', {})); }" in script
+    assert "/api/ports/open" in inspect.getsource(api_module)
+    css = (UI_DIR / "style.css").read_text("utf-8")
+    for variant in ("mapped", "no_gateway", "refused", "invalid_config"):
+        assert f".ports.{variant}" in css
+
+
+def test_phase3_ac28_prefill_manual_instruction_and_expiry_in_the_lobby():
+    script = ui_script()
+    block, prefill, _ = lobby_ports_ui(script)
+
+    # Pre-remplissage : seulement un `mapped` avec adresse, une fois, et seulement si le champ est vide.
+    assert "if (!po || po.status !== 'mapped' || !po.address || po.expires_at === portsPrefilled) return;" in prefill
+    assert "if (addressDraft === '') addressDraft = po.address;" in prefill
+    assert [line.strip() for line in prefill.splitlines() if "addressDraft =" in line] == [
+        "if (addressDraft === '') addressDraft = po.address;"
+    ]
+    assert "api(" not in prefill  # l'invitation ne change qu'au clic sur "Use this address" (R5)
+    assert '<input id="f-address" value="${esc(addressDraft)}"' in script
+    poll = script[script.index("async function poll()") : script.index("async function refreshSetup")]
+    assert poll.index("S = state;") < poll.index("prefillAddress();") < poll.index("render();")
+    assert "if (out.state) { S = out.state; prefillAddress(); render(); }" in script
+    # `no_gateway` / `refused` / `invalid_config` : raison et consigne manuelle de l'API (AC15).
+    failed = block[block.index("['no_gateway', 'refused', 'invalid_config'].includes(po.status)") :]
+    assert "${esc(portsReason(po))}" in failed
+    assert "${po.manual ? `<p class=\"hint\">${esc(po.manual)}</p>` : ''}" in failed
+    # `mapped` : l'heure d'expiration vient de `expires_at` (epoch), en heure locale du navigateur.
+    mapped = block[block.index("if (po.status === 'mapped')") : block.index("} else if")]
+    assert "${esc(expiryText(po.expires_at))}" in mapped
+    assert "po.address_note" in mapped
+    expiry = script[script.index("function expiryText(") : script.index("function portsReason(")]
+    assert "new Date(expiresAt * 1000)" in expiry
+
+
+def phase2_ui_script() -> str | None:
+    """`ui/app.js` a la base de la phase 2 (`3b5f407`), ou `None` sans historique git."""
+    try:
+        out = subprocess.run(
+            ["git", "show", "3b5f407:ui/app.js"],
+            cwd=UI_DIR.parent,
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return out.stdout.decode("utf-8")
+
+
+def test_phase3_ac29_added_ui_lines_are_english():
+    script = ui_script()
+    block, prefill, _ = lobby_ports_ui(script)
+    ports = script[script.index("// ---------------------------------------------------------------- ports") :]
+    ports = ports[: ports.index("// Tout vient de `invite`")]
+    forbidden = re.compile(r"[éèàç]|adresse|ouvrir|échec", re.IGNORECASE)
+
+    base = phase2_ui_script()
+    if base is None:
+        # Sans historique, au moins le code propre a la phase.
+        added = ports.splitlines()
+    else:
+        before = set(base.splitlines())
+        added = [line for line in script.splitlines() if line not in before]
+        assert all(line in added for line in block.splitlines() if line.strip() and line not in before)
+        assert any("data-action=\"open-ports\"" in line for line in added)
+    assert added
+    assert [line for line in added if forbidden.search(line)] == []
 
 
 def test_ui_only_calls_routes_of_the_service():

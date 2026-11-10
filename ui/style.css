@@ -150,3 +150,10 @@ input:focus, select:focus { outline: 1px solid var(--amber); }
   max-width: 940px; margin: 10px auto 96px; padding: 0 18px;
   color: #6d7660; font-size: 11.5px; line-height: 1.6;
 }
+
+/* Ouverture des ports (UPnP) : un bloc sous le champ d'adresse, une variante par resultat. */
+.ports { margin: 12px 0 0; padding: 10px 12px; border-left: 3px solid var(--line); border-radius: 6px; }
+.ports p { margin: 6px 0 0; overflow-wrap: anywhere; }
+.ports.mapped { border-left-color: var(--green); background: #1b2416; }
+.ports.no_gateway, .ports.refused { border-left-color: var(--amber); background: #2a2416; }
+.ports.invalid_config { border-left-color: var(--red); background: #2a1a16; }

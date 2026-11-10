@@ -11,6 +11,8 @@ let setup = null;             // dernier contrôle de `/api/setup`, `null` tant 
 let setupPhase = null;        // phase à laquelle ce contrôle a été demandé
 let folderDraft = '';         // dossier du jeu en cours de saisie
 let addressDraft = '';        // adresse publique en cours de saisie
+let portsLease = null;        // dernier bail annonce par `ports_opening`, pour le libelle du bouton
+let portsPrefilled = null;    // `expires_at` du resultat `mapped` deja propose dans `#f-address`
 let shown = null;             // dernier contenu posé dans `#app`
 let quitting = false;         // la sortie est demandée : plus aucun autre écran
 let stopped = false;          // le service ne répond plus après cette demande
@@ -43,6 +45,7 @@ async function poll() {
     // Un 403, un 500 ou le 503 de `turned_away` portent du JSON sans `phase` : `S` ne change pas.
     if (!state || typeof state.phase !== 'string') return unreachable();
     S = state;
+    prefillAddress();
     $('#svc').textContent = 'service : ok';
     $('#svc').className = 'badge badge-ok';
   } catch (e) {
@@ -73,7 +76,7 @@ async function refreshSetup() {
 
 function answered(out) {
   if (!out.ok) toast(out.message || out.error || 'action refusée', true);
-  if (out.state) { S = out.state; render(); }
+  if (out.state) { S = out.state; prefillAddress(); render(); }
   return out;
 }
 
@@ -383,6 +386,58 @@ function playedTable() {
     <p class="hint">Hash des règles : ${esc(S.config.rules_hash || '')}</p>`;
 }
 
+// ---------------------------------------------------------------- ports (UPnP, R8)
+// Tout vient de `ports_opening` : ports, bail et consigne manuelle sont ceux de l'API.
+function portsNamed(po) {
+  return (po.ports || []).map((p) => `${p.port}/${p.protocol}`).join(', ');
+}
+
+function leaseText(s) {
+  if (s % 3600 === 0) return `${s / 3600} h`;
+  if (s % 60 === 0) return `${s / 60} min`;
+  return `${s} s`;
+}
+
+// Heure locale du navigateur, depuis l'epoch rendue par le service.
+function expiryText(expiresAt) {
+  return new Date(expiresAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function portsReason(po) {
+  if (po.status === 'invalid_config') return `invalid setting ${po.key || ''}`.trim();
+  if (po.error_code !== undefined) return `router error ${po.error_code} ${po.error_text || ''}`.trim();
+  return po.failure || po.reason || 'unknown reason';
+}
+
+// Une proposition par resultat `mapped`, jamais par-dessus une saisie : l'invitation ne change
+// qu'au clic sur "Use this address" (R5).
+function prefillAddress() {
+  const po = S && S.ports_opening;
+  if (!po || po.status !== 'mapped' || !po.address || po.expires_at === portsPrefilled) return;
+  portsPrefilled = po.expires_at;
+  if (addressDraft === '') addressDraft = po.address;
+}
+
+function portsBlock() {
+  const po = S.ports_opening || {};
+  if (Number.isFinite(po.lease_s) && po.lease_s > 0) portsLease = po.lease_s;
+  const busy = po.status === 'in_progress';
+  const label = busy ? 'Opening ports…'
+    : `Open ports ${portsNamed(po)}${portsLease ? ` for ${leaseText(portsLease)}` : ''}`;
+  let result = '';
+  if (po.status === 'mapped') {
+    result = `<p class="hint">Ports ${esc(portsNamed(po))} are open until ${esc(expiryText(po.expires_at))}.</p>
+      <p class="hint">${po.address ? `Public address read from the router: ${esc(po.address)}` : esc(po.address_note || 'Public address not available.')}</p>`;
+  } else if (['no_gateway', 'refused', 'invalid_config'].includes(po.status)) {
+    result = `<p class="hint">Ports could not be opened automatically (${esc(portsReason(po))}).</p>
+      ${po.manual ? `<p class="hint">${esc(po.manual)}</p>` : ''}`;
+  }
+  return `<div class="ports ${esc(po.status || '')}">
+        <div class="actions"><button class="ghost" data-action="open-ports" ${busy ? 'disabled' : ''}>${esc(label)}</button></div>
+        ${result}
+      </div>`;
+}
+
 // Tout vient de `invite` : le service décide de ce qui existe et le dit en anglais.
 function inviteCard() {
   const inv = S.invite || {};
@@ -419,7 +474,8 @@ function inviteCard() {
       ${real ? `<label class="field address"><span>Public address, for a guest outside your network</span>
         <input id="f-address" value="${esc(addressDraft)}" maxlength="253" placeholder="IP address or host name">
       </label>
-      <div class="actions"><button class="ghost" data-action="set-address">Use this address</button></div>` : ''}
+      <div class="actions"><button class="ghost" data-action="set-address">Use this address</button></div>
+      ${portsBlock()}` : ''}
       ${inv.rematch_note ? `<p class="hint">${esc(inv.rematch_note)}</p>` : ''}
       ${playedTable()}
     </section>`;
@@ -564,6 +620,7 @@ document.addEventListener('click', async (ev) => {
   if (a === 'choose-folder') { return setupAction('/api/setup/pz-dir', { folder: folderDraft }); }
   if (a === 'copy-link') { return copy(S.invite.link); }
   if (a === 'save-launcher') { return saveLauncher(); }
+  if (a === 'open-ports') { return answered(await api('/api/ports/open', {})); }
   if (a === 'set-address') { return answered(await api('/api/invite/address', { address: addressDraft })); }
   if (a === 'start') {
     localStorage.setItem('pzduel.pseudo', draft.pseudo);
