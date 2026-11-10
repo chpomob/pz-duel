@@ -317,9 +317,20 @@ The important ones:
   abruptly, no token on the local API.
 - **No anti-cheat**: the player owns their files. A leaderboard only means anything among friends.
 - **Opening ports (UPnP) and shutdown**: if you quit while an opening is still running, the exit
-  may take one extra router request timeout (3 s by default). If two openings in one session reach
-  two different routers, only the latest router's mappings are removed at exit; the other ones stay
-  until their lease runs out.
+  waits at most the discovery window plus one router request timeout (5 s by default) for it to
+  finish and record what it placed, then goes on. The whole removal takes at most the discovery
+  window plus `(3 mappings + 2)` request timeouts — 17 s with the shipped settings — so a router that
+  went silent cannot hold `Quit` open. Every mapping recorded during the session is
+  removed, including those placed on a second, different router: the exit no longer needs to
+  rediscover a router, it keeps the address of each one it used. A mapping the router refuses to
+  delete — or one whose ownership is uncertain, because the lease may have expired — is still
+  attempted, and a refusal is accepted: it then stays until its lease runs out. PZ Duel never
+  assumes the router honours that lease.
+- **When some ports could not be closed**: after a partial failure, the lobby names the couples that
+  may still be open (`Ports 17271/UDP may still be open on your router: their removal was not
+  confirmed`) and says the rest of the truth: PZ Duel tries again when it stops, otherwise they close
+  when their lease ends, *if your router honours it*. Check your router's port forwarding page if
+  you are unsure.
 
 ## Thanks
 

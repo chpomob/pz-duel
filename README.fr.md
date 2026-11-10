@@ -323,9 +323,20 @@ Les plus importantes :
   l'arbitre meurt brutalement, pas de jeton sur l'API locale.
 - **Pas d'anti-triche** : le joueur possède ses fichiers. Le classement n'a de sens qu'entre amis.
 - **Ouverture des ports (UPnP) et arrêt** : si vous quittez pendant qu'une ouverture est en cours,
-  la sortie peut prendre un délai de requête de plus vers la box (3 s par défaut). Si deux ouvertures
-  d'une même session joignent deux box différentes, seules les redirections de la dernière box sont
-  supprimées à la sortie ; les autres restent jusqu'au terme de leur bail.
+  la sortie attend au plus la fenêtre de découverte plus un délai de requête vers la box (5 s par
+  défaut) que cette ouverture finisse et enregistre ce qu'elle a posé, puis continue. La suppression
+  entière prend au plus la fenêtre de découverte plus `(3 redirections + 2)` délais de requête — 17 s
+  avec les réglages livrés — donc une box devenue muette ne retient pas `Quit`. Toutes les
+  redirections enregistrées pendant la session sont supprimées, y compris celles posées sur une
+  seconde box : la sortie n'a plus besoin de redécouvrir une box, elle garde l'adresse de chacune de
+  celles qu'elle a utilisées. Une redirection que la box refuse de supprimer — ou dont la propriété
+  est incertaine, parce que le bail a pu expirer — est tout de même tentée, et un refus est accepté :
+  elle reste alors jusqu'au terme de son bail. PZ Duel ne suppose jamais que la box respecte ce bail.
+- **Quand certains ports n'ont pas pu être refermés** : après un échec partiel, le lobby nomme les
+  couples qui peuvent être encore ouverts (`Ports 17271/UDP may still be open on your router: their
+  removal was not confirmed`) et dit le reste : PZ Duel réessaie à l'arrêt, sinon ils se ferment au
+  terme de leur bail, *si votre box le respecte*. Vérifiez la page de redirection de ports de votre
+  box en cas de doute.
 
 ## Merci
 
