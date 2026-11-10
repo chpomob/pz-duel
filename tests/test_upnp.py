@@ -304,10 +304,10 @@ def test_ac4_foreign_control_url_is_no_gateway(control_url, socket_guard):
 def test_ac2_no_reply_is_no_gateway_within_timeout():
     with FakeIGD(ssdp_reply=False) as igd:
         started = time.monotonic()
-        gateway, failure = upnp.find_gateway(_cfg(discovery_timeout_s=0.5), igd.ssdp_target)
+        gateway, failure = upnp.find_gateway(_cfg(discovery_timeout_s=1), igd.ssdp_target)
         elapsed = time.monotonic() - started
         assert gateway is None and failure == {"status": "no_gateway", "reason": "no_reply"}
-        assert elapsed <= 0.5 + 1
+        assert elapsed <= 1 + 1
         assert len(igd.msearches) == 1
         assert igd.fetches == [] and igd.calls == []
 
@@ -460,11 +460,23 @@ def test_ac3_fetch_chunked_body_is_read():
     assert reply.body == b"hello world"
 
 
-GOOD_DESCRIPTION = (
-    '<root xmlns="urn:schemas-upnp-org:device-1-0"><device><serviceList><service>'
-    "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>"
-    "<controlURL>{control}</controlURL></service></serviceList></device></root>"
-)
+DEVICE = "urn:schemas-upnp-org:device:"
+
+
+def igd_description(service: str = "WANIPConnection:1", control: str = "/ctl", root_type: str = "InternetGatewayDevice:1") -> str:
+    """Description minimale d'un IGD : racine, `WANDevice`, `WANConnectionDevice`, service (C3)."""
+    return (
+        '<root xmlns="urn:schemas-upnp-org:device-1-0">'
+        f"<device><deviceType>{DEVICE}{root_type}</deviceType><deviceList>"
+        f"<device><deviceType>{DEVICE}WANDevice:1</deviceType><deviceList>"
+        f"<device><deviceType>{DEVICE}WANConnectionDevice:1</deviceType><serviceList><service>"
+        f"<serviceType>urn:schemas-upnp-org:service:{service}</serviceType>"
+        f"<controlURL>{control}</controlURL></service></serviceList></device>"
+        "</deviceList></device></deviceList></device></root>"
+    )
+
+
+GOOD_DESCRIPTION = igd_description(control="{control}")
 
 
 @pytest.mark.parametrize(
@@ -497,11 +509,7 @@ def test_ac3_unknown_xml_encoding_is_no_gateway(monkeypatch):
 
 
 def test_ac3_find_service_rejects_doctype_and_entities():
-    good = (
-        b'<root xmlns="urn:schemas-upnp-org:device-1-0"><device><serviceList><service>'
-        b"<serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType>"
-        b"<controlURL>/ctl</controlURL></service></serviceList></device></root>"
-    )
+    good = igd_description("WANIPConnection:2").encode("utf-8")
     assert upnp._find_service(good) == ("WANIPConnection:2", "/ctl")
     assert upnp._find_service(b'<!DOCTYPE r [<!ENTITY a "b">]>' + good) is None
     assert upnp._find_service(b"<!entity x>" + good) is None
@@ -540,7 +548,8 @@ def test_ac4_same_host_rule(location, responder, expected, socket_guard):
 
 # --- P4 : séquence de mappings, règle d'abandon, retrait ------------------------------
 
-FAST = {"discovery_timeout_s": 0.5, "request_timeout_s": 0.5}
+# Fenêtre de découverte minimale acceptée (C8 : au moins `upnp.MX_MIN` seconde).
+FAST = {"discovery_timeout_s": upnp.MX_MIN, "request_timeout_s": 0.5}
 
 
 def _open(igd: FakeIGD, cancel: threading.Event | None = None, **overrides: object):
@@ -1304,6 +1313,11 @@ def test_ac20_public_address_never_logged_nor_journaled(upnp_rig, igd, socket_gu
 
 
 # -- AC22 / AC23 / AC24 : arrêt ------------------------------------------------------------
+def _retained(engine: Engine) -> list[tuple[int, str]]:
+    """Couples retenus pour l'arrêt, toutes box confondues, dans leur ordre d'insertion."""
+    return [couple for _, couple in engine._upnp_retained]
+
+
 def _deletes_after(igd: FakeIGD, count: int) -> list[tuple[int, str]]:
     return igd.couples("DeletePortMapping")[count:]
 
@@ -1383,7 +1397,7 @@ def test_ac32_engine_retains_two_and_deletes_them_at_shutdown(upnp_rig, igd):
     opening = _click(lobby.engine)[0]
     assert opening["status"] == "refused" and opening["error_code"] == 718
     assert opening["still_active"] == _dicts(ports[:2])
-    assert set(lobby.engine._upnp_retained) == set(ports[:2])
+    assert set(_retained(lobby.engine)) == set(ports[:2])
     igd.set_responsive()
     seen = len(igd.actions("DeletePortMapping"))
     assert lobby.engine.shutdown()
@@ -1451,7 +1465,7 @@ def test_shutdown_first_delete_silent_still_tries_the_others(upnp_rig, igd, capl
     caplog.set_level(logging.DEBUG)
     lobby = Lobby(upnp_rig, "demo")
     assert _click(lobby.engine)[0]["status"] == "mapped"
-    retained = list(lobby.engine._upnp_retained)
+    retained = _retained(lobby.engine)
     seen = len(igd.actions("DeletePortMapping"))
     igd.configure(silent_on={("DeletePortMapping", seen + 1)})
     started = time.monotonic()
@@ -1638,3 +1652,244 @@ def test_ac22_service_stop_deletes_the_three_mappings(upnp_rig, igd, stop):
         assert igd.mappings == {}
     finally:
         service.kill()
+
+
+# -- P9F1 : constats de la revue de branche ------------------------------------------------
+# Chaque test tombe si la correction de son constat est retirée (mutation vérifiée).
+
+NOT_IGD = f"{DEVICE}MediaServer:1"
+
+
+def _wait_for(condition, timeout_s: float = ENGINE_WAIT_S) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"condition toujours fausse après {timeout_s} s")
+        time.sleep(0.02)
+
+
+# C1 : l'arrêt et la fusion d'une ouverture tardive ne perdent aucun mapping.
+def test_c1_opening_merged_after_the_shutdown_copy_removes_its_own_mappings(upnp_rig, igd, monkeypatch):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+    real_open = upnp.open_ports
+    gate = threading.Event()
+
+    def late_open(cfg, couples, target, cancel):
+        # Le réseau est fait, mais la fusion n'arrive qu'après la copie de l'arrêt.
+        outcome = real_open(cfg, couples, target, None)
+        gate.wait(ENGINE_WAIT_S)
+        return outcome
+
+    monkeypatch.setattr(upnp, "open_ports", late_open)
+    assert engine.open_ports()[0]
+    _wait_for(lambda: len(igd.actions("GetExternalIPAddress")) == 1)
+    assert set(igd.mappings) == set(ports)
+    seen = len(igd.actions("DeletePortMapping"))
+    stopper = threading.Thread(target=engine.shutdown, daemon=True)
+    stopper.start()
+    _wait_for(lambda: engine._ports_released)
+    assert engine._upnp_retained == {}
+    gate.set()
+    stopper.join(ENGINE_WAIT_S)
+    assert not stopper.is_alive()
+    assert sorted(_deletes_after(igd, seen)) == sorted(ports)
+    assert igd.mappings == {}
+    assert engine._upnp_retained == {}
+
+
+# C2 : une ouverture sur une autre box ne fait pas oublier les mappings de la première.
+def test_c2_retention_is_indexed_by_gateway_and_couple(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    ports = _engine_ports(upnp_rig)
+    assert _click(engine)[0]["status"] == "mapped"
+    with FakeIGD() as other:
+        engine._upnp_target = other.ssdp_target
+        assert _click(engine)[0]["status"] == "mapped"
+        assert set(igd.mappings) == set(ports) and set(other.mappings) == set(ports)
+        assert len(engine._upnp_retained) == 2 * len(ports)
+        assert engine.shutdown()
+        assert igd.mappings == {}
+        assert other.mappings == {}
+    assert engine._upnp_retained == {}
+
+
+# C3 : identité IGD vérifiée avant toute écriture SOAP.
+@pytest.mark.parametrize("options", [{"device_type": NOT_IGD}, {"wan_in_root": True}])
+def test_c3_wan_service_outside_an_igd_tree_is_no_gateway(options, socket_guard):
+    with FakeIGD(**options) as igd:
+        result, gateway, cleared = _open(igd)
+        assert result["status"] == "no_gateway" and result["reason"] == "no_service"
+        assert (gateway, cleared) == (None, [])
+        assert igd.fetches == ["/desc.xml"]
+        assert igd.calls == []
+        _assert_manual(result)
+
+
+def test_c3_find_service_requires_the_igd_tree():
+    assert upnp._find_service(igd_description().encode()) == ("WANIPConnection:1", "/ctl")
+    assert upnp._find_service(igd_description(root_type="InternetGatewayDevice:2").encode()) is not None
+    assert upnp._find_service(igd_description(root_type="MediaServer:1").encode()) is None
+    flat = (
+        f'<root><device><deviceType>{upnp.SEARCH_TARGET}</deviceType><serviceList><service>'
+        "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>"
+        "<controlURL>/ctl</controlURL></service></serviceList></device></root>"
+    )
+    assert upnp._find_service(flat.encode()) is None
+
+
+# C4 : filtrage sur `ST`, candidats suivants, budget global.
+def test_c4_non_igd_responder_first_does_not_stop_the_search(socket_guard):
+    with FakeIGD(device_type=NOT_IGD) as decoy, FakeIGD() as igd:
+        igd.configure(ssdp_before=[decoy.ssdp_answer()])
+        result, gateway, _ = _open(igd)
+        assert result["status"] == "mapped"
+        assert gateway is not None and gateway.port == igd.http_port
+        assert decoy.fetches == ["/desc.xml"] and decoy.calls == []
+        assert len(igd.actions("AddPortMapping")) == 3
+
+
+def test_c4_reply_with_a_foreign_st_is_not_a_candidate():
+    with FakeIGD() as decoy, FakeIGD() as igd:
+        igd.configure(ssdp_before=[decoy.ssdp_answer(f"{DEVICE}MediaRenderer:1")])
+        result, gateway, _ = _open(igd)
+        assert result["status"] == "mapped"
+        assert gateway is not None and gateway.port == igd.http_port
+        assert decoy.fetches == [] and decoy.calls == []
+
+
+def test_c4_location_without_igd_st_is_ignored():
+    igd = FakeIGD(location="http://127.0.0.1:1/desc.xml")
+    assert upnp._location(igd.ssdp_answer()) == "http://127.0.0.1:1/desc.xml"
+    assert upnp._location(igd.ssdp_answer(f"{DEVICE}InternetGatewayDevice:2")) is not None
+    assert upnp._location(igd.ssdp_answer("upnp:rootdevice")) is None
+    assert upnp._location(igd.ssdp_answer(f"{DEVICE}MediaRenderer:1")) is None
+    assert upnp._location(igd.ssdp_answer().replace(b"ST: ", b"X-ST: ")) is None
+
+
+def test_c4_candidates_are_tried_within_a_global_budget():
+    decoys = [FakeIGD(delay_s=5).start() for _ in range(6)]
+    try:
+        with FakeIGD(ssdp_reply=False, ssdp_before=[d.ssdp_answer() for d in decoys]) as igd:
+            cfg = _cfg(**FAST)
+            started = time.monotonic()
+            gateway, failure = upnp.find_gateway(cfg, igd.ssdp_target)
+            elapsed = time.monotonic() - started
+    finally:
+        for decoy in decoys:
+            decoy.close()
+    assert gateway is None and failure == {"status": "no_gateway", "reason": "timeout"}
+    assert elapsed <= cfg["discovery_timeout_s"] + cfg["request_timeout_s"] + 0.4
+    tried = sum(len(d.fetches) for d in decoys)
+    assert 2 <= tried < len(decoys)
+
+
+# C5 : un `mapped` échu ne s'affiche plus comme actif et ne propose plus l'adresse.
+def test_c5_expired_mapping_is_neither_shown_nor_proposed(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    opening, _, _ = _click(engine)
+    assert opening["status"] == "mapped" and opening["address"] == PUBLIC
+    engine._clock = lambda: opening["expires_at"] - 1
+    assert engine.snapshot()["ports_opening"]["status"] == "mapped"
+    engine._clock = lambda: opening["expires_at"]
+    view = engine.snapshot()["ports_opening"]
+    assert view == {
+        "status": "idle",
+        "expired": True,
+        "ports": _dicts(_engine_ports(upnp_rig)),
+        "lease_s": upnp_rig.runtime["upnp"]["lease_s"],
+    }
+    assert PUBLIC not in json.dumps(view)
+
+
+# C6 : l'échéance affichée ne dépasse jamais l'expiration réelle d'un mapping.
+def test_c6_expiry_is_a_conservative_bound(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    # L'heure murale réelle, celle que note le faux IGD à chaque appel (le banc la fige sinon).
+    lobby.engine._clock = time.time
+    opening, _, _ = _click(lobby.engine)
+    lease = upnp_rig.runtime["upnp"]["lease_s"]
+    adds = igd.actions("AddPortMapping")
+    assert len(adds) == 3
+    assert opening["expires_at"] <= min(call.at for call in adds) + lease
+    assert {expires for _, expires in lobby.engine._upnp_retained.values()} == {opening["expires_at"]}
+
+
+# C7 : aucune exception ne sort, même sur des entrées malformées.
+MALFORMED_PORTS = [
+    None,
+    5,
+    "abc",
+    [(1,)],
+    [None, None, None],
+    [("a", "UDP")] * 3,
+    [[[], "UDP"], [[], "UDP"], [[], "TCP"]],
+    [[{}, "UDP"], [1, "UDP"], [2, "TCP"]],
+    [(True, "UDP"), (2, "UDP"), (3, "TCP")],
+]
+
+
+@pytest.mark.parametrize("ports", MALFORMED_PORTS)
+def test_c7_malformed_ports_are_invalid_config_without_traffic(ports, socket_guard):
+    result, gateway, cleared = upnp.open_ports(_cfg(), ports, ("127.0.0.1", 9))
+    assert result["status"] == "invalid_config" and result["key"] == "ports"
+    assert (gateway, cleared) == (None, [])
+    assert isinstance(upnp.validate(_cfg(), ports), type(None))
+    assert isinstance(upnp.validate({}, ports), dict)
+    assert isinstance(upnp.manual_instruction(ports), str)
+    assert socket_guard.sends == [] and socket_guard.connects == []
+
+
+def test_c7_ports_ok_checks_types_before_building_a_set():
+    assert upnp._ports_ok([([], "UDP"), ([], "UDP"), ([], "TCP")]) is False
+    assert upnp._ports_ok([({}, "UDP"), (1, "UDP"), (2, ["TCP"])]) is False
+    assert upnp._ports_ok(list(PORTS)) is True
+
+
+def test_c7_huge_integer_setting_is_invalid_config(socket_guard):
+    result, _, _ = upnp.open_ports(_cfg(request_timeout_s=10**400), PORTS, ("127.0.0.1", 9))
+    assert result["status"] == "invalid_config" and result["key"] == "upnp.request_timeout_s"
+    assert socket_guard.sends == []
+
+
+def test_c7_delete_mappings_never_raises_on_malformed_mappings():
+    with FakeIGD() as igd:
+        gateway = _gateway(igd)
+        max_bytes = _cfg()["max_response_bytes"]
+        assert upnp.delete_mappings(gateway, None, 0.5, max_bytes=max_bytes) == []  # type: ignore[arg-type]
+        bad = ["x", (1,), ([], "UDP"), (0, "UDP"), None]
+        failures = upnp.delete_mappings(gateway, [PORTS[0], *bad], 0.5, max_bytes=max_bytes)
+        assert failures == bad
+        assert igd.couples("DeletePortMapping") == [PORTS[0]]
+
+
+# C8 : `MX` borné à 1–5, fenêtre de découverte d'au moins une seconde.
+@pytest.mark.parametrize(("window", "mx"), [(1, 1), (1.9, 1), (2, 2), (5, 5), (5.5, 5), (30, 5), (1e9, 5)])
+def test_c8_mx_is_bounded(window, mx):
+    request = upnp._msearch(("127.0.0.1", 9), window).decode("ascii")
+    assert f"\r\nMX: {mx}\r\n" in request
+
+
+@pytest.mark.parametrize("window", [0.5, 0.999])
+def test_c8_discovery_window_under_one_second_is_invalid_config(window, socket_guard):
+    result, gateway, _ = upnp.open_ports(_cfg(discovery_timeout_s=window), PORTS, ("127.0.0.1", 9))
+    assert result["status"] == "invalid_config" and result["key"] == "upnp.discovery_timeout_s"
+    assert gateway is None
+    assert socket_guard.sends == [] and socket_guard.connects == []
+    assert upnp.validate(_cfg(discovery_timeout_s=1)) is None
+
+
+# M1 : un mapping retenu dont le bail est échu n'est plus supprimé à l'arrêt.
+def test_m1_expired_retained_mapping_is_not_deleted_at_shutdown(upnp_rig, igd):
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    opening, _, _ = _click(engine)
+    assert opening["status"] == "mapped"
+    seen = len(igd.actions("DeletePortMapping"))
+    engine._clock = lambda: opening["expires_at"]
+    assert engine.shutdown()
+    assert _deletes_after(igd, seen) == []
+    assert engine._upnp_retained == {}

@@ -867,7 +867,9 @@ def test_phase3_ac28_prefill_manual_instruction_and_expiry_in_the_lobby():
     assert "if (!po || po.status !== 'mapped' || !po.address || po.expires_at === portsPrefilled) return;" in prefill
     assert "if (addressDraft === '') addressDraft = po.address;" in prefill
     assert [line.strip() for line in prefill.splitlines() if "addressDraft =" in line] == [
-        "if (addressDraft === '') addressDraft = po.address;"
+        "if (addressDraft === portsProposed) addressDraft = '';",
+        "if (addressDraft === '') addressDraft = po.address;",
+        "if (addressDraft === po.address) portsProposed = po.address;",
     ]
     assert "api(" not in prefill  # l'invitation ne change qu'au clic sur "Use this address" (R5)
     assert '<input id="f-address" value="${esc(addressDraft)}"' in script
@@ -884,6 +886,42 @@ def test_phase3_ac28_prefill_manual_instruction_and_expiry_in_the_lobby():
     assert "po.address_note" in mapped
     expiry = script[script.index("function expiryText(") : script.index("function portsReason(")]
     assert "new Date(expiresAt * 1000)" in expiry
+
+
+def test_p9f1_c3_suggested_address_is_presented_as_not_verified():
+    """C3 : l'adresse lue sur la box est une proposition, jamais présentée comme vérifiée."""
+    block, _, _ = lobby_ports_ui(ui_script())
+    mapped = block[block.index("if (po.status === 'mapped')") : block.index("} else if")]
+    (line,) = [line for line in mapped.splitlines() if "${esc(po.address)}" in line]
+    assert "Suggested public address" in line and "(not verified, check it before you use it)" in line
+    assert "Public address read from the router" not in mapped
+
+
+def test_p9f1_c5_expired_opening_is_shown_and_its_proposal_taken_back():
+    """C5 : un résultat échu (`expired`) se dit, et la proposition restée intacte est retirée."""
+    script = ui_script()
+    block, prefill, _ = lobby_ports_ui(script)
+    expired = block[block.index("} else if (po.expired) {") :]
+    assert "The lease of the earlier port opening has ended" in expired.splitlines()[1]
+    prefill = prefill[: prefill.index("function stillActiveText(")]
+    head = prefill.index("if (po && po.expired && portsProposed !== null) {")
+    assert head < prefill.index("if (addressDraft === portsProposed) addressDraft = '';")
+    assert prefill.index("portsProposed = null;") < prefill.index("po.status !== 'mapped'")
+    assert "if (addressDraft === po.address) portsProposed = po.address;" in prefill
+    assert "let portsProposed = null;" in script
+
+
+def test_p9f1_m2_still_active_mappings_are_named_after_a_failure():
+    """M2 : les couples `still_active` d'un échec sont nommés, leur fermeture non confirmée."""
+    script = ui_script()
+    block, _, _ = lobby_ports_ui(script)
+    failed = block[block.index("['no_gateway', 'refused', 'invalid_config'].includes(po.status)") :]
+    failed = failed[: failed.index("} else if")]
+    assert "${stillActiveText(po)}" in failed
+    still = script[script.index("function stillActiveText(") : script.index("function portsBlock()")]
+    assert "(po.still_active || []).map((p) => `${p.port}/${p.protocol}`).join(', ')" in still
+    assert "if (!still) return '';" in still
+    assert "${esc(still)}" in still and "their removal was not confirmed" in still
 
 
 def phase2_ui_script() -> str | None:

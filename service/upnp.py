@@ -6,6 +6,14 @@ maximale d'une réponse) viennent de la section `upnp` de `service/runtime.json`
 l'appelant ; les deux seules constantes du protocole SSDP sont nommées ci-dessous, une fois.
 
 Garde-fous :
+- seule une réponse SSDP `200` dont le `ST` désigne une passerelle IGD est candidate ; les
+  candidats sont essayés dans leur ordre d'arrivée, jusqu'au premier qui se valide, dans un
+  budget global de `discovery_timeout_s + request_timeout_s` (C4) ;
+- une passerelle n'est retenue, avant toute écriture SOAP, que si sa description est celle d'un
+  IGD : périphérique racine `InternetGatewayDevice`, et service WAN compatible rangé sous
+  `WANDevice` puis `WANConnectionDevice` (C3). Rien de plus ne l'authentifie : un hôte du réseau
+  local qui imite tout cela reste indiscernable, d'où une adresse publique présentée par l'UI
+  comme non vérifiée ;
 - l'URL de description (`LOCATION`) doit être en `http`, et son hôte un littéral IP égal à
   l'adresse qui a répondu à la découverte ; un nom ou une autre adresse rend `no_gateway`
   sans résolution DNS ni connexion (AC4). L'URL de contrôle suit la même règle ;
@@ -14,7 +22,8 @@ Garde-fous :
 - une description portant `<!DOCTYPE` ou `<!ENTITY` (en ASCII) est refusée avant toute analyse
   XML, et l'analyseur lui-même refuse toute déclaration de DTD ou d'entité, quel que soit
   l'encodage du document (UTF-16…) ; un encodage inconnu rend `no_gateway` ;
-- aucune exception ne sort du module : chaque échec devient un résultat.
+- aucune exception ne sort du module, même sur des entrées malformées : chaque échec devient
+  un résultat.
 
 L'adresse locale vue par la socket de la requête (`getsockname`) sert de `NewInternalClient`,
 jamais une adresse saisie par l'utilisateur (AC10).
@@ -43,7 +52,7 @@ import time
 import urllib.parse
 import threading
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from xml.parsers import expat
 from xml.sax.saxutils import escape
@@ -51,7 +60,17 @@ from xml.sax.saxutils import escape
 SSDP_PORT = 1900
 SSDP_GROUP = "239.255.255.250"
 
-SEARCH_TARGET = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
+# Bornes de `MX` fixées par le protocole SSDP (UDA 1.1 : de 1 à 5 secondes). La fenêtre de
+# découverte ne peut pas être plus courte que l'attente minimale annoncée (C8).
+MX_MIN = 1
+MX_MAX = 5
+
+DEVICE_PREFIX = "urn:schemas-upnp-org:device:"
+SEARCH_TARGET = f"{DEVICE_PREFIX}InternetGatewayDevice:1"
+# `ST` acceptés dans une réponse, et types attendus à chaque niveau de l'arborescence IGD (C3, C4).
+IGD_TYPES = (SEARCH_TARGET, f"{DEVICE_PREFIX}InternetGatewayDevice:2")
+WAN_DEVICE_TYPES = (f"{DEVICE_PREFIX}WANDevice:1", f"{DEVICE_PREFIX}WANDevice:2")
+WAN_CONNECTION_TYPES = (f"{DEVICE_PREFIX}WANConnectionDevice:1", f"{DEVICE_PREFIX}WANConnectionDevice:2")
 SERVICE_PREFIX = "urn:schemas-upnp-org:service:"
 SERVICE_TYPES = ("WANIPConnection:1", "WANIPConnection:2", "WANPPPConnection:1")
 FORBIDDEN_MARKUP = (b"<!doctype", b"<!entity")
@@ -134,29 +153,68 @@ class Reply:
 # --- découverte ------------------------------------------------------------------
 
 
+def _mx(timeout_s: float) -> int:
+    """`MX` annoncé : la fenêtre en secondes entières, bornée à [MX_MIN, MX_MAX] (C8)."""
+    return min(MX_MAX, max(MX_MIN, int(timeout_s)))
+
+
 def _msearch(target: tuple[str, int], timeout_s: float) -> bytes:
-    wait = max(1, int(timeout_s))
     return (
         "M-SEARCH * HTTP/1.1\r\n"
         f"HOST: {target[0]}:{target[1]}\r\n"
         'MAN: "ssdp:discover"\r\n'
-        f"MX: {wait}\r\n"
+        f"MX: {_mx(timeout_s)}\r\n"
         f"ST: {SEARCH_TARGET}\r\n\r\n"
     ).encode("ascii")
 
 
 def _location(data: bytes) -> str | None:
-    """`LOCATION` d'une réponse SSDP `200`, ou `None` si la réponse ne se lit pas."""
+    """`LOCATION` d'une réponse SSDP `200` dont le `ST` désigne un IGD, sinon `None` (C4)."""
     text = data.decode("latin-1")
     lines = text.split("\r\n")
     status = lines[0].split()
     if len(status) < 2 or not status[0].upper().startswith("HTTP/") or status[1] != "200":
         return None
+    headers: dict[str, str] = {}
     for line in lines[1:]:
         name, sep, value = line.partition(":")
-        if sep and name.strip().upper() == "LOCATION" and value.strip():
-            return value.strip()
-    return None
+        if sep:
+            headers.setdefault(name.strip().upper(), value.strip())
+    if headers.get("ST") not in IGD_TYPES or not headers.get("LOCATION"):
+        return None
+    return headers["LOCATION"]
+
+
+def _replies(target: tuple[str, int], timeout_s: float, deadline: float, max_bytes: int) -> Iterator[tuple[str, str]]:
+    """Envoie une M-SEARCH, puis rend chaque `(répondeur, LOCATION)` compatible, une fois.
+
+    Jusqu'à `deadline` (monotone), l'attente bloque ; au-delà, seules les réponses déjà
+    arrivées sont encore lues, sans attendre. Un datagramme illisible (trop long, ICMP renvoyé
+    en erreur par Windows) ou incompatible est ignoré. Les erreurs de socket remontent à
+    l'appelant, qui les convertit.
+    """
+    seen: set[tuple[str, str]] = set()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(_msearch(target, timeout_s), target)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                sock.settimeout(remaining)
+            else:
+                sock.setblocking(False)
+            try:
+                data, peer = sock.recvfrom(max_bytes)
+            except (BlockingIOError, socket.timeout, TimeoutError):
+                return
+            except OSError:
+                if remaining <= 0:
+                    return
+                continue
+            location = _location(data)
+            if location is None or (peer[0], location) in seen:
+                continue
+            seen.add((peer[0], location))
+            yield peer[0], location
 
 
 def discover(
@@ -165,30 +223,18 @@ def discover(
     timeout_s: float,
     max_bytes: int,
 ) -> tuple[str, str] | None:
-    """Envoie une M-SEARCH à `target` et rend `(adresse du répondeur, LOCATION)` ou `None`.
+    """Envoie une M-SEARCH à `target` et rend le premier `(répondeur, LOCATION)` compatible.
 
-    La première réponse qui se lit l'emporte ; l'attente totale est bornée par une échéance
-    monotone de `timeout_s`. Un datagramme illisible (trop long, ICMP renvoyé en erreur par
-    Windows) est ignoré jusqu'à l'échéance. Aucune exception ne sort.
+    L'attente totale est bornée par une échéance monotone de `timeout_s` ; `None` sans réponse
+    compatible. `find_gateway` ne s'arrête pas là : il essaie les candidats suivants (C4).
+    Aucune exception ne sort.
     """
-    deadline = time.monotonic() + timeout_s
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.sendto(_msearch(target, timeout_s), target)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                sock.settimeout(remaining)
-                try:
-                    data, peer = sock.recvfrom(max_bytes)
-                except (socket.timeout, TimeoutError):
-                    return None
-                except OSError:
-                    continue
-                location = _location(data)
-                if location is not None:
-                    return peer[0], location
+        replies = _replies(target, timeout_s, time.monotonic() + timeout_s, max_bytes)
+        try:
+            return next(replies, None)
+        finally:
+            replies.close()
     except ERRORS as exc:
         log.info("upnp: discovery failed (%s)", type(exc).__name__)
         return None
@@ -393,8 +439,29 @@ def _parse(xml: bytes) -> ET.Element:
     return ET.fromstring(xml)
 
 
+def _children(element: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in element if _local_name(child.tag) == name]
+
+
+def _text(element: ET.Element, name: str) -> str:
+    found = _children(element, name)
+    return (found[0].text or "").strip() if found else ""
+
+
+def _subdevices(device: ET.Element, types: tuple[str, ...]) -> Iterator[ET.Element]:
+    for listing in _children(device, "deviceList"):
+        for child in _children(listing, "device"):
+            if _text(child, "deviceType") in types:
+                yield child
+
+
 def _find_service(xml: bytes) -> tuple[str, str] | None:
-    """`(type de service, controlURL)` du premier service WAN compatible, sinon `None`."""
+    """`(type de service, controlURL)` du premier service WAN compatible d'un IGD, sinon `None`.
+
+    Identité vérifiée (C3) : la racine porte un périphérique `InternetGatewayDevice`, et le
+    service n'est cherché que sous `WANDevice` puis `WANConnectionDevice` de ce périphérique ;
+    un service WAN rangé ailleurs, ou porté par un autre type de périphérique, ne compte pas.
+    """
     lowered = xml.lower()
     if any(marker in lowered for marker in FORBIDDEN_MARKUP):
         return None
@@ -402,23 +469,51 @@ def _find_service(xml: bytes) -> tuple[str, str] | None:
         root = _parse(xml)
     except PARSE_ERRORS:
         return None
-    for element in root.iter():
-        if _local_name(element.tag) != "service":
+    if _local_name(root.tag) != "root":
+        return None
+    for igd in _children(root, "device"):
+        if _text(igd, "deviceType") not in IGD_TYPES:
             continue
-        fields = {_local_name(child.tag): (child.text or "").strip() for child in element}
-        service_type = fields.get("serviceType", "")
-        control_url = fields.get("controlURL", "")
-        if not service_type.startswith(SERVICE_PREFIX) or not control_url:
-            continue
-        short = service_type[len(SERVICE_PREFIX) :]
-        if short in SERVICE_TYPES:
-            return short, control_url
+        for wan in _subdevices(igd, WAN_DEVICE_TYPES):
+            for connection in _subdevices(wan, WAN_CONNECTION_TYPES):
+                for listing in _children(connection, "serviceList"):
+                    for element in _children(listing, "service"):
+                        service_type = _text(element, "serviceType")
+                        control_url = _text(element, "controlURL")
+                        if not service_type.startswith(SERVICE_PREFIX) or not control_url:
+                            continue
+                        short = service_type[len(SERVICE_PREFIX) :]
+                        if short in SERVICE_TYPES:
+                            return short, control_url
     return None
 
 
 def _no_gateway(reason: str) -> tuple[None, dict]:
     log.info("upnp: no gateway (%s)", reason)
     return None, {"status": NO_GATEWAY, "reason": reason}
+
+
+def _candidate(
+    responder_ip: str, location: str, timeout_s: float, max_bytes: int
+) -> tuple[Gateway | None, str]:
+    """Valide un candidat : `(Gateway, "")` ou `(None, raison)`. Aucune écriture SOAP ici."""
+    place = _same_host(location, responder_ip)
+    if place is None:
+        return None, "foreign_location"
+    host, port, path = place
+    reply = _fetch(host, port, path, None, timeout_s, max_bytes)
+    if reply.failure is not None:
+        return None, reply.failure
+    if reply.status != http.client.OK:
+        return None, UNREADABLE
+    service = _find_service(reply.body)
+    if service is None:
+        return None, "no_service"
+    service_type, control_url = service
+    control_path = _control_path(location, control_url, host, port)
+    if control_path is None:
+        return None, "foreign_control_url"
+    return Gateway(host, port, control_path, service_type), ""
 
 
 def find_gateway(
@@ -428,36 +523,44 @@ def find_gateway(
 ) -> tuple[Gateway | None, dict | None]:
     """Découvre la box et lit sa description : `(Gateway, None)` ou `(None, résultat no_gateway)`.
 
-    `cfg` est la section `upnp` de `runtime.json`. `cancel`, levé pendant la découverte, empêche
-    la lecture de la description (raison `cancelled`). Aucune exception ne sort.
+    `cfg` est la section `upnp` de `runtime.json`. Les réponses SSDP compatibles sont essayées
+    dans leur ordre d'arrivée, jusqu'à la première passerelle validée (C4) ; le tout tient dans
+    `discovery_timeout_s + request_timeout_s`, chaque lecture de description étant aussi bornée
+    par `request_timeout_s`. Sans passerelle, la raison est celle du dernier candidat essayé, ou
+    `no_reply`. `cancel`, levé, empêche la lecture de toute description (raison `cancelled`).
+    Aucune exception ne sort.
     """
     try:
         timeout_s = cfg["discovery_timeout_s"]
         request_timeout_s = cfg["request_timeout_s"]
         max_bytes = cfg["max_response_bytes"]
-        found = discover(target, timeout_s=timeout_s, max_bytes=max_bytes)
-        if found is None:
-            return _no_gateway("no_reply")
-        if _stopped(cancel):
-            return _no_gateway(CANCELLED)
-        responder_ip, location = found
-        place = _same_host(location, responder_ip)
-        if place is None:
-            return _no_gateway("foreign_location")
-        host, port, path = place
-        reply = _fetch(host, port, path, None, request_timeout_s, max_bytes)
-        if reply.failure is not None:
-            return _no_gateway(reply.failure)
-        if reply.status != http.client.OK:
-            return _no_gateway(UNREADABLE)
-        service = _find_service(reply.body)
-        if service is None:
-            return _no_gateway("no_service")
-        service_type, control_url = service
-        control_path = _control_path(location, control_url, host, port)
-        if control_path is None:
-            return _no_gateway("foreign_control_url")
-        return Gateway(host, port, control_path, service_type), None
+        window_end = time.monotonic() + timeout_s
+        budget_end = window_end + request_timeout_s
+        reason = "no_reply"
+        replies = _replies(target, timeout_s, window_end, max_bytes)
+        try:
+            while True:
+                try:
+                    found = next(replies, None)
+                except ERRORS as exc:
+                    log.info("upnp: discovery failed (%s)", type(exc).__name__)
+                    found = None
+                if found is None:
+                    break
+                responder_ip, location = found
+                if _stopped(cancel):
+                    return _no_gateway(CANCELLED)
+                remaining = budget_end - time.monotonic()
+                if remaining <= 0:
+                    break
+                gateway, reason = _candidate(
+                    responder_ip, location, min(request_timeout_s, remaining), max_bytes
+                )
+                if gateway is not None:
+                    return gateway, None
+        finally:
+            replies.close()
+        return _no_gateway(reason)
     except (*PARSE_ERRORS, TypeError) as exc:
         return _no_gateway(type(exc).__name__)
 
@@ -467,8 +570,23 @@ def find_gateway(
 Couple = tuple[int, str]
 
 
-def _couples(ports: Iterable[Sequence[object]]) -> list[Couple]:
-    return [(port, protocol) for port, protocol in ports]  # type: ignore[misc]
+def _couples(ports: object) -> list[Couple] | None:
+    """Couples `(port, protocole)` de `ports`, ou `None` si `ports` ne se lit pas ainsi (C7).
+
+    Seule la forme est vérifiée ici (un entier qui n'est pas un booléen, une chaîne) ; les
+    valeurs le sont par `_ports_ok`. Aucune exception ne sort.
+    """
+    try:
+        couples = [tuple(item) for item in ports]  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - un itérable quelconque peut lever n'importe quoi
+        return None
+    for couple in couples:
+        if len(couple) != 2:
+            return None
+        port, protocol = couple
+        if not isinstance(port, int) or isinstance(port, bool) or not isinstance(protocol, str):
+            return None
+    return couples  # type: ignore[return-value]
 
 
 def _as_dicts(couples: Iterable[Couple]) -> list[dict]:
@@ -477,7 +595,7 @@ def _as_dicts(couples: Iterable[Couple]) -> list[dict]:
 
 def manual_instruction(ports: Iterable[Sequence[object]]) -> str:
     """Consigne manuelle (anglais) qui nomme chaque port et son protocole (R4, AC15)."""
-    named = ", ".join(f"{port}/{protocol}" for port, protocol in _couples(ports))
+    named = ", ".join(f"{port}/{protocol}" for port, protocol in _couples(ports) or [])
     return (
         f"Open these ports by hand in your router's settings and forward them to this computer: "
         f"{named}. Then enter your public address in the field below."
@@ -486,21 +604,27 @@ def manual_instruction(ports: Iterable[Sequence[object]]) -> str:
 
 def _invalid(key: str, ports: Iterable[Sequence[object]] | None) -> dict:
     result: dict = {"status": INVALID_CONFIG, "key": key}
-    if ports is not None:
-        couples = _couples(ports)
+    couples = None if ports is None else _couples(ports)
+    if couples:
         result["ports"] = _as_dicts(couples)
         result["manual"] = manual_instruction(couples)
     return result
 
 
 def _positive_number(value: object) -> bool:
-    # `1e999` se lit `inf` dans runtime.json : un délai infini ou NaN est refusé ici (R3).
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value > 0
-    )
+    # `1e999` se lit `inf` dans runtime.json : un délai infini ou NaN est refusé ici (R3). Un
+    # entier trop grand pour un flottant fait lever `isfinite` : refusé lui aussi (C7).
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except OverflowError:
+        return False
+
+
+def _discovery_window(value: object) -> bool:
+    # Une fenêtre plus courte que `MX_MIN` se fermerait avant les réponses différées (C8).
+    return _positive_number(value) and value >= MX_MIN  # type: ignore[operator]
 
 
 def _positive_int(value: object) -> bool:
@@ -511,13 +635,14 @@ def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) 
     """`None` si la section `upnp` est utilisable, sinon le résultat `invalid_config` (R3, AC13).
 
     Aucun trafic : section absente ou d'un autre type → clé `upnp` ; clé absente ou mal typée,
-    ou bail hors de ]0, MAX_LEASE_S] → clé `upnp.<nom>`. Avec `ports`, le résultat porte la
+    bail hors de ]0, MAX_LEASE_S], ou fenêtre de découverte de moins de `MX_MIN` seconde → clé
+    `upnp.<nom>`. Avec `ports`, le résultat porte la
     consigne manuelle (R4).
     """
     if not isinstance(upnp_cfg, dict):
         return _invalid("upnp", ports)
     checks: dict[str, Callable[[object], bool]] = {
-        "discovery_timeout_s": _positive_number,
+        "discovery_timeout_s": _discovery_window,
         "request_timeout_s": _positive_number,
         "lease_s": lambda v: _positive_int(v) and v <= MAX_LEASE_S,  # type: ignore[operator]
         "description": lambda v: isinstance(v, str) and bool(v.strip()),
@@ -529,13 +654,16 @@ def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) 
     return None
 
 
-def _ports_ok(couples: list) -> bool:
-    if len(couples) != MAPPING_COUNT or len(set(couples)) != len(couples):
+def _couple_ok(couple: Couple) -> bool:
+    port, protocol = couple
+    return isinstance(port, int) and not isinstance(port, bool) and port in PORT_RANGE and protocol in PROTOCOLS
+
+
+def _ports_ok(couples: list | None) -> bool:
+    """Trois couples distincts, chacun valide ; les types sont vérifiés avant le `set` (C7)."""
+    if couples is None or len(couples) != MAPPING_COUNT or not all(map(_couple_ok, couples)):
         return False
-    return all(
-        isinstance(port, int) and not isinstance(port, bool) and port in PORT_RANGE and protocol in PROTOCOLS
-        for port, protocol in couples
-    )
+    return len(set(couples)) == len(couples)
 
 
 # --- adresse publique ---------------------------------------------------------------
@@ -784,7 +912,7 @@ def open_ports(
         return invalid, None, []
     if not _ports_ok(couples):
         return _invalid("ports", couples), None, []
-    assert isinstance(cfg, dict)
+    assert isinstance(cfg, dict) and couples is not None
     try:
         if _stopped(cancel):
             _, failure = _no_gateway(CANCELLED)
@@ -819,7 +947,18 @@ def delete_mappings(
     est notée et le mapping suivant est tenté quand même. Aucune exception ne sort.
     """
     failures: list[Couple] = []
-    for couple in _couples(mappings):
+    try:
+        items = list(mappings)
+    except Exception:  # noqa: BLE001 - l'arrêt ne doit jamais lever
+        log.info("upnp: shutdown delete given no mappings")
+        return failures
+    for item in items:
+        couples = _couples([item])
+        if not couples or not _couple_ok(couples[0]):
+            # Un couple malformé ne part pas : il compte parmi les échecs (C7).
+            failures.append(item)  # type: ignore[arg-type]
+            continue
+        couple = couples[0]
         try:
             answer = _delete(gateway, couple, request_timeout_s, max_bytes)
         except Exception as exc:  # noqa: BLE001 - l'arrêt ne doit jamais lever

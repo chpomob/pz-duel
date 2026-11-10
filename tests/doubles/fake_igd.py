@@ -7,7 +7,12 @@ de `(SSDP_GROUP, SSDP_PORT)`.
 - SSDP : socket UDP liée à `127.0.0.1:0` ; une M-SEARCH reçue est notée dans `msearches`,
   et la réponse unicast porte `LOCATION: http://<location_host>:<http_port>/desc.xml`
   (`location_host` vaut `127.0.0.1` ; `127.0.0.2` ou un nom pour AC4 ; `location` remplace
-  l'URL entière). `ssdp_reply=False` ne répond pas (aucune passerelle).
+  l'URL entière). `ssdp_reply=False` ne répond pas (aucune passerelle). `ssdp_st` remplace le
+  `ST` de la réponse (par défaut, celui de la demande) ; `ssdp_before` liste des réponses brutes
+  envoyées, dans l'ordre, avant la sienne, depuis la même socket : d'autres répondeurs (P9F1, C4).
+- `device_type` : type du périphérique racine de la description (par défaut l'IGD) ;
+  `wan_in_root=True` range le service WAN dans la liste du périphérique racine au lieu de
+  l'arborescence `WANDevice` / `WANConnectionDevice` (P9F1, C3).
 - HTTP (`ThreadingHTTPServer` sur `127.0.0.1:0`) : `GET /desc.xml` rend la description,
   notée dans `fetches`. `service_type` vaut `"WANIPConnection:1"`, `"WANPPPConnection:1"`, ou
   `None` (aucun service compatible) ; `description="malformed"` rend un XML cassé,
@@ -15,7 +20,8 @@ de `(SSDP_GROUP, SSDP_PORT)`.
   `upnp.max_response_bytes + 1` de `service/runtime.json`). `POST` sur `control_path` traite
   `DeletePortMapping`, `AddPortMapping`, `GetExternalIPAddress`.
 - Chaque appel SOAP est noté dans `calls` (`order` global à partir de 1, `index` dans son
-  action à partir de 1, `action`, `args`) **avant** toute décision : un appel muet est donc
+  action à partir de 1, `action`, `args`, `at` l'heure murale `time.time()` de réception)
+  **avant** toute décision : un appel muet est donc
   enregistré (AC33). Le tableau `mappings` `{(port, protocole): args}` suit les ajouts et
   suppressions qui ont reçu une réponse ; `apply_silent=True` applique aussi les appels muets.
 - Règles, toutes modifiables en cours de route (`configure`, `set_responsive`) :
@@ -39,6 +45,7 @@ import ipaddress
 import json
 import socket
 import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 LOOPBACK = "127.0.0.1"
+IGD_TYPE = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
 RUNTIME_PATH = Path(__file__).resolve().parents[2] / "service" / "runtime.json"
 SERVICE_PREFIX = "urn:schemas-upnp-org:service:"
 SOAP_ENV = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -77,6 +85,7 @@ class Call:
     args: dict[str, str]
     client: str = ""
     silent: bool = False
+    at: float = 0.0
 
 
 @dataclass
@@ -92,6 +101,8 @@ class _Rules:
     strict_deletes: bool = False
     apply_silent: bool = False
     ssdp_reply: bool = True
+    ssdp_st: str | None = None
+    ssdp_before: list[bytes] = field(default_factory=list)
 
 
 def _match(keys: Any, call: Call) -> bool:
@@ -115,6 +126,8 @@ class FakeIGD:
         location: str | None = None,
         control_path: str = CONTROL_PATH,
         control_url: str | None = None,
+        device_type: str = IGD_TYPE,
+        wan_in_root: bool = False,
         **rules: Any,
     ) -> None:
         if description not in ("ok", "malformed", "oversized"):
@@ -126,6 +139,8 @@ class FakeIGD:
         self._location = location
         self.control_path = control_path
         self.control_url = control_url if control_url is not None else control_path
+        self.device_type = device_type
+        self.wan_in_root = wan_in_root
         self.rules = _Rules()
         self.configure(**rules)
 
@@ -235,6 +250,19 @@ class FakeIGD:
 
     # --- SSDP -------------------------------------------------------------------
 
+    def ssdp_answer(self, st: str = IGD_TYPE) -> bytes:
+        """Réponse SSDP de ce faux IGD ; à glisser dans `ssdp_before` d'un autre (C4)."""
+        return (
+            "HTTP/1.1 200 OK\r\n"
+            "CACHE-CONTROL: max-age=120\r\n"
+            "EXT:\r\n"
+            f"LOCATION: {self.location}\r\n"
+            "SERVER: FakeIGD/1.0 UPnP/1.1\r\n"
+            f"ST: {st}\r\n"
+            f"USN: uuid:fake-igd::{st}\r\n"
+            "\r\n"
+        ).encode("latin-1")
+
     def _serve_ssdp(self) -> None:
         sock = self._udp
         assert sock is not None
@@ -257,18 +285,16 @@ class FakeIGD:
             with self.lock:
                 self.msearches.append(peer)
                 reply = self.rules.ssdp_reply
+                st = self.rules.ssdp_st or st
+                before = list(self.rules.ssdp_before)
+            try:
+                for other in before:
+                    sock.sendto(other, peer)
+            except OSError:
+                return
             if not reply:
                 continue
-            answer = (
-                "HTTP/1.1 200 OK\r\n"
-                "CACHE-CONTROL: max-age=120\r\n"
-                "EXT:\r\n"
-                f"LOCATION: {self.location}\r\n"
-                "SERVER: FakeIGD/1.0 UPnP/1.1\r\n"
-                f"ST: {st}\r\n"
-                f"USN: uuid:fake-igd::{st}\r\n"
-                "\r\n"
-            ).encode("latin-1")
+            answer = self.ssdp_answer(st)
             try:
                 sock.sendto(answer, peer)
             except OSError:
@@ -290,7 +316,15 @@ class FakeIGD:
             "<SCPDURL>/l3f.xml</SCPDURL></service>"
         )
         wan = ""
-        if self.service_type is not None:
+        if self.service_type is not None and self.wan_in_root:
+            services += (
+                "<service>"
+                f"<serviceType>{SERVICE_PREFIX}{self.service_type}</serviceType>"
+                "<serviceId>urn:upnp-org:serviceId:WANConn1</serviceId>"
+                f"<controlURL>{self.control_url}</controlURL>"
+                "<eventSubURL>/evt/wan</eventSubURL><SCPDURL>/wan.xml</SCPDURL></service>"
+            )
+        elif self.service_type is not None:
             wan = (
                 "<device><deviceType>urn:schemas-upnp-org:device:WANConnectionDevice:1</deviceType>"
                 "<serviceList><service>"
@@ -304,7 +338,7 @@ class FakeIGD:
             '<?xml version="1.0"?>'
             '<root xmlns="urn:schemas-upnp-org:device-1-0">'
             "<specVersion><major>1</major><minor>0</minor></specVersion>"
-            "<device><deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>"
+            f"<device><deviceType>{self.device_type}</deviceType>"
             "<friendlyName>Fake IGD</friendlyName>"
             f"<serviceList>{services}</serviceList>"
             "<deviceList><device>"
@@ -323,7 +357,7 @@ class FakeIGD:
         with self.lock:
             self._order += 1
             self._per_action[action] = self._per_action.get(action, 0) + 1
-            call = Call(self._order, self._per_action[action], action, args, client)
+            call = Call(self._order, self._per_action[action], action, args, client, at=time.time())
             r = self.rules
             call.silent = (
                 r.silent

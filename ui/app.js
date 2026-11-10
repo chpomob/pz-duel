@@ -13,6 +13,7 @@ let folderDraft = '';         // dossier du jeu en cours de saisie
 let addressDraft = '';        // adresse publique en cours de saisie
 let portsLease = null;        // dernier bail annonce par `ports_opening`, pour le libelle du bouton
 let portsPrefilled = null;    // `expires_at` du resultat `mapped` deja propose dans `#f-address`
+let portsProposed = null;     // address put in `#f-address` by the last `mapped` result, until it expires
 let shown = null;             // dernier contenu posé dans `#app`
 let quitting = false;         // la sortie est demandée : plus aucun autre écran
 let stopped = false;          // le service ne répond plus après cette demande
@@ -411,11 +412,25 @@ function portsReason(po) {
 
 // Une proposition par resultat `mapped`, jamais par-dessus une saisie : l'invitation ne change
 // qu'au clic sur "Use this address" (R5).
+// Once the lease has ended (`expired`), a proposal left untouched in the field is taken back (C5).
 function prefillAddress() {
   const po = S && S.ports_opening;
+  if (po && po.expired && portsProposed !== null) {
+    if (addressDraft === portsProposed) addressDraft = '';
+    portsProposed = null;
+    return;
+  }
   if (!po || po.status !== 'mapped' || !po.address || po.expires_at === portsPrefilled) return;
   portsPrefilled = po.expires_at;
   if (addressDraft === '') addressDraft = po.address;
+  if (addressDraft === po.address) portsProposed = po.address;
+}
+
+// Mappings whose removal the router did not confirm after a failed opening (M2).
+function stillActiveText(po) {
+  const still = (po.still_active || []).map((p) => `${p.port}/${p.protocol}`).join(', ');
+  if (!still) return '';
+  return `<p class="err">Ports ${esc(still)} may still be open on your router: their removal was not confirmed. PZ Duel tries again when it stops; otherwise they close when their lease ends.</p>`;
 }
 
 function portsBlock() {
@@ -427,10 +442,13 @@ function portsBlock() {
   let result = '';
   if (po.status === 'mapped') {
     result = `<p class="hint">Ports ${esc(portsNamed(po))} are open until ${esc(expiryText(po.expires_at))}.</p>
-      <p class="hint">${po.address ? `Public address read from the router: ${esc(po.address)}` : esc(po.address_note || 'Public address not available.')}</p>`;
+      <p class="hint">${po.address ? `Suggested public address, as reported by the router (not verified, check it before you use it): ${esc(po.address)}` : esc(po.address_note || 'Public address not available.')}</p>`;
   } else if (['no_gateway', 'refused', 'invalid_config'].includes(po.status)) {
     result = `<p class="hint">Ports could not be opened automatically (${esc(portsReason(po))}).</p>
+      ${stillActiveText(po)}
       ${po.manual ? `<p class="hint">${esc(po.manual)}</p>` : ''}`;
+  } else if (po.expired) {
+    result = '<p class="hint">The lease of the earlier port opening has ended: the ports are no longer reported as open.</p>';
   }
   return `<div class="ports ${esc(po.status || '')}">
         <div class="actions"><button class="ghost" data-action="open-ports" ${busy ? 'disabled' : ''}>${esc(label)}</button></div>
