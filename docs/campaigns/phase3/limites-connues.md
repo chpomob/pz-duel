@@ -61,3 +61,31 @@ une vraie box. Ce que cela ne prouve pas : le chemin heureux (poser puis retirer
 ici pour une raison que la box n'expose pas. **Le test de Naylo est la seconde mesure, et c'est elle
 qui dira si l'UPnP est utilisable en pratique** ou si les instructions manuelles doivent passer au
 premier plan dans le README.
+
+### Chemin heureux prouvé — et la raison du refus (même jour, même box)
+
+Bisection sur la box de l'auteur, mêmes appels SOAP, un paramètre à la fois :
+
+| port externe | résultat |
+|---|---|
+| 1024, 8080, 17271, 40000, 49151 | `718 ConflictInMappingEntry` |
+| 49152, 50000, 51414-51419, 65535 | **accepté** |
+
+La box n'accepte que les ports externes de la plage dynamique (≥ 49152) et répond 718 — « conflit » —
+pour tout port réservé, alors qu'aucune entrée n'existe (`714`). Ce n'est pas un défaut du produit :
+c'est la politique de la box, et elle rend les trois ports fixes du duel (17271, 17272, 17280)
+**impossibles à ouvrir par UPnP** sur ce modèle.
+
+Avec des externes dans la plage acceptée et des internes inchangés, le chemin complet passe :
+
+- `49271 -> 17271/UDP`, `49272 -> 17272/UDP`, `49280 -> 17280/TCP` ajoutés en < 0,01 s chacun,
+  description `PZ Duel` visible sur la box ;
+- relus par `GetSpecificPortMappingEntry` : `NewLeaseDuration` = **7199**, donc la box **honore le bail**
+  demandé (7 200 s) et le décrémente — l'hypothèse inverse du mineur n° 3 ne vaut pas ici ;
+- retirés, puis relus : `714` sur les trois. Table de redirections identique à l'état initial.
+
+**Conséquence produit** : tel que livré, le bouton ne peut jamais réussir sur une box qui applique cette
+politique. Le produit doit choisir ses **ports externes** dans la plage acceptée, garder les internes,
+et donner les externes à l'invité — le `.bat` construit déjà `+connect hôte:port`
+(`service/guest_launcher.py:234`) et les ports vivent dans `runtime.json`, donc le changement est borné.
+C'est une décision de phase 4, pas une correction de la phase 3.
