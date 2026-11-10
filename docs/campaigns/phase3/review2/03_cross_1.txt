@@ -1,0 +1,114 @@
+```json
+{
+  "findings": [
+    {
+      "id": "X1",
+      "severity": "major",
+      "original_id": "I1",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 646,
+      "summary": "Confirmed: the same box seen at two LOCATIONs becomes two gateways, and the shared budget makes the false refusal more likely",
+      "evidence": "The code matches the claim. _replies deduplicates on (peer[0], location) (upnp.py:250). find_gateway deduplicates on the whole frozen Gateway(host, port, control_path, service_type) (upnp.py:646, dataclass at :158). Two descriptions on one responder IP, with different control paths, therefore reach _select. _select asks for exactly one public answer (:608), so two identical public addresses from the same host give ambiguous_gateway. There is a second effect the original reviewer did not mention. budget_end = window_end + request_timeout_s (:631). All description fetches AND all GetExternalIPAddress reads must fit in that single request_timeout_s (3 s by default, runtime.json:63) after the window closes, and _select returns AMBIGUOUS when the budget runs out (:595-596). With two candidates from one box, that is 4 HTTP round trips in 3 s, so a slow but responsive router can also be refused as ambiguous. The M-SEARCH sends only ST IGD:1 (:195), which reduces how often one box answers twice. It does not stop a box that exposes separate IGD:1 and IGD:2 description files from answering twice. Fix: collapse candidates that share a responder IP before _select, or treat 'same host, same public address' as resolved.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X2",
+      "severity": "minor",
+      "original_id": "I2",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 2183,
+      "summary": "Confirmed: the M1 expiry decision uses wall time even though a monotonic clock is already injected",
+      "evidence": "Engine already holds self._monotonic (engine.py:1669). Yet expires_at = click + lease_s, where click comes from self._clock() (:2077, :2104). The checks at :2183 and :2218-2225 compare against self._clock() as well. If the clock steps backwards, the service deletes a couple whose real lease has expired and which a third party may have taken, and M1 forbids exactly that. If the clock steps forwards, deletes that were still needed are skipped. That only leaks the mapping until the lease ends, which is the safer direction. In practice the lease is at most 7200 s, so the backwards case needs a step of minutes, for example a DST or timezone error on a mis-set Windows RTC or a large NTP correction. That is uncommon, so minor is right. Fix: store a monotonic deadline next to the displayed wall-time expires_at.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X3",
+      "severity": "minor",
+      "original_id": "I3",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 2128,
+      "summary": "Valid but unlikely, and the consequence is worse than a stuck button: mappings can leak with no shutdown warning",
+      "evidence": "_merge_opening clears _ports_pending at :2128, before the loop that indexes item['port']/item['protocol'] (:2144) and before state.log (:2151). Both run outside any try. If either raises partway through, three things follow. (a) _ports_opening stays whatever was set. If the raise happens after :2133, the view is already the new result, so the 'stuck in_progress' claim only holds when something before :2133 raises. (b) Couples later in the loop are never added to _upnp_retained. (c) Because _ports_pending is already empty, _release_ports (:2228, :2239) neither waits nor names the opening as abandoned. Mappings that are live on the router are then neither deleted nor reported, which goes against R6/C1. The trigger is unlikely: the result dicts come from upnp._as_dicts and _refused, which always set those keys. The with-block releases the lock, so there is no deadlock. Keep it minor. Wrap the merge in try/except, and on failure retain every couple from the result before publishing a terminal status.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X4",
+      "severity": "minor",
+      "original_id": "I4",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 2215,
+      "summary": "The ~26 s worst case is reachable; there is no in-process outer timeout, but closing the Windows console window gives the process only about 5 s",
+      "evidence": "The arithmetic holds with runtime.json (discovery 2, request 3): join 5 s (:2215), up to 3 retained deletes at 3 s each (:2229), a second join of 3 s (:2235), and 3 handoff deletes at 3 s each (:2243). The full path needs a previous click whose mappings are retained AND a second click still in flight. open_ports refuses only while an opening is in progress (:2062), so a re-click after a finished opening allows this. delete_mappings does not stop after a timeout on the same gateway (upnp.py:1077-1092), so an unresponsive box costs the full 3 s per couple. In-process, nothing cuts this short. stop_on_signal runs engine.shutdown() before httpd.shutdown() (main.py:230-234), so the main thread waits, and a second Ctrl+C is ignored (main.py:236). Outside the process, closing the console window on Windows sends CTRL_CLOSE_EVENT, and Windows ends the process after roughly 5 s (SetConsoleCtrlHandler documentation, HandlerRoutine). The R6 deletes and the 'abandoned' log line can be lost there with no trace. Suggested fixes: one overall deadline for the release, and stop deleting on a gateway after its first timeout.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "X5",
+      "severity": "nit",
+      "original_id": "I5",
+      "action": "CHALLENGE",
+      "file": "service/upnp.py",
+      "line": 973,
+      "summary": "Delete-before-add is what R3 requires, and many routers refuse to delete another host's mapping anyway",
+      "evidence": "spec.md:112-113 (R3) says: 'Chaque mapping est supprimé avant d'être ajouté, de sorte qu'un mapping déjà présent ne fait pas échouer l'ouverture', and AC11 (spec.md:210) tests it. The code is therefore conformant, and this is a design question for the spec, not a defect. The comparison with M1 does not hold. M1 is about a mapping the service believes is its own after the lease, which is a silent and invisible deletion. R3 runs on an explicit click by the host. Impact also depends on the router. miniupnpd, the most common IGD implementation, has secure_mode on by default. In that mode it refuses DeletePortMapping and AddPortMapping for a different internal client (606/718), and the click then ends as 'refused' through the existing 718 path instead of overwriting the other host. This router behaviour is from memory of the miniupnpd source and was not checked in this session. At most a spec note; not minor.",
+      "confidence": "medium",
+      "basis": "spec"
+    },
+    {
+      "id": "X6",
+      "severity": "nit",
+      "original_id": "I6",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 302,
+      "summary": "Confirmed: port 0 falls back to 80; the impact stays limited to the pinned responder IP",
+      "evidence": "`port = parts.port or http.client.HTTP_PORT` (upnp.py:302) maps an explicit :0 to 80. The host check runs before it (:298-301), so no request can leave for another host. Out-of-range ports raise ValueError inside parts.port, and the surrounding except ERRORS (:308) appears to catch that. Agree that this is a nit.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X7",
+      "severity": "nit",
+      "original_id": "I7",
+      "action": "CHALLENGE",
+      "file": "service/upnp.py",
+      "line": 319,
+      "summary": "Honoring URLBase would not help on its own: _control_path rejects any control port that differs from the description port",
+      "evidence": "_control_path returns None when checked[1] != port (upnp.py:319). _candidate then reports foreign_control_url (:551-552). A URLBase or absolute controlURL on another port of the same IP is refused before any request is sent. I7 predicts an unreadable response or a timeout instead, so its stated outcome is wrong. The fix it suggests would turn that into a refusal unless the port pin is relaxed too. See X8.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "X8",
+      "severity": "minor",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/upnp.py",
+      "line": 319,
+      "summary": "The control URL is pinned to the description port as well as the host, so an IGD with a different SOAP port is refused",
+      "evidence": "The security property (AC4: no request to a host other than the responder) is enforced by _same_host, which compares hosts (:298-301). On top of that, _control_path requires the control URL's port to equal the description port (:319). The host pin already gives the SSRF protection. The port pin only refuses some legitimate devices, whose controlURL is absolute on a different port of the same IP, as foreign_control_url, and the host falls back to the manual instruction. How common such devices are is an inference (no device was tested). Confirm by checking whether the spec requires 'same port' (AC1/AC4 wording) and with a FakeIGD that serves the description on one port and SOAP on another. If the spec does not require it, compare the host only.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "X9",
+      "severity": "minor",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/upnp.py",
+      "line": 515,
+      "summary": "The first WAN*Connection service in document order is used, without checking whether that connection is up",
+      "evidence": "_find_service returns the first WANIPConnection or WANPPPConnection it finds across all WANConnectionDevices (upnp.py:514-523). Nothing calls GetStatusInfo or reads ConnectionStatus. DSL or multi-WAN routers often list an unused WANIPConnection before the active WANPPPConnection, or the reverse. The mapping then goes on an idle connection: AddPortMapping succeeds, the result is 'mapped', but no traffic arrives, or GetExternalIPAddress returns an empty or private address. miniupnpc's UPNP_GetValidIGD checks connection status for this reason; that comes from memory of the library, version not checked. Confirm with a FakeIGD description holding two WANConnectionDevices where only the second is Connected. Fix: prefer a service whose GetStatusInfo reports Connected, within the existing budget.",
+      "confidence": "medium",
+      "basis": "inference"
+    }
+  ]
+}
+```

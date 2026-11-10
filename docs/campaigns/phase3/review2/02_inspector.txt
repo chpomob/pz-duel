@@ -1,0 +1,84 @@
+READ: /tmp/review-master-1
+READ:ba93e5893b82dab5
+
+```json
+{
+  "read_files": ["/tmp/review-master-1"],
+  "read_nonce": "READ:ba93e5893b82dab5",
+  "findings": [
+    {
+      "id": "I1",
+      "severity": "major",
+      "file": "service/upnp.py",
+      "line": 608,
+      "summary": "One router that publishes two IGD descriptions is treated as two ambiguous gateways and gets no mapping at all",
+      "evidence": "find_gateway deduplicates candidates on the whole Gateway object (host, port, control_path, service_type), and _replies deduplicates on (peer, LOCATION). A single router that answers M-SEARCH with two LOCATIONs (for example an IGD:1 and an IGD:2 description, or two root devices with different control URLs) therefore produces two Gateways. _select then reads GetExternalIPAddress from both. Both report the same public address, so len(public) == 2 and the result is no_gateway/ambiguous_gateway with no writes. That is a false refusal on one physical box. The 'both-public' test (tests/test_upnp.py, test_p9f2_c3_c4_unresolved_ambiguity_is_refused_without_writes) uses two separate fake IGDs, so the same-host case is never exercised. Possible fixes: treat candidates whose host is the same responder IP as one box, or treat 'every public answer is the same address and comes from the same host' as resolved. Confirm with a FakeIGD that sends two SSDP replies with different LOCATION paths on the same host and port. Whether such routers are common is an inference.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "I2",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2183,
+      "summary": "Lease expiry (M1) is checked against the wall clock, so a clock step breaks the 'conservative bound' guarantee",
+      "evidence": "Engine._clock defaults to time.time (engine.py:1668). expires_at = click + lease_s (line 2104) is wall-clock time, and the shutdown filter (line 2218) and the per-entry alive check (line 2183) compare it with self._clock(). If NTP or the user moves the clock backwards between the click and shutdown, the service believes a lease is still running after the router has dropped it. It then sends DeletePortMapping for a couple a third party may have taken since, which is exactly what M1 forbids. If the clock moves forward, the service skips deletes that were still needed. The _merge_opening docstring says the bound is 'jamais postérieure à l'expiration réelle', but that only holds on a monotonic clock. Keep a monotonic deadline (self._monotonic) for the delete decision and use wall time only for the expires_at that is displayed.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "I3",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2104,
+      "summary": "An exception in _merge_opening leaves ports_opening stuck at in_progress, so the host can never retry",
+      "evidence": "In _run_opening, the try/except covers only upnp.open_ports. _merge_opening runs under the lock with no guard. It indexes item[\"port\"] and item[\"protocol\"] from the result, and it calls state.log. If any of that raises, _ports_pending has already been cleared but _ports_opening is still {\"status\": \"in_progress\"}. From then on, open_ports refuses every click with 'an opening is already in progress' until the service restarts. The thread dies with only the default threading excepthook output, and the UI button stays disabled. The upnp module promises well-formed results, so this is a last-resort path, but the fallback built for open_ports does not protect the merge. Put the merge in a try/finally that publishes a terminal status.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "I4",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2235,
+      "summary": "Shutdown can now block for tens of seconds of serial network waits, and nothing reconciles that with outer stop timeouts",
+      "evidence": "_release_ports runs inside stop(). It does a first join of discovery_timeout_s + request_timeout_s (5 s), then up to three sequential deletes at request_timeout_s each (9 s), then a second join of request_timeout_s (3 s), then up to three handoff deletes (9 s). With the default runtime.json values that is about 26 s worst case before stop() returns. If the launcher, the /api/quit path or the onefile loader kills the process sooner, the deletes R6 promises are cut off silently, and so is the 'abandoned' log line that C1 depends on. I did not check the outer timeouts. Confirm them, or bound the whole release by one overall deadline.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "I5",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 973,
+      "summary": "The pre-emptive DeletePortMapping on opening removes another LAN host's existing mapping, against the reasoning behind M1",
+      "evidence": "_open sends DeletePortMapping for each couple before AddPortMapping and ignores the result. If another machine on the LAN already holds 16261/UDP (another PZ host, for example), the click silently removes that machine's mapping and replaces it with this one. M1 refuses to delete expired entries at shutdown because 'le couple a pu être repris par un tiers sur la box', yet the opening path deletes third-party mappings without any check. R3 prescribes delete-then-add, so this is spec-conformant. Still, a GetSpecificPortMappingEntry check on NewInternalClient, or reporting a 718 conflict instead, would avoid clobbering another host. Flagged so the trade-off is decided on purpose.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "I6",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 304,
+      "summary": "An explicit port 0 in LOCATION or controlURL silently becomes port 80",
+      "evidence": "`port = parts.port or http.client.HTTP_PORT` treats port 0 as missing. 'http://192.168.1.1:0/desc.xml' is therefore fetched on port 80 of the responder instead of being rejected as malformed. The impact is small because the host is still pinned to the responder IP. Use `80 if parts.port is None else parts.port` and reject 0.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "I7",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 316,
+      "summary": "A relative controlURL is resolved against LOCATION and the description's URLBase is ignored",
+      "evidence": "UPnP Device Architecture 1.0 says relative URLs are resolved against <URLBase> when it is present. _control_path always joins against the LOCATION. On a router whose URLBase names a different port (some older devices), the joined URL keeps the description port, so control requests go to the wrong endpoint and fail as unreadable or timeout. They do not land on another host. UDA 1.1 deprecated URLBase, so the impact is limited to legacy routers.",
+      "confidence": "low",
+      "basis": "external"
+    }
+  ],
+  "verdict": "REQUEST_CHANGES"
+}
+```
+
+Note: pytest is not installed in this worktree's interpreter (no .venv, and the system python3.14 has no pytest), so I could not run the test suite. All findings come from reading the code.

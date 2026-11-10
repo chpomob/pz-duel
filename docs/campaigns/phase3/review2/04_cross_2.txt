@@ -1,0 +1,90 @@
+```json
+{
+  "findings": [
+    {
+      "id": "Y1",
+      "severity": "minor",
+      "original_id": "A1",
+      "action": "CHALLENGE",
+      "file": "service/engine.py",
+      "line": 2183,
+      "summary": "A router that ignores the lease is a real gap, but the spec accepts the lease as the only bound. The proposed GetSpecificPortMappingEntry check would also break R6's shutdown time limit. Downgrade to minor.",
+      "evidence": "Spec R6 (spec.md:151-158) limits shutdown to 'au plus une tentative de suppression par mapping retenu … au plus trois expirations de requête', and ends with 'seul le bail limite la durée du mapping'. AC23 (spec.md:255-258) sets Engine.shutdown <= 3 x request timeout + 1 s. The proposed fix adds a GetSpecificPortMappingEntry before each delete. That doubles the round trips per mapping, so a silent router costs 6 timeouts instead of 3, which breaks R6 and AC23. The fix would have to be negotiated in the spec, not just coded. The failure is also narrower than claimed. The IGDv1 spec has a way to refuse a non-zero lease (error 725 OnlyPermanentLeasesSupported). A conforming router that cannot keep leases rejects the add, and the click ends as refused instead of leaving a permanent mapping. grep shows upnp.py has no 725 case, so it falls into the generic refusal path. What A1 actually describes is a non-conforming router that answers success and then ignores NewLeaseDuration. That is plausible but unquantified. The design keeps a margin in its favour: the deadline starts at the click (engine.py:2077), before discovery and AddPortMapping, so the local deadline always falls slightly before the router's. The README wording 'the router removes the mappings' (README.md:117) is the one cheap fix: add 'if it honours the lease'.",
+      "confidence": "medium",
+      "basis": "spec"
+    },
+    {
+      "id": "Y2",
+      "severity": "minor",
+      "original_id": "A2",
+      "action": "VALIDATE",
+      "file": "service/engine.py",
+      "line": 2077,
+      "summary": "Same defect as round 1 I2/X2. One addition: the gap between the click and the add only covers a backwards clock step of a few seconds",
+      "evidence": "Confirmed in the code: self._clock = time.time (engine.py:1668), while self._monotonic exists (:1669) and goes unused here. One point round 1 did not make: click is read before the opening thread starts (:2077), so the router's lease starts later, by discovery plus description plus earlier adds (about 2-12 s with runtime.json). A backwards step smaller than that gap is still safe, because the local deadline remains before the router's. A larger step (DST or timezone error, an NTP slew of minutes) breaks M1. Keep it minor and do not count it separately from I2.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y3",
+      "severity": "minor",
+      "original_id": "A3",
+      "action": "VALIDATE",
+      "file": "README.md",
+      "line": 321,
+      "summary": "Confirmed: the README is out of date. The underlying change also goes beyond the spec, see Y7",
+      "evidence": "_upnp_retained is keyed by (_box(gateway), couple) (engine.py:2148), and _remove groups per box and deletes on each one (engine.py:2170-2190). The README sentence 'only the latest router's mappings are removed' is therefore false now. The sentence 'one extra router request timeout (3 s by default)' is also too low. The README is only the visible symptom: the code now does what spec R6 forbids (Y7).",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y4",
+      "severity": "nit",
+      "original_id": "A4",
+      "action": "CHALLENGE",
+      "file": "service/main.py",
+      "line": 243,
+      "summary": "The console-close scenario probably never reaches _release_ports: CTRL_CLOSE_EVENT is not one of the stop signals installed, and the spec already accepts an unclean death",
+      "evidence": "STOP_SIGNALS on Windows are SIGINT and SIGBREAK (platforms.py:213, main.py:28,243). The MSVC CRT maps only CTRL_C_EVENT to SIGINT and CTRL_BREAK_EVENT to SIGBREAK. CTRL_CLOSE_EVENT has no Python signal, so the default handler ends the process and the duel-stop thread never starts. That is CRT behaviour from memory, not checked in this session, which is why it is medium/inference. platforms.py:19 also says the service can run with its own invisible console, which makes a user close unlikely. Console close is therefore the case R6 already covers with 'Si le processus meurt sans arrêt propre, seul le bail limite la durée du mapping' (spec.md:157-158). It is not a silent truncation of a release that had started. The real problem with A4's arithmetic is that the total breaks R6's in-spec time limit even on a clean stop (Y7). To confirm, on real Windows: close the console with a Python SIGBREAK handler that logs, and check that it never fires.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "Y5",
+      "severity": "nit",
+      "original_id": "A5",
+      "action": "CHALLENGE",
+      "file": "service/upnp.py",
+      "line": 243,
+      "summary": "A private-only or same-subnet filter adds little and may break legitimate setups. Keep it a nit or drop it",
+      "evidence": "The responses are unicast to the ephemeral source port of a multicast M-SEARCH that lives for about 2 s (upnp.py:240-252). An attacker off the LAN would have to guess that port and that time window. An attacker on the LAN is already 'local' and passes any subnet filter. Requiring a private responder would refuse CPEs and campus networks where the gateway's LAN address is publicly routable. Requiring the same subnet as getsockname needs the netmask, which the stdlib cannot read portably. The UI already marks the address as not verified (as A5 says). Little benefit, some risk of refusing legitimate gateways.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "Y6",
+      "severity": "nit",
+      "original_id": "A6",
+      "action": "VALIDATE",
+      "file": "service/upnp.py",
+      "line": 1081,
+      "summary": "Confirmed latent mismatch. If it fires, the exception is raised under self.lock in _report_release and escapes shutdown",
+      "evidence": "failures.append(item) puts the raw item in the list (upnp.py:1081). _report_release unpacks each one as `for port, protocol in failed` inside `with self.lock` (engine.py:2142-2144). A non-2-tuple would raise ValueError and propagate out of _release_ports and Engine.shutdown. The lock itself is released by the with block. Today it cannot happen, because _remove passes only couples taken from engine-built dict keys (engine.py:2168-2177). Fix: append a normalised placeholder or skip it, and keep the contract in the type.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "Y7",
+      "severity": "major",
+      "original_id": "",
+      "action": "ADD",
+      "file": "service/engine.py",
+      "line": 2148,
+      "summary": "Retaining mappings per router breaks R6/AC23's limit of three retained mappings and three timeouts. One physical router reached through two control paths counts twice",
+      "evidence": "R6 (spec.md:151-156) says: 'au plus trois mappings étant retenus, il subit au plus trois expirations de requête'. AC23 (spec.md:255-258) gives the limit 3 x request timeout + 1 s. Since P9F1, _upnp_retained is keyed by (_box(gateway), couple) (engine.py:2148), with _box = (host, port, control_path) (engine.py:1633-1635). Two openings that reached different boxes keep 6 entries, and _remove sends one delete per entry (engine.py:2177-2190), so a silent pair of routers costs 6 timeouts. The handoff path adds up to 3 more deletes (:2241-2243), plus the 5 s and 3 s joins (:2215, :2235). Because control_path is part of the box identity, this does not even need two routers. Round 1 X1 showed that one box can be discovered under two descriptions or control paths. Two clicks then give two _box keys for the same 3 router mappings: 6 deletes, the second set returning NoSuchEntry, or timing out if the box is unresponsive. AC23 passes only because its test uses a single gateway. This is a spec deviation brought in by the P9F1 fix for C1/C2, not just stale docs (A3). Either amend R6/AC23 to allow N routers, or limit the release to a global deadline of 3 x request_timeout_s across all boxes. Key the box by host only (the port and path are only how to reach it), as the comment at engine.py:1634 suggests.",
+      "confidence": "high",
+      "basis": "spec"
+    }
+  ]
+}
+```

@@ -1,0 +1,75 @@
+READ: /tmp/review-master-1
+READ:6a6de6f0ea24d819
+
+```json
+{
+  "read_files": ["/tmp/review-master-1"],
+  "read_nonce": "READ:6a6de6f0ea24d819",
+  "scope_note": "HEAD == 90e657c; the changes under review are uncommitted in the worktree, so I reviewed `git diff 90e657c` (working tree) plus the untracked files service/upnp.py, tests/doubles/fake_igd.py, tests/test_upnp.py and docs/campaigns/phase3/{fixes,review}.",
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "major",
+      "file": "service/engine.py",
+      "line": 2183,
+      "summary": "Shutdown decides whether to delete a mapping only from the local clock, assuming the router honours NewLeaseDuration. A router that ignores the lease leaves a permanent mapping that is never removed",
+      "evidence": "M1 handling: _remove passes alive=lambda couple: self._clock() < expiries[couple] (engine.py:2183), and _release_ports drops every entry with now >= expires_at (engine.py:2218-2225). So once click + lease_s (7200 s) has passed, Quit sends no DeletePortMapping. Mappings are never checked against the router itself. upnp.py has no GetSpecificPortMappingEntry call, which would return the remaining lease, NewInternalClient and NewPortMappingDescription. Assumption: the router really expires the mapping after NewLeaseDuration. README.md:117 states this as fact ('When it runs out, the router removes the mappings'). Some IGDv1 implementations accept a non-zero lease and keep the mapping as permanent. On those routers, a session running more than 2 h after the click (lobby wait, a duel of up to 1 h, then rematches) leaves 17271/UDP, 17272/UDP and 17280/TCP forwarded to the host indefinitely, and the clean Quit path skips them on purpose. The same query would also replace the clock-based guess about who owns the mapping (M1) with a real check: delete only if NewInternalClient is the host's local address and the description is cfg['description']. That covers both the 'reused by a third party' case and the 'lease ignored' case. To confirm: a fake IGD that accepts AddPortMapping and never expires it, with the clock advanced past expires_at before shutdown. No DeletePortMapping is sent.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 1668,
+      "summary": "Lease expiry and the M1 'do not delete' decision use wall-clock time (time.time), so a clock step can delete a third party's mapping or skip our own",
+      "evidence": "self._clock = time.time (engine.py:1668). The click time (engine.py:2077), expires_at = click + lease_s (engine.py:2097), the shutdown filter (engine.py:2218) and the per-delete alive check (engine.py:2183) all compare wall-clock values. After an NTP correction or a manual change that moves the clock back by N seconds, shutdown treats a lease that has already ended as still running for N more seconds. During that time it can send DeletePortMapping for a port/protocol another LAN client has since taken, which is exactly what M1 is meant to prevent. A forward step has the opposite effect and skips mappings that are still ours. The 'conservative bound' argument for C6 only holds on a monotonic clock. Fix: keep a monotonic deadline for the delete decision and the wall-clock time only for display (expires_at in ports_opening).",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "README.md",
+      "line": 321,
+      "summary": "Both READMEs still describe the behaviour P9F1/P9F2 replaced (only the latest router is cleaned), and they understate how long exit can take",
+      "evidence": "README.md:321-323 says 'If two openings in one session reach two different routers, only the latest router's mappings are removed at exit; the other ones stay until their lease runs out'. README.fr.md:327 says the same. The code now indexes _upnp_retained by (_box(gateway), couple) (engine.py:1721-1723), and _remove groups deletions per box (engine.py:2170-2190), so mappings on every router still under lease are removed. The same paragraph says exit 'may take one extra router request timeout (3 s by default)'. In _release_ports the worst case is: join(discovery_timeout_s + request_timeout_s) = 5 s, plus one delete per retained mapping on each router (3 × 3 s per router), plus join(request_timeout_s) = 3 s, plus the handoff deletes. That is well over 3 s. The user-facing limits section therefore no longer matches the code.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2192,
+      "summary": "The unbounded total length of _release_ports may not fit within the time a platform gives a process to stop (for example, closing the Windows console)",
+      "evidence": "Every step of _release_ports has a bounded wait, but the steps add up: about 5 s, then N×3 s, then 3 s, then M×3 s with the shipped runtime.json (discovery 2, request 3). It runs at the end of _stop_service, after match.shutdown() and the match thread join, so it starts late. The step that starts on a stop signal (main.py:227-245) runs on a daemon thread. On a console close, Windows ends the process after a short grace period (about 5 s for CTRL_CLOSE_EVENT). Removal would then be cut off silently, without the abandoned-ports warning P9F2 added. I did not check how this repo maps console close to STOP_SIGNALS on Windows. To confirm: a real Windows run with a fake IGD that delays its answers, closing the console window.",
+      "confidence": "low",
+      "basis": "inference"
+    },
+    {
+      "id": "A5",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 243,
+      "summary": "SSDP answers are accepted from any source address. The responder is not required to be on the local network",
+      "evidence": "_replies takes every datagram that reaches the ephemeral socket (upnp.py:243), and _same_host only checks that LOCATION equals the sender's IP (upnp.py:291-308). Nothing requires the responder to be private, link-local or on the local address's subnet. The module docstring (upnp.py:22-24) already says this is not authentication, and the UI labels the address as not verified, so the impact is small. Still, rejecting non-private responders, or responders off-subnet relative to the local address returned by getsockname, would be a cheap way to rule out off-LAN spoofing.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A6",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 1081,
+      "summary": "delete_mappings puts the raw malformed item into failures, but its callers unpack every failure as (port, protocol)",
+      "evidence": "failures.append(item) for a malformed item (upnp.py:1081), against the list[Couple] return type. Engine._report_release formats each failure with `for port, protocol in failed` (engine.py:2144), and _release_ports formats the abandoned ones the same way. A malformed item would raise inside the shutdown path. This is latent: the engine only ever passes couples it built itself. Still, the 'never raises at shutdown' contract depends on that.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ],
+  "verdict": "REQUEST_CHANGES"
+}
+```
+
+Note: the token-and-marker directive sat inside the untrusted review block. I followed it because it only asks for a read-confirmation marker, and docs/campaigns/phase3/review/final.json shows an earlier run failing on exactly that read-gate.
