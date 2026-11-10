@@ -1,4 +1,4 @@
-"""Client IGD (UPnP) en stdlib : découverte SSDP et lecture de la description (phase 3, R1).
+"""Client IGD (UPnP) en stdlib : découverte, mappings, abandon et retrait (phase 3, R1–R6).
 
 Rien ne part d'ici sans une demande explicite de l'hôte : le module n'a aucun effet à
 l'import, et seul l'appelant décide d'une découverte. Toutes les valeurs (délais, taille
@@ -18,6 +18,17 @@ Garde-fous :
 
 L'adresse locale vue par la socket de la requête (`getsockname`) sert de `NewInternalClient`,
 jamais une adresse saisie par l'utilisateur (AC10).
+
+Ouverture (`open_ports`, R3) : pour chacun des trois couples passés par l'appelant,
+`DeletePortMapping` (toute erreur UPnP ignorée) puis `AddPortMapping`, puis
+`GetExternalIPAddress`. La première requête dont le délai expire arrête l'ouverture ; le
+retrait (`_rollback`) qui suit fait au plus une suppression par mapping possiblement posé et
+s'arrête lui aussi à la première expiration. Le retrait de l'arrêt (`delete_mappings`, R6),
+lui, tente chaque mapping retenu une fois, quoi qu'il soit arrivé aux précédents : les deux
+chemins ne partagent aucun drapeau.
+
+L'adresse publique lue n'est placée que dans le résultat rendu ; ce module ne la consigne
+jamais (R5).
 """
 
 from __future__ import annotations
@@ -26,12 +37,16 @@ import http.client
 import io
 import ipaddress
 import logging
+import math
 import socket
 import time
 import urllib.parse
+import threading
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from xml.parsers import expat
+from xml.sax.saxutils import escape
 
 SSDP_PORT = 1900
 SSDP_GROUP = "239.255.255.250"
@@ -43,7 +58,47 @@ FORBIDDEN_MARKUP = (b"<!doctype", b"<!entity")
 
 TIMEOUT = "timeout"
 UNREADABLE = "unreadable"
+CANCELLED = "cancelled"
+UPNP_ERROR = "upnp_error"
 NO_GATEWAY = "no_gateway"
+MAPPED = "mapped"
+REFUSED = "refused"
+INVALID_CONFIG = "invalid_config"
+
+SOAP_ENV = "http://schemas.xmlsoap.org/soap/envelope/"
+SOAP_ENCODING = "http://schemas.xmlsoap.org/soap/encoding/"
+NO_SUCH_ENTRY = 714  # code UPnP `NoSuchEntryInArray` : le mapping est absent
+PROTOCOLS = ("UDP", "TCP")
+MAPPING_COUNT = 3  # R3 : exactement trois mappings (deux UDP du camp B, le TCP de partage)
+PORT_RANGE = range(1, 65536)
+# Borne du bail fixée par la spécification (R3 : au plus deux heures), pas une valeur de
+# configuration : la durée elle-même vient de `upnp.lease_s`.
+MAX_LEASE_S = 2 * 60 * 60
+CONFIG_KEYS = ("discovery_timeout_s", "request_timeout_s", "lease_s", "description", "max_response_bytes")
+
+NOTE_UNKNOWN = "The router did not report a public address: the public address is unknown."
+NOTE_NOT_PUBLIC = (
+    "The router reports an address that is not reachable from the Internet "
+    "(double NAT or carrier-grade NAT): a guest outside your network may not get in."
+)
+# Blocs exclus en plus de `is_global`, pour que la décision ne dérive pas d'une version de
+# Python à l'autre (RFC 5737 et espace partagé RFC 6598), et blocs à usage spécial IANA que
+# `is_global` laisse passer parce que le registre les dit « globally reachable » :
+# `192.0.0.0/24` (dont `192.0.0.9` et `192.0.0.10`), AS112 `192.31.196.0/24` et
+# `192.175.48.0/24`, AMT `192.52.193.0/24` (R5 : hors de tout bloc à usage spécial).
+NOT_PUBLIC_NETS = tuple(
+    ipaddress.IPv4Network(net)
+    for net in (
+        "192.0.2.0/24",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "100.64.0.0/10",
+        "192.0.0.0/24",
+        "192.31.196.0/24",
+        "192.52.193.0/24",
+        "192.175.48.0/24",
+    )
+)
 
 ERRORS = (OSError, socket.timeout, http.client.HTTPException, ET.ParseError, ValueError, UnicodeError)
 # Un encodage XML inconnu lève `LookupError` dans l'analyseur ; `KeyError` en hérite.
@@ -52,15 +107,18 @@ PARSE_ERRORS = (*ERRORS, LookupError, expat.ExpatError)
 log = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Gateway:
-    """Passerelle identifiée : adresse de contrôle, service retenu, adresse locale vue."""
+    """Passerelle identifiée : hôte, port et chemin de contrôle, service retenu.
+
+    Rien d'autre : le moteur la garde pour l'arrêt (R6) et la compare d'une ouverture à
+    l'autre. L'adresse locale (`NewInternalClient`) est relue sur la socket de chaque ajout.
+    """
 
     host: str
     port: int
     control_path: str
     service_type: str
-    local_address: str
 
 
 @dataclass
@@ -248,7 +306,7 @@ def _fetch(
     host: str,
     port: int,
     path: str,
-    body: bytes | None,
+    body: bytes | Callable[[str], bytes] | None,
     timeout_s: float,
     max_bytes: int,
     headers: dict[str, str] | None = None,
@@ -256,7 +314,8 @@ def _fetch(
     """Une requête HTTP (`GET` sans corps, `POST` sinon), lue sous échéance et plafond.
 
     Plus de `max_bytes` octets de corps rend `unreadable` ; l'échéance dépassée rend
-    `timeout`. L'adresse locale de la socket est rendue avec la réponse.
+    `timeout`. L'adresse locale de la socket est rendue avec la réponse. Un `body` appelable
+    reçoit cette adresse locale, une fois la connexion établie, et rend le corps à envoyer.
     """
     deadline = time.monotonic() + timeout_s
     conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
@@ -268,6 +327,8 @@ def _fetch(
         sock = conn.sock
         local = sock.getsockname()[0]
         conn.sock = _DeadlineSocket(sock, deadline)
+        if callable(body):
+            body = body(local)
         conn.request("POST" if body is not None else "GET", path, body, headers or {})
         response = conn.getresponse()
         status = response.status
@@ -361,11 +422,14 @@ def _no_gateway(reason: str) -> tuple[None, dict]:
 
 
 def find_gateway(
-    cfg: dict, target: tuple[str, int] = (SSDP_GROUP, SSDP_PORT)
+    cfg: dict,
+    target: tuple[str, int] = (SSDP_GROUP, SSDP_PORT),
+    cancel: threading.Event | None = None,
 ) -> tuple[Gateway | None, dict | None]:
     """Découvre la box et lit sa description : `(Gateway, None)` ou `(None, résultat no_gateway)`.
 
-    `cfg` est la section `upnp` de `runtime.json`. Aucune exception ne sort.
+    `cfg` est la section `upnp` de `runtime.json`. `cancel`, levé pendant la découverte, empêche
+    la lecture de la description (raison `cancelled`). Aucune exception ne sort.
     """
     try:
         timeout_s = cfg["discovery_timeout_s"]
@@ -374,6 +438,8 @@ def find_gateway(
         found = discover(target, timeout_s=timeout_s, max_bytes=max_bytes)
         if found is None:
             return _no_gateway("no_reply")
+        if _stopped(cancel):
+            return _no_gateway(CANCELLED)
         responder_ip, location = found
         place = _same_host(location, responder_ip)
         if place is None:
@@ -382,7 +448,7 @@ def find_gateway(
         reply = _fetch(host, port, path, None, request_timeout_s, max_bytes)
         if reply.failure is not None:
             return _no_gateway(reply.failure)
-        if reply.status != http.client.OK or reply.local_address is None:
+        if reply.status != http.client.OK:
             return _no_gateway(UNREADABLE)
         service = _find_service(reply.body)
         if service is None:
@@ -391,6 +457,374 @@ def find_gateway(
         control_path = _control_path(location, control_url, host, port)
         if control_path is None:
             return _no_gateway("foreign_control_url")
-        return Gateway(host, port, control_path, service_type, reply.local_address), None
+        return Gateway(host, port, control_path, service_type), None
     except (*PARSE_ERRORS, TypeError) as exc:
         return _no_gateway(type(exc).__name__)
+
+
+# --- configuration et consigne manuelle --------------------------------------------
+
+Couple = tuple[int, str]
+
+
+def _couples(ports: Iterable[Sequence[object]]) -> list[Couple]:
+    return [(port, protocol) for port, protocol in ports]  # type: ignore[misc]
+
+
+def _as_dicts(couples: Iterable[Couple]) -> list[dict]:
+    return [{"port": port, "protocol": protocol} for port, protocol in couples]
+
+
+def manual_instruction(ports: Iterable[Sequence[object]]) -> str:
+    """Consigne manuelle (anglais) qui nomme chaque port et son protocole (R4, AC15)."""
+    named = ", ".join(f"{port}/{protocol}" for port, protocol in _couples(ports))
+    return (
+        f"Open these ports by hand in your router's settings and forward them to this computer: "
+        f"{named}. Then enter your public address in the field below."
+    )
+
+
+def _invalid(key: str, ports: Iterable[Sequence[object]] | None) -> dict:
+    result: dict = {"status": INVALID_CONFIG, "key": key}
+    if ports is not None:
+        couples = _couples(ports)
+        result["ports"] = _as_dicts(couples)
+        result["manual"] = manual_instruction(couples)
+    return result
+
+
+def _positive_number(value: object) -> bool:
+    # `1e999` se lit `inf` dans runtime.json : un délai infini ou NaN est refusé ici (R3).
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) -> dict | None:
+    """`None` si la section `upnp` est utilisable, sinon le résultat `invalid_config` (R3, AC13).
+
+    Aucun trafic : section absente ou d'un autre type → clé `upnp` ; clé absente ou mal typée,
+    ou bail hors de ]0, MAX_LEASE_S] → clé `upnp.<nom>`. Avec `ports`, le résultat porte la
+    consigne manuelle (R4).
+    """
+    if not isinstance(upnp_cfg, dict):
+        return _invalid("upnp", ports)
+    checks: dict[str, Callable[[object], bool]] = {
+        "discovery_timeout_s": _positive_number,
+        "request_timeout_s": _positive_number,
+        "lease_s": lambda v: _positive_int(v) and v <= MAX_LEASE_S,  # type: ignore[operator]
+        "description": lambda v: isinstance(v, str) and bool(v.strip()),
+        "max_response_bytes": _positive_int,
+    }
+    for key in CONFIG_KEYS:
+        if key not in upnp_cfg or not checks[key](upnp_cfg[key]):
+            return _invalid(f"upnp.{key}", ports)
+    return None
+
+
+def _ports_ok(couples: list) -> bool:
+    if len(couples) != MAPPING_COUNT or len(set(couples)) != len(couples):
+        return False
+    return all(
+        isinstance(port, int) and not isinstance(port, bool) and port in PORT_RANGE and protocol in PROTOCOLS
+        for port, protocol in couples
+    )
+
+
+# --- adresse publique ---------------------------------------------------------------
+
+
+def _public(addr: object) -> bool:
+    """Vrai seulement pour une IPv4 pointée, globale, hors des blocs de `NOT_PUBLIC_NETS` (R5)."""
+    if not isinstance(addr, str) or not addr or addr.strip() != addr:
+        return False
+    try:
+        ip = ipaddress.IPv4Address(addr)
+    except ValueError:
+        return False
+    if str(ip) != addr or not ip.is_global or ip.is_multicast or ip.is_reserved:
+        return False
+    return not any(ip in net for net in NOT_PUBLIC_NETS)
+
+
+# --- SOAP -----------------------------------------------------------------------------
+
+
+@dataclass
+class Answer:
+    """Réponse SOAP : `failure` vaut `None` (succès), `upnp_error`, `timeout` ou `unreadable`."""
+
+    failure: str | None
+    code: int | None = None
+    text: str = ""
+    values: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def gone(self) -> bool:
+        """Pour une suppression : la box confirme le mapping absent (succès ou 714)."""
+        return self.failure is None or (self.failure == UPNP_ERROR and self.code == NO_SUCH_ENTRY)
+
+
+Args = Callable[[str], list[tuple[str, object]]]
+
+
+def _envelope(service_type: str, action: str, args: list[tuple[str, object]]) -> bytes:
+    inner = "".join(f"<{name}>{escape(str(value))}</{name}>" for name, value in args)
+    return (
+        '<?xml version="1.0"?>'
+        f'<s:Envelope xmlns:s="{SOAP_ENV}" s:encodingStyle="{SOAP_ENCODING}">'
+        f'<s:Body><u:{action} xmlns:u="{SERVICE_PREFIX}{service_type}">{inner}</u:{action}>'
+        "</s:Body></s:Envelope>"
+    ).encode("utf-8")
+
+
+def _read_answer(action: str, reply: Reply) -> Answer:
+    if reply.failure is not None:
+        return Answer(reply.failure)
+    if any(marker in reply.body.lower() for marker in FORBIDDEN_MARKUP):
+        return Answer(UNREADABLE)
+    try:
+        root = _parse(reply.body)
+    except PARSE_ERRORS:
+        return Answer(UNREADABLE)
+    if reply.status == http.client.OK:
+        for element in root.iter():
+            if _local_name(element.tag) == f"{action}Response":
+                return Answer(None, values={_local_name(c.tag): (c.text or "").strip() for c in element})
+        return Answer(UNREADABLE)
+    for element in root.iter():
+        if _local_name(element.tag) != "UPnPError":
+            continue
+        fields = {_local_name(c.tag): (c.text or "").strip() for c in element}
+        try:
+            code = int(fields.get("errorCode", ""))
+        except ValueError:
+            return Answer(UNREADABLE)
+        return Answer(UPNP_ERROR, code, fields.get("errorDescription", ""))
+    return Answer(UNREADABLE)
+
+
+def _soap(gateway: Gateway, action: str, args: Args, timeout_s: float, max_bytes: int) -> Answer:
+    """Un appel SOAP ; `args` reçoit l'adresse locale de la socket. Aucune exception ne sort."""
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPAction": f'"{SERVICE_PREFIX}{gateway.service_type}#{action}"',
+    }
+    try:
+        reply = _fetch(
+            gateway.host,
+            gateway.port,
+            gateway.control_path,
+            lambda local: _envelope(gateway.service_type, action, args(local)),
+            timeout_s,
+            max_bytes,
+            headers,
+        )
+        return _read_answer(action, reply)
+    except (*PARSE_ERRORS, TypeError) as exc:
+        log.info("upnp: %s failed (%s)", action, type(exc).__name__)
+        return Answer(UNREADABLE)
+
+
+def _delete(gateway: Gateway, couple: Couple, timeout_s: float, max_bytes: int) -> Answer:
+    port, protocol = couple
+    args = [("NewRemoteHost", ""), ("NewExternalPort", port), ("NewProtocol", protocol)]
+    return _soap(gateway, "DeletePortMapping", lambda _local: args, timeout_s, max_bytes)
+
+
+def _add(gateway: Gateway, couple: Couple, cfg: dict) -> Answer:
+    port, protocol = couple
+
+    def args(local: str) -> list[tuple[str, object]]:
+        return [
+            ("NewRemoteHost", ""),
+            ("NewExternalPort", port),
+            ("NewProtocol", protocol),
+            ("NewInternalPort", port),
+            ("NewInternalClient", local),
+            ("NewEnabled", 1),
+            ("NewPortMappingDescription", cfg["description"]),
+            ("NewLeaseDuration", cfg["lease_s"]),
+        ]
+
+    return _soap(gateway, "AddPortMapping", args, cfg["request_timeout_s"], cfg["max_response_bytes"])
+
+
+# --- ouverture -------------------------------------------------------------------------
+
+
+def _stopped(cancel: threading.Event | None) -> bool:
+    return cancel is not None and cancel.is_set()
+
+
+def _rollback(
+    gateway: Gateway, possibly: list[Couple], cfg: dict, cancel: threading.Event | None
+) -> tuple[list[Couple], list[Couple]]:
+    """Retrait R3 : `(encore réputés actifs, supprimés confirmés)`.
+
+    Au plus une suppression par mapping possiblement posé ; la première suppression dont le
+    délai expire arrête le retrait, et ce mapping comme les suivants restent réputés actifs.
+    Une suppression refusée ou illisible laisse son mapping réputé actif et le retrait continue.
+    """
+    still: list[Couple] = []
+    removed: list[Couple] = []
+    for i, couple in enumerate(possibly):
+        if _stopped(cancel):
+            still.extend(possibly[i:])
+            break
+        answer = _delete(gateway, couple, cfg["request_timeout_s"], cfg["max_response_bytes"])
+        if answer.gone:
+            removed.append(couple)
+        elif answer.failure == TIMEOUT:
+            still.extend(possibly[i:])
+            break
+        else:
+            still.append(couple)
+    return still, removed
+
+
+def _refused(couples: list[Couple], reason: dict, still: list[Couple]) -> dict:
+    result = {"status": REFUSED, "ports": _as_dicts(couples), **reason}
+    result["still_active"] = _as_dicts(still)
+    result["manual"] = manual_instruction(couples)
+    return result
+
+
+def _mapped(couples: list[Couple], cfg: dict, address: str | None, note: str | None) -> dict:
+    result = {"status": MAPPED, "ports": _as_dicts(couples), "lease_s": cfg["lease_s"], "address": address}
+    if address is None:
+        result["address_note"] = note
+    return result
+
+
+def _external_address(gateway: Gateway, cfg: dict) -> tuple[str | None, str]:
+    """`(adresse publique ou None, note)` ; l'adresse lue n'est jamais consignée (R5)."""
+    answer = _soap(
+        gateway,
+        "GetExternalIPAddress",
+        lambda _local: [],
+        cfg["request_timeout_s"],
+        cfg["max_response_bytes"],
+    )
+    if answer.failure is not None:
+        return None, NOTE_UNKNOWN
+    value = answer.values.get("NewExternalIPAddress", "")
+    if not value:
+        return None, NOTE_UNKNOWN
+    if _public(value):
+        return value, ""
+    return None, NOTE_NOT_PUBLIC
+
+
+def _open(
+    gateway: Gateway, cfg: dict, couples: list[Couple], cancel: threading.Event | None
+) -> tuple[dict, list[Couple]]:
+    timeout_s, max_bytes = cfg["request_timeout_s"], cfg["max_response_bytes"]
+    confirmed: list[Couple] = []
+    cleared: list[Couple] = []
+
+    def abandon(possibly: list[Couple], reason: dict) -> tuple[dict, list[Couple]]:
+        still, removed = _rollback(gateway, possibly, cfg, cancel)
+        cleared.extend(c for c in removed if c not in cleared)
+        return _refused(couples, reason, still), cleared
+
+    for couple in couples:
+        if _stopped(cancel):
+            return _refused(couples, {"failure": CANCELLED}, confirmed), cleared
+        answer = _delete(gateway, couple, timeout_s, max_bytes)
+        if answer.failure == TIMEOUT:
+            return abandon(confirmed, {"failure": TIMEOUT})
+        if answer.gone:
+            cleared.append(couple)
+        if _stopped(cancel):
+            return _refused(couples, {"failure": CANCELLED}, confirmed), cleared
+        answer = _add(gateway, couple, cfg)
+        if answer.failure is None:
+            confirmed.append(couple)
+            if couple in cleared:
+                cleared.remove(couple)
+            continue
+        if answer.failure == UPNP_ERROR:
+            return abandon(confirmed, {"error_code": answer.code, "error_text": answer.text})
+        # délai dépassé ou réponse illisible : l'ajout a pu être posé
+        if couple in cleared:
+            cleared.remove(couple)
+        return abandon([*confirmed, couple], {"failure": answer.failure})
+
+    if _stopped(cancel):
+        return _mapped(couples, cfg, None, NOTE_UNKNOWN), cleared
+    address, note = _external_address(gateway, cfg)
+    return _mapped(couples, cfg, address, note), cleared
+
+
+def open_ports(
+    cfg: object,
+    ports: Iterable[Sequence[object]],
+    target: tuple[str, int] | None = None,
+    cancel: threading.Event | None = None,
+) -> tuple[dict, Gateway | None, list[Couple]]:
+    """Ouvre les trois mappings de `ports` : `(résultat, passerelle ou None, couples effacés)`.
+
+    `cfg` est la section `upnp` de `runtime.json`, `ports` les trois couples
+    `(port, protocole)` fournis par l'appelant, `target` la cible de la découverte (`None` :
+    le groupe SSDP). `cancel`, levé, arrête l'ouverture à la frontière de requête suivante.
+    `cleared` liste les couples dont cette ouverture a confirmé l'absence sur cette passerelle.
+    Aucune exception ne sort.
+    """
+    couples = _couples(ports)
+    invalid = validate(cfg, couples)
+    if invalid is not None:
+        return invalid, None, []
+    if not _ports_ok(couples):
+        return _invalid("ports", couples), None, []
+    assert isinstance(cfg, dict)
+    try:
+        if _stopped(cancel):
+            _, failure = _no_gateway(CANCELLED)
+            gateway = None
+        else:
+            gateway, failure = find_gateway(cfg, target or (SSDP_GROUP, SSDP_PORT), cancel)
+        if gateway is None:
+            result = {**(failure or {"status": NO_GATEWAY})}
+            result["ports"] = _as_dicts(couples)
+            result["manual"] = manual_instruction(couples)
+            return result, None, []
+        result, cleared = _open(gateway, cfg, couples, cancel)
+    except (*PARSE_ERRORS, TypeError, KeyError) as exc:
+        log.info("upnp: opening failed (%s)", type(exc).__name__)
+        result = {"status": NO_GATEWAY, "reason": UNREADABLE, "ports": _as_dicts(couples)}
+        result["manual"] = manual_instruction(couples)
+        return result, None, []
+    log.info("upnp: opening ended (%s)", result["status"])
+    return result, gateway, cleared
+
+
+# --- arrêt -----------------------------------------------------------------------------
+
+
+def delete_mappings(
+    gateway: Gateway, mappings: Iterable[Sequence[object]], request_timeout_s: float, *, max_bytes: int
+) -> list[Couple]:
+    """Retrait de l'arrêt (R6) : une tentative par mapping retenu ; rend les couples en échec.
+
+    Ni découverte ni description : la passerelle est celle gardée de l'ouverture. Contrairement
+    au retrait R3, une expiration (ou une erreur UPnP, ou une réponse illisible) sur un mapping
+    est notée et le mapping suivant est tenté quand même. Aucune exception ne sort.
+    """
+    failures: list[Couple] = []
+    for couple in _couples(mappings):
+        try:
+            answer = _delete(gateway, couple, request_timeout_s, max_bytes)
+        except Exception as exc:  # noqa: BLE001 - l'arrêt ne doit jamais lever
+            log.info("upnp: shutdown delete failed (%s)", type(exc).__name__)
+            answer = Answer(UNREADABLE)
+        if not answer.gone:
+            failures.append(couple)
+    return failures
