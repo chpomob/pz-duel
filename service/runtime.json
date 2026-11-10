@@ -66,6 +66,10 @@
     "description": "PZ Duel",
     "max_response_bytes": 65536
   },
+  "upnp_ports": {
+    "external_ports": {"udp_game": 49271, "udp_aux": 49272, "tcp_share": 49280},
+    "fallback_range": [49152, 50175]
+  },
   "managed_ini": {
     "PauseEmpty": "true",
     "WorkshopItems": "",

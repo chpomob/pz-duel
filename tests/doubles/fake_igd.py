@@ -43,7 +43,10 @@ de `(SSDP_GROUP, SSDP_PORT)`.
     `set_responsive()` les lève tous (AC32) ;
   - `delay_s` : délai avant chaque réponse HTTP (AC16) ;
   - `external_ip` : adresse rendue par `GetExternalIPAddress` ; `None` rend l'erreur 501 ;
-  - `strict_deletes=True` : une suppression d'un mapping absent rend 714.
+  - `strict_deletes=True` : une suppression d'un mapping absent rend 714 ;
+  - `conflict_ports` : ports externes (un `range`, un ensemble) où `AddPortMapping` rend 718
+    alors que le tableau ne tient aucune entrée, comme une Freebox sous 49152 (P9F7) : un
+    refus sur une plage, puis un succès sur une autre.
 - Un gestionnaire muet attend sur un `threading.Event` libéré par `close()` (ou par
   `set_responsive()`), puis ferme la connexion sans répondre : le démontage ne bloque jamais,
   et `daemon_threads = True` ne laisse aucun fil retenir l'interpréteur.
@@ -112,6 +115,7 @@ class _Rules:
     delay_s: float = 0.0
     external_ip: str | None = "5.6.7.8"
     strict_deletes: bool = False
+    conflict_ports: Any = ()
     apply_silent: bool = False
     ssdp_reply: bool = True
     ssdp_st: str | None = None
@@ -453,6 +457,10 @@ class FakeIGD:
         error = rules.errors.get((call.action, call.index), rules.errors.get(call.action))
         if call.action not in ACTIONS:
             error = 401
+        if error is None and call.action == "AddPortMapping":
+            key = self._key(call)
+            if key is not None and key[0] in rules.conflict_ports:
+                error = 718
         if error is None:
             error = self._apply(call)
         if error is None and call.action == "GetExternalIPAddress" and rules.external_ip is None:

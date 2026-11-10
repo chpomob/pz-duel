@@ -1190,3 +1190,27 @@ def test_p9f5_c2_open_game_is_disabled_until_the_guest_is_here():
     (button,) = [line for line in here.splitlines() if 'data-action="open-game"' in line]
     assert "disabled" not in button
     assert "unlocks as soon as your opponent is connected" not in here
+
+
+def test_p9f7_lobby_says_not_public_and_warning_before_the_button_and_shows_the_mapping():
+    """Mutation : retirer `${before}` du bloc — l'annonce CGNAT ne précède plus le bouton ;
+    ou `portsMapping` sans `->` — la correspondance externe -> interne disparaît."""
+    script = ui_script()
+    block, _, _ = lobby_ports_ui(script)
+    template = block[block.index("return `<div class=\"ports") :]
+    assert template.index("${before}") < template.index('data-action="open-ports"')
+    assert "po.not_public" in block and "po.warning" in block
+    mapped = block[block.index("if (po.status === 'mapped')") : block.index("} else if")]
+    assert "portsMapping(po.ports)" in mapped and "po.first_refused" in mapped
+    mapping = script[script.index("function portsMapping(") : script.index("function leaseText(")]
+    assert "`${p.port} -> ${p.internal}/${p.protocol}`" in mapping
+    node = shutil.which("node")
+    if node is None:
+        return
+    program = (
+        f"{mapping}\n"
+        "process.stdout.write(portsMapping([{port: 49271, protocol: 'UDP', internal: 17271},"
+        " {port: 49280, protocol: 'TCP', internal: 49280}, {port: 1, protocol: 'TCP'}]));"
+    )
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    assert done.stdout == "49271 -> 17271/UDP, 49280/TCP, 1/TCP"

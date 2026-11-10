@@ -168,6 +168,23 @@ range, no DMZ, no other port.
   ports and protocols. Do that as described above, then enter your public address. A failed opening
   never blocks the duel: you can still launch it.
 
+#### French routers and the high port range
+
+French routers (Freebox, SFR, Bbox; Livebox with a shared IPv4) reserve the ports below 49152: a
+Freebox answers `718 ConflictInMappingEntry` to any UPnP request under 49152, even on a free port.
+So PZ Duel does not ask the router for 17271, 17272 and 17280: it opens **external** ports in the
+high range, by default **49271/UDP, 49272/UDP and 49280/TCP** (`upnp_ports.external_ports` in
+`service/runtime.json`), and forwards them to the ports the game keeps listening on (17271, 17272,
+17280). If the router still answers `718`, PZ Duel tries once more with three ports from
+`upnp_ports.fallback_range` (49152-50175 by default), never more; a port in that range already
+used by another device on the router is skipped, never overwritten. Once an opening was tried, the
+invitation, the link and the `.bat` carry the external ports really opened. If your router refuses
+anyway, the lobby shows the correspondence to type in by hand: `49271 -> 17271/UDP`,
+`49272 -> 17272/UDP`, `49280 -> 17280/TCP`. A configured external port under 49152 is accepted but
+the lobby warns that most French routers will refuse it. If the address you entered, or the one the
+router reports, is private or shared (`10.0.0.0/8`, `100.64.0.0/10`, `192.168.0.0/16`…), the lobby
+says so above the button: no port forwarding will make the duel reachable from the Internet.
+
 ### Never share the `.bat` publicly
 
 **Do not post or distribute the `.bat`.** It holds your address and the password of the guest's server,

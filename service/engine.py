@@ -9,6 +9,7 @@ bout : un échec finit en `error`, jamais dans le parcours simulé.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import logging
 import math
@@ -170,6 +171,21 @@ SCOPE_UNVERIFIED_TEXT = (
     "Unverified address: PZ Duel cannot test it. For a remote guest, open UDP ports {game} "
     "and {udp} to play and TCP port {share} for the link."
 )
+# P9F7 : après un essai d'ouverture, l'invitation porte les ports externes ; la correspondance
+# externe -> interne est celle à recopier dans la box si aucun mapping n'a été posé.
+SCOPE_EXTERNAL_TEXT = (
+    "Unverified address: PZ Duel cannot test it. For a remote guest, the router must forward "
+    "these ports to this computer (external port -> port on this computer): {mapping}."
+)
+# P9F7 : une adresse privée ou d'IPv4 partagée (CGNAT) est dite avant tout essai d'ouverture.
+NOT_PUBLIC_TEXT = (
+    "This address is not public (private network or carrier-grade NAT): no port forwarding "
+    "will make the duel reachable from the Internet. A guest outside your network cannot join."
+)
+ROUTER_NOT_PUBLIC_TEXT = (
+    "Your router reported an address that is not public (double NAT or carrier-grade NAT): "
+    "no port forwarding on it will make the duel reachable from the Internet."
+)
 SCOPE_NO_ADDRESS_TEXT = "No usable address was detected: enter an address your guest can reach."
 SCOPE_MOCK_TEXT = "Simulated duel: there is no link and no launcher."
 REMATCH_NOTE = "rematch_note"
@@ -212,6 +228,15 @@ LAUNCHER_CODE_TEXT = (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _ipv4_literal(value: object) -> bool:
+    """Vrai pour une IPv4 écrite en clair : un nom d'hôte ne se juge pas sans résolution (P9F7)."""
+    try:
+        ipaddress.IPv4Address(str(value))
+    except ValueError:
+        return False
+    return True
 
 
 class ActionRefused(Exception):
@@ -1772,6 +1797,19 @@ class Engine:
         # Vrai quand l'arrêt a rendu la main sans cette fusion, en nommant ses couples : plus rien
         # de cette ouverture n'est fusionné ensuite (C1, P9F2).
         self._ports_abandoned = False
+        # Vrai dès qu'une ouverture a lu sur la box une adresse non publique (P9F7) : la vue le
+        # redit avant tout nouvel essai. Jamais l'adresse elle-même, seulement ce constat.
+        self._router_not_public = False
+        # Vrai dès qu'une ouverture a rendu un résultat (P9F7) : l'invitation vers une adresse
+        # saisie porte alors les ports externes. Avant tout essai, rien ne dit à l'hôte que sa
+        # box traduit les ports : l'invitation garde ceux où le jeu écoute (redirection à la main).
+        self._ports_attempted = False
+        # Le mod lu pour la dernière invitation : une ouverture qui change les externes la
+        # reconstruit sous le verrou, sans relire le disque (P9F7).
+        self._invite_mod: tuple[str, ...] | LauncherRefused | None = None
+        # Les externes que porte l'invitation servie (`_invite_externals` au moment où elle a été
+        # rendue) : la fusion d'une ouverture ne la reconstruit que s'ils changent (revue P9F7 A1).
+        self._invite_built_externals: list[int] | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -2117,14 +2155,39 @@ class Engine:
     # -- ouverture des ports (phase 3) ---------------------------------------
     # Hors d'`ACTIONS`, comme l'invitation. Aucun appel réseau sous `self.lock` (AC16) : le fil
     # `ports-open` fait les requêtes, puis reprend le verrou pour publier le résultat.
-    def _upnp_ports(self) -> list[tuple[int, str]]:
-        """Les trois couples de R3 : les deux UDP du camp B, le TCP de partage."""
+    def _internal_ports(self) -> list[int]:
+        """Ports internes de R3, où le jeu et le partage écoutent : ils ne bougent pas (P9F7)."""
         guest = self.runtime["ports"][GUEST_SIDE]
-        return [
-            (guest["game"], UDP),
-            (guest["udp"], UDP),
-            (self.runtime["share_port"], TCP),
-        ]
+        return [guest["game"], guest["udp"], self.runtime["share_port"]]
+
+    def _upnp_ports(self) -> list[tuple[int, str]]:
+        """Les trois couples externes de R3 (P9F7) : `upnp_ports.external_ports`, ceux qui voyagent.
+
+        Des externes invalides (refusés au clic, AC13) sont remplacés par les internes, pour que
+        la vue neutre nomme encore trois ports.
+        """
+        cfg = upnp.merged_config(self.runtime)
+        if upnp.external_ports_ok(cfg):
+            return upnp.external_couples(cfg)
+        return list(zip(self._internal_ports(), (UDP, UDP, TCP)))
+
+    def _invite_externals(self) -> list[int] | None:
+        """Externes que l'invitation vers une adresse saisie porte, ou `None` avant tout essai."""
+        return self._live_externals() if self._ports_attempted else None
+
+    def _stale_invite(self) -> bool:
+        """Vrai si les externes à porter ne sont plus ceux de l'invitation servie (revue P9F7 A1)."""
+        return self._invite_externals() != self._invite_built_externals
+
+    def _live_externals(self) -> list[int]:
+        """Externes que l'invitation porte (P9F7) : ceux réellement ouverts par une ouverture
+        `mapped` dont le bail court encore, sinon les externes configurés."""
+        opening = self._ports_opening
+        if opening.get("status") == upnp.MAPPED and self._ports_ledger.proposal() == upnp.PROPOSAL_LIVE:
+            ports = [item.get("port") for item in opening.get("ports", [])]
+            if len(ports) == upnp.MAPPING_COUNT and all(isinstance(p, int) for p in ports):
+                return ports
+        return [port for port, _ in self._upnp_ports()]
 
     def _ports_view(self) -> dict[str, Any]:
         """Copie de l'état d'ouverture ; le neutre nomme les ports et le bail avant le clic (R8).
@@ -2141,11 +2204,39 @@ class Engine:
                 view = {"status": PORTS_IDLE, "expired": True}
             else:
                 view["expired"] = True
+        cfg = upnp.merged_config(self.runtime)
         if view["status"] in (PORTS_IDLE, PORTS_IN_PROGRESS):
-            cfg = self.runtime.get("upnp")
-            view.setdefault("ports", [{"port": p, "protocol": t} for p, t in self._upnp_ports()])
+            internal = self._internal_ports()
+            view.setdefault(
+                "ports",
+                [
+                    {"port": p, "protocol": t, "internal": i}
+                    for (p, t), i in zip(self._upnp_ports(), internal)
+                ],
+            )
             view.setdefault("lease_s", cfg.get("lease_s") if isinstance(cfg, dict) else None)
+        # P9F7 : avertissement d'un externe sous 49152, et adresse non publique dite avant l'essai.
+        warning = upnp.low_port_warning(cfg)
+        if warning is not None:
+            view["warning"] = warning
+        reach = self._reach_note()
+        if reach is not None:
+            view["not_public"] = reach
         return view
+
+    def _reach_note(self) -> str | None:
+        """Pourquoi aucune redirection ne rendra le duel joignable, ou `None` (P9F7).
+
+        L'adresse saisie pour l'invitation, si c'est une IPv4 privée ou partagée (CGNAT), ou une
+        adresse non publique déjà lue sur la box par une ouverture précédente. La vue ne porte
+        que ce constat, jamais l'adresse lue (R5).
+        """
+        entered = self._entered_address
+        if entered is not None and _ipv4_literal(entered) and not upnp.is_public(entered):
+            return NOT_PUBLIC_TEXT
+        if self._router_not_public:
+            return ROUTER_NOT_PUBLIC_TEXT
+        return None
 
     def open_ports(self) -> tuple[bool, str]:
         """Lance l'ouverture des trois mappings, à la demande de l'hôte, au lobby d'un duel réel."""
@@ -2160,9 +2251,18 @@ class Engine:
             if self._ports_opening["status"] == PORTS_IN_PROGRESS:
                 return False, "an opening is already in progress"
             ports = self._upnp_ports()
-            cfg = self.runtime.get("upnp")
+            internal = self._internal_ports()
+            cfg = upnp.merged_config(self.runtime)
             invalid = upnp.validate(cfg, ports)
             if invalid is not None:
+                invalid = {
+                    **invalid,
+                    "ports": [
+                        {"port": p, "protocol": t, "internal": i}
+                        for (p, t), i in zip(ports, internal)
+                    ],
+                    "manual": upnp.manual_instruction(ports, internal),
+                }
                 # Aucun fil, aucun paquet : la configuration est refusée avant tout (AC13).
                 self._ports_opening = invalid
                 self.state.log(f"port opening: {upnp.INVALID_CONFIG}", "warn")
@@ -2170,7 +2270,8 @@ class Engine:
             assert isinstance(cfg, dict)
             self._ports_cfg = dict(cfg)
             self._ports_opening = {"status": PORTS_IN_PROGRESS}
-            self._ports_pending = list(ports)
+            # Le repli (P9F7) peut poser ses propres couples : tous sont possiblement posés.
+            self._ports_pending = [*ports, *upnp.fallback_candidates(cfg, ports)]
             click = (self._clock(), self._ports_ledger.clock())
             self.state.log("port opening requested")
             self._ports_thread = threading.Thread(
@@ -2192,17 +2293,26 @@ class Engine:
         (revue I3) : `_merge_failed` retient tous ses couples, à vérifier avant tout retrait, et
         publie un statut terminal.
         """
+        internal = self._internal_ports()
         try:
             result, gateway, cleared = upnp.open_ports(
-                cfg, ports, self._upnp_target, self._ports_cancel
+                cfg,
+                ports,
+                self._upnp_target,
+                self._ports_cancel,
+                internal=internal,
+                fallback=True,
             )
         except Exception as exc:  # noqa: BLE001 - `upnp` promet de ne rien lever ; dernier filet
             LOGGER.warning("port opening failed (%s)", type(exc).__name__)
             result = {
                 "status": upnp.NO_GATEWAY,
                 "reason": upnp.UNREADABLE,
-                "ports": [{"port": p, "protocol": t} for p, t in ports],
-                "manual": upnp.manual_instruction(ports),
+                "ports": [
+                    {"port": p, "protocol": t, "internal": i}
+                    for (p, t), i in zip(ports, internal)
+                ],
+                "manual": upnp.manual_instruction(ports, internal),
             }
             gateway, cleared = None, []
         with self.lock:
@@ -2250,9 +2360,23 @@ class Engine:
         view = dict(result)
         if status == upnp.MAPPED:
             view["expires_at"] = terms["expires_at"]
+        self._ports_attempted = True
         self._ports_opening = view
+        # Le dernier constat de la box fait foi (revue P9F7 A3) : une adresse publique lue efface
+        # un « non publique » d'une ouverture précédente ; une adresse inconnue ne tranche pas.
+        if result.get("address_note") == upnp.NOTE_NOT_PUBLIC:
+            self._router_not_public = True
+        elif status == upnp.MAPPED and upnp.is_public(result.get("address")):
+            self._router_not_public = False
         level = "info" if status == upnp.MAPPED else "warn"
         self.state.log(f"port opening: {status}", level)
+        if result.get("first_refused"):
+            self.state.log("port opening: router refused the configured ports, fallback range used")
+        # L'invitation porte les externes réellement ouverts (P9F7) : un repli les change. La
+        # comparaison se fait avec ceux de l'invitation servie, pas avec la vue d'avant la fusion,
+        # déjà passée par `in_progress` (revue P9F7 A1).
+        if self._stale_invite() and self.real and self.state.phase == "lobby":
+            self.state.invite = self._build_invite(self._invite_mod)
 
     def _merge_failed(
         self,
@@ -2272,25 +2396,37 @@ class Engine:
         if self._ports_abandoned:
             return
         self._ports_pending = []
-        dicts = [{"port": p, "protocol": t} for p, t in ports]
+        self._ports_attempted = True
+        if self._stale_invite() and self.real and self.state.phase == "lobby":
+            self.state.invite = self._build_invite(self._invite_mod)
+        internal = self._internal_ports()
+        dicts = [{"port": p, "protocol": t, "internal": i} for (p, t), i in zip(ports, internal)]
         if gateway is not None:
             terms = self._lease_terms(cfg, click)
+            # Le repli (P9F7) a pu poser ses couples : eux aussi sont vérifiés avant tout retrait.
+            # Tous ses candidats, chacun avec le port interne où il arriverait (revue P9F7 A2).
+            alternate = upnp.fallback_candidates(cfg, ports, internal)
+            inner = {**dict(zip(ports, internal)), **alternate}
             self._ports_ledger.suspect(
-                gateway, ports, expires_at=terms["expires_at"], description=terms["description"]
+                gateway,
+                [*ports, *alternate],
+                expires_at=terms["expires_at"],
+                description=terms["description"],
+                internal=inner,
             )
             self._ports_opening = {
                 "status": upnp.REFUSED,
                 "failure": upnp.UNREADABLE,
                 "ports": dicts,
                 "still_active": list(dicts),
-                "manual": upnp.manual_instruction(ports),
+                "manual": upnp.manual_instruction(ports, internal),
             }
         else:
             self._ports_opening = {
                 "status": upnp.NO_GATEWAY,
                 "reason": upnp.UNREADABLE,
                 "ports": dicts,
-                "manual": upnp.manual_instruction(ports),
+                "manual": upnp.manual_instruction(ports, internal),
             }
 
     def _report_release(self, released: upnp.Released) -> None:
@@ -2440,6 +2576,7 @@ class Engine:
 
         Appelé sous `self.lock` : `mod`, lu et haché avant par `_read_mod`, n'y est qu'assemblé.
         """
+        self._invite_mod = mod
         invite = self._invite_fields()
         self._launcher = None
         if not self.real:
@@ -2474,6 +2611,7 @@ class Engine:
         }
         if not self.real:
             return invite
+        self._invite_built_externals = self._invite_externals()
         invite[REMATCH_NOTE] = REMATCH_NOTE_TEXT
         if self._share is None:
             invite[SHARE_TEXT] = SHARE_UNAVAILABLE_TEXT.format(port=self.runtime["share_port"])
@@ -2485,22 +2623,40 @@ class Engine:
             invite["scope_text"] = SCOPE_NO_ADDRESS_TEXT
             return invite
         invite["ip"] = invite["address"] = address
+        share_port = self.runtime["share_port"]
         if self._entered_address is None:
             invite["scope"] = SCOPE_LAN
             invite["scope_text"] = SCOPE_LAN_TEXT
         else:
-            ports = self.runtime["ports"][GUEST_SIDE]
+            # Une adresse saisie est celle que l'invité vise depuis Internet. Dès qu'une
+            # ouverture a été tentée, l'invitation, le `.bat` et le lien portent les ports
+            # externes (P9F7) : réellement ouverts s'il y en a, sinon configurés, et le lobby dit
+            # la correspondance à recopier dans la box. Sur le réseau local (adresse détectée),
+            # rien ne traduit : les ports internes restent.
+            externals = self._invite_externals()
             invite["scope"] = SCOPE_UNVERIFIED
-            invite["scope_text"] = SCOPE_UNVERIFIED_TEXT.format(
-                game=ports["game"], udp=ports["udp"], share=self.runtime["share_port"]
-            )
+            if externals is None:
+                ports = self.runtime["ports"][GUEST_SIDE]
+                invite["scope_text"] = SCOPE_UNVERIFIED_TEXT.format(
+                    game=ports["game"], udp=ports["udp"], share=share_port
+                )
+            else:
+                invite["port"] = externals[0]
+                share_port = externals[2]
+                invite["scope_text"] = SCOPE_EXTERNAL_TEXT.format(
+                    mapping=upnp.correspondence(
+                        zip(externals, (UDP, UDP, TCP)), self._internal_ports()
+                    )
+                )
+            reach = self._reach_note()
+            if reach is not None:
+                invite["scope_text"] += " " + reach
         if PASSWORD_ALLOWED.fullmatch(config["password"]) is None:
             # Le mot de passe saisi ne peut pas voyager dans un `.bat` (D-H).
             invite["launcher_refused"] = PASSWORD_REFUSED
             return invite
         if self._share is None:
             return invite  # un lien mort ne s'affiche pas
-        share_port = self.runtime["share_port"]
         link = f"http://{address}:{share_port}/{self._share_token}/{LAUNCHER_NAME}"
         invite["link"] = invite["qr_text"] = link
         return invite

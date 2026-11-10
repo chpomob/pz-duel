@@ -43,6 +43,13 @@ Ouverture (`open_ports`, R3) : pour chacun des trois couples passés par l'appel
 retrait (`_rollback`) qui suit fait au plus une suppression par mapping possiblement posé et
 s'arrête lui aussi à la première expiration.
 
+Ports externes (P9F7) : l'appelant passe les ports externes (ceux que la box ouvre et que
+l'invitation porte, `upnp_ports.external_ports`) et, à part, les ports internes où le jeu écoute ; un
+mapping va de l'un à l'autre. Les box françaises rendent 718 sous 49152 : sur un 718, et si son
+retrait a tout effacé, l'ouverture réessaie une seule fois avec les trois premiers ports libres de
+`upnp_ports.fallback_range` : chaque candidat est d'abord lu sur la box, et un port déjà pris par
+un autre appareil est sauté plutôt qu'écrasé. Deux tentatives au plus.
+
 Suivi de vie (P9F3) : `Ledger` est l'unique propriétaire des mappings retenus — une entrée par
 box (`Gateway.box`, l'hôte qui a répondu : deux descriptions d'une même box sont une seule box)
 et par couple, avec son échéance sur une horloge monotone et son état « à nous » (bail en cours)
@@ -120,12 +127,38 @@ PORT_RANGE = range(1, 65536)
 # Borne du bail fixée par la spécification (R3 : au plus deux heures), pas une valeur de
 # configuration : la durée elle-même vient de `upnp.lease_s`.
 MAX_LEASE_S = 2 * 60 * 60
-CONFIG_KEYS = ("discovery_timeout_s", "request_timeout_s", "lease_s", "description", "max_response_bytes")
+# Section dédiée `upnp_ports` de `runtime.json` (P9F7) : l'appelant la fusionne à `upnp` avant
+# de passer la configuration ; une clé fautive y est nommée `upnp_ports.<nom>`.
+PORTS_SECTION = "upnp_ports"
+PORTS_KEYS = ("external_ports", "fallback_range")
+CONFIG_KEYS = (
+    "discovery_timeout_s",
+    "request_timeout_s",
+    "lease_s",
+    "description",
+    "max_response_bytes",
+    *PORTS_KEYS,
+)
+# Ports externes (P9F7) : ceux que la box ouvre et que l'invitation porte ; le jeu écoute, lui,
+# sur ses ports internes, qui ne bougent pas. Une clé par mapping, dans l'ordre de R3.
+EXTERNAL_KEYS = ("udp_game", "udp_aux", "tcp_share")
+# Bornes d'un port externe accepté par la validation : ni port système, ni hors de 16 bits.
+EXTERNAL_MIN = 1024
+EXTERNAL_MAX = 65535
+# Début de la plage dynamique (RFC 6335) : sous ce port, la plupart des box françaises (Freebox,
+# SFR, Bbox mesurées ou documentées) rendent 718 à `AddPortMapping`, même sans entrée existante.
+HIGH_RANGE_START = 49152
+CONFLICT = 718  # code UPnP `ConflictInMappingEntry` : seul code qui déclenche le repli (P9F7)
+LOW_PORT_WARNING = (
+    "External port {ports} is below 49152: most French routers (Freebox, SFR, Bbox) refuse "
+    "to open it. PZ Duel will try, then fall back to the high range."
+)
 
 NOTE_UNKNOWN = "The router did not report a public address: the public address is unknown."
 NOTE_NOT_PUBLIC = (
     "The router reports an address that is not reachable from the Internet "
-    "(double NAT or carrier-grade NAT): a guest outside your network may not get in."
+    "(double NAT or carrier-grade NAT): a guest outside your network may not get in. "
+    "No port forwarding on this router will make the duel reachable from the Internet."
 )
 # Blocs exclus en plus de `is_global`, pour que la décision ne dérive pas d'une version de
 # Python à l'autre (RFC 5737 et espace partagé RFC 6598), et blocs à usage spécial IANA que
@@ -711,25 +744,54 @@ def _couples(ports: object) -> list[Couple] | None:
     return couples  # type: ignore[return-value]
 
 
-def _as_dicts(couples: Iterable[Couple]) -> list[dict]:
-    return [{"port": port, "protocol": protocol} for port, protocol in couples]
+def _as_dicts(couples: Iterable[Couple], internal: Sequence[int] | None = None) -> list[dict]:
+    """Couples en dictionnaires ; avec `internal` (P9F7), chacun porte aussi son port interne."""
+    dicts = [{"port": port, "protocol": protocol} for port, protocol in couples]
+    if internal is not None and len(internal) == len(dicts):
+        for item, inner in zip(dicts, internal):
+            item["internal"] = inner
+    return dicts
 
 
-def manual_instruction(ports: Iterable[Sequence[object]]) -> str:
-    """Consigne manuelle (anglais) qui nomme chaque port et son protocole (R4, AC15)."""
-    named = ", ".join(f"{port}/{protocol}" for port, protocol in _couples(ports) or [])
+def correspondence(ports: Iterable[Sequence[object]], internal: Sequence[object] | None) -> str:
+    """`externe -> interne/protocole` pour chaque couple (P9F7) ; sans `internal`, `port/protocole`."""
+    couples = _couples(ports) or []
+    if internal is None or len(internal) != len(couples):
+        return ", ".join(f"{port}/{protocol}" for port, protocol in couples)
+    return ", ".join(
+        f"{port} -> {inner}/{protocol}" for (port, protocol), inner in zip(couples, internal)
+    )
+
+
+def manual_instruction(
+    ports: Iterable[Sequence[object]], internal: Sequence[object] | None = None
+) -> str:
+    """Consigne manuelle (anglais) qui nomme chaque port et son protocole (R4, AC15).
+
+    Avec `internal` (P9F7), chaque port externe est nommé avec le port interne où il doit
+    arriver : `49271 -> 17271/UDP`, la correspondance à recopier dans la box.
+    """
+    named = correspondence(ports, internal)
+    if internal is not None and "->" in named:
+        return (
+            "Open these ports by hand in your router's settings and forward them to this "
+            f"computer, external port -> port on this computer: {named}. "
+            "Then enter your public address in the field below."
+        )
     return (
         f"Open these ports by hand in your router's settings and forward them to this computer: "
         f"{named}. Then enter your public address in the field below."
     )
 
 
-def _invalid(key: str, ports: Iterable[Sequence[object]] | None) -> dict:
+def _invalid(
+    key: str, ports: Iterable[Sequence[object]] | None, internal: Sequence[int] | None = None
+) -> dict:
     result: dict = {"status": INVALID_CONFIG, "key": key}
     couples = None if ports is None else _couples(ports)
     if couples:
-        result["ports"] = _as_dicts(couples)
-        result["manual"] = manual_instruction(couples)
+        result["ports"] = _as_dicts(couples, internal)
+        result["manual"] = manual_instruction(couples, internal)
     return result
 
 
@@ -758,14 +820,147 @@ def _positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _external_port(value: object) -> bool:
+    return _positive_int(value) and EXTERNAL_MIN <= value <= EXTERNAL_MAX  # type: ignore[operator]
+
+
+def _external_ports(value: object) -> bool:
+    """Trois ports externes nommés par `EXTERNAL_KEYS`, chacun dans [1024, 65535], distincts."""
+    if not isinstance(value, dict) or set(value) != set(EXTERNAL_KEYS):
+        return False
+    ports = [value[key] for key in EXTERNAL_KEYS]
+    return all(map(_external_port, ports)) and len(set(ports)) == len(ports)
+
+
+def _fallback_range(value: object) -> bool:
+    """`[premier, dernier]` dans [1024, 65535], assez large pour trois ports libres (P9F7).
+
+    Le repli saute au plus les trois externes déjà refusés : `2 × MAPPING_COUNT` ports suffisent
+    toujours à en trouver trois autres.
+    """
+    if not isinstance(value, list) or len(value) != 2 or not all(map(_external_port, value)):
+        return False
+    first, last = value
+    return last - first + 1 >= 2 * MAPPING_COUNT
+
+
+def merged_config(runtime: dict) -> object:
+    """Section `upnp` complétée par `upnp_ports` (P9F7) ; telle quelle si l'une n'est pas un objet."""
+    cfg, extra = runtime.get("upnp"), runtime.get(PORTS_SECTION)
+    if isinstance(cfg, dict) and isinstance(extra, dict):
+        return {**cfg, **{key: extra[key] for key in PORTS_KEYS if key in extra}}
+    return cfg
+
+
+def external_ports_ok(upnp_cfg: object) -> bool:
+    """Vrai si `upnp_cfg` porte trois ports externes valides, quoi qu'il en soit du reste."""
+    return isinstance(upnp_cfg, dict) and _external_ports(upnp_cfg.get("external_ports"))
+
+
+def external_couples(upnp_cfg: dict) -> list[Couple]:
+    """Les trois couples externes configurés, dans l'ordre de R3 ; la section doit être valide."""
+    ports = upnp_cfg["external_ports"]
+    return [(ports[key], protocol) for key, protocol in zip(EXTERNAL_KEYS, ("UDP", "UDP", "TCP"))]
+
+
+def low_port_warning(upnp_cfg: object) -> str | None:
+    """Avertissement (pas une erreur) pour un externe configuré sous 49152 (P9F7).
+
+    Une box permissive l'accepte : la valeur est gardée, et l'ouverture se replie sur la plage
+    haute si la box rend 718. `None` quand tout est dans la plage haute ou la section invalide.
+    """
+    if not isinstance(upnp_cfg, dict) or not _external_ports(upnp_cfg.get("external_ports")):
+        return None
+    low = [port for port, _ in external_couples(upnp_cfg) if port < HIGH_RANGE_START]
+    if not low:
+        return None
+    return LOW_PORT_WARNING.format(ports=", ".join(map(str, low)))
+
+
+FALLBACK_TRIES = 3  # candidats du repli par couple (P9F7) : bornent les lectures de la box
+
+
+def _fallback_slots(upnp_cfg: dict, couples: Sequence[Couple]) -> list[list[Couple]]:
+    """Les candidats du repli, couple par couple (P9F7) : les `FALLBACK_TRIES * 3` premiers ports
+    de `fallback_range` qui ne sont pas parmi `couples`, distribués en tourniquet — le couple `i`
+    ne prend que les ports de rang `i`, `i + 3`, `i + 6`. Un port ne sert donc qu'à un couple,
+    avec un protocole et un port interne connus d'avance. Vide si la plage ne suffit pas.
+    """
+    first, last = upnp_cfg["fallback_range"]
+    taken = {port for port, _ in couples}
+    count = len(couples)
+    free = [port for port in range(first, last + 1) if port not in taken][: count * FALLBACK_TRIES]
+    if count == 0 or len(free) < count:
+        return []
+    return [[(port, protocol) for port in free[index::count]] for index, (_, protocol) in enumerate(couples)]
+
+
+def fallback_couples(upnp_cfg: dict, couples: Sequence[Couple]) -> list[Couple]:
+    """Les trois couples préférés du repli (P9F7) : déterministes, les trois premiers ports de
+    `fallback_range` qui ne sont pas déjà parmi `couples` (ceux que la box vient de refuser),
+    dans l'ordre et avec les protocoles de `couples`. Vide si la plage ne suffit pas. Un
+    candidat que la box dit déjà pris par un autre appareil est sauté (`fallback_candidates`).
+    """
+    return [slot[0] for slot in _fallback_slots(upnp_cfg, couples)]
+
+
+def fallback_candidates(
+    upnp_cfg: dict, couples: Sequence[Couple], internal: Sequence[int] | None = None
+) -> dict[Couple, int | None]:
+    """Tous les couples que le repli peut poser (P9F7), avec le port interne où chacun arrive
+    (`None` sans `internal`) : à retenir comme possiblement posés tant que l'issue est inconnue.
+    """
+    return {
+        couple: None if internal is None else internal[index]
+        for index, slot in enumerate(_fallback_slots(upnp_cfg, couples))
+        for couple in slot
+    }
+
+
+def _free_fallback(
+    gateway: Gateway,
+    cfg: dict,
+    couples: list[Couple],
+    cancel: threading.Event | None,
+    internal: Sequence[int] | None,
+) -> list[Couple] | None:
+    """Les trois couples du repli, chacun libre sur la box, ou `None` (revue P9F7 A2).
+
+    `_attempt` supprime avant d'ajouter : un candidat déjà pris par un autre appareil serait
+    effacé. Chaque candidat est donc d'abord lu (`GetSpecificPortMappingEntry`, sans écriture) ;
+    seuls servent un couple absent (714) ou un couple déjà à nous (même client, même port
+    interne, notre description). Pris par un autre, ou réponse qui ne permet pas de trancher : le
+    candidat suivant de ce couple. Un délai dépassé, une annulation ou un couple sans candidat
+    libre arrêtent le repli. Au plus `FALLBACK_TRIES * 3` lectures.
+    """
+    timeout_s, max_bytes = cfg["request_timeout_s"], cfg["max_response_bytes"]
+    chosen: list[Couple] = []
+    for index, slot in enumerate(_fallback_slots(cfg, couples)):
+        inner = None if internal is None else internal[index]
+        for couple in slot:
+            if _stopped(cancel):
+                return None
+            probe = Lease(gateway.box, couple, gateway, -math.inf, 0.0, cfg["description"], inner)
+            owner = _owner(gateway, probe, timeout_s, max_bytes)
+            if owner == TIMEOUT:
+                return None
+            if owner in (GONE, STILL_OURS):
+                chosen.append(couple)
+                break
+        else:
+            return None
+    return chosen if len(chosen) == len(couples) else None
+
+
 def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) -> dict | None:
     """`None` si la section `upnp` est utilisable, sinon le résultat `invalid_config` (R3, AC13).
 
     Aucun trafic : section absente ou d'un autre type → clé `upnp` ; clé absente ou mal typée,
     bail hors de ]0, MAX_LEASE_S], fenêtre de découverte de moins de `MX_MIN` seconde, délai
-    au-delà de `MAX_WAIT_S` ou taille au-delà de `sys.maxsize` (non représentables) → clé
-    `upnp.<nom>`. Avec `ports`, le résultat porte la
-    consigne manuelle (R4).
+    au-delà de `MAX_WAIT_S` ou taille au-delà de `sys.maxsize` (non représentables), ports
+    externes hors de [1024, 65535] ou en double, plage de repli trop courte → clé `upnp.<nom>`.
+    Un externe sous 49152 n'est pas refusé ici : c'est `low_port_warning` (P9F7). Avec `ports`,
+    le résultat porte la consigne manuelle (R4).
     """
     if not isinstance(upnp_cfg, dict):
         return _invalid("upnp", ports)
@@ -776,10 +971,13 @@ def validate(upnp_cfg: object, ports: Iterable[Sequence[object]] | None = None) 
         "description": lambda v: isinstance(v, str) and bool(v.strip()),
         # Représentable comme taille C (`Py_ssize_t`) : au-delà, toute API de lecture lève (P9F2).
         "max_response_bytes": lambda v: _positive_int(v) and v <= sys.maxsize,  # type: ignore[operator]
+        "external_ports": _external_ports,
+        "fallback_range": _fallback_range,
     }
     for key in CONFIG_KEYS:
         if key not in upnp_cfg or not checks[key](upnp_cfg[key]):
-            return _invalid(f"upnp.{key}", ports)
+            section = PORTS_SECTION if key in PORTS_KEYS else "upnp"
+            return _invalid(f"{section}.{key}", ports)
     return None
 
 
@@ -815,6 +1013,11 @@ def _public(addr: object) -> bool:
     if ip is None or not ip.is_global or ip.is_multicast or ip.is_reserved:
         return False
     return not any(ip in net for net in NOT_PUBLIC_NETS)
+
+
+def is_public(addr: object) -> bool:
+    """Vrai pour une IPv4 joignable depuis Internet (R5) ; faux pour privée, CGNAT, réservée."""
+    return _public(addr)
 
 
 # --- SOAP -----------------------------------------------------------------------------
@@ -906,15 +1109,17 @@ def _delete(gateway: Gateway, couple: Couple, timeout_s: float, max_bytes: int) 
     return _soap(gateway, "DeletePortMapping", lambda _local: args, timeout_s, max_bytes)
 
 
-def _add(gateway: Gateway, couple: Couple, cfg: dict) -> Answer:
+def _add(gateway: Gateway, couple: Couple, cfg: dict, internal: int | None = None) -> Answer:
+    """`AddPortMapping` de `couple` (port externe) vers `internal` (par défaut le même port)."""
     port, protocol = couple
+    inner = port if internal is None else internal
 
     def args(local: str) -> list[tuple[str, object]]:
         return [
             ("NewRemoteHost", ""),
             ("NewExternalPort", port),
             ("NewProtocol", protocol),
-            ("NewInternalPort", port),
+            ("NewInternalPort", inner),
             ("NewInternalClient", local),
             ("NewEnabled", 1),
             ("NewPortMappingDescription", cfg["description"]),
@@ -957,15 +1162,34 @@ def _rollback(
     return still, removed
 
 
-def _refused(couples: list[Couple], reason: dict, still: list[Couple]) -> dict:
-    result = {"status": REFUSED, "ports": _as_dicts(couples), **reason}
-    result["still_active"] = _as_dicts(still)
-    result["manual"] = manual_instruction(couples)
+def _inner_of(couples: Sequence[Couple], internal: Sequence[int] | None, still: Sequence[Couple]) -> list[int] | None:
+    if internal is None:
+        return None
+    return [internal[couples.index(c)] for c in still]
+
+
+def _refused(
+    couples: list[Couple], reason: dict, still: list[Couple], internal: Sequence[int] | None = None
+) -> dict:
+    result = {"status": REFUSED, "ports": _as_dicts(couples, internal), **reason}
+    result["still_active"] = _as_dicts(still, _inner_of(couples, internal, still))
+    result["manual"] = manual_instruction(couples, internal)
     return result
 
 
-def _mapped(couples: list[Couple], cfg: dict, address: str | None, note: str | None) -> dict:
-    result = {"status": MAPPED, "ports": _as_dicts(couples), "lease_s": cfg["lease_s"], "address": address}
+def _mapped(
+    couples: list[Couple],
+    cfg: dict,
+    address: str | None,
+    note: str | None,
+    internal: Sequence[int] | None = None,
+) -> dict:
+    result = {
+        "status": MAPPED,
+        "ports": _as_dicts(couples, internal),
+        "lease_s": cfg["lease_s"],
+        "address": address,
+    }
     if address is None:
         result["address_note"] = note
     return result
@@ -991,28 +1215,80 @@ def _external_address(gateway: Gateway, cfg: dict) -> tuple[str | None, str]:
 
 
 def _open(
-    gateway: Gateway, cfg: dict, couples: list[Couple], cancel: threading.Event | None
+    gateway: Gateway,
+    cfg: dict,
+    couples: list[Couple],
+    cancel: threading.Event | None,
+    internal: Sequence[int] | None = None,
+    fallback: bool = False,
+) -> tuple[dict, list[Couple]]:
+    """Ouverture des trois couples, puis, sur 718, au plus un repli dans `fallback_range` (P9F7).
+
+    Le repli n'a lieu que si la première tentative s'est arrêtée sur un `718` et que son retrait
+    a confirmé l'absence de tout ce qu'elle avait posé (rien de réputé actif) : sinon le résultat
+    devrait suivre deux jeux de couples, et le premier refus est rendu tel quel. Deux tentatives
+    au plus, chacune bornée comme avant par une requête par étape ; l'annulation est vérifiée à
+    chaque frontière de requête, repli compris. Le résultat porte les externes réellement
+    ouverts ; un repli en échec rend son propre `refused`, avec le code de la box. Les candidats
+    du repli sont d'abord lus sur la box (`_free_fallback`) : un mapping d'un autre appareil
+    n'est jamais supprimé pour faire place au nôtre (revue P9F7 A2).
+    """
+    result, cleared = _attempt(gateway, cfg, couples, cancel, internal)
+    if not (
+        fallback
+        and result["status"] == REFUSED
+        and result.get("error_code") == CONFLICT
+        and not result["still_active"]
+        and not _stopped(cancel)
+    ):
+        return result, cleared
+    alternate = _free_fallback(gateway, cfg, couples, cancel, internal)
+    if not alternate:
+        return result, cleared
+    log.info("upnp: router refused the configured ports (718), trying the fallback range once")
+    second, cleared_again = _attempt(gateway, cfg, alternate, cancel, internal)
+    if second["status"] == REFUSED:
+        # Les deux tentatives ont échoué : la consigne nomme les externes configurés, ceux que
+        # l'invitation porte ; `still_active` reste celui du repli, seul à avoir pu rester posé.
+        second["fallback_tried"] = second["ports"]
+        second["ports"] = _as_dicts(couples, internal)
+        second["manual"] = manual_instruction(couples, internal)
+    else:
+        second["first_refused"] = _as_dicts(couples, internal)
+    cleared.extend(c for c in cleared_again if c not in cleared)
+    return second, cleared
+
+
+def _attempt(
+    gateway: Gateway,
+    cfg: dict,
+    couples: list[Couple],
+    cancel: threading.Event | None,
+    internal: Sequence[int] | None = None,
 ) -> tuple[dict, list[Couple]]:
     timeout_s, max_bytes = cfg["request_timeout_s"], cfg["max_response_bytes"]
     confirmed: list[Couple] = []
     cleared: list[Couple] = []
 
+    def refused(reason: dict, still: list[Couple]) -> dict:
+        return _refused(couples, reason, still, internal)
+
     def abandon(possibly: list[Couple], reason: dict) -> tuple[dict, list[Couple]]:
         still, removed = _rollback(gateway, possibly, cfg, cancel)
         cleared.extend(c for c in removed if c not in cleared)
-        return _refused(couples, reason, still), cleared
+        return refused(reason, still), cleared
 
-    for couple in couples:
+    for index, couple in enumerate(couples):
         if _stopped(cancel):
-            return _refused(couples, {"failure": CANCELLED}, confirmed), cleared
+            return refused({"failure": CANCELLED}, confirmed), cleared
         answer = _delete(gateway, couple, timeout_s, max_bytes)
         if answer.failure == TIMEOUT:
             return abandon(confirmed, {"failure": TIMEOUT})
         if answer.gone:
             cleared.append(couple)
         if _stopped(cancel):
-            return _refused(couples, {"failure": CANCELLED}, confirmed), cleared
-        answer = _add(gateway, couple, cfg)
+            return refused({"failure": CANCELLED}, confirmed), cleared
+        answer = _add(gateway, couple, cfg, None if internal is None else internal[index])
         if answer.failure is None:
             confirmed.append(couple)
             if couple in cleared:
@@ -1026,9 +1302,15 @@ def _open(
         return abandon([*confirmed, couple], {"failure": answer.failure})
 
     if _stopped(cancel):
-        return _mapped(couples, cfg, None, NOTE_UNKNOWN), cleared
+        return _mapped(couples, cfg, None, NOTE_UNKNOWN, internal), cleared
     address, note = _external_address(gateway, cfg)
-    return _mapped(couples, cfg, address, note), cleared
+    return _mapped(couples, cfg, address, note, internal), cleared
+
+
+def _internal_ok(internal: object) -> bool:
+    if not isinstance(internal, (list, tuple)) or len(internal) != MAPPING_COUNT:
+        return False
+    return all(_positive_int(p) and p in PORT_RANGE for p in internal)
 
 
 def open_ports(
@@ -1036,18 +1318,28 @@ def open_ports(
     ports: Iterable[Sequence[object]],
     target: tuple[str, int] | None = None,
     cancel: threading.Event | None = None,
+    *,
+    internal: Sequence[int] | None = None,
+    fallback: bool = False,
 ) -> tuple[dict, Gateway | None, list[Couple]]:
     """Ouvre les trois mappings de `ports` : `(résultat, passerelle ou None, couples effacés)`.
 
     `cfg` est la section `upnp` de `runtime.json`, `ports` les trois couples
-    `(port, protocole)` fournis par l'appelant, `target` la cible de la découverte (`None` :
-    le groupe SSDP). `cancel`, levé, arrête l'ouverture à la frontière de requête suivante.
-    `cleared` liste les couples dont cette ouverture a confirmé l'absence sur cette passerelle.
-    Aucune exception ne sort.
+    `(port externe, protocole)` fournis par l'appelant, `target` la cible de la découverte
+    (`None` : le groupe SSDP). `cancel`, levé, arrête l'ouverture à la frontière de requête
+    suivante. `cleared` liste les couples dont cette ouverture a confirmé l'absence sur cette
+    passerelle. `internal` (P9F7) donne, dans l'ordre, le port où chaque externe arrive (par
+    défaut le même) ; chaque dictionnaire du résultat le porte alors en `internal`. `fallback`
+    autorise un repli unique dans `fallback_range` quand la box rend 718. Aucune exception ne sort.
     """
     couples = _couples(ports)
+    if internal is not None and not _internal_ok(internal):
+        return _invalid("ports", couples), None, []
+    internal = None if internal is None else list(internal)
     invalid = validate(cfg, couples)
     if invalid is not None:
+        if couples and internal is not None and len(couples) == len(internal):
+            return _invalid(invalid["key"], couples, internal), None, []
         return invalid, None, []
     if not _ports_ok(couples):
         return _invalid("ports", couples), None, []
@@ -1060,15 +1352,15 @@ def open_ports(
             gateway, failure = find_gateway(cfg, target or (SSDP_GROUP, SSDP_PORT), cancel)
         if gateway is None:
             result = {**(failure or {"status": NO_GATEWAY})}
-            result["ports"] = _as_dicts(couples)
-            result["manual"] = manual_instruction(couples)
+            result["ports"] = _as_dicts(couples, internal)
+            result["manual"] = manual_instruction(couples, internal)
             return result, None, []
-        result, cleared = _open(gateway, cfg, couples, cancel)
+        result, cleared = _open(gateway, cfg, couples, cancel, internal, fallback)
     except (*PARSE_ERRORS, TypeError, KeyError) as exc:
         # `PARSE_ERRORS` couvre `ArithmeticError` : une erreur numérique devient un résultat.
         log.info("upnp: opening failed (%s)", type(exc).__name__)
-        result = {"status": NO_GATEWAY, "reason": UNREADABLE, "ports": _as_dicts(couples)}
-        result["manual"] = manual_instruction(couples)
+        result = {"status": NO_GATEWAY, "reason": UNREADABLE, "ports": _as_dicts(couples, internal)}
+        result["manual"] = manual_instruction(couples, internal)
         return result, None, []
     log.info("upnp: opening ended (%s)", result["status"])
     return result, gateway, cleared
@@ -1108,6 +1400,8 @@ class Lease:
     deadline: float
     expires_at: float
     description: str
+    # Port interne où arrive le couple (P9F7) ; `None` : le même que le port externe.
+    internal: int | None = None
 
 
 @dataclass
@@ -1150,6 +1444,7 @@ def _owner(gateway: Gateway, lease: Lease, timeout_s: float, max_bytes: int) -> 
     `NewInternalClient` de l'ajout), au même port interne, avec notre description.
     """
     port, protocol = lease.couple
+    inner = port if lease.internal is None else lease.internal
     args = [("NewRemoteHost", ""), ("NewExternalPort", port), ("NewProtocol", protocol)]
     answer = _soap(gateway, "GetSpecificPortMappingEntry", lambda _local: args, timeout_s, max_bytes)
     if answer.failure == UPNP_ERROR and answer.code == NO_SUCH_ENTRY:
@@ -1169,7 +1464,7 @@ def _owner(gateway: Gateway, lease: Lease, timeout_s: float, max_bytes: int) -> 
     # comparée de même (revue P9F3 A2), sinon un mapping à nous passerait pour celui d'un tiers.
     ours = (
         client == answer.local
-        and internal == str(port)
+        and internal == str(inner)
         and description == lease.description.strip()
     )
     return STILL_OURS if ours else OTHER_OWNER
@@ -1246,9 +1541,14 @@ class Ledger:
         else:
             active = []
         couples: list[Couple] = []
+        inner_of: dict[Couple, int] = {}
         for item in active if isinstance(active, list) else []:
             if isinstance(item, dict):
-                couples.extend(_couples([(item.get("port"), item.get("protocol"))]) or [])
+                found = _couples([(item.get("port"), item.get("protocol"))]) or []
+                couples.extend(found)
+                inner = item.get("internal")
+                if found and _positive_int(inner) and inner in PORT_RANGE:
+                    inner_of[found[0]] = inner
         with self._lock:
             if status == MAPPED:
                 self._proposal_deadline = deadline
@@ -1260,7 +1560,8 @@ class Ledger:
             for couple in couples:
                 if _couple_ok(couple):
                     self._entries[(gateway.box, couple)] = Lease(
-                        gateway.box, couple, gateway, deadline, expires_at, description
+                        gateway.box, couple, gateway, deadline, expires_at, description,
+                        inner_of.get(couple),
                     )
 
     def retain(
@@ -1292,8 +1593,12 @@ class Ledger:
         *,
         expires_at: float,
         description: str,
+        internal: dict | None = None,
     ) -> None:
         """Retient `couples` comme peut-être posés sur `gateway`, sans jamais les présumer à nous.
+
+        `internal` (P9F7) : `{couple: port interne}` des couples qui n'arrivent pas sur le même
+        port, pour que la vérification de l'arrêt reconnaisse le mapping comme le nôtre.
 
         Filet d'une fusion en échec (revue P9F3 A1) : l'issue réelle de l'ouverture est inconnue,
         et un couple jamais touché peut appartenir à un autre appareil. Chaque couple entre donc
@@ -1306,7 +1611,8 @@ class Ledger:
                 key = (gateway.box, couple)
                 if _couple_ok(couple) and key not in self._entries:
                     self._entries[key] = Lease(
-                        gateway.box, couple, gateway, -math.inf, expires_at, description
+                        gateway.box, couple, gateway, -math.inf, expires_at, description,
+                        (internal or {}).get(couple),
                     )
 
     def release(self, request_timeout_s: float, max_bytes: int, deadline: float) -> Released:

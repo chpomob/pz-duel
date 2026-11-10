@@ -177,6 +177,23 @@ de ports, ni DMZ, ni autre port.
   et protocoles. Faites-le comme décrit ci-dessus, puis saisissez votre adresse publique. Un échec ne
   bloque jamais le duel : vous pouvez le lancer quand même.
 
+#### Box françaises et plage haute de ports
+
+Les box françaises (Freebox, SFR, Bbox ; Livebox en IPv4 partagée) réservent les ports sous 49152 :
+une Freebox répond `718 ConflictInMappingEntry` à toute demande UPnP sous 49152, même sur un port
+libre. PZ Duel ne demande donc pas 17271, 17272 et 17280 à la box : il ouvre des ports **externes**
+dans la plage haute, par défaut **49271/UDP, 49272/UDP et 49280/TCP** (`upnp_ports.external_ports` dans
+`service/runtime.json`), et les redirige vers les ports où le jeu écoute toujours (17271, 17272,
+17280). Si la box répond encore `718`, PZ Duel réessaie une seule fois avec trois ports de
+`upnp_ports.fallback_range` (49152-50175 par défaut), jamais plus ; un port de cette plage déjà
+utilisé par un autre appareil sur la box est sauté, jamais écrasé. Dès qu'une ouverture a été tentée,
+l'invitation, le lien et le `.bat` portent les ports externes réellement ouverts. Si ta box refuse
+quand même, le lobby affiche la correspondance à saisir à la main : `49271 -> 17271/UDP`,
+`49272 -> 17272/UDP`, `49280 -> 17280/TCP`. Un port externe configuré sous 49152 est accepté, mais le
+lobby avertit que la plupart des box françaises le refuseront. Si l'adresse saisie, ou celle que
+donne la box, est privée ou partagée (`10.0.0.0/8`, `100.64.0.0/10`, `192.168.0.0/16`…), le lobby le
+dit au-dessus du bouton : aucune redirection ne rendra le duel joignable depuis Internet.
+
 ### Ne diffusez jamais le `.bat`
 
 **Ne publiez pas et ne diffusez pas le `.bat`.** Il contient votre adresse et le mot de passe du serveur

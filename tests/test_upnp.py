@@ -136,7 +136,8 @@ def ac12_audit(monkeypatch):
 
 
 def _cfg(**overrides: object) -> dict:
-    cfg = dict(load_runtime()["upnp"])
+    """Section `upnp` livrée, complétée par `upnp_ports` (P9F7) comme le moteur la passe."""
+    cfg = dict(upnp.merged_config(load_runtime()))
     cfg.update(overrides)
     return cfg
 
@@ -1041,8 +1042,20 @@ def _aimed(igd: FakeIGD):
 
 
 def _engine_ports(rig) -> list[tuple[int, str]]:
+    """Les trois couples externes que le moteur ouvre (P9F7) : `upnp.external_ports`."""
+    return upnp.external_couples(upnp.merged_config(rig.runtime))
+
+
+def _engine_internal(rig) -> list[int]:
+    """Les ports internes où le jeu écoute : ceux du camp B et le port de partage."""
     guest = rig.runtime["ports"]["B"]
-    return [(guest["game"], "UDP"), (guest["udp"], "UDP"), (rig.runtime["share_port"], "TCP")]
+    return [guest["game"], guest["udp"], rig.runtime["share_port"]]
+
+
+def _edicts(rig, couples) -> list[dict]:
+    """`_dicts` d'un résultat du moteur : chaque couple porte son port interne (P9F7)."""
+    inner = dict(zip(_engine_ports(rig), _engine_internal(rig)))
+    return [{"port": p, "protocol": t, "internal": inner[(p, t)]} for p, t in couples]
 
 
 def _wait_opening(engine: Engine, timeout_s: float = ENGINE_WAIT_S) -> dict:
@@ -1197,7 +1210,7 @@ def test_ac15_mapped_state_carries_ports_and_expiry(upnp_rig, igd):
     lease = upnp_rig.runtime["upnp"]["lease_s"]
     ports = _engine_ports(upnp_rig)
     assert opening["status"] == "mapped"
-    assert opening["ports"] == _dicts(ports)
+    assert opening["ports"] == _edicts(upnp_rig, ports)
     assert opening["lease_s"] == lease
     assert before + lease - 2 <= opening["expires_at"] <= after + lease + 2
     assert set(igd.mappings) == set(ports)
@@ -1214,7 +1227,8 @@ def test_ac15_no_gateway_state_carries_manual_text(upnp_rig, igd):
 
 
 def test_ac15_refused_718_state_carries_code_and_manual_text(upnp_rig, igd):
-    igd.configure(errors={("AddPortMapping", 3): 718})
+    # 718 au 3ᵉ ajout, puis au 3ᵉ ajout du repli (P9F7) : les deux tentatives échouent.
+    igd.configure(errors={("AddPortMapping", 3): 718, ("AddPortMapping", 6): 718})
     lobby = Lobby(upnp_rig, "demo")
     opening, _, _ = _click(lobby.engine)
     assert opening["status"] == "refused" and opening["error_code"] == 718
@@ -1249,7 +1263,7 @@ def test_ac17_failed_opening_leaves_invite_and_duel_untouched(upnp_rig, igd, fai
     if failure == "no_gateway":
         igd.configure(ssdp_reply=False)
     else:
-        igd.configure(errors={("AddPortMapping", 3): 718})
+        igd.configure(errors={("AddPortMapping", 3): 718, ("AddPortMapping", 6): 718})
     duel = Duel(upnp_rig)
     invite = duel.state()["invite"]
     opening, _, _ = _click(duel.engine)
@@ -1264,7 +1278,7 @@ def test_ac18_state_without_click_only_adds_neutral_opening(upnp_rig, igd):
     engine = upnp_rig.build()
     neutral = {
         "status": "idle",
-        "ports": _dicts(_engine_ports(upnp_rig)),
+        "ports": _edicts(upnp_rig, _engine_ports(upnp_rig)),
         "lease_s": upnp_rig.runtime["upnp"]["lease_s"],
     }
     state = engine.snapshot()
@@ -1383,7 +1397,7 @@ def test_ac24_nothing_active_sends_nothing_at_shutdown(upnp_rig, igd, socket_gua
         engine.runtime = {**engine.runtime, "upnp": {**engine.runtime["upnp"], "lease_s": 0}}
         assert not engine.open_ports()[0]
     elif case == "refused_empty":
-        igd.configure(errors={("AddPortMapping", 3): 718})
+        igd.configure(errors={("AddPortMapping", 3): 718, ("AddPortMapping", 6): 718})
         opening = _click(engine)[0]
         assert opening["status"] == "refused" and opening["still_active"] == []
     before = _traffic(igd, socket_guard)
@@ -1402,7 +1416,8 @@ def test_ac25_runtime_copy_changes_the_arguments(upnp_rig, igd):
     lobby = Lobby(rig, "demo")
     assert _click(lobby.engine)[0]["status"] == "mapped"
     ports = _engine_ports(rig)
-    assert ports[2][0] == rig.runtime["share_port"]
+    assert _engine_internal(rig)[2] == rig.runtime["share_port"]
+    assert [int(c.args["NewInternalPort"]) for c in igd.actions("AddPortMapping")] == _engine_internal(rig)
     assert sorted(igd.couples("AddPortMapping")) == sorted(ports)
     for call in igd.actions("AddPortMapping"):
         assert call.args["NewLeaseDuration"] == "3600"
@@ -1416,7 +1431,7 @@ def test_ac32_engine_retains_two_and_deletes_them_at_shutdown(upnp_rig, igd):
     igd.configure(errors={("AddPortMapping", 3): 718}, silent_from=7)
     opening = _click(lobby.engine)[0]
     assert opening["status"] == "refused" and opening["error_code"] == 718
-    assert opening["still_active"] == _dicts(ports[:2])
+    assert opening["still_active"] == _edicts(upnp_rig, ports[:2])
     assert set(_retained(lobby.engine)) == set(ports[:2])
     igd.set_responsive()
     seen = len(igd.actions("DeletePortMapping"))
@@ -1431,7 +1446,7 @@ def test_ac33_engine_retries_the_possibly_placed_mapping_at_shutdown(upnp_rig, i
     igd.configure(silent_from=2)
     opening = _click(lobby.engine)[0]
     assert opening["status"] == "refused" and opening["failure"] == "timeout"
-    assert opening["still_active"] == _dicts(ports[:1])
+    assert opening["still_active"] == _edicts(upnp_rig, ports[:1])
     assert igd.couples("DeletePortMapping") == [ports[0], ports[0]]
     started = time.monotonic()
     lobby.engine.shutdown()
@@ -1469,7 +1484,8 @@ def test_retention_survives_a_later_invalid_config(upnp_rig, igd):
 def test_retention_is_cleared_by_a_confirmed_rollback(upnp_rig, igd):
     lobby = Lobby(upnp_rig, "demo")
     assert _click(lobby.engine)[0]["status"] == "mapped"
-    igd.configure(errors={("AddPortMapping", 6): 718})
+    # 718 au 3ᵉ ajout de ce clic, puis au 3ᵉ ajout de son repli (P9F7).
+    igd.configure(errors={("AddPortMapping", 6): 718, ("AddPortMapping", 9): 718})
     opening = _click(lobby.engine)[0]
     assert opening["status"] == "refused" and opening["error_code"] == 718
     assert opening["still_active"] == []
@@ -1698,9 +1714,9 @@ def test_c1_opening_merged_after_the_shutdown_copy_removes_its_own_mappings(upnp
     real_open = upnp.open_ports
     gate = threading.Event()
 
-    def late_open(cfg, couples, target, cancel):
+    def late_open(cfg, couples, target, cancel, **kwargs):
         # Le réseau est fait, mais la fusion n'arrive qu'après la copie de l'arrêt.
-        outcome = real_open(cfg, couples, target, None)
+        outcome = real_open(cfg, couples, target, None, **kwargs)
         gate.wait(ENGINE_WAIT_S)
         return outcome
 
@@ -1823,7 +1839,7 @@ def test_c5_expired_mapping_is_neither_shown_nor_proposed(upnp_rig, igd):
     assert view == {
         "status": "idle",
         "expired": True,
-        "ports": _dicts(_engine_ports(upnp_rig)),
+        "ports": _edicts(upnp_rig, _engine_ports(upnp_rig)),
         "lease_s": upnp_rig.runtime["upnp"]["lease_s"],
     }
     assert PUBLIC not in json.dumps(view)
@@ -1941,8 +1957,8 @@ def _gated_open(monkeypatch, gate: threading.Event):
     real_open = upnp.open_ports
     returned = threading.Event()
 
-    def late_open(cfg, couples, target, cancel):
-        outcome = real_open(cfg, couples, target, None)
+    def late_open(cfg, couples, target, cancel, **kwargs):
+        outcome = real_open(cfg, couples, target, None, **kwargs)
         gate.wait(4 * ENGINE_WAIT_S)
         returned.set()
         return outcome
@@ -2531,8 +2547,10 @@ def test_p9f3_merge_failure_publishes_a_terminal_status_and_retains_the_couples(
     monkeypatch.setattr(engine.state, "log", failing_log)
     opening = _click(engine)[0]
     assert opening["status"] == "refused" and opening["failure"] == "unreadable"
-    assert opening["still_active"] == _dicts(ports)
-    assert set(_retained(engine)) == set(ports)
+    assert opening["still_active"] == _edicts(upnp_rig, ports)
+    # Le repli (P9F7) a pu poser ses couples : eux aussi sont retenus, à vérifier avant retrait.
+    fallback = upnp.fallback_candidates(upnp.merged_config(upnp_rig.runtime), ports)
+    assert set(_retained(engine)) == set(ports) | set(fallback)
     ok, message = engine.open_ports()
     assert ok, message  # l'hôte peut réessayer
     _wait_opening(engine)
@@ -2607,13 +2625,15 @@ def test_p9f3_r1_a1_merge_failure_before_record_verifies_before_deleting(upnp_ri
     monkeypatch.setattr(engine._ports_ledger, "record", failing_record)
     opening = _click(engine)[0]
     assert opening["status"] == "refused" and opening["failure"] == "unreadable"
-    assert set(_retained(engine)) == set(ports)
+    # Les couples du repli (P9F7) sont retenus aussi : vérifiés, absents (714), jamais supprimés.
+    fallback = upnp.fallback_candidates(upnp.merged_config(upnp_rig.runtime), ports)
+    assert set(_retained(engine)) == set(ports) | set(fallback)
     taken = ports[-1]
     with igd.lock:
         igd.mappings[taken]["NewInternalClient"] = "10.9.9.9"
     seen = len(igd.actions("DeletePortMapping"))
     assert engine.shutdown()
-    assert len(igd.actions("GetSpecificPortMappingEntry")) == 3
+    assert len(igd.actions("GetSpecificPortMappingEntry")) == len(ports) + len(fallback)
     assert sorted(_deletes_after(igd, seen)) == sorted(ports[:-1])
     assert set(igd.mappings) == {taken}
 
@@ -2661,3 +2681,368 @@ def test_p9f3_r2_a3_malformed_ownership_answer_is_a_failure_not_foreign(fields):
         released = ledger.release(0.5, _cfg()["max_response_bytes"], upnp.deadline_in(5))
         assert released.foreign == [] and sorted(released.failed) == sorted(PORTS)
         assert igd.actions("DeletePortMapping") == []
+
+
+# -- P9F7 : ports externes dans la plage des box, repli sur 718, invitation qui les porte --------
+# Une Freebox rend 718 à tout `AddPortMapping` sous 49152 (mesuré le 2026-11-10).
+FREEBOX_REFUSED = range(1024, upnp.HIGH_RANGE_START)
+INTERNAL = [port for port, _ in PORTS]
+
+
+def _externals(**ports: int) -> dict:
+    return {**RUNTIME["upnp_ports"]["external_ports"], **ports}
+
+
+def test_p9f7_shipped_external_ports_are_in_the_high_range_and_internals_do_not_move():
+    """Mutation : remettre 17271/17272/17280 dans `external_ports` — la valeur livrée change."""
+    cfg = _cfg()
+    assert cfg["external_ports"] == {"udp_game": 49271, "udp_aux": 49272, "tcp_share": 49280}
+    assert cfg["fallback_range"] == [49152, 50175]
+    assert upnp.external_couples(cfg) == [(49271, "UDP"), (49272, "UDP"), (49280, "TCP")]
+    assert INTERNAL == [17271, 17272, 17280]
+    assert RUNTIME["managed_ini"]["UPnP"] == "false"
+    assert upnp.low_port_warning(cfg) is None
+    # Section dédiée : `upnp` garde ses cinq clés, et sans `upnp_ports` la clé fautive est nommée.
+    assert set(RUNTIME["upnp_ports"]) == {"external_ports", "fallback_range"}
+    assert "external_ports" not in RUNTIME["upnp"]
+    alone = upnp.merged_config({"upnp": RUNTIME["upnp"]})
+    assert upnp.validate(alone) == {"status": "invalid_config", "key": "upnp_ports.external_ports"}
+
+
+@pytest.mark.parametrize(
+    ("value", "key"),
+    [
+        (_externals(udp_game=1023), "upnp_ports.external_ports"),
+        (_externals(tcp_share=65536), "upnp_ports.external_ports"),
+        (_externals(udp_aux=49271), "upnp_ports.external_ports"),
+        (_externals(udp_game=True), "upnp_ports.external_ports"),
+        (_externals(udp_game="49271"), "upnp_ports.external_ports"),
+        ({"udp_game": 49271, "udp_aux": 49272}, "upnp_ports.external_ports"),
+        ([49271, 49272, 49280], "upnp_ports.external_ports"),
+    ],
+)
+def test_p9f7_external_ports_are_validated_like_the_other_settings(value, key, socket_guard):
+    """Mutation : retirer `"external_ports": _external_ports` des contrôles — `validate` accepte."""
+    cfg = _cfg(external_ports=value)
+    assert upnp.validate(cfg) == {"status": "invalid_config", "key": key}
+    result, gateway, _ = upnp.open_ports(cfg, PORTS, ("127.0.0.1", 9))
+    assert result["key"] == key and gateway is None
+    assert socket_guard.sends == [] and socket_guard.connects == []
+
+
+@pytest.mark.parametrize("value", [[49152], [49152, 49155], [50175, 49152], [1000, 2000], "49152-50175"])
+def test_p9f7_fallback_range_is_validated(value):
+    """Mutation : retirer `"fallback_range": _fallback_range` des contrôles — `validate` accepte."""
+    assert upnp.validate(_cfg(fallback_range=value)) == {
+        "status": "invalid_config",
+        "key": "upnp_ports.fallback_range",
+    }
+
+
+def test_p9f7_low_external_port_is_a_warning_not_an_error():
+    """Mutation : `low_port_warning` qui rend toujours `None` — aucun avertissement ; ou refuser
+    sous 49152 dans `validate` — la configuration permissive devient invalide."""
+    cfg = _cfg(external_ports=_externals(udp_game=17271, tcp_share=40000))
+    assert upnp.validate(cfg) is None
+    warning = upnp.low_port_warning(cfg)
+    assert warning is not None
+    assert "17271, 40000" in warning and "49152" in warning and "49272" not in warning
+    assert upnp.low_port_warning(_cfg(external_ports=_externals(udp_game=49152))) is None
+
+
+def test_p9f7_fallback_couples_are_deterministic_and_skip_the_refused_ones():
+    """Mutation : ne pas sauter les couples déjà refusés — le repli redemande un port refusé."""
+    cfg = _cfg(fallback_range=[49271, 49290])
+    refused = [(49271, "UDP"), (49272, "UDP"), (49280, "TCP")]
+    assert upnp.fallback_couples(cfg, refused) == [(49273, "UDP"), (49274, "UDP"), (49275, "TCP")]
+    assert upnp.fallback_couples(_cfg(), refused) == [(49152, "UDP"), (49153, "UDP"), (49154, "TCP")]
+    assert upnp.fallback_couples(_cfg(), refused) == upnp.fallback_couples(_cfg(), refused)
+
+
+def test_p9f7_mapping_goes_from_external_to_internal_port():
+    """Mutation : `NewInternalPort` égal au port externe dans `_add` — 49271 arrive sur 49271."""
+    couples = upnp.external_couples(_cfg())
+    with FakeIGD() as igd:
+        result, _, _ = upnp.open_ports(
+            _cfg(**FAST), couples, igd.ssdp_target, internal=INTERNAL, fallback=True
+        )
+        assert result["status"] == "mapped"
+        assert result["ports"] == [
+            {"port": 49271, "protocol": "UDP", "internal": 17271},
+            {"port": 49272, "protocol": "UDP", "internal": 17272},
+            {"port": 49280, "protocol": "TCP", "internal": 17280},
+        ]
+        pairs = [(c.args["NewExternalPort"], c.args["NewInternalPort"]) for c in igd.actions("AddPortMapping")]
+        assert pairs == [("49271", "17271"), ("49272", "17272"), ("49280", "17280")]
+
+
+def test_p9f7_fake_igd_refuses_718_on_a_range_and_accepts_another():
+    """Le double : 718 sur la plage basse sans aucune entrée (714 à la relecture), succès au-dessus."""
+    with FakeIGD(conflict_ports=FREEBOX_REFUSED) as igd:
+        status, body = _soap(igd, "AddPortMapping", _mapping(17271, "UDP"))
+        assert status == 500 and b"<errorCode>718</errorCode>" in body
+        status, body = _soap(igd, "GetSpecificPortMappingEntry", {"NewRemoteHost": "", "NewExternalPort": "17271", "NewProtocol": "UDP"})
+        assert status == 500 and b"<errorCode>714</errorCode>" in body
+        status, _ = _soap(igd, "AddPortMapping", _mapping(49152, "UDP"))
+        assert status == 200 and (49152, "UDP") in igd.mappings
+
+
+def test_p9f7_718_on_configured_ports_falls_back_once_into_the_high_range():
+    """Mutation : retirer le repli de `_open` — l'ouverture reste `refused` 718 sur 17271."""
+    couples = list(PORTS)  # externes configurés sous 49152, comme avant P9F7
+    with FakeIGD(conflict_ports=FREEBOX_REFUSED) as igd:
+        result, _, _ = upnp.open_ports(
+            _cfg(**FAST), couples, igd.ssdp_target, internal=INTERNAL, fallback=True
+        )
+        assert result["status"] == "mapped"
+        assert [(p["port"], p["internal"]) for p in result["ports"]] == [
+            (49152, 17271), (49153, 17272), (49154, 17280),
+        ]
+        assert [p["port"] for p in result["first_refused"]] == INTERNAL
+        assert set(igd.mappings) == {(49152, "UDP"), (49153, "UDP"), (49154, "TCP")}
+        adds = igd.couples("AddPortMapping")
+        assert adds == [(17271, "UDP"), (49152, "UDP"), (49153, "UDP"), (49154, "TCP")]
+
+
+def test_p9f7_two_attempts_at_most_then_refused_with_code_and_correspondence():
+    """Mutation : réessayer tant que la box rend 718 — plus de deux tentatives d'ajout."""
+    couples = upnp.external_couples(_cfg())
+    with FakeIGD(conflict_ports=range(1024, 65536)) as igd:
+        result, _, _ = upnp.open_ports(
+            _cfg(**FAST), couples, igd.ssdp_target, internal=INTERNAL, fallback=True
+        )
+        assert result["status"] == "refused"
+        assert result["error_code"] == 718 and result["error_text"] == "ConflictInMappingEntry"
+        assert len(igd.actions("AddPortMapping")) == 2
+        assert igd.mappings == {}
+        assert "49271 -> 17271/UDP" in result["manual"]
+        assert [p["port"] for p in result["fallback_tried"]] == [49152, 49153, 49154]
+
+
+def test_p9f7_r1_a2_fallback_skips_a_candidate_held_by_another_device():
+    """Mutation : `_open` qui prend `fallback_couples` sans lire la box — le mapping de l'autre
+    appareil sur 49152/UDP est supprimé puis remplacé par le nôtre."""
+    foreign = {"NewInternalClient": "10.9.9.9", "NewInternalPort": "5000",
+               "NewPortMappingDescription": "console", "NewEnabled": "1", "NewLeaseDuration": "0"}
+    with FakeIGD(conflict_ports=FREEBOX_REFUSED) as igd:
+        _seed(igd, (49152, "UDP"), **foreign)
+        result, _, _ = upnp.open_ports(
+            _cfg(**FAST), list(PORTS), igd.ssdp_target, internal=INTERNAL, fallback=True
+        )
+        assert result["status"] == "mapped"
+        # Le couple 0 prend son candidat suivant (rang 3) ; les autres gardent le leur.
+        assert [p["port"] for p in result["ports"]] == [49155, 49153, 49154]
+        assert igd.mappings[(49152, "UDP")] == foreign
+        assert (49152, "UDP") not in igd.couples("DeletePortMapping")
+        assert (49152, "UDP") not in igd.couples("AddPortMapping")
+
+
+def test_p9f7_r1_a2_no_fallback_when_a_couple_has_no_free_candidate():
+    """Mutation : traiter un candidat illisible ou pris comme libre — le repli écrase un tiers."""
+    foreign = {"NewInternalClient": "10.9.9.9", "NewInternalPort": "5000",
+               "NewPortMappingDescription": "console", "NewEnabled": "1", "NewLeaseDuration": "0"}
+    with FakeIGD(conflict_ports=FREEBOX_REFUSED) as igd:
+        held = [(port, "UDP") for port in (49152, 49155, 49158)]
+        for couple in held:
+            _seed(igd, couple, **foreign)
+        result, _, _ = upnp.open_ports(
+            _cfg(**FAST), list(PORTS), igd.ssdp_target, internal=INTERNAL, fallback=True
+        )
+        assert result["status"] == "refused" and result["error_code"] == 718
+        assert len(igd.actions("AddPortMapping")) == 1
+        assert len(igd.actions("GetSpecificPortMappingEntry")) == upnp.FALLBACK_TRIES
+        assert all(igd.mappings[c] == foreign for c in held)
+
+
+def test_p9f7_r1_a2_fallback_candidates_are_dealt_one_port_per_couple():
+    """Chaque candidat sert un seul couple : son protocole et son port interne sont connus."""
+    cfg = _cfg(fallback_range=[49152, 50175])
+    refused = [(49271, "UDP"), (49272, "UDP"), (49280, "TCP")]
+    candidates = upnp.fallback_candidates(cfg, refused, [1, 2, 3])
+    assert len(candidates) == upnp.FALLBACK_TRIES * 3
+    assert candidates[(49152, "UDP")] == 1 and candidates[(49155, "UDP")] == 1
+    assert candidates[(49153, "UDP")] == 2 and candidates[(49154, "TCP")] == 3
+    assert len({port for port, _ in candidates}) == len(candidates)
+    assert upnp.fallback_couples(cfg, refused) == [
+        (49152, "UDP"), (49153, "UDP"), (49154, "TCP"),
+    ]
+
+
+def test_p9f7_no_fallback_without_the_caller_asking():
+    """Le repli est demandé par l'appelant (le moteur) : sans lui, un seul essai, comme avant."""
+    with FakeIGD(conflict_ports=FREEBOX_REFUSED) as igd:
+        result, _, _ = _open(igd)
+        assert result["status"] == "refused" and result["error_code"] == 718
+        assert len(igd.actions("AddPortMapping")) == 1
+
+
+def test_p9f7_no_fallback_when_the_first_rollback_left_a_mapping():
+    """Mutation : retirer `not result["still_active"]` — un repli s'ajoute à un mapping non retiré."""
+    couples = upnp.external_couples(_cfg())
+    with FakeIGD(errors={("AddPortMapping", 3): 718, ("DeletePortMapping", 4): 501}) as igd:
+        result, _, _ = upnp.open_ports(
+            _cfg(**FAST), couples, igd.ssdp_target, internal=INTERNAL, fallback=True
+        )
+        assert result["status"] == "refused" and result["error_code"] == 718
+        assert result["still_active"] == [{"port": 49271, "protocol": "UDP", "internal": 17271}]
+        assert len(igd.actions("AddPortMapping")) == 3
+
+
+# -- P9F7, moteur ----------------------------------------------------------------------------
+def _join_port(engine: Engine) -> int:
+    """Le port que le `.bat` produit donne à `+connect`, lu dans le fichier lui-même."""
+    from test_share import join_line
+
+    return join_line(engine.guest_launcher())[1]
+
+
+def test_p9f7_engine_opens_the_external_ports_towards_the_internal_ones(upnp_rig, igd):
+    """Mutation : `_upnp_ports` rend les ports internes — la box reçoit 17271 et le refuse."""
+    igd.configure(conflict_ports=FREEBOX_REFUSED)
+    lobby = Lobby(upnp_rig, "demo")
+    opening = _click(lobby.engine)[0]
+    assert opening["status"] == "mapped"
+    assert opening["ports"] == _edicts(upnp_rig, _engine_ports(upnp_rig))
+    internal = [int(c.args["NewInternalPort"]) for c in igd.actions("AddPortMapping")]
+    assert internal == _engine_internal(upnp_rig)
+    assert [p for p, _ in igd.couples("AddPortMapping")] == [49271, 49272, 49280]
+
+
+def test_p9f7_invite_and_bat_carry_the_external_port_really_opened(upnp_rig, igd):
+    """Mutation : `_invite_fields` garde le port interne — le `.bat` vise 17271 que nul n'ouvre ;
+    ou `_live_externals` rend les externes configurés — le `.bat` vise 49271, refusé par la box."""
+    igd.configure(conflict_ports=range(49250, 49300))  # 49271… refusés, le repli 49200… accepté
+    rig = upnp_rig
+    rig.runtime["upnp_ports"] = {**rig.runtime["upnp_ports"], "fallback_range": [49200, 49300]}
+    lobby = Lobby(rig, "demo")
+    engine = lobby.engine
+    assert engine.set_invite_address(ENTERED)[0]
+    opening = _click(engine)[0]
+    assert opening["status"] == "mapped"
+    assert [p["port"] for p in opening["ports"]] == [49200, 49201, 49202]
+    invite = lobby.state()["invite"]
+    assert invite["port"] == 49200
+    assert _join_port(engine) == 49200
+    assert f"{ENTERED}:49202/" in invite["link"]
+    assert "49200 -> " in invite["scope_text"]
+
+
+def test_p9f7_failed_opening_puts_configured_externals_and_the_correspondence(upnp_rig, igd):
+    """Mutation : ne pas reconstruire l'invitation après l'essai — elle garde 17271 (interne)."""
+    igd.configure(ssdp_reply=False)
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    assert engine.set_invite_address(ENTERED)[0]
+    internal = _engine_internal(upnp_rig)
+    assert lobby.state()["invite"]["port"] == internal[0]  # avant tout essai : redirection à la main
+    opening = _click(engine)[0]
+    assert opening["status"] == "no_gateway"
+    invite = lobby.state()["invite"]
+    assert invite["port"] == 49271 and _join_port(engine) == 49271
+    for text in (invite["scope_text"], opening["manual"]):
+        assert f"49271 -> {internal[0]}/UDP" in text
+        assert f"49272 -> {internal[1]}/UDP" in text
+        assert f"49280 -> {internal[2]}/TCP" in text
+
+
+def test_p9f7_local_network_invite_keeps_the_internal_port(upnp_rig, igd):
+    """Sur le réseau local rien ne traduit les ports : l'adresse détectée garde l'interne."""
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    invite = lobby.state()["invite"]
+    assert invite["scope"] == "lan"
+    assert invite["port"] == _engine_internal(upnp_rig)[0]
+
+
+def test_p9f7_low_configured_external_is_warned_in_the_view(upnp_rig, igd):
+    """Mutation : retirer `view["warning"]` de `_ports_view` — l'hôte n'est pas averti."""
+    rig = upnp_rig
+    rig.runtime["upnp_ports"] = {**rig.runtime["upnp_ports"], "external_ports": _externals(udp_game=17271)}
+    engine = rig.build()
+    view = engine.snapshot()["ports_opening"]
+    assert "17271" in view["warning"] and "49152" in view["warning"]
+    assert view["ports"][0] == {"port": 17271, "protocol": "UDP", "internal": _engine_internal(rig)[0]}
+    rig.runtime["upnp_ports"] = {**rig.runtime["upnp_ports"], "external_ports": _externals()}
+    assert "warning" not in engine.snapshot()["ports_opening"]
+
+
+@pytest.mark.parametrize("address", ["100.64.1.2", "10.1.2.3", "192.168.1.20"])
+def test_p9f7_not_public_entered_address_is_said_before_any_opening(upnp_rig, igd, address):
+    """Mutation : retirer `not_public` de `_ports_view` — l'annonce n'arrive qu'après l'échec."""
+    lobby = Lobby(upnp_rig, "demo")
+    assert lobby.engine.set_invite_address(address)[0]
+    view = lobby.state()["ports_opening"]
+    assert view["status"] == "idle"
+    assert "no port forwarding will make the duel reachable from the Internet" in view["not_public"]
+    assert igd.calls == [] and igd.msearches == []
+    assert lobby.engine.set_invite_address("82.64.1.2")[0]
+    assert "not_public" not in lobby.state()["ports_opening"]
+
+
+def test_p9f7_router_not_public_address_is_said_before_the_next_try(upnp_rig, igd, caplog):
+    """Mutation : ne pas retenir `_router_not_public` — le second essai n'est plus précédé de l'annonce."""
+    caplog.set_level(logging.DEBUG)
+    igd.configure(external_ip="100.64.7.7")
+    lobby = Lobby(upnp_rig, "demo")
+    assert "not_public" not in lobby.state()["ports_opening"]
+    opening = _click(lobby.engine)[0]
+    assert opening["status"] == "mapped" and opening["address"] is None
+    assert "No port forwarding" in opening["address_note"]
+    view = lobby.state()["ports_opening"]
+    assert "carrier-grade NAT" in view["not_public"]
+    assert "100.64.7.7" not in caplog.text
+    assert "100.64.7.7" not in json.dumps(lobby.engine.snapshot()["logs"])
+
+
+def test_p9f7_r1_a3_public_address_clears_the_router_not_public_note(upnp_rig, igd):
+    """Mutation : ne jamais remettre `_router_not_public` à faux — après une box corrigée,
+    l'annonce « aucune redirection » reste à côté d'une adresse publique."""
+    igd.configure(external_ip="100.64.7.7")
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    assert "not_public" in lobby.state()["ports_opening"]
+    igd.configure(external_ip="5.6.7.8")
+    opening = _click(lobby.engine)[0]
+    assert opening["status"] == "mapped" and opening["address"] == "5.6.7.8"
+    assert "not_public" not in lobby.state()["ports_opening"]
+
+
+def test_p9f7_r1_a3_unknown_address_keeps_the_router_not_public_note(upnp_rig, igd):
+    """Une adresse que la box ne rend pas ne tranche pas : le constat précédent reste."""
+    igd.configure(external_ip="100.64.7.7")
+    lobby = Lobby(upnp_rig, "demo")
+    assert _click(lobby.engine)[0]["status"] == "mapped"
+    igd.configure(external_ip=None)
+    assert _click(lobby.engine)[0]["address"] is None
+    assert "not_public" in lobby.state()["ports_opening"]
+
+
+def test_p9f7_r1_a1_retry_failing_after_a_fallback_rebuilds_the_invitation(upnp_rig, igd):
+    """Mutation : comparer à `_invite_externals()` lu après `in_progress` — le second essai, en
+    échec, rend les externes configurés comme « avant » et l'invitation garde 49200, retiré."""
+    igd.configure(conflict_ports=range(49250, 49300))
+    rig = upnp_rig
+    rig.runtime["upnp_ports"] = {**rig.runtime["upnp_ports"], "fallback_range": [49200, 49300]}
+    lobby = Lobby(rig, "demo")
+    engine = lobby.engine
+    assert engine.set_invite_address(ENTERED)[0]
+    assert _click(engine)[0]["status"] == "mapped"
+    assert lobby.state()["invite"]["port"] == 49200
+    igd.configure(conflict_ports=range(1024, 65536))  # configurés et repli refusés
+    opening = _click(engine)[0]
+    assert opening["status"] == "refused" and opening["error_code"] == 718
+    assert (49200, "UDP") not in igd.mappings
+    invite = lobby.state()["invite"]
+    assert invite["port"] == 49271 and _join_port(engine) == 49271
+    assert f"{ENTERED}:49280/" in invite["link"]
+
+
+def test_p9f7_expired_lease_with_translated_port_is_still_recognised_as_ours(upnp_rig, igd):
+    """Mutation : `_owner` compare `NewInternalPort` au port externe — 49271 -> 17271 passe pour
+    celui d'un tiers et reste ouvert sur la box après l'arrêt."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    assert _click(engine)[0]["status"] == "mapped"
+    _at(engine, _lease_deadline(engine) + 1)
+    assert engine.shutdown()
+    assert igd.mappings == {}

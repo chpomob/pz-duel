@@ -436,6 +436,13 @@ function portsNamed(po) {
   return (po.ports || []).map((p) => `${p.port}/${p.protocol}`).join(', ');
 }
 
+// P9F7: the router opens the external port, the game listens on the internal one.
+// `49271 -> 17271/UDP` is what a host types into the router by hand.
+function portsMapping(list) {
+  return (list || []).map((p) => (Number.isInteger(p.internal) && p.internal !== p.port
+    ? `${p.port} -> ${p.internal}/${p.protocol}` : `${p.port}/${p.protocol}`)).join(', ');
+}
+
 function leaseText(s) {
   if (s % 3600 === 0) return `${s / 3600} h`;
   if (s % 60 === 0) return `${s / 60} min`;
@@ -484,9 +491,13 @@ function portsBlock() {
   const busy = po.status === 'in_progress';
   const label = busy ? 'Opening ports…'
     : `Open ports ${portsNamed(po)}${portsLease ? ` for ${leaseText(portsLease)}` : ''}`;
+  // Said before the button (P9F7): a private or carrier-grade NAT address cannot be reached.
+  const before = `${po.not_public ? `<p class="err" id="ports-not-public">${esc(po.not_public)}</p>` : ''}
+        ${po.warning ? `<p class="notice" id="ports-warning">${esc(po.warning)}</p>` : ''}`;
   let result = '';
   if (po.status === 'mapped') {
-    result = `<p class="hint">Ports ${esc(portsNamed(po))} are open until ${esc(expiryText(po.expires_at))}.</p>
+    result = `${po.first_refused ? `<p class="hint">Your router refused ports ${esc(portsNamed({ ports: po.first_refused }))}: PZ Duel opened these instead.</p>` : ''}
+      <p class="hint">Ports ${esc(portsMapping(po.ports))} are open until ${esc(expiryText(po.expires_at))}.</p>
       <p class="hint">${po.address ? `Suggested public address, as reported by the router (not verified, check it before you use it): ${esc(po.address)}` : esc(po.address_note || 'Public address not available.')}</p>`;
   } else if (['no_gateway', 'refused', 'invalid_config'].includes(po.status)) {
     result = `<p class="hint">Ports could not be opened automatically (${esc(portsReason(po))}).</p>
@@ -496,6 +507,7 @@ function portsBlock() {
     result = '<p class="hint">The lease of the earlier port opening has ended: the ports are no longer reported as open.</p>';
   }
   return `<div class="ports ${esc(po.status || '')}">
+        ${before}
         <div class="actions"><button class="ghost" data-action="open-ports" ${busy ? 'disabled' : ''}>${esc(label)}</button></div>
         ${result}
       </div>`;
