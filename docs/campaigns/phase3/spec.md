@@ -25,6 +25,12 @@ targets:
     description: "Reçoit les tests d'écran d'AC27 et AC28, à côté des assertions d'écran existantes qui lisent `ui/app.js` par `ui_script()` : bouton d'ouverture présent dans le lobby d'un duel réel et absent en mode simulé, pré-remplissage du champ `#f-address` (vide rempli, saisie existante conservée), textes de résultat (consigne manuelle après `no_gateway`/`refused`, heure d'expiration après `mapped`)"
   - file: tests/test_api_security.py
     description: "La nouvelle route entre dans `Handler.POST_ROUTES`, donc dans les balayages existants Origin/Host ; ajout des cas propres à la route : `Content-Type` non JSON et méthode `GET` refusés sans aucun appel au faux IGD"
+  - file: tests/test_rules_load.py
+    description: "Reçoit l'assertion de la section `upnp` livrée par `runtime.json` (les 5 clés, leurs types et leurs bornes), à côté des contrôles existants du fichier de configuration"
+  - file: tests/test_modes.py
+    description: "Reçoit les cas de refus de l'action d'ouverture hors du lobby d'un duel réel (phases idle/running/ended, mode simulé), avec les doubles de serveurs existants"
+  - file: tests/doubles/run_service.py
+    description: "Le double de service apprend la nouvelle route d'ouverture, pour que les tests de l'API et du parcours complet puissent la poster sans vrai moteur"
   - file: README.md
     description: "Étape « Open ports » du lobby, ce qu'elle ouvre, et la consigne manuelle si elle échoue"
   - file: README.fr.md
@@ -289,3 +295,18 @@ au parcours d'aujourd'hui : la consigne manuelle reste, le duel en LAN marche co
   jamais, fait rendre `refused` (délai dépassé) ; il reçoit ensuite un `DeletePortMapping` pour ce
   couple (retrait du mapping possiblement posé), et, si ce retrait reste aussi sans réponse, l'arrêt
   du service lui envoie de nouveau exactement 1 `DeletePortMapping` pour ce couple.
+
+## Amendment A1 — trois fichiers de test ajoutés aux cibles (10/11/2026)
+
+Le plan dérivé de cette spécification touche trois fichiers qui ne figuraient pas dans `targets`, et
+chacun pour une raison mécanique, pas pour élargir le périmètre :
+
+- `tests/test_rules_load.py` : la nouvelle section `upnp` de `runtime.json` doit être assertée là où les
+  autres clés le sont déjà.
+- `tests/test_modes.py` : les refus hors lobby (R2) s'expriment avec les doubles de serveurs que ce
+  fichier possède déjà.
+- `tests/doubles/run_service.py` : le double de service doit connaître la nouvelle route, sinon les
+  tests d'API ne peuvent pas la poster sans vrai moteur.
+
+Aucune autre cible ne s'ajoute sans un nouvel amendement, et aucun critère d'acceptation n'est
+modifié, affaibli ou retiré par celui-ci.
