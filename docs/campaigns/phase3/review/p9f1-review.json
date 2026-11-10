@@ -1,0 +1,130 @@
+{
+ "constats": [
+  {
+   "id": "C1",
+   "corrige": "partiel",
+   "ou": "service/engine.py:2169",
+   "test": "test_c1_opening_merged_after_the_shutdown_copy_removes_its_own_mappings",
+   "mutation": "oui",
+   "commentaire": "_release_ports conserve un join borné avant la copie. _merge_opening détecte une fusion tardive et _run_opening effectue alors le retrait lui-même (lignes 2131 et 2090). Supprimer ce retrait fait échouer le test. Mais le test débloque volontairement la fusion avant la seconde attente : rien ne garantit que le fil démon ait terminé lorsque shutdown retourne."
+  },
+  {
+   "id": "C2",
+   "corrige": true,
+   "ou": "service/engine.py:2134",
+   "test": "test_c2_retention_is_indexed_by_gateway_and_couple",
+   "mutation": "oui",
+   "commentaire": "_merge_opening indexe par (_box(gateway), couple). _release_ports regroupe et retire les mappings de chaque passerelle (ligne 2181). Le test ouvre sur deux passerelles, exige six références puis vérifie les deux tableaux vides après arrêt ; revenir à une clé limitée au couple le fait échouer."
+  },
+  {
+   "id": "C3",
+   "corrige": "partiel",
+   "ou": "service/upnp.py:475",
+   "test": "test_c3_wan_service_outside_an_igd_tree_is_no_gateway",
+   "mutation": "oui",
+   "commentaire": "_find_service impose la hiérarchie IGD/WANDevice/WANConnectionDevice. Retirer cette validation fait échouer les tests C3. portsBlock présente aussi l'adresse comme non vérifiée (ui/app.js:445), assertion couverte par test_p9f1_c3_suggested_address_is_presented_as_not_verified. En revanche, aucune sélection de la passerelle attendue n'existe : find_gateway retient toujours le premier IGD valide. Aucun test ne départage deux IGD valides."
+  },
+  {
+   "id": "C4",
+   "corrige": "partiel",
+   "ou": "service/upnp.py:519",
+   "test": "test_c4_non_igd_responder_first_does_not_stop_the_search",
+   "mutation": "oui",
+   "commentaire": "_location filtre ST (ligne 183) et find_gateway poursuit après un candidat invalide ; revenir au premier candidat fait échouer le test. test_c4_candidates_are_tried_within_a_global_budget détecte également la suppression du budget appliqué aux descriptions. La pertinence entre plusieurs IGD valides reste absente, et la boucle interne de réception peut dépasser ce budget sous un flux de réponses ignorées."
+  },
+  {
+   "id": "C5",
+   "corrige": "partiel",
+   "ou": "service/engine.py:2029",
+   "test": "test_c5_expired_mapping_is_neither_shown_nor_proposed",
+   "mutation": "oui",
+   "commentaire": "_ports_view transforme le dernier mapped échu en idle/expired sans adresse ; supprimer cette garde fait échouer le test. prefillAddress et portsBlock traitent expired, avec des assertions statiques dans test_p9f1_c5_expired_opening_is_shown_and_its_proposal_taken_back. Mais une tentative ultérieure échouée remplace le mapped et fait perdre le signal d'expiration de sa proposition. La revanche conserve cet état ; son test existant couvre seulement un parcours sans ouverture."
+  },
+  {
+   "id": "C6",
+   "corrige": true,
+   "ou": "service/engine.py:2108",
+   "test": "test_c6_expiry_is_a_conservative_bound",
+   "mutation": "non",
+   "commentaire": "La documentation de _merge_opening qualifie explicitement click + lease_s de borne conservatrice. Le test vérifie cette inégalité et la présence de l'échéance dans les références retenues. Supprimer la documentation ajoutée pour C6 ne change aucune assertion : l'ancien calcul satisfaisait déjà l'inégalité. L'assertion sur les références teste C2/M1, pas la correction documentaire C6. L'exigence de mutation propre à ce constat n'est donc pas satisfaite."
+  },
+  {
+   "id": "C7",
+   "corrige": "partiel",
+   "ou": "service/upnp.py:573",
+   "test": "test_c7_malformed_ports_are_invalid_config_without_traffic",
+   "mutation": "oui",
+   "commentaire": "_couples protège l'itération et valide les types ; _ports_ok valide avant le set (ligne 662). Les tests test_c7_ports_ok_checks_types_before_building_a_set et test_c7_delete_mappings_never_raises_on_malformed_mappings détectent aussi le retrait de ces protections. Toutefois, le contrat général reste faux : certaines configurations numériques acceptées provoquent un OverflowError non intercepté."
+  },
+  {
+   "id": "C8",
+   "corrige": true,
+   "ou": "service/upnp.py:627",
+   "test": "test_c8_discovery_window_under_one_second_is_invalid_config",
+   "mutation": "oui",
+   "commentaire": "_discovery_window refuse les délais inférieurs à une seconde ; supprimer cette borne fait échouer le test sans trafic extérieur. _mx borne MX à 1–5, couvert séparément par test_c8_mx_is_bounded, notamment pour 30 secondes. La configuration livrée utilise deux secondes. Les littéraux 1 et 5 sont des bornes protocolaires documentées."
+  },
+  {
+   "id": "M1",
+   "corrige": "partiel",
+   "ou": "service/engine.py:2175",
+   "test": "test_m1_expired_retained_mapping_is_not_deleted_at_shutdown",
+   "mutation": "oui",
+   "commentaire": "_merge_opening mémorise une échéance et _release_ports exclut les entrées déjà échues lors de la copie. Retirer le filtre fait échouer le test. Mais les échéances ne sont plus contrôlées pendant les suppressions successives et le retrait tardif de _run_opening les ignore entièrement. Le test ne couvre que des mappings tous expirés avant le début du retrait."
+  },
+  {
+   "id": "M2",
+   "corrige": true,
+   "ou": "ui/app.js:430",
+   "test": "test_p9f1_m2_still_active_mappings_are_named_after_a_failure",
+   "mutation": "oui",
+   "commentaire": "stillActiveText nomme les couples et indique que leur suppression n'a pas été confirmée ; portsBlock l'appelle dans la branche d'échec (ligne 448). Supprimer cet appel ou le texte contrôlé fait échouer le test. Il s'agit d'une vérification statique du source, sans exécution du rendu. Le suivi moteur des still_active est également exercé par les tests AC32/AC33 jusqu'à l'arrêt."
+  }
+ ],
+ "regressions": [
+  {
+   "gravite": "bloquer",
+   "ou": "service/engine.py:2200",
+   "probleme": "C1 reste ouvert : après le second join borné, _release_ports retourne sans vérifier la fin du fil démon. Une fusion retardée au-delà des deux attentes laisse shutdown terminer avant le retrait ; la sortie du processus peut tuer le fil et laisser les mappings jusqu'au bail. La copie précède toujours potentiellement la fusion, contrairement à P9F1.",
+   "correction": "Garantir la fin de la fusion et du retrait avant la fin de shutdown, en bornant les opérations pouvant retarder ce transfert. Ajouter un test retardant la fusion au-delà des deux attentes actuelles et exigeant que l'arrêt ne termine pas avant le nettoyage."
+  },
+  {
+   "gravite": "majeur",
+   "ou": "service/upnp.py:559",
+   "probleme": "C3/C4 restent incomplets : le premier IGD doté d'une description conforme reçoit les écritures SOAP, même si une autre passerelle est celle attendue pour l'accès Internet. La conformité de l'arbre XML ne prouve pas cette pertinence. Les tests utilisent un premier candidat invalide ou au ST incompatible, jamais deux IGD valides.",
+   "correction": "Définir et appliquer une sélection explicite de la passerelle pertinente avant toute écriture, avec refus en cas d'ambiguïté non résolue. Tester deux IGD valides dans les deux ordres et vérifier l'absence d'écriture sur celui non retenu."
+  },
+  {
+   "gravite": "majeur",
+   "ou": "service/engine.py:2090",
+   "probleme": "M1 n'est pas respecté sur tous les chemins : le retrait tardif envoie ses suppressions sans contrôler expires_at. Sur le chemin normal, le filtre de la ligne 2175 intervient une seule fois ; les premières requêtes peuvent attendre assez longtemps pour que les mappings suivants expirent puis soient repris par un tiers avant leur suppression.",
+   "correction": "Transmettre les échéances jusqu'au retrait et vérifier chaque entrée immédiatement avant sa tentative, y compris pour le nettoyage tardif. Tester une expiration pendant les premières suppressions et une fusion tardive après expiration."
+  },
+  {
+   "gravite": "majeur",
+   "ou": "service/upnp.py:206",
+   "probleme": "Le contrat R1/C7 « aucune exception ne sort » reste violé. max_response_bytes = 10**400 est accepté par validate, mais recvfrom ne peut pas convertir cette taille et lève OverflowError. Cette exception n'est interceptée ni par find_gateway ni par open_ports. Le filet du moteur masque alors le défaut du module.",
+   "correction": "Valider la représentabilité des paramètres destinés aux sockets et convertir les erreurs numériques restantes en résultats. Ajouter un test direct d'open_ports avec une configuration acceptée aujourd'hui qui déborde les limites des sockets, sans trafic extérieur."
+  },
+  {
+   "gravite": "majeur",
+   "ou": "service/upnp.py:199",
+   "probleme": "Le budget global de C4 n'est pas absolu. Après l'échéance, _replies continue à recevoir sans attendre ; un flux continu de réponses incompatibles ou dupliquées reste dans les continue de la ligne 215. Aucun candidat n'est rendu à find_gateway, qui ne peut donc contrôler son budget ni l'annulation. La découverte peut rester active indéfiniment.",
+   "correction": "Contrôler une échéance absolue et l'annulation à chaque tour de réception, y compris pour les paquets ignorés. Si les réponses déjà reçues doivent être conservées, borner explicitement leur collecte. Tester un flux continu de réponses ignorées."
+  },
+  {
+   "gravite": "majeur",
+   "ou": "service/engine.py:2117",
+   "probleme": "Une ouverture mapped peut préremplir une adresse non acceptée, puis une nouvelle tentative no_gateway/refused/invalid_config remplace ce résultat. _ports_view ne produit plus expired lorsque le premier bail arrive à échéance, et prefillAddress conserve indéfiniment l'ancienne proposition. Le problème persiste au lobby d'une revanche.",
+   "correction": "Conserver l'échéance de la proposition indépendamment du dernier résultat d'ouverture et transmettre son expiration à l'UI. Tester succès, nouvelle tentative échouée, expiration puis nouveau lobby."
+  },
+  {
+   "gravite": "mineur",
+   "ou": "ui/app.js:426",
+   "probleme": "prefillAddress marque comme proposition automatique toute saisie égale à l'adresse rapportée, même si l'hôte l'avait déjà tapée. À expiration, la ligne 419 efface donc une saisie personnelle. Le test statique impose précisément cette affectation sans vérifier la provenance de la valeur.",
+   "correction": "Marquer portsProposed seulement lorsque le préremplissage modifie effectivement un champ vide, et abandonner cette provenance lors d'une saisie utilisateur. Tester qu'une adresse déjà saisie, même identique à celle du routeur, survit à l'expiration."
+  }
+ ],
+ "verdict": "REQUEST_CHANGES",
+ "justification": "Le nettoyage tardif ne garantit pas la fin de l'arrêt, la sélection entre IGD valides manque et des suppressions peuvent viser des mappings expirés. C6 possède un test qui ne détecte pas le retrait de sa correction. Les autres mutations indiquées sont déduites des assertions, sans exécution : aucun fichier modifié, aucun test lancé. Dans les fichiers lus, aucun nouvel envoi de test hors boucle locale, aucune nouvelle journalisation d'adresse publique ni valeur opérationnelle en dur n'ont été relevés."
+}
