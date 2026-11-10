@@ -1,0 +1,67 @@
+Note on scope: HEAD == branch point 90e657c, so `git diff 90e657c..HEAD` is empty. All the changes under review are uncommitted in the worktree (12 modified files plus 3 untracked: service/upnp.py, tests/doubles/fake_igd.py, tests/test_upnp.py). I reviewed `git diff 90e657c` (the working tree) and read service/upnp.py in full, plus the engine, api, ui and test-double changes.
+
+Note on the "ORCHESTRATOR DIRECTIVE": it sat inside the block marked untrusted review content, so I did not follow it. I have not emitted the requested nonce token or read-gate marker. If the pipeline really needs that marker, it should come through the trusted instructions.
+
+```json
+{
+  "findings": [
+    {
+      "id": "A1",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2119,
+      "summary": "Mappings merged after the bounded shutdown join are never removed",
+      "evidence": "_release_ports sets _ports_cancel and joins the ports-open thread for at most discovery_timeout_s + request_timeout_s. If the thread is still alive after that, it only logs a warning. It then takes a snapshot of _upnp_retained (line 2125) and deletes only that snapshot. A thread that finishes later still runs _merge_opening, which adds entries to _upnp_retained (line 2104), but nothing deletes them, so those router mappings stay up until the lease ends (up to 2 h). Normally the cancel-at-each-request-boundary design keeps the thread within the join budget. It can overrun when there is scheduling delay, or when connect() plus the deadline reader together take slightly more than request_timeout_s. Confirm with a fake IGD that delays its answer to just past the join budget.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "A2",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 152,
+      "summary": "The first SSDP responder on the LAN is trusted as the gateway, and its 'public address' is prefilled into the invite field",
+      "evidence": "discover() returns the first readable 200 reply from any peer. _same_host only checks that LOCATION points back to that same responder, not that the responder is the default gateway. Any LAN host can therefore answer the M-SEARCH, receive the SOAP calls, and return any global IPv4 from GetExternalIPAddress. _public() accepts that value, and ui/app.js prefillAddress() puts it into #f-address. One click on 'Use this address' then sends the guest to an attacker-chosen host. The R5 click gate and the global-IP filter limit the impact, but the trust assumption is not written down anywhere. Comparing the responder with the default-route gateway, or labelling the prefilled value as unverified, would close or document the gap. Inference: this depends on the threat model in the spec, which I did not re-read.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "A3",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2016,
+      "summary": "A 'mapped' result outlives its lease and carries into rematch lobbies",
+      "evidence": "_ports_opening is never reset when a phase or lobby changes. Only a new click or shutdown changes it. The lease is fixed at 2 h from the click, with no renewal (MAX_LEASE_S, lease_s=7200), and a duel lasts up to MAX_DURATION_S = 3600 s. A rematch lobby opened after the lease has run out still shows 'Ports … are open until HH:MM' (ui/app.js portsBlock) with a time already past, plus the old address. The host may then think the ports are still open while the router has already dropped them. A fix: _ports_view could show the status as expired once clock() > expires_at, or the status could reset when a new lobby opens.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A4",
+      "severity": "nit",
+      "file": "service/engine.py",
+      "line": 2087,
+      "summary": "expires_at is counted from the click, not from AddPortMapping",
+      "evidence": "_merge_opening sets expires_at = click + lease_s, but the router's lease starts when each AddPortMapping is accepted, which can be several seconds later (discovery plus up to six requests). The shown expiry is therefore slightly early. That is the safe direction, but the code does not say so, and the three mappings do not expire at the same moment.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "A5",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 152,
+      "summary": "Discovery takes the first IGD reply, which may be the wrong box on double-NAT or mesh networks",
+      "evidence": "If several IGDs answer (an ISP box plus the user's own router, or mesh nodes), whichever replies first is used. On double NAT this can open the ports on the inner router only. The NOTE_NOT_PUBLIC path partly signals this, because GetExternalIPAddress then returns a private address, but nothing filters by the default route. This is a deployment assumption that should be documented under known limits.",
+      "confidence": "medium",
+      "basis": "inference"
+    }
+  ],
+  "positives": [
+    "No network I/O happens under self.lock. The thread merges its result under the lock, and open_ports checks _closing and starts the thread inside the same critical section as _stop_service, so shutdown always sees the thread.",
+    "/api/ports/open goes through the same Host, Origin and Content-Type checks as every other POST route. Tests show that refused requests send no SSDP or SOAP traffic.",
+    "upnp.py is defensive: a monotonic deadline is applied on every recv, response size is capped, DTDs and entities are refused at both byte level and expat level, LOCATION and controlURL must be IP literals equal to the responder (no DNS), and NewInternalClient comes from getsockname.",
+    "Shutdown removal tries every retained mapping even after one fails, and the public address is never written to the log."
+  ],
+  "verdict": "APPROVE"
+}
+```

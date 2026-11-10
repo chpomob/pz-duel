@@ -1,0 +1,62 @@
+READ: /tmp/review-master-1
+READ:34a4b34c94e2a422
+```json
+{
+  "read_files": ["/tmp/review-master-1"],
+  "read_nonce": "READ:34a4b34c94e2a422",
+  "scope_note": "HEAD == branch point 90e657c, so `git diff 90e657c..HEAD` is empty; the change under review is the uncommitted working tree (12 modified files + service/upnp.py, tests/doubles/fake_igd.py, tests/test_upnp.py untracked). Reviewed `git diff` + untracked files. Targeted suites (test_upnp, test_setup_flow, test_api_security, test_rules_load, test_modes) run with the project venv: 796 passed.",
+  "findings": [
+    {
+      "id": "B1",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2104,
+      "summary": "Retained mapping on an earlier gateway is overwritten (and never removed) when a later opening maps the same couple on a different gateway",
+      "evidence": "`_upnp_retained` is keyed by (port, protocol) only; `_merge_opening` does `self._upnp_retained[(port, proto)] = gateway`. If opening #1 maps 3 couples on gateway A and opening #2 (network change, or a different IGD answering SSDP first) maps the same couples on gateway B, A's records are replaced, so `_release_ports` only deletes on B and A's mappings stay open until the lease expires (≤ 7200 s). The comment at the field definition says each record is 'lié à la passerelle qui l'a posé', and R6 asks to remove 'chaque mapping posé par le service et encore réputé actif'. The keying keeps the R6 bound of 'au plus trois mappings', so this may be an accepted trade-off, but it is not documented; at minimum log the dropped gateway's couples, or key by (gateway, couple) and keep the 3-expiry bound by other means.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "B2",
+      "severity": "minor",
+      "file": "service/engine.py",
+      "line": 2121,
+      "summary": "An opening thread that outlives the shutdown join merges mappings after the retained snapshot; they are never removed and the warning does not name them",
+      "evidence": "`_release_ports` sets cancel, joins for discovery_timeout_s + request_timeout_s, logs 'port opening still running at shutdown' if still alive, then snapshots `_upnp_retained`. A thread that finishes later (e.g. a slow GC pause, or connect() + deadline overrun at the edge) still calls `_merge_opening` under the lock and adds retained couples that nobody deletes. The daemon thread is then killed at process exit. The impact is bounded by the lease, but the spec's 'Un échec de suppression est consigné' is not met for these couples. A fix could be to read `_ports_opening`/retained after the join only when the thread is dead, and otherwise log the couples of the in-flight opening as possibly left open.",
+      "confidence": "medium",
+      "basis": "inference"
+    },
+    {
+      "id": "B3",
+      "severity": "minor",
+      "file": "service/upnp.py",
+      "line": 189,
+      "summary": "Discovery stops at the first readable SSDP 200 reply without checking ST, so a non-IGD responder can mask the real gateway",
+      "evidence": "`discover` returns the first datagram for which `_location` finds a LOCATION. It does not check that the reply's `ST` matches `SEARCH_TARGET`, and it does not collect other replies. Some LAN devices answer every M-SEARCH, and a mesh node or second router can also answer. If one of them replies first, `find_gateway` fails with `no_service` or `foreign_control_url`, and the real IGD that answers 50 ms later is ignored. Checking `ST` in `_location`, or trying later replies until the deadline after a description fails, would make this more robust. The fake IGD tests use a single responder, so they don't cover this case.",
+      "confidence": "medium",
+      "basis": "code"
+    },
+    {
+      "id": "B4",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 781,
+      "summary": "`open_ports` can raise on malformed `ports` despite the 'Aucune exception ne sort' contract",
+      "evidence": "`_couples(ports)` (unpacking) and `_ports_ok` (`set(couples)`) run before the `try`. An element that is not a pair raises ValueError/TypeError, and an unhashable port (e.g. a list) raises TypeError from `set()`. `delete_mappings` has the same problem: `_couples(mappings)` is outside its try. The engine always passes well-formed int/str tuples, so this can't happen today, but the docstring makes a module-wide guarantee.",
+      "confidence": "high",
+      "basis": "code"
+    },
+    {
+      "id": "B5",
+      "severity": "nit",
+      "file": "service/upnp.py",
+      "line": 138,
+      "summary": "MX is derived as max(1, int(timeout_s)), which can exceed the discovery deadline or the UDA cap of 5",
+      "evidence": "With discovery_timeout_s = 0.5, MX = 1, so devices may legitimately delay their reply past the 0.5 s deadline. With a large timeout (e.g. 30), MX = 30, which is outside the UDA 1.1 range of 1–5. The shipped value (2) is fine; clamping MX to [1, min(5, floor(timeout_s))] would make other configurations behave as intended.",
+      "confidence": "medium",
+      "basis": "external"
+    }
+  ],
+  "verdict": "APPROVE"
+}
+```
