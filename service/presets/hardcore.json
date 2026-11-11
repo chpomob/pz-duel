@@ -12,6 +12,8 @@
     {"id": "explosion_horde", "when": "atom(explosion)", "effects": [{"kind": "horde_area", "n": 30, "radius": 20, "distance": [50, 80], "warn_s": 12}]},
     {"id": "repair_noise", "when": "atom(vehicle_repair)", "effects": [{"kind": "noise", "radius": 40, "distance": [30, 60], "warn_s": 0}]}
   ],
+  "spacing": 4,
+  "aggro": 0.6,
   "modifiers": {},
   "budget": {"threats_per_minute": 6, "concurrent_effects": 4, "per_effect_cooldown_s": 20},
   "score": {"points": {"zombie_kill": 1}},

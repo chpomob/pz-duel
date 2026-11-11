@@ -50,6 +50,14 @@ SPRINTER_PERCENT = "sprinter_percent"
 PERCENT = 100
 POP_KIND = "spawn_pop"
 SPRINTER_KIND = "spawn_sprinter"
+# Pops dispersés et ciblage à l'apparition (P9F8) : clés de table facultatives, recopiées
+# telles quelles dans chaque commande de pop, que le mod lit avec un repli sûr (0, 0).
+# `spacing` : cases minimales entre deux zombies du lot ; `aggro` : poids du ciblage, 0 = aucun.
+SPACING = "spacing"
+MAX_SPACING = 20
+AGGRO = "aggro"
+POP_SETTINGS = (SPACING, AGGRO)
+POP_KINDS = (POP_KIND, SPRINTER_KIND)
 
 TABLE_KEYS = (
     "id",
@@ -66,7 +74,7 @@ TABLE_KEYS = (
     "disconnect_grace_s",
     "summary",
 )
-OPTIONAL_TABLE_KEYS = (SPRINTER_PERCENT,)
+OPTIONAL_TABLE_KEYS = (SPRINTER_PERCENT, *POP_SETTINGS)
 BOUNDED_PARAMS = {
     "n": (1, "max_n"),
     "warn_s": (0, "max_warn_s"),
@@ -260,6 +268,10 @@ def load_table(
     _check_header(raw, where, file_stem)
     if SPRINTER_PERCENT in raw:
         _check_int(raw[SPRINTER_PERCENT], where, SPRINTER_PERCENT, 0, PERCENT)
+    if SPACING in raw:
+        _check_int(raw[SPACING], where, SPACING, 0, MAX_SPACING)
+    if AGGRO in raw:
+        _check_unit(raw[AGGRO], where, AGGRO)
     atoms = _check_atoms(raw["atoms"], catalog, active_atoms)
     _check_budget(raw["budget"], limits)
     narrowed = active_atoms is not None
@@ -337,6 +349,14 @@ def _check_number(
     if value < minimum or (exclusive and value == minimum):
         floor = f"supérieur à {minimum}" if exclusive else f"d'au moins {minimum}"
         _fail(where, field, f"nombre {floor} attendu, reçu {value}")
+
+
+def _check_unit(value: Any, where: str, field: str) -> None:
+    """Nombre fini de 0 à 1 ; un booléen n'en est pas un, même si Python le compte."""
+    if type(value) is not int and (type(value) is not float or not math.isfinite(value)):
+        _fail(where, field, f"nombre fini de 0 à 1 attendu, reçu {value!r}")
+    if not 0 <= value <= 1:
+        _fail(where, field, f"nombre de 0 à 1 attendu, reçu {value}")
 
 
 def _check_text(value: Any, where: str, field: str) -> None:
@@ -812,6 +832,8 @@ class MatchCore:
         self._sprinter_percent: int | None = table.get(SPRINTER_PERCENT)
         # Zombies de pop admis par camp visé depuis le début du match : le dernier `k` donné.
         self._popped = {side: 0 for side in SIDES}
+        # Réglages de pop (P9F8), ajoutés aux seules commandes de pop, hors des clés de lot.
+        self._pop_settings = {key: table[key] for key in POP_SETTINGS if key in table}
         self._tick = -1
         self._events: list[Mapping[str, Any]] = []
         self._inputs: list[Callable[[], None]] = []
@@ -1186,7 +1208,14 @@ class MatchCore:
     def _send(self, target: str, lot: _Lot, params: Mapping[str, Any]) -> None:
         self._last_seq += 1
         origin = {"rule": lot.rule, "boot": lot.event["boot"], "event_seq": lot.event["seq"]}
-        command = {"v": PROTOCOL_VERSION, "seq": self._last_seq, **params, "origin": origin}
+        settings = self._pop_settings if params["kind"] in POP_KINDS else {}
+        command = {
+            "v": PROTOCOL_VERSION,
+            "seq": self._last_seq,
+            **params,
+            **settings,
+            "origin": origin,
+        }
         latency_ms = self._t0_ms + self._now_ms - lot.oldest_t_ms
         self._record("command", {"command": command, "latency_ms": latency_ms}, target)
         self._last_sent[target, params["kind"]] = self._now_ms

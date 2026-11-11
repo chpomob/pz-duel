@@ -50,6 +50,8 @@ local BEAT_MS = 10000
 -- Garde-fou de sécurité, pas un équilibrage : aucun effet sous ce rayon du joueur.
 local MIN_DISTANCE = 10
 local PLACE_ATTEMPTS = 32
+-- Borne haute de `spacing`, la même que celle de l'arbitre (`service/rules.py`).
+local MAX_SPACING = 20
 local RAIN_INTENSITY = 1.0
 local SPRINT_WALK_TYPE = "sprint1"
 local DUEL_MARK = "duelOrigin"
@@ -642,8 +644,9 @@ local function freeSquare(x, y)
     return nil
 end
 
--- Une case libre à une distance du joueur comprise dans `distance`, ou nil.
-local function pickSquare(player, distance)
+-- Une case libre à une distance du joueur comprise dans `distance`, ou nil. `accept`,
+-- facultatif, écarte une case libre que l'appelant ne veut pas (trop près d'une autre).
+local function pickSquare(player, distance, accept)
     local low, high = distance[1], distance[2]
     local px, py = player:getX(), player:getY()
     for _ = 1, PLACE_ATTEMPTS do
@@ -652,7 +655,7 @@ local function pickSquare(player, distance)
         local x = math.floor(px + math.cos(angle) * radius)
         local y = math.floor(py + math.sin(angle) * radius)
         local gap = distanceBetween(x, y, px, py)
-        if gap >= low and gap <= high then
+        if gap >= low and gap <= high and (not accept or accept(x, y)) then
             local square = freeSquare(x, y)
             if square then return square end
         end
@@ -675,7 +678,8 @@ local function pickAround(player, center, radius)
     return nil
 end
 
-local function spawnAt(square, count, prepare)
+-- Crée `count` zombies sur `square` et les ajoute à `created` ; rend le nombre créé.
+local function spawnAt(square, count, prepare, created)
     local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, nil, nil)
     if not zombies then return 0 end
     local spawned = zombies:size()
@@ -683,27 +687,94 @@ local function spawnAt(square, count, prepare)
         local zombie = zombies:get(i)
         zombie:getModData()[DUEL_MARK] = true
         if prepare then prepare(zombie) end
+        if created then created[#created + 1] = zombie end
     end
     return spawned
 end
 
-local function spawnResult(spawned)
+local function spawnResult(spawned, extra)
     if spawned == 0 then
         return { status = "failed", reason = "no_spawn", spawned = 0 }
     end
-    return { status = "applied", spawned = spawned }
+    local result = { status = "applied", spawned = spawned }
+    if extra then
+        for key, value in pairs(extra) do result[key] = value end
+    end
+    return result
 end
 
 local NO_SQUARE = { status = "failed", reason = "no_square" }
+
+-- Réglage facultatif de la commande (P9F8) : absent ou hors bornes, la valeur sûre `low`
+-- ou la borne franchie. Le preset le règle, l'arbitre le valide : le mod ne fait que replier.
+local function optionalNumber(cmd, key, low, high)
+    local value = cmd[key]
+    if type(value) ~= "number" or value ~= value or value < low then return low end
+    if value > high then return high end
+    return value
+end
+
+-- Cases du lot (P9F8) : la première comme avant, puis une par zombie, à au moins
+-- `spacing` cases de toutes celles déjà retenues. `spacing` nul garde le tas d'avant.
+local function pickSpread(player, distance, count, spacing)
+    local first = pickSquare(player, distance)
+    if not first then return nil end
+    local squares = { first }
+    if spacing <= 0 then return squares end
+    local function farFromAll(x, y)
+        for _, square in ipairs(squares) do
+            if distanceBetween(x, y, square:getX(), square:getY()) < spacing then return false end
+        end
+        return true
+    end
+    for _ = 2, count do
+        local square = pickSquare(player, distance, farFromAll)
+        if not square then break end
+        squares[#squares + 1] = square
+    end
+    return squares
+end
+
+-- Oriente un zombie vers le joueur (P9F8). Chaque appel sous `pcall` : une fonction absente
+-- d'une version du jeu laisse le zombie créé, simplement non compté comme ciblé.
+local function targetPlayer(zombie, player, aggro)
+    local okTarget = pcall(function() zombie:setTarget(player) end)
+    local okAggro = pcall(function() zombie:addAggro(player, aggro) end)
+    local okSpotted = pcall(function() zombie:spotted(player, true) end)
+    return okTarget and okAggro and okSpotted
+end
 
 -- Traitements par `kind` ----------------------------------------------------------
 
 local handlers = {}
 
+-- Le nombre ne baisse jamais : faute de cases espacées en nombre, les zombies restants
+-- naissent sur les cases déjà retenues, à tour de rôle. `spread` dit combien de cases
+-- distinctes ont reçu un zombie, `targeted` combien de zombies ont été orientés.
 local function spawnGroup(cmd, player, prepare)
-    local square = pickSquare(player, cmd.distance)
-    if not square then return NO_SQUARE end
-    return spawnResult(spawnAt(square, needNumber(cmd, "n"), prepare))
+    local count = needNumber(cmd, "n")
+    local spacing = math.floor(optionalNumber(cmd, "spacing", 0, MAX_SPACING))
+    local aggro = optionalNumber(cmd, "aggro", 0, 1)
+    local squares = pickSpread(player, cmd.distance, count, spacing)
+    if not squares then return NO_SQUARE end
+    local perSquare = {}
+    for i = 1, count do
+        local slot = (i - 1) % #squares + 1
+        perSquare[slot] = (perSquare[slot] or 0) + 1
+    end
+    local created, spawned, spread = {}, 0, 0
+    for slot, square in ipairs(squares) do
+        local made = spawnAt(square, perSquare[slot], prepare, created)
+        spawned = spawned + made
+        if made > 0 then spread = spread + 1 end
+    end
+    local targeted = 0
+    if aggro > 0 then
+        for _, zombie in ipairs(created) do
+            if targetPlayer(zombie, player, aggro) then targeted = targeted + 1 end
+        end
+    end
+    return spawnResult(spawned, { spread = spread, targeted = targeted })
 end
 
 local function makeSprinter(zombie)
@@ -728,7 +799,7 @@ handlers.horde_area = function(cmd, player)
     local spawned = 0
     for _ = 1, needNumber(cmd, "n") do
         local square = pickAround(player, center, radius)
-        if square then spawned = spawned + spawnAt(square, 1, nil) end
+        if square then spawned = spawned + spawnAt(square, 1, nil, nil) end
     end
     return spawnResult(spawned)
 end
@@ -879,6 +950,8 @@ local function emitResult(seq, result)
         status = result.status,
         reason = result.reason,
         spawned = result.spawned,
+        spread = result.spread,
+        targeted = result.targeted,
     }, side)
 end
 

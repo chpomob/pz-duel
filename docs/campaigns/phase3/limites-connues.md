@@ -89,3 +89,29 @@ politique. Le produit doit choisir ses **ports externes** dans la plage accepté
 et donner les externes à l'invité — le `.bat` construit déjà `+connect hôte:port`
 (`service/guest_launcher.py:234`) et les ports vivent dans `runtime.json`, donc le changement est borné.
 C'est une décision de phase 4, pas une correction de la phase 3.
+
+## P9F8 — pops dispersés et ciblage à l'apparition : ce qui reste à voir en jeu
+
+Le preset règle deux champs que l'arbitre recopie dans chaque commande `spawn_pop` et
+`spawn_sprinter` : `spacing` (cases entre deux zombies du lot, défaut 4) et `aggro` (poids du
+ciblage, 0,6 ; `demo` à 0). Absents de la commande, le mod replie sur 0 et 0, soit le
+comportement d'avant. Le `cmd_result` d'un pop porte `spawned`, `spread` (cases distinctes
+ayant reçu un zombie) et `targeted` (zombies dont `setTarget`, `addAggro` et `spotted` ont tous
+réussi).
+
+Prouvé hors du jeu, sur le vrai `DuelCore.lua` exécuté par `mini_lua` : les cases retenues sont
+dans la bande et espacées ; faute de place, le nombre est gardé en superposant (`spawned` = `n`,
+`spread` < `n`) ; chaque zombie reçoit les trois appels ; une fonction absente laisse le pop
+`applied` avec `targeted: 0`.
+
+**Pas prouvé, à vérifier manette en main :**
+
+- que la dispersion se **voit** : `isFree` et le placement réel de `addZombiesInOutfit` sur une
+  case peuvent différer de la cellule simulée ;
+- que les trois appels **existent et agissent** sur 42.21 (`javap` atteste la signature, pas
+  l'effet) : les zombies doivent venir vers le joueur au lieu de vaquer, et `targeted` doit
+  valoir `spawned` dans le journal ;
+- qu'un poids d'`aggro` de 0,6 suffit — ou ne rend pas les zombies insensibles au reste du monde ;
+- que la superposition, quand elle arrive (`spread` < `spawned`), reste rare à 4 cases d'écart.
+
+`horde_area` n'est pas concernée : elle disperse déjà par `radius`, et n'est pas ciblée.

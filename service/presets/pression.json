@@ -13,6 +13,8 @@
     {"id": "builder_payoff", "when": "atom(build).count(3).within(120s).then(atom(zombie_kill), within=30s)", "effects": [{"kind": "horde_area", "n": 25, "radius": 20, "distance": [50, 80], "warn_s": 12}]},
     {"id": "hurt_supply", "when": "atom(damage_taken)", "effects": [{"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}], "target": "self"}]}
   ],
+  "spacing": 4,
+  "aggro": 0.6,
   "modifiers": {
     "combo": {"per": 0.15, "max": 3.0, "on": "zombie_kill", "reset_on": "damage_taken"},
     "score_gap": {"when_gt": 30, "attacker": 0.6, "defender_bonus": {"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}]}}

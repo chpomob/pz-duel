@@ -11,6 +11,8 @@
     {"id": "hurt_supply", "when": "atom(damage_taken)", "effects": [{"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}], "target": "self"}]}
   ],
   "sprinter_percent": 1,
+  "spacing": 4,
+  "aggro": 0.6,
   "modifiers": {},
   "budget": {"threats_per_minute": 6, "concurrent_effects": 4, "per_effect_cooldown_s": 20},
   "score": {"points": {"zombie_kill": 1}},

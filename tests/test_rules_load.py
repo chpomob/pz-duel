@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
+import random
 import re
 from pathlib import Path
 
@@ -148,6 +150,54 @@ FORBIDDEN = {
     "sprinter_texte": (
         lambda t: t.update(sprinter_percent="1"),
         ("section table", "« sprinter_percent »", "entier attendu"),
+    ),
+    "spacing_moins_1": (
+        lambda t: t.update(spacing=-1),
+        ("section table", "« spacing »", "de 0 à 20", "reçu -1"),
+    ),
+    "spacing_21": (
+        lambda t: t.update(spacing=21),
+        ("section table", "« spacing »", "de 0 à 20", "reçu 21"),
+    ),
+    "spacing_flottant": (
+        lambda t: t.update(spacing=4.5),
+        ("section table", "« spacing »", "entier attendu", "reçu 4.5"),
+    ),
+    "spacing_booleen": (
+        lambda t: t.update(spacing=True),
+        ("section table", "« spacing »", "entier attendu", "reçu True"),
+    ),
+    "spacing_texte": (
+        lambda t: t.update(spacing="4"),
+        ("section table", "« spacing »", "entier attendu", "reçu '4'"),
+    ),
+    "aggro_negatif": (
+        lambda t: t.update(aggro=-0.1),
+        ("section table", "« aggro »", "de 0 à 1", "reçu -0.1"),
+    ),
+    "aggro_1_5": (
+        lambda t: t.update(aggro=1.5),
+        ("section table", "« aggro »", "de 0 à 1", "reçu 1.5"),
+    ),
+    "aggro_2": (
+        lambda t: t.update(aggro=2),
+        ("section table", "« aggro »", "de 0 à 1", "reçu 2"),
+    ),
+    "aggro_nan": (
+        lambda t: t.update(aggro=float("nan")),
+        ("section table", "« aggro »", "nombre fini", "reçu nan"),
+    ),
+    "aggro_infini": (
+        lambda t: t.update(aggro=float("inf")),
+        ("section table", "« aggro »", "nombre fini", "reçu inf"),
+    ),
+    "aggro_booleen": (
+        lambda t: t.update(aggro=True),
+        ("section table", "« aggro »", "nombre fini", "reçu True"),
+    ),
+    "aggro_texte": (
+        lambda t: t.update(aggro="0.6"),
+        ("section table", "« aggro »", "nombre fini", "reçu '0.6'"),
     ),
     "threats_manquant": (
         lambda t: t["budget"].pop("threats_per_minute"),
@@ -582,6 +632,8 @@ class Duel:
         raw["budget"].update(budget)
         kill_effect = changes.pop("kill_effect", {})
         kills_effect(raw).update(kill_effect)
+        for key in changes.pop("drop", ()):
+            raw.pop(key)
         raw.update(changes)
         self.catalog = rules.load_effects()
         table = load_table(raw, self.catalog, runtime["limits"], file_stem=name)
@@ -743,3 +795,291 @@ def test_tables_without_the_key_keep_their_journal(runtime):
     (fired,) = duel.of_type("rule_fired")
     assert set(fired["data"]) == {"rule", "event", "multipliers"}
     assert duel.sent_at(1) == [("B", "spawn_pop", 2)]
+
+
+# P9F8 : pops dispersés et ciblage à l'apparition, réglés par le preset ---------------------
+
+
+@pytest.mark.parametrize(
+    "spacing, aggro", [(0, 0), (20, 1), (4, 0.6), (4, 1.0), (0, 0.0)]
+)
+def test_pop_settings_accept_their_bounds(catalog, limits, spacing, aggro):
+    """Bornes incluses : 0 et 20 cases, 0 et 1 de poids, entier ou flottant."""
+    raw = {**table(), "spacing": spacing, "aggro": aggro}
+    assert load_table(raw, catalog, limits) == raw
+
+
+def test_shipped_presets_carry_the_pop_settings():
+    """Quatre presets : 4 cases d'écart partout, ciblage à 0,6 sauf `demo`, simulé, à 0."""
+    for name in SHIPPED:
+        preset = read_preset(name)
+        assert preset["spacing"] == 4, name
+        assert preset["aggro"] == (0 if name == "demo" else 0.6), name
+
+
+def pop_commands(duel: Duel) -> list[dict]:
+    return [r["data"]["command"] for r in duel.of_type("command")]
+
+
+def test_pop_commands_carry_spacing_and_aggro(runtime):
+    """Le preset voyage dans la commande : le mod n'a rien à connaître d'avance. Mutation :
+    des réglages lus du runtime ou omis laissent la commande sans `spacing` ni `aggro`."""
+    duel = Duel(runtime, spacing=7, aggro=0.25)
+    duel.kill(1)
+    (command,) = pop_commands(duel)
+    assert command["kind"] == "spawn_pop" and command["n"] == 2
+    assert (command["spacing"], command["aggro"]) == (7, 0.25)
+    assert list(command)[-1] == "origin"
+
+
+def test_sprinter_commands_carry_them_too(runtime):
+    """Le sprinter est un pop découpé : il porte les mêmes réglages."""
+    duel = Duel(runtime, sprinter_percent=100, spacing=3, aggro=1)
+    duel.kill(1)
+    (command,) = pop_commands(duel)
+    assert command["kind"] == "spawn_sprinter"
+    assert (command["spacing"], command["aggro"]) == (3, 1)
+
+
+def test_other_effects_do_not_carry_the_pop_settings(runtime):
+    """Une caisse de soin n'a ni écart ni ciblage. Mutation : ajouter les réglages à toute
+    commande les enverrait à `supply_drop`."""
+    duel = Duel(runtime)
+    hurt = {
+        "v": 1, "boot": 1, "seq": 1, "t_ms": T0_MS + 1000, "src": "A", "side": "A",
+        "kind": "damage_taken", "data": {"hp": 80, "delta": -20},
+    }  # fmt: skip
+    duel.core.submit_event(parse_event(hurt, duel.catalog))
+    duel.to(2)
+    commands = pop_commands(duel)
+    assert [c["kind"] for c in commands] == ["supply_drop"]
+    assert "spacing" not in commands[0] and "aggro" not in commands[0]
+
+
+def test_a_table_without_the_settings_sends_none(runtime):
+    """Sans les clés, la commande reste celle d'avant P9F8 : le mod replie sur 0 et 0."""
+    duel = Duel(runtime, drop=("spacing", "aggro"))
+    duel.kill(1)
+    (command,) = pop_commands(duel)
+    assert "spacing" not in command and "aggro" not in command
+
+
+def test_a_pop_held_by_the_cooldown_keeps_the_settings(runtime):
+    """Le second kill attend le cooldown dans un lot, servi à 21 s : sa commande porte les
+    mêmes réglages que la première. Mutation : réglages ajoutés au seul envoi immédiat."""
+    duel = Duel(runtime)
+    duel.kill(1)
+    duel.kill(2)
+    duel.to(30)
+    assert [(c["n"], c["spacing"], c["aggro"]) for c in pop_commands(duel)] == [
+        (2, 4, 0.6),
+        (2, 4, 0.6),
+    ]
+
+
+def test_the_journal_says_spawned_spread_and_targeted(runtime):
+    """`rule_fired`, puis la commande et ses réglages, puis `cmd_result` avec `spawned`,
+    `spread` et `targeted` tels que le mod les rend : un lot de 2 sur une seule case se lit
+    dans le journal. Mutation : un `cmd_result` réduit à ses champs connus perdrait `spread`."""
+    duel = Duel(runtime)
+    duel.kill(1)
+    (command,) = pop_commands(duel)
+    result = {
+        "v": 1, "boot": 1, "seq": 1, "t_ms": T0_MS + 8000, "src": "B", "side": "B",
+        "kind": "cmd_result",
+        "data": {"seq": command["seq"], "status": "applied", "spawned": 2, "spread": 1,
+                 "targeted": 2},
+    }  # fmt: skip
+    duel.core.submit_event(parse_event(dump_line(result), duel.catalog))
+    duel.to(9)
+    types = [r["type"] for r in duel.records if r["type"] in ("rule_fired", "command", "cmd_result")]
+    assert types == ["rule_fired", "command", "cmd_result"]
+    (logged,) = duel.of_type("cmd_result")
+    assert logged["side"] == "B"
+    data = logged["data"]["data"]
+    assert (data["spawned"], data["spread"], data["targeted"]) == (2, 1, 2)
+    assert duel.of_type("cmd_result_ignored") == []
+
+
+# Le vrai mod sous `mini_lua` : ce que le double prouve, c'est la logique du lot (cases
+# retenues, nombre gardé, appels de ciblage), pas le comportement des zombies dans le jeu.
+
+
+class SpawnSquare:
+    def __init__(self, x: int, y: int, free: bool) -> None:
+        self.x, self.y, self.free = int(x), int(y), free
+
+    def getX(self) -> int:
+        return self.x
+
+    def getY(self) -> int:
+        return self.y
+
+    def isFree(self, _strict: bool) -> bool:
+        return self.free
+
+
+class ZombieList:
+    def __init__(self, zombies: list) -> None:
+        self.zombies = zombies
+
+    def size(self) -> int:
+        return len(self.zombies)
+
+    def get(self, index: int):
+        return self.zombies[index]
+
+
+TARGETING = ("setTarget", "addAggro", "spotted")
+
+
+def spawned_zombie(missing: tuple[str, ...]):
+    """Un zombie créé, qui note les appels de ciblage ; `missing` les retire de sa classe."""
+    from doubles.mini_lua import Table
+
+    calls: list[tuple] = []
+    methods = {
+        name: (lambda name: lambda self, *args: calls.append((name, *args)))(name)
+        for name in TARGETING
+        if name not in missing
+    }
+    methods.update(
+        getModData=lambda self: self.mod_data,
+        setWalkType=lambda self, walk: calls.append(("setWalkType", walk)),
+        setSpeedTypeFromWalkType=lambda self: None,
+    )
+    zombie = type("SpawnedZombie", (), methods)()
+    zombie.mod_data = Table()
+    zombie.calls = calls
+    return zombie
+
+
+class SpawnGame:
+    """Le vrai `DuelCore.lua` avec une cellule où tout est libre et un générateur réglé."""
+
+    def __init__(self, monkeypatch, missing: tuple[str, ...] = (), seed: int = 9) -> None:
+        import test_lua_attribution
+        from doubles.mini_lua import Lua
+
+        rng = random.Random(seed)
+        self.spawns: list[tuple[int, int, int]] = []
+        self.zombies: list = []
+
+        def zomb_rand(low, high=None):
+            return rng.randrange(int(low)) if high is None else rng.randrange(int(low), int(high))
+
+        def add_zombies(x, y, _z, count, _outfit, _female):
+            self.spawns.append((int(x), int(y), int(count)))
+            made = [spawned_zombie(missing) for _ in range(int(count))]
+            self.zombies += made
+            return ZombieList(made)
+
+        extra = {
+            "ZombRand": zomb_rand,
+            "getCell": lambda: _Cell(),
+            "addZombiesInOutfit": add_zombies,
+        }
+        monkeypatch.setattr(test_lua_attribution, "Lua", lambda env: Lua({**env, **extra}))
+        self.game = test_lua_attribution.Game()
+        self.game.player.isAsleep = lambda: False
+        self.game.player.getVehicle = lambda: None
+        self.player = self.game.player
+
+    def apply(self, kind: str = "spawn_pop", n: int = 2, **settings) -> dict:
+        command = {"v": 1, "seq": 1, "kind": kind, "n": n, "distance": [12, 20], "warn_s": 0}
+        self.game.commands = dump_line({**command, **settings})
+        self.game.flush()
+        (result,) = self.game.lines("cmd_result")
+        return result["data"]
+
+
+class _Cell:
+    def getGridSquare(self, x, y, _z) -> SpawnSquare:
+        return SpawnSquare(x, y, True)
+
+
+def test_mod_spreads_a_pop_over_spaced_squares(monkeypatch):
+    """`spacing: 4`, `n: 4` : quatre cases, chacune dans la bande, toutes à 4 cases ou plus
+    l'une de l'autre. Mutation : le tas d'avant (`addZombiesInOutfit(…, n)` sur une case)."""
+    spawn = SpawnGame(monkeypatch)
+    data = spawn.apply(n=4, spacing=4)
+    assert (data["status"], data["spawned"], data["spread"]) == ("applied", 4, 4)
+    assert [count for *_, count in spawn.spawns] == [1, 1, 1, 1]
+    squares = [(x, y) for x, y, _ in spawn.spawns]
+    px, py = spawn.player.getX(), spawn.player.getY()
+    for x, y in squares:
+        assert 12 <= math.dist((x, y), (px, py)) <= 20
+    for index, one in enumerate(squares):
+        for other in squares[index + 1 :]:
+            assert math.dist(one, other) >= 4
+
+
+def test_mod_without_spacing_keeps_the_single_square(monkeypatch):
+    """`spacing` absent : le comportement d'avant, deux zombies sur une case, `spread` à 1."""
+    spawn = SpawnGame(monkeypatch)
+    data = spawn.apply(n=2)
+    assert (data["spawned"], data["spread"], data["targeted"]) == (2, 1, 0)
+    assert [count for *_, count in spawn.spawns] == [2]
+
+
+def test_mod_never_lowers_the_count_when_squares_run_out(monkeypatch):
+    """12 zombies à 20 cases d'écart dans une bande de 12 à 20 : la place manque, mais les 12
+    naissent, superposés sur les cases retenues. Mutation : abandonner les zombies sans case
+    à eux rendrait `spawned` égal à `spread`."""
+    spawn = SpawnGame(monkeypatch)
+    data = spawn.apply(n=12, spacing=20)
+    assert data["status"] == "applied" and data["spawned"] == 12
+    assert 1 <= data["spread"] < 12
+    assert sum(count for *_, count in spawn.spawns) == 12
+    assert len({(x, y) for x, y, _ in spawn.spawns}) == data["spread"]
+
+
+def test_mod_targets_every_created_zombie(monkeypatch):
+    """`aggro: 0.6` : chaque zombie reçoit `setTarget`, `addAggro` à 0,6 puis `spotted`."""
+    spawn = SpawnGame(monkeypatch)
+    data = spawn.apply(n=3, spacing=4, aggro=0.6)
+    assert data["targeted"] == 3
+    player = spawn.player
+    for zombie in spawn.zombies:
+        assert zombie.calls == [
+            ("setTarget", player),
+            ("addAggro", player, 0.6),
+            ("spotted", player, True),
+        ]
+
+
+def test_mod_sprinters_are_spread_and_targeted_too(monkeypatch):
+    spawn = SpawnGame(monkeypatch)
+    data = spawn.apply(kind="spawn_sprinter", n=2, spacing=4, aggro=1)
+    assert (data["spawned"], data["spread"], data["targeted"]) == (2, 2, 2)
+    for zombie in spawn.zombies:
+        assert zombie.calls[0][0] == "setWalkType"
+        assert [call[0] for call in zombie.calls[1:]] == list(TARGETING)
+
+
+def test_mod_aggro_zero_targets_nobody(monkeypatch):
+    spawn = SpawnGame(monkeypatch)
+    data = spawn.apply(n=2, spacing=4, aggro=0)
+    assert (data["spawned"], data["targeted"]) == (2, 0)
+    assert all(zombie.calls == [] for zombie in spawn.zombies)
+
+
+@pytest.mark.parametrize("missing", TARGETING)
+def test_mod_spawn_survives_a_missing_targeting_function(monkeypatch, missing):
+    """Une fonction de ciblage absente de la version du jeu : le pop reste appliqué, les
+    zombies créés, et `targeted` dit 0. Mutation : un appel hors `pcall` rend `lua_error`."""
+    spawn = SpawnGame(monkeypatch, missing=(missing,))
+    data = spawn.apply(n=2, spacing=4, aggro=0.6)
+    assert (data["status"], data["spawned"], data["spread"]) == ("applied", 2, 2)
+    assert data["targeted"] == 0
+    for zombie in spawn.zombies:
+        assert [call[0] for call in zombie.calls] == [m for m in TARGETING if m != missing]
+
+
+def test_mod_still_refuses_too_close_with_the_new_settings(monkeypatch):
+    spawn = SpawnGame(monkeypatch)
+    command = {"v": 1, "seq": 1, "kind": "spawn_pop", "n": 2, "distance": [9, 20], "warn_s": 0}
+    spawn.game.commands = dump_line({**command, "spacing": 4, "aggro": 0.6})
+    spawn.game.flush()
+    (result,) = spawn.game.lines("cmd_result")
+    assert result["data"]["reason"] == "too_close" and spawn.spawns == []

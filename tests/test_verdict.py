@@ -242,6 +242,10 @@ def test_spawn_status():
         ("failed", {"reason": "no_spawn", "spawned": 0}, 0, "ko"),
         ("failed", {"spawned": 1}, 0, "ko"),
         ("applied", {"spawned": 1}, PROBE_TIMEOUT_S + 1, "ko"),
+        # P9F8 : le mod rend aussi `spread` et `targeted` ; la sonde ne juge que `spawned`.
+        ("applied", {"spawned": 1, "spread": 1, "targeted": 0}, 0, "ok"),
+        ("applied", {"spawned": 2, "spread": 1, "targeted": 2}, 0, "ok"),
+        ("applied", {"spawned": 0, "spread": 0, "targeted": 0}, 0, "ko"),
     ],
 )
 def test_spawn_result(status, fields, delay_s, expected):
