@@ -1,0 +1,15 @@
+# Fins de ligne imposées (P9F17) : l'arbre de travail est en LF sur tout poste, Windows compris.
+# Les tests découpent les fichiers lus sur "\n" ; un checkout CRLF les faisait tomber.
+* text=auto eol=lf
+
+# Binaires : jamais convertis.
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+
+# Scripts batch : cmd.exe attend CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

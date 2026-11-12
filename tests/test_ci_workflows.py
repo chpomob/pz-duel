@@ -999,3 +999,15 @@ def test_ac51_both_languages_cite_the_same_proofs():
     cited = {language: set(CITATION.findall(read(LIMITS[language]))) for language in LANGUAGES}
 
     assert cited[EN] == cited[FR]
+
+
+def test_p9f17_gitattributes_forces_lf_for_every_file():
+    """Le dépôt impose LF à l'extraction, sur tout poste (P9F17).
+
+    Mutation : `.gitattributes` retiré, ou sa règle `*` sans `eol=lf`, échoue.
+    """
+    attributes = REPO / ".gitattributes"
+    assert attributes.is_file()
+    rules = [line.split() for line in attributes.read_text("utf-8").splitlines()]
+    star = [rule[1:] for rule in rules if rule and rule[0] == "*"]
+    assert star and "eol=lf" in star[0] and "text=auto" in star[0]

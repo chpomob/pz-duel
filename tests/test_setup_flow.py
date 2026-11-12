@@ -803,8 +803,9 @@ def test_setup_state_hashes_the_mod_with_no_lock_held(healthy, monkeypatch, real
 # -- UI : lecture statique, le rendu se vérifie à la main ---------------------
 
 
-def ui_script() -> str:
-    return (UI_DIR / "app.js").read_text("utf-8")
+def ui_script(ui_dir: Path = UI_DIR) -> str:
+    """`ui/app.js` en LF, quel que soit le checkout (P9F17) : les découpages ci-dessous cherchent `\n`."""
+    return (ui_dir / "app.js").read_text("utf-8").replace("\r\n", "\n")
 
 
 def test_ac26_can_launch_commands_the_disabled_attribute():
@@ -978,7 +979,9 @@ def _run_prefill(script: str, steps: list[tuple[str, object]]) -> list[str]:
     )
     node = shutil.which("node")
     assert node is not None
-    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
     return json.loads(done.stdout)
 
 
@@ -1129,7 +1132,10 @@ def _render_invite(
     )
     node = shutil.which("node")
     assert node is not None, "node est requis pour rendre l'écran"
-    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    # Node écrit en UTF-8 : décodé tel quel, pas avec l'encodage local (cp1252 sous Windows, P9F17).
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
     return done.stdout
 
 
@@ -1215,7 +1221,9 @@ def test_p9f7_lobby_says_not_public_and_warning_before_the_button_and_shows_the_
         "process.stdout.write(portsMapping([{port: 49271, protocol: 'UDP', internal: 17271},"
         " {port: 49280, protocol: 'TCP', internal: 49280}, {port: 1, protocol: 'TCP'}]));"
     )
-    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
     assert done.stdout == "49271 -> 17271/UDP, 49280/TCP, 1/TCP"
 
 
@@ -1363,7 +1371,9 @@ def _render_referee(players: dict, scope: dict | None = None) -> str:
     )
     node = shutil.which("node")
     assert node is not None, "node est requis pour rendre l'écran"
-    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
     return _plain(done.stdout)
 
 
@@ -1433,7 +1443,11 @@ def _render_settings_panel(catalog: dict) -> str:
     )
     node = shutil.which("node")
     assert node is not None
-    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    # Node écrit en UTF-8 ; sans `encoding`, `text=True` décode avec l'encodage local (cp1252 sous
+    # Windows) et « Règles » devient « RÃ¨gles » : `index` ne le trouve plus (P9F17).
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
     return done.stdout
 
 
@@ -1455,6 +1469,41 @@ def test_p9f15_settings_panel_is_flat_and_built_from_the_served_catalog():
     assert html.count('type="checkbox"') == sum(f["type"] == "bool" for f in catalog["fields"])
     assert 'id="set-pop_distance-0"' in html and 'id="set-pop_distance-1"' in html
     assert 'data-action="settings-defaults"' in html and "Valeurs par défaut" in html
+
+
+def test_p9f17_ui_script_reads_a_crlf_checkout_as_lf(tmp_path):
+    """Un `app.js` extrait en CRLF se découpe comme sous Linux.
+
+    Mutation : `ui_script()` lisant sans traduire les fins de ligne (`read_bytes().decode()`)
+    garde les `\r` et `"));\n"` devient introuvable. `read_text` brut, lui, ne fait pas tomber ce
+    test : le mode texte de Python traduit déjà `\r\n` ; le `.replace` est une ceinture en plus.
+    """
+    real = (UI_DIR / "app.js").read_bytes().replace(b"\r\n", b"\n")
+    (tmp_path / "app.js").write_bytes(real.replace(b"\n", b"\r\n"))
+    assert b"\r\n" in (tmp_path / "app.js").read_bytes()
+
+    script = ui_script(tmp_path)
+
+    assert "\r" not in script
+    esc = script[script.index("const esc = ") :]
+    assert esc.index("));\n") > 0
+    assert script == real.decode("utf-8")
+
+
+def test_p9f17_settings_panel_survives_a_windows_locale(monkeypatch):
+    """Sous un encodage local cp1252 (runner Windows), le rendu Node garde ses accents.
+
+    Mutation : `encoding="utf-8"` retiré de `_render_settings_panel` (retour à `text=True`) fait
+    décoder la sortie en cp1252, « >Règles</h3> » devient « >RÃ¨gles</h3> » et `index` lève
+    `ValueError: substring not found` — l'erreur de la CI Windows.
+    """
+    if shutil.which("node") is None:
+        pytest.skip("node absent")
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "cp1252")
+
+    html = _render_settings_panel(Engine("mock").settings_catalog())
+
+    assert ">Règles</h3>" in html and "Valeurs par défaut" in html
 
 
 def esc_html(text: str) -> str:

@@ -550,3 +550,37 @@ Le compilateur y est un fichier vide et son appel un enregistreur : rien ne lanc
 - La durée imprimée est capturée par pytest : elle paraît dans le journal quand le fixture échoue,
   ou sous `-s` ; un run vert ne la montre pas. La faire paraître toujours demanderait de toucher
   `tests.yml`, que `test_ci_workflows` veut identique à la publication, hors du périmètre.
+
+## P9F17 — sortie de Node lue en UTF-8, fins de ligne LF imposées au dépôt (2026-11-12)
+
+**Cause :** après P9F16, la CI Windows garde une erreur :
+`test_p9f15_settings_panel_is_flat_and_built_from_the_served_catalog`,
+`tests\test_setup_flow.py:1452: ValueError: substring not found`. La ligne 1452 de `744af6b` est
+`html.index(">Règles</h3>")`, pas le découpage de `ui/app.js` : le rendu Node était lu par
+`subprocess.run(..., text=True)`, qui décode avec l'encodage local — cp1252 sur le runner. Node
+écrit en UTF-8, « Règles » devient « RÃ¨gles », `>Monde</h3>` (ASCII) est trouvé et `>Règles</h3>`
+ne l'est pas. L'hypothèse CRLF de la spécification ne tenait pas seule : `Path.read_text` ouvre en
+mode texte et traduit déjà `\r\n` en `\n`, sur tout poste.
+
+**Fait :**
+
+- Les cinq rendus Node de `tests/test_setup_flow.py` lisent leur sortie avec `encoding="utf-8"`.
+  Seul celui des réglages tombait ; les quatre autres n'assertaient que de l'ASCII.
+- `.gitattributes` impose `* text=auto eol=lf` (binaires déclarés `binary`, `*.bat`/`*.cmd` en
+  CRLF ; aucun n'est versionné aujourd'hui). `git add --renormalize .` ne change aucun blob : le
+  dépôt était déjà en LF.
+- `ui_script()` normalise `\r\n` en `\n` en plus de la traduction du mode texte.
+
+**Tests et mutations :** `tests/test_setup_flow.py` —
+`test_p9f17_settings_panel_survives_a_windows_locale` force `subprocess._text_encoding` à cp1252 :
+`encoding="utf-8"` retiré du rendu des réglages, il tombe comme la CI Windows ;
+`test_p9f17_ui_script_reads_a_crlf_checkout_as_lf` écrit un `app.js` en CRLF : `ui_script()` lisant
+par `read_bytes().decode()`, il tombe (rendu à `read_text` brut, il passe : le mode texte suffit).
+`tests/test_ci_workflows.py` — `test_p9f17_gitattributes_forces_lf_for_every_file` :
+`.gitattributes` retiré, il tombe.
+
+**Ouvert :**
+
+- La preuve finale est la CI Windows verte sur ce commit, à relire après le push.
+- La garde d'encodage repose sur `subprocess._text_encoding`, nom privé de CPython (3.11+) : s'il
+  change, le `monkeypatch.setattr` lève et le test le dit, il ne passe pas en silence.
