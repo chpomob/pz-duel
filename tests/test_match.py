@@ -7,6 +7,8 @@ import json
 import math
 import threading
 import shutil
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,7 @@ from test_snapshots import (  # noqa: F401
 )
 from service import engine as engine_module
 from service.api import make_server
+from service.guest_launcher import LauncherRefused
 from service.journal import JOURNAL_NAME, JournalError
 from service.proofs import PROOFS_NAME
 from service.protocol import dump_line, parse_event, parse_session
@@ -3969,3 +3972,147 @@ def test_already_invisible_admin_stays_invisible_after_the_release():
     assert server.result(2)["status"] == "applied"
     assert admin.invisible and not admin.blocked
 
+
+
+# -- P9F14 : mode arbitre — deux invités, aucun joueur sur la machine qui héberge ----------------
+
+REFEREE_ADDRESS = "192.168.1.20"
+
+
+@pytest.fixture
+def referee_lobby(engine_rig, monkeypatch):
+    """Un lobby réel lancé en mode arbitre : `Lobby` ne passe que preset et mot de passe."""
+    monkeypatch.setattr(engine_module, "local_ip", lambda: REFEREE_ADDRESS)
+    original = engine_module.Engine.action
+
+    def action(self, name, payload=None):
+        if name == "start":
+            payload = {**(payload or {}), "mode": "referee"}
+        return original(self, name, payload)
+
+    monkeypatch.setattr(engine_module.Engine, "action", action)
+    return Lobby(engine_rig, PRESET)
+
+
+def _join(launcher: bytes) -> tuple[str, int, str]:
+    """Ce que le `.bat` donne à `+connect` et à `+password` (comme `test_share.join_line`)."""
+    from test_share import join_line
+
+    return join_line(launcher)
+
+
+def test_p9f14_open_game_is_refused_in_referee_mode_and_opens_nothing(referee_lobby, engine_rig):
+    """Personne ne joue ici : même l'adversaire identifié, aucun client ne part, rien n'est écrit.
+
+    Mutation : retirer `if self._referee(): return False, NO_LOCAL_PLAYER_TEXT` de `_open_game` —
+    B identifié, la demande part vers le client de l'hôte (lancé ou introuvable, et journalisé).
+    """
+    lobby, engine = referee_lobby, referee_lobby.engine
+    launched = []
+    engine._client_launcher = lambda *args, **kwargs: launched.append(args)
+    lobby.mods["B"].beat(players=(PLAYERS["B"],))
+    engine_rig.until(lambda s: s["players"]["B"] == PLAYERS["B"])
+
+    assert engine.action("open_game") == (False, "refused, reason: no_local_player")
+    assert launched == [] and engine._client is None and not engine._client_starting
+    assert not any("client" in line["msg"].lower() for line in lobby.state()["logs"])
+    # Par l'API aussi : un refus, sans le moindre secret.
+    server = make_server(engine)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, reply = call(
+            f"http://127.0.0.1:{server.server_address[1]}/api/action", {"action": "open_game"}
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(WAIT_S)
+    assert status == 409 and reply["ok"] is False
+    assert reply["message"] == "refused, reason: no_local_player"
+    assert launched == []
+
+
+def test_p9f14_each_invitation_carries_the_password_of_its_own_side(referee_lobby, engine_rig):
+    """L'invitation de A porte `host_password`, celle de B le mot de passe de B, et chaque `.bat`
+    ouvre son propre serveur.
+
+    Mutation : `password = config["password"]` pour les deux camps dans `_invite_fields` —
+    l'invitation de A porte le mot de passe de B, et son `.bat` se heurte au serveur A.
+    """
+    lobby, engine = referee_lobby, referee_lobby.engine
+    state = lobby.state()
+    host_password = state["config"]["host_password"]
+    invite = state["invite"]
+    side_b = {key: value for key, value in invite.items() if key != "A"}
+    assert state["config"]["mode"] == "referee"
+    assert invite["side"] == "B" and invite["A"]["side"] == "A"
+    assert invite["password"] == PLAYER_PASSWORD
+    assert invite["A"]["password"] == host_password != PLAYER_PASSWORD
+    assert host_password not in json.dumps(side_b)
+    assert PLAYER_PASSWORD not in json.dumps(invite["A"])
+    ports = engine_rig.runtime["ports"]
+    assert _join(engine.side_launcher("A")) == (REFEREE_ADDRESS, ports["A"]["game"], host_password)
+    assert _join(engine.guest_launcher()) == (REFEREE_ADDRESS, ports["B"]["game"], PLAYER_PASSWORD)
+    assert engine.side_launcher("B") == engine.guest_launcher()
+    # Deux codes de lanceur, deux jetons de partage : un camp ne reçoit jamais l'autre.
+    assert invite["launcher_code"] != invite["A"]["launcher_code"]
+    server_dir = engine_rig.zomboid / "Server"
+    assert read_ini(server_dir / "duelA.ini")["Password"] == host_password
+    assert read_ini(server_dir / "duelB.ini")["Password"] == PLAYER_PASSWORD
+
+
+def test_p9f14_launcher_route_serves_each_side_and_refuses_the_rest(referee_lobby, engine_rig):
+    """`GET /api/invite/launcher?side=A|B` : le `.bat` du camp ; un autre camp, 400.
+
+    Mutation : `_get_launcher` qui ignore `side` — `?side=A` rend le `.bat` de B.
+    """
+    engine = referee_lobby.engine
+    server = make_server(engine)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/api/invite/launcher"
+
+    def get(url: str) -> tuple[int, bytes]:
+        try:
+            with urllib.request.urlopen(url) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read()
+
+    try:
+        side_a, side_b, plain, other = (
+            get(f"{base}?side=A"), get(f"{base}?side=B"), get(base), get(f"{base}?side=C")
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(WAIT_S)
+    assert side_a == (200, engine.side_launcher("A"))
+    assert side_b == (200, engine.guest_launcher()) == plain
+    assert side_a[1] != side_b[1]
+    assert other[0] == 400
+
+
+def test_p9f14_host_mode_has_one_invitation_and_no_launcher_for_a(engine_rig, monkeypatch):
+    """Le défaut, inchangé : une invitation, sans `host_password`, et pas de `.bat` pour A.
+
+    Mutation : `_referee()` toujours vrai — une seconde invitation porte `host_password`.
+    """
+    monkeypatch.setattr(engine_module, "local_ip", lambda: REFEREE_ADDRESS)
+    lobby = Lobby(engine_rig, PRESET)
+    state = lobby.state()
+    assert state["config"]["mode"] == "host"
+    assert "A" not in state["invite"] and "side" not in state["invite"]
+    assert state["config"]["host_password"] not in json.dumps(state["invite"])
+    with pytest.raises(LauncherRefused):
+        lobby.engine.side_launcher("A")
+    assert lobby.engine.side_launcher("B") == lobby.engine.guest_launcher()
+
+
+def test_p9f14_unknown_play_mode_is_refused_before_any_effect(engine_rig):
+    engine = engine_rig.build()
+    ok, message = engine.action("start", {"preset": PRESET, "mode": "spectator"})
+    assert not ok and "host ou referee" in message
+    assert engine.snapshot()["phase"] == "idle"

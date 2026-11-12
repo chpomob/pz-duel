@@ -60,6 +60,10 @@ peut-être à un tiers, supprimé seulement si la box (`GetSpecificPortMappingEn
 pointé vers nous avec notre description — une box qui ignore le bail ne garde donc pas le mapping
 pour toujours, et un couple repris par un tiers n'est pas touché.
 
+Mode arbitre (P9F14) : le moteur appelle `open_ports` une seconde fois, après celle de B, avec
+les trois couples du camp A (`side_a_couples`, dérivés de ceux de B) ; chaque appel garde ses trois mappings, son repli
+et son résultat, si bien qu'un échec sur A n'efface rien de B. Le registre les retient tous.
+
 L'adresse publique lue n'est placée que dans le résultat rendu ; ce module ne la consigne
 jamais (R5).
 """
@@ -77,7 +81,7 @@ import time
 import urllib.parse
 import threading
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from xml.parsers import expat
 from xml.sax.saxutils import escape
@@ -863,6 +867,24 @@ def external_couples(upnp_cfg: dict) -> list[Couple]:
     return [(ports[key], protocol) for key, protocol in zip(EXTERNAL_KEYS, ("UDP", "UDP", "TCP"))]
 
 
+def side_a_couples(upnp_cfg: dict, offset: int) -> list[Couple] | None:
+    """Les trois couples externes du camp A en mode arbitre (P9F14), ou `None`.
+
+    Personne ne joue alors sur la machine qui héberge : le joueur A vient de l'extérieur, comme
+    B. Aucun port de plus dans la configuration : chaque externe de A est celui de B décalé de
+    `offset` (fixé par l'appelant), si bien qu'il suit les externes configurés de B, dans la même
+    plage. `None` si la section est invalide, si un externe de A sort de [1024, 65535] ou s'il
+    croise un externe de B : rien ne doit écraser un mapping de B.
+    """
+    if not external_ports_ok(upnp_cfg):
+        return None
+    couples_b = external_couples(upnp_cfg)
+    couples = [(port + offset, protocol) for port, protocol in couples_b]
+    if not all(_external_port(port) for port, _ in couples) or set(couples) & set(couples_b):
+        return None
+    return couples
+
+
 def low_port_warning(upnp_cfg: object) -> str | None:
     """Avertissement (pas une erreur) pour un externe configuré sous 49152 (P9F7).
 
@@ -880,14 +902,18 @@ def low_port_warning(upnp_cfg: object) -> str | None:
 FALLBACK_TRIES = 3  # candidats du repli par couple (P9F7) : bornent les lectures de la box
 
 
-def _fallback_slots(upnp_cfg: dict, couples: Sequence[Couple]) -> list[list[Couple]]:
+def _fallback_slots(
+    upnp_cfg: dict, couples: Sequence[Couple], reserved: Collection[int] = ()
+) -> list[list[Couple]]:
     """Les candidats du repli, couple par couple (P9F7) : les `FALLBACK_TRIES * 3` premiers ports
-    de `fallback_range` qui ne sont pas parmi `couples`, distribués en tourniquet — le couple `i`
-    ne prend que les ports de rang `i`, `i + 3`, `i + 6`. Un port ne sert donc qu'à un couple,
-    avec un protocole et un port interne connus d'avance. Vide si la plage ne suffit pas.
+    de `fallback_range` qui ne sont ni parmi `couples` ni dans `reserved`, distribués en
+    tourniquet — le couple `i` ne prend que les ports de rang `i`, `i + 3`, `i + 6`. Un port ne
+    sert donc qu'à un couple, avec un protocole et un port interne connus d'avance. Vide si la
+    plage ne suffit pas. `reserved` (revue P9F14 A1) : les externes que l'autre ouverture du mode
+    arbitre peut poser, préférés comme repli ; aucun des deux camps n'écrase l'autre.
     """
     first, last = upnp_cfg["fallback_range"]
-    taken = {port for port, _ in couples}
+    taken = {port for port, _ in couples} | set(reserved)
     count = len(couples)
     free = [port for port in range(first, last + 1) if port not in taken][: count * FALLBACK_TRIES]
     if count == 0 or len(free) < count:
@@ -895,24 +921,29 @@ def _fallback_slots(upnp_cfg: dict, couples: Sequence[Couple]) -> list[list[Coup
     return [[(port, protocol) for port in free[index::count]] for index, (_, protocol) in enumerate(couples)]
 
 
-def fallback_couples(upnp_cfg: dict, couples: Sequence[Couple]) -> list[Couple]:
+def fallback_couples(
+    upnp_cfg: dict, couples: Sequence[Couple], reserved: Collection[int] = ()
+) -> list[Couple]:
     """Les trois couples préférés du repli (P9F7) : déterministes, les trois premiers ports de
     `fallback_range` qui ne sont pas déjà parmi `couples` (ceux que la box vient de refuser),
     dans l'ordre et avec les protocoles de `couples`. Vide si la plage ne suffit pas. Un
     candidat que la box dit déjà pris par un autre appareil est sauté (`fallback_candidates`).
     """
-    return [slot[0] for slot in _fallback_slots(upnp_cfg, couples)]
+    return [slot[0] for slot in _fallback_slots(upnp_cfg, couples, reserved)]
 
 
 def fallback_candidates(
-    upnp_cfg: dict, couples: Sequence[Couple], internal: Sequence[int] | None = None
+    upnp_cfg: dict,
+    couples: Sequence[Couple],
+    internal: Sequence[int] | None = None,
+    reserved: Collection[int] = (),
 ) -> dict[Couple, int | None]:
     """Tous les couples que le repli peut poser (P9F7), avec le port interne où chacun arrive
     (`None` sans `internal`) : à retenir comme possiblement posés tant que l'issue est inconnue.
     """
     return {
         couple: None if internal is None else internal[index]
-        for index, slot in enumerate(_fallback_slots(upnp_cfg, couples))
+        for index, slot in enumerate(_fallback_slots(upnp_cfg, couples, reserved))
         for couple in slot
     }
 
@@ -923,6 +954,7 @@ def _free_fallback(
     couples: list[Couple],
     cancel: threading.Event | None,
     internal: Sequence[int] | None,
+    reserved: Collection[int] = (),
 ) -> list[Couple] | None:
     """Les trois couples du repli, chacun libre sur la box, ou `None` (revue P9F7 A2).
 
@@ -935,7 +967,7 @@ def _free_fallback(
     """
     timeout_s, max_bytes = cfg["request_timeout_s"], cfg["max_response_bytes"]
     chosen: list[Couple] = []
-    for index, slot in enumerate(_fallback_slots(cfg, couples)):
+    for index, slot in enumerate(_fallback_slots(cfg, couples, reserved)):
         inner = None if internal is None else internal[index]
         for couple in slot:
             if _stopped(cancel):
@@ -1221,6 +1253,7 @@ def _open(
     cancel: threading.Event | None,
     internal: Sequence[int] | None = None,
     fallback: bool = False,
+    reserved: Collection[int] = (),
 ) -> tuple[dict, list[Couple]]:
     """Ouverture des trois couples, puis, sur 718, au plus un repli dans `fallback_range` (P9F7).
 
@@ -1242,7 +1275,7 @@ def _open(
         and not _stopped(cancel)
     ):
         return result, cleared
-    alternate = _free_fallback(gateway, cfg, couples, cancel, internal)
+    alternate = _free_fallback(gateway, cfg, couples, cancel, internal, reserved)
     if not alternate:
         return result, cleared
     log.info("upnp: router refused the configured ports (718), trying the fallback range once")
@@ -1321,6 +1354,7 @@ def open_ports(
     *,
     internal: Sequence[int] | None = None,
     fallback: bool = False,
+    reserved: Collection[int] = (),
 ) -> tuple[dict, Gateway | None, list[Couple]]:
     """Ouvre les trois mappings de `ports` : `(résultat, passerelle ou None, couples effacés)`.
 
@@ -1330,7 +1364,10 @@ def open_ports(
     suivante. `cleared` liste les couples dont cette ouverture a confirmé l'absence sur cette
     passerelle. `internal` (P9F7) donne, dans l'ordre, le port où chaque externe arrive (par
     défaut le même) ; chaque dictionnaire du résultat le porte alors en `internal`. `fallback`
-    autorise un repli unique dans `fallback_range` quand la box rend 718. Aucune exception ne sort.
+    autorise un repli unique dans `fallback_range` quand la box rend 718 ; `reserved` (revue
+    P9F14 A1) nomme les externes que ce repli ne prend jamais. Un couple de `ports` dans
+    `reserved` est refusé sans trafic : il écraserait un mapping de l'autre camp. Aucune
+    exception ne sort.
     """
     couples = _couples(ports)
     if internal is not None and not _internal_ok(internal):
@@ -1341,7 +1378,7 @@ def open_ports(
         if couples and internal is not None and len(couples) == len(internal):
             return _invalid(invalid["key"], couples, internal), None, []
         return invalid, None, []
-    if not _ports_ok(couples):
+    if not _ports_ok(couples) or any(port in reserved for port, _ in couples):
         return _invalid("ports", couples), None, []
     assert isinstance(cfg, dict) and couples is not None
     try:
@@ -1355,7 +1392,7 @@ def open_ports(
             result["ports"] = _as_dicts(couples, internal)
             result["manual"] = manual_instruction(couples, internal)
             return result, None, []
-        result, cleared = _open(gateway, cfg, couples, cancel, internal, fallback)
+        result, cleared = _open(gateway, cfg, couples, cancel, internal, fallback, reserved)
     except (*PARSE_ERRORS, TypeError, KeyError) as exc:
         # `PARSE_ERRORS` couvre `ArithmeticError` : une erreur numérique devient un résultat.
         log.info("upnp: opening failed (%s)", type(exc).__name__)

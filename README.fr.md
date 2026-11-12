@@ -137,6 +137,33 @@ dossier `matches` et le verrou d'instance unique (avec le port où il écoute).
    succès, le mod `duelcore` qu'il a remplacé n'est pas supprimé : il est gardé dans
    `Zomboid\duelcore.previous`, dans votre dossier utilisateur, et la fenêtre dit comment y revenir.
 
+### Deux invités (mode arbitre)
+
+Le PC qui lance PZ Duel n'est pas obligé de jouer. Dans `Configurer un duel`, **Who plays** propose
+`Me and a guest` (le défaut, tout ce qui précède) ou `Two guests: this computer only hosts and
+referees`. Le choix part dans la demande de lancement (`"mode": "host"` ou `"referee"`) et se relit
+dans `/api/state` sous `config.mode` (le `mode` de premier niveau dit déjà simulé ou réel). La
+revanche le garde.
+
+En mode arbitre :
+
+- le lobby montre **deux invitations complètes**, *Player A* et *Player B*, chacune avec son code de
+  lanceur, son lien, son `Save launcher` (`GET /api/invite/launcher?side=A` ou `?side=B` ; sans
+  `side`, B) et son mot de passe serveur. Envoyez chacune à son joueur, et lisez chaque code à voix
+  haute à son seul joueur ;
+- **pas de bouton de jeu** : personne ne joue sur cette machine, et `open_game` répond
+  `refused, reason: no_local_player` ;
+- `Open ports` ouvre **six** redirections, trois par camp, toutes décrites `PZ Duel` : celles de B
+  comme avant (49271 et 49272 UDP, 49280 TCP par défaut) et celles de A, dix plus bas (49261 et
+  49262 UDP, 49270 TCP), vers les ports de jeu de A et son propre écouteur de partage
+  (`share_port` + 1, 17281 par défaut). Un échec sur A s'affiche sur sa propre ligne et laisse les
+  redirections de B en place ;
+- **le mot de passe serveur du camp A part dans l'invitation de A.** En mode hôte, c'est l'accès de
+  l'hôte, qui ne sort jamais de la machine ; en mode arbitre, c'est l'accès d'un joueur, comme
+  celui de B ;
+- la tenue ne change pas : les deux mondes restent figés tant que **les deux** joueurs ne sont pas
+  là, si bien qu'aucun invité ne peut jouer avant l'autre.
+
 ### Jouer par Internet
 
 Sur le même réseau local, il n'y a rien de plus à faire. Sinon, l'hôte redirige ces ports de sa box

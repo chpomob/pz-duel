@@ -128,6 +128,30 @@ single-instance lock (with the port it listens on).
    it succeeds, the `duelcore` mod it replaced is not deleted: it is kept in
    `Zomboid\duelcore.previous`, in your user folder, and the window says how to go back to it.
 
+### Two guests (referee mode)
+
+The PC that runs PZ Duel does not have to play. In `Configurer un duel`, **Who plays** offers
+`Me and a guest` (the default, everything above) or `Two guests: this computer only hosts and
+referees`. The choice travels in the start request (`"mode": "host"` or `"referee"`) and reads back
+in `/api/state` under `config.mode` (the top-level `mode` already says simulated or real). A rematch
+keeps it.
+
+In referee mode:
+
+- the lobby shows **two complete invitations**, *Player A* and *Player B*, each with its own launcher
+  code, link, `Save launcher` (`GET /api/invite/launcher?side=A` or `?side=B`; without `side`, B) and
+  server password. Send each one to its player, and read each code aloud to its own player only;
+- there is **no game button**: nobody plays on this computer, and `open_game` answers
+  `refused, reason: no_local_player`;
+- `Open ports` opens **six** mappings, three per side, all described `PZ Duel`: B's as before
+  (49271 and 49272 UDP, 49280 TCP by default) and A's, ten lower (49261 and 49262 UDP, 49270 TCP),
+  towards A's game ports and A's own share listener (`share_port` + 1, 17281 by default). A failure
+  on A is shown on its own line and leaves B's mappings in place;
+- **side A's server password goes into A's invitation.** In the default mode it is the host's own
+  access and never leaves the machine; in referee mode it is a player's access, like B's;
+- the freeze is unchanged: both worlds stay frozen until **both** players are in, so neither guest
+  can play before the other.
+
 ### Playing over the Internet
 
 On the same local network, there is nothing more to do. Otherwise the host forwards these ports on

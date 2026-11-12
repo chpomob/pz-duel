@@ -363,3 +363,79 @@ quand les deux joueurs sont là).
   à défaut, le code reste sélectionnable d'un clic (`user-select: all`).
 - Les textes ajoutés sont en anglais (règle AC29) ; le reste de la carte mêle encore français et
   anglais.
+
+## P9F14 — mode arbitre : deux invités, aucun joueur local (2026-11-12)
+
+Demande du propriétaire : séparer le serveur et les joueurs, avoir deux invités, que la machine qui
+héberge ne soit pas forcément un joueur. Le lobby propose désormais **qui joue** au lancement :
+`Me and a guest` (`mode: "host"`, le défaut, strictement le comportement d'avant) ou `Two guests`
+(`mode: "referee"`). Le choix part dans le corps de `POST /api/action {"action":"start", …}`, se
+relit dans `/api/state` sous `config.mode` et survit à la revanche. Ce n'est pas un réglage de preset.
+
+**Où se lit le mode.** La spécification demandait `/api/state.mode` ; ce champ de premier niveau dit
+déjà `mock` ou `real` et l'ensemble des clés de premier niveau est figé par
+`tests/test_modes.py::test_api_backward_compatible`. Le mode de jeu vit donc dans `config.mode`. En
+mode hôte, `config` gagne ce seul champ (`"host"`) ; rien d'autre ne change.
+
+**Ce qui change en mode arbitre :**
+
+- **Deux invitations complètes.** Celle de B reste à la racine de `invite`, comme avant ; celle de A
+  est rangée sous `invite.A`. Chacune a son lien (jeton propre), son code de lanceur, son `.bat`
+  (`GET /api/invite/launcher?side=A|B`, sans `side` : B ; `?side=A` hors mode arbitre : 409) et son
+  mot de passe serveur.
+- **Un second écouteur de partage**, pour A, sur `share_port + 1` (17281). `service/share.py` ne
+  sert qu'un jeton par écouteur et n'était pas dans le périmètre : A a donc le sien, qui reçoit un
+  adaptateur (`_SideShare`) rendant le `.bat` de A. La spécification parlait de « 17280 TCP pour
+  chaque camp » ; c'est 17280 pour B et 17281 pour A. Port pris : le lien de A est annoncé
+  indisponible, le `.bat` s'enregistre encore depuis l'UI, comme pour B.
+- **Six redirections.** Le même clic ouvre B (inchangé), puis A sur le même fil, une fois B
+  fusionné : un échec sur A ne touche ni le résultat ni les mappings de B, et s'annonce à part
+  (`ports_opening.A`, journal `port opening (side A): …`). Les externes de A sont ceux de B décalés
+  de `SIDE_A_EXTERNAL_OFFSET = -10` (49261, 49262 UDP, 49270 TCP), refusés s'ils sortiraient de
+  [1024, 65535] ou croiseraient un externe de B ; ils suivent ainsi les externes configurés de B
+  dans la plage haute. `runtime.json` n'était pas dans le périmètre : aucune clé nouvelle. Même
+  description `PZ Duel`, même bail, même repli unique sur 718, même registre (`upnp.Ledger`) ;
+  le budget de retrait à l'arrêt passe à deux fois `MAPPING_COUNT` requêtes.
+- **`open_game` refusé** : `refused, reason: no_local_player`, sans journal, sans client lancé ; le
+  bouton n'existe pas (carte `refereeCard`).
+- **Renversement assumé du contrat de `host_password`.** Jusqu'ici, c'était un secret de machine :
+  il n'ouvrait que A, seul l'hôte le lisait au lobby, et `_invite_fields` garantissait que `invite`
+  ne le portait jamais (`tests/test_share.py::test_invite_never_carries_the_host_password`, toujours
+  vrai en mode hôte). En mode arbitre, personne ne joue sur la machine : ce mot de passe n'est plus
+  un secret de machine mais **l'accès d'un participant**, qui doit pouvoir se connecter depuis chez
+  lui. Il part donc dans l'invitation de A et dans son `.bat`, exactement comme celui de B dans les
+  siens. Les deux secrets restent séparés par camp (code du lanceur, mot de passe serveur) ; un camp
+  ne reçoit jamais ceux de l'autre. Conséquence : l'invitation de A survit au lobby comme celle de B,
+  et y garde ce mot de passe (`config.host_password`, lui, disparaît toujours hors du lobby).
+
+**Inchangé :** la tenue (P9F10-P9F12) fige les deux mondes tant que les deux joueurs ne sont pas là,
+quel que soit le mode ; l'identité d'un camp reste le premier nom vu sur son serveur. Le duel, les
+règles, les presets, la dérive : inchangés.
+
+**Tests et mutations :**
+`tests/test_upnp.py::test_p9f14_referee_opens_six_mappings_and_two_invitations` (`ports_a = None`
+dans `open_ports` : trois redirections seulement),
+`test_p9f14_failure_on_a_is_reported_apart_and_leaves_b_open` (l'issue de A publiée dans
+`_ports_opening` : l'échec de A remplace le `mapped` de B),
+`test_p9f14_host_mode_opens_exactly_three_and_one_invitation` (`_referee()` toujours vrai),
+`test_p9f14_side_a_couples_follow_b_and_never_cross_it` ;
+`tests/test_match.py::test_p9f14_open_game_is_refused_in_referee_mode_and_opens_nothing` (refus
+retiré de `_open_game`), `test_p9f14_each_invitation_carries_the_password_of_its_own_side`
+(`config["password"]` pour les deux camps), `test_p9f14_launcher_route_serves_each_side_and_refuses_the_rest`
+(`side` ignoré), `test_p9f14_host_mode_has_one_invitation_and_no_launcher_for_a` ;
+`tests/test_setup_flow.py::test_p9f14_referee_lobby_shows_two_invitations_and_no_game_button`
+(bascule vers `refereeCard` retirée), `test_p9f14_start_carries_the_chosen_play_mode`.
+
+**Ouvert, à vérifier en session réelle :**
+
+- Aucune session à deux joueurs distants et aucun client sur la machine hôte n'a encore eu lieu.
+  À voir : les deux `.bat` rejoignent chacun leur serveur depuis deux réseaux différents ; la tenue
+  fige bien le premier arrivé, quel que soit le camp ; le duel part seul quand le second arrive.
+- Six redirections sur une vraie box : seule la box de l'auteur a vu trois redirections (P9F5). Une
+  box qui limite le nombre de redirections par appareil, ou qui rend 718 sur 49261/49262/49270, est
+  possible ; le repli unique couvre le 718, pas une limite de nombre.
+- Le second écouteur de partage (17281) passe par le pare-feu Windows comme le premier : invite à
+  autoriser à confirmer sur Windows réel.
+- Le préflight ne contrôle pas 17281 ; un port pris ne bloque rien mais coupe le lien de A.
+- Le texte du lanceur (`LAUNCHER_CODE_TEXT`) dit « your guest » pour les deux camps : juste pour
+  l'arbitre, qui a deux invités.

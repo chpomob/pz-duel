@@ -221,6 +221,25 @@ GUEST_NOT_HERE = (
     "impossible d'ouvrir le jeu : l'adversaire n'est pas encore connecté. Le jeu s'ouvre dès "
     "que l'invité est identifié, pour que ton monde ne tourne pas seul en l'attendant."
 )
+# Qui joue (P9F14), choisi au `start` et gardé par la revanche : `host`, le défaut, est le duel
+# d'avant (l'hôte joue A depuis cette machine) ; `referee` : la machine héberge et arbitre, deux
+# invités jouent A et B depuis chez eux. Une décision de session, jamais un réglage de preset.
+PLAY_HOST = "host"
+PLAY_REFEREE = "referee"
+PLAY_MODES = (PLAY_HOST, PLAY_REFEREE)
+PLAY_MODE_REFUSED = "mode refusé : host ou referee attendu"
+# En mode arbitre, aucun client ne s'ouvre ici : `open_game` n'a plus d'objet.
+NO_LOCAL_PLAYER = "no_local_player"
+NO_LOCAL_PLAYER_TEXT = f"refused, reason: {NO_LOCAL_PLAYER}"
+SIDE_A_UNAVAILABLE = (
+    "invitation A unavailable: only a duel with two guests (referee mode) has a second invitation"
+)
+# L'écouteur de partage de A se tient à côté de celui de B : un écouteur ne sert qu'un jeton.
+SIDE_A_SHARE_OFFSET = 1
+SIDE_A_PORTS_REFUSED = "upnp_ports.external_ports_a"
+# Les externes de A sont ceux de B décalés d'autant (P9F14) : 49261, 49262 et 49270 pour les
+# 49271, 49272 et 49280 livrés, dans la plage haute des box, distincts de ceux de B.
+SIDE_A_EXTERNAL_OFFSET = -10
 # Le lobby s'ouvre depuis `contract` : l'écouteur naît juste avant lui, sans lui survivre.
 SHARE_PHASES = ("contract", "lobby")
 # Formes neutres de `ports_opening` ; les autres statuts viennent de `service/upnp.py`.
@@ -241,6 +260,21 @@ LAUNCHER_CODE_TEXT = (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _SideShare:
+    """Ce que l'écouteur de partage lit du moteur : le `.bat` d'un camp (P9F14).
+
+    `ShareServer` ne connaît que `guest_launcher()` ; l'écouteur de A reçoit cet adaptateur, qui
+    rend le lanceur de A sous les mêmes refus que celui de B.
+    """
+
+    def __init__(self, engine: Engine, side: str) -> None:
+        self._engine = engine
+        self._side = side
+
+    def guest_launcher(self) -> bytes:
+        return self._engine.side_launcher(self._side)
 
 
 def _ipv4_literal(value: object) -> bool:
@@ -2035,6 +2069,16 @@ class Engine:
         # Les externes que porte l'invitation servie (`_invite_externals` au moment où elle a été
         # rendue) : la fusion d'une ouverture ne la reconstruit que s'ils changent (revue P9F7 A1).
         self._invite_built_externals: list[int] | None = None
+        # Mode arbitre (P9F14) : la seconde invitation, celle du camp A, avec son `.bat`, son
+        # écouteur de partage, son jeton et son ouverture de ports. Inertes en mode hôte.
+        self._launcher_a: bytes | None = None
+        self._launcher_refusal_a = SIDE_A_UNAVAILABLE
+        self._share_a: ShareServer | None = None
+        self._share_token_a: str | None = None
+        self._ports_opening_a: dict[str, Any] = {"status": PORTS_IDLE}
+        self._ports_pending_a: list[tuple[int, str]] = []
+        self._ports_attempted_a = False
+        self._invite_built_externals_a: list[int] | None = None
         backend = "serveurs réels" if self.real else "backend simulé"
         self.state.log(f"service démarré ({backend})")
         self._presets = load_presets(
@@ -2045,6 +2089,10 @@ class Engine:
     def real(self) -> bool:
         return self.mode == MODE_REAL
 
+    def _referee(self) -> bool:
+        """Vrai si le duel en cours se joue à deux invités (P9F14). Sous `self.lock`."""
+        return self.state.config.get("mode") == PLAY_REFEREE
+
     # -- lecture ---------------------------------------------------------
     def snapshot(self) -> dict:
         with self.lock:
@@ -2053,9 +2101,16 @@ class Engine:
             if state["phase"] != "lobby":
                 invite = state["invite"].items()
                 state["invite"] = {key: value for key, value in invite if key not in LOBBY_ONLY}
+                side_a = state["invite"].get(HOST_SIDE)
+                if isinstance(side_a, dict):
+                    side_a = {key: value for key, value in side_a.items() if key not in LOBBY_ONLY}
+                    state["invite"] = {**state["invite"], HOST_SIDE: side_a}
             # Présent dans toutes les phases ; l'UI ne le montre qu'au lobby. `invite` n'en
             # reçoit rien : l'adresse proposée reste dans `ports_opening.address` (R5).
             state["ports_opening"] = self._ports_view()
+            if self.real and self._referee():
+                # P9F14 : l'ouverture de A est annoncée à part, sous `ports_opening.A`.
+                state["ports_opening"][HOST_SIDE] = self._ports_view(HOST_SIDE)
             # Rien qui varie d'un appel à l'autre : l'UI compte le délai depuis son dernier appel
             # réussi, chacun étant un battement. `armed` est faux si l'arrêt ne peut pas tirer.
             state["idle_quit"] = {
@@ -2110,7 +2165,8 @@ class Engine:
 
     def _ports_held(self) -> bool:
         """Des redirections posées ou en cours de pose, que l'arrêt retirera. Sous `self.lock`."""
-        return bool(self._ports_ledger.entries()) or bool(self._ports_pending)
+        held = bool(self._ports_ledger.entries()) or bool(self._ports_pending)
+        return held or bool(self._ports_pending_a)
 
     def presets(self) -> list[dict]:
         return self._presets
@@ -2273,6 +2329,12 @@ class Engine:
                     return False, "action indisponible avec de vrais serveurs"
                 if phase != "lobby":
                     return False, "personne à faire entrer (phase %s)" % phase
+                if self._referee() and not self.state.players.get(HOST_SIDE):
+                    # P9F14 : deux invités, le premier simulé tient A.
+                    self.state.players[HOST_SIDE] = "joueur A (sim)"
+                    self.state.log("joueur A simulé connecté")
+                    self.state.event("joueur connecté", HOST_SIDE)
+                    return True, "joueur A connecté"
                 if self.state.players.get("B"):
                     return False, "l'adversaire est déjà là"
                 self.state.players["B"] = "invité (sim)"
@@ -2318,6 +2380,9 @@ class Engine:
         `_client_starting` retient donc le second appel, jusqu'à ce que `_client` prenne le relais.
         """
         with self.lock:
+            # P9F14 : en mode arbitre, personne ne joue ici. Refus sans journal ni client.
+            if self._referee():
+                return False, NO_LOCAL_PLAYER_TEXT
             phase = self.state.phase
             if phase != "lobby":
                 return False, f"impossible d'ouvrir le jeu en phase {phase} : il s'ouvre au lobby"
@@ -2380,50 +2445,73 @@ class Engine:
     # -- ouverture des ports (phase 3) ---------------------------------------
     # Hors d'`ACTIONS`, comme l'invitation. Aucun appel réseau sous `self.lock` (AC16) : le fil
     # `ports-open` fait les requêtes, puis reprend le verrou pour publier le résultat.
-    def _internal_ports(self) -> list[int]:
-        """Ports internes de R3, où le jeu et le partage écoutent : ils ne bougent pas (P9F7)."""
-        guest = self.runtime["ports"][GUEST_SIDE]
-        return [guest["game"], guest["udp"], self.runtime["share_port"]]
+    def _internal_ports(self, side: str = GUEST_SIDE) -> list[int]:
+        """Ports internes de R3, où le jeu et le partage écoutent : ils ne bougent pas (P9F7).
 
-    def _upnp_ports(self) -> list[tuple[int, str]]:
+        `side` vaut `A` en mode arbitre seulement (P9F14) : ses ports de jeu et son écouteur de
+        partage, à côté de celui de B.
+        """
+        ports = self.runtime["ports"][side]
+        return [ports["game"], ports["udp"], self._share_port(side)]
+
+    def _share_port(self, side: str = GUEST_SIDE) -> int:
+        """Port où écoute le partage d'un camp : `share_port` pour B, le suivant pour A (P9F14)."""
+        offset = SIDE_A_SHARE_OFFSET if side == HOST_SIDE else 0
+        return self.runtime["share_port"] + offset
+
+    def _upnp_ports(self, side: str = GUEST_SIDE) -> list[tuple[int, str]]:
         """Les trois couples externes de R3 (P9F7) : `upnp_ports.external_ports`, ceux qui voyagent.
 
         Des externes invalides (refusés au clic, AC13) sont remplacés par les internes, pour que
-        la vue neutre nomme encore trois ports.
+        la vue neutre nomme encore trois ports. Ceux de A (P9F14) sont ceux de B décalés de
+        `SIDE_A_EXTERNAL_OFFSET` (`upnp.side_a_couples`) ; impossibles, ce sont aussi les internes.
         """
         cfg = upnp.merged_config(self.runtime)
-        if upnp.external_ports_ok(cfg):
+        if side == HOST_SIDE:
+            couples = upnp.side_a_couples(cfg, SIDE_A_EXTERNAL_OFFSET) if isinstance(cfg, dict) else None
+            if couples is not None:
+                return couples
+        elif upnp.external_ports_ok(cfg):
             return upnp.external_couples(cfg)
-        return list(zip(self._internal_ports(), (UDP, UDP, TCP)))
+        return list(zip(self._internal_ports(side), (UDP, UDP, TCP)))
 
-    def _invite_externals(self) -> list[int] | None:
+    def _invite_externals(self, side: str = GUEST_SIDE) -> list[int] | None:
         """Externes que l'invitation vers une adresse saisie porte, ou `None` avant tout essai."""
-        return self._live_externals() if self._ports_attempted else None
+        attempted = self._ports_attempted_a if side == HOST_SIDE else self._ports_attempted
+        return self._live_externals(side) if attempted else None
 
     def _stale_invite(self) -> bool:
         """Vrai si les externes à porter ne sont plus ceux de l'invitation servie (revue P9F7 A1)."""
-        return self._invite_externals() != self._invite_built_externals
+        if self._invite_externals() != self._invite_built_externals:
+            return True
+        built_a = self._invite_built_externals_a
+        return self._referee() and self._invite_externals(HOST_SIDE) != built_a
 
-    def _live_externals(self) -> list[int]:
+    def _opening(self, side: str) -> dict[str, Any]:
+        return self._ports_opening_a if side == HOST_SIDE else self._ports_opening
+
+    def _live_externals(self, side: str = GUEST_SIDE) -> list[int]:
         """Externes que l'invitation porte (P9F7) : ceux réellement ouverts par une ouverture
         `mapped` dont le bail court encore, sinon les externes configurés."""
-        opening = self._ports_opening
+        opening = self._opening(side)
         if opening.get("status") == upnp.MAPPED and self._ports_ledger.proposal() == upnp.PROPOSAL_LIVE:
             ports = [item.get("port") for item in opening.get("ports", [])]
             if len(ports) == upnp.MAPPING_COUNT and all(isinstance(p, int) for p in ports):
                 return ports
-        return [port for port, _ in self._upnp_ports()]
+        return [port for port, _ in self._upnp_ports(side)]
 
-    def _ports_view(self) -> dict[str, Any]:
+    def _ports_view(self, side: str = GUEST_SIDE) -> dict[str, Any]:
         """Copie de l'état d'ouverture ; le neutre nomme les ports et le bail avant le clic (R8).
 
         Le registre (`upnp.Ledger`) dit si la dernière proposition `mapped` vaut encore, sur son
         horloge monotone (P9F3) : échue, un `mapped` redevient la forme neutre, marquée `expired`,
         sans l'adresse qu'il proposait (C5) ; quel que soit le dernier résultat (un nouvel essai
         en échec, une ouverture en cours), la vue porte `expired`, pour que l'UI la retire du
-        champ (C5, P9F2). `expires_at` (heure murale) n'est que l'heure affichée.
+        champ (C5, P9F2). `expires_at` (heure murale) n'est que l'heure affichée. La vue de A
+        (P9F14) suit les mêmes règles ; avertissement et constat d'adresse ne sont dits qu'une
+        fois, dans celle de B.
         """
-        view = copy.deepcopy(self._ports_opening)
+        view = copy.deepcopy(self._opening(side))
         if self._ports_ledger.proposal() == upnp.PROPOSAL_EXPIRED:
             if view["status"] == upnp.MAPPED:
                 view = {"status": PORTS_IDLE, "expired": True}
@@ -2431,15 +2519,17 @@ class Engine:
                 view["expired"] = True
         cfg = upnp.merged_config(self.runtime)
         if view["status"] in (PORTS_IDLE, PORTS_IN_PROGRESS):
-            internal = self._internal_ports()
+            internal = self._internal_ports(side)
             view.setdefault(
                 "ports",
                 [
                     {"port": p, "protocol": t, "internal": i}
-                    for (p, t), i in zip(self._upnp_ports(), internal)
+                    for (p, t), i in zip(self._upnp_ports(side), internal)
                 ],
             )
             view.setdefault("lease_s", cfg.get("lease_s") if isinstance(cfg, dict) else None)
+        if side == HOST_SIDE:
+            return view
         # P9F7 : avertissement d'un externe sous 49152, et adresse non publique dite avant l'essai.
         warning = upnp.low_port_warning(cfg)
         if warning is not None:
@@ -2464,7 +2554,12 @@ class Engine:
         return None
 
     def open_ports(self) -> tuple[bool, str]:
-        """Lance l'ouverture des trois mappings, à la demande de l'hôte, au lobby d'un duel réel."""
+        """Lance l'ouverture des trois mappings, à la demande de l'hôte, au lobby d'un duel réel.
+
+        En mode arbitre (P9F14), le même clic ouvre ensuite les trois mappings du camp A, sur le
+        même fil et après ceux de B : six en tout. Le résultat de A est publié à part
+        (`ports_opening.A`) ; un échec de A ne touche ni le résultat ni les mappings de B.
+        """
         with self.lock:
             if not self.real:
                 return False, "not available in simulated mode"
@@ -2473,52 +2568,119 @@ class Engine:
             phase = self.state.phase
             if phase != "lobby":
                 return False, f"only in the lobby, phase {phase}"
-            if self._ports_opening["status"] == PORTS_IN_PROGRESS:
+            if PORTS_IN_PROGRESS in (self._ports_opening["status"], self._ports_opening_a["status"]):
                 return False, "an opening is already in progress"
             ports = self._upnp_ports()
             internal = self._internal_ports()
             cfg = upnp.merged_config(self.runtime)
             invalid = upnp.validate(cfg, ports)
+            referee = self._referee()
             if invalid is not None:
-                invalid = {
-                    **invalid,
-                    "ports": [
-                        {"port": p, "protocol": t, "internal": i}
-                        for (p, t), i in zip(ports, internal)
-                    ],
-                    "manual": upnp.manual_instruction(ports, internal),
-                }
                 # Aucun fil, aucun paquet : la configuration est refusée avant tout (AC13).
-                self._ports_opening = invalid
+                self._ports_opening = self._invalid_opening(invalid, ports, internal)
+                if referee:
+                    side_a = self._upnp_ports(HOST_SIDE)
+                    self._ports_opening_a = self._invalid_opening(
+                        invalid, side_a, self._internal_ports(HOST_SIDE)
+                    )
                 self.state.log(f"port opening: {upnp.INVALID_CONFIG}", "warn")
                 return False, f"invalid configuration: {invalid['key']}"
             assert isinstance(cfg, dict)
             self._ports_cfg = dict(cfg)
             self._ports_opening = {"status": PORTS_IN_PROGRESS}
+            ports_a = self._side_a_opening(cfg) if referee else None
+            # Revue P9F14 A1 : les deux ouvertures se réservent des externes disjoints, repli
+            # compris. B ne se replie jamais sur un préféré de A ; A ne touche, ni en préféré ni
+            # en repli, aucun couple que B peut poser. `_attempt` efface avant d'ajouter : sans
+            # cela, A écraserait un repli de B, et le lanceur de B joindrait le serveur de A.
+            reserved_b = frozenset(port for port, _ in ports_a or ())
             # Le repli (P9F7) peut poser ses propres couples : tous sont possiblement posés.
-            self._ports_pending = [*ports, *upnp.fallback_candidates(cfg, ports)]
+            self._ports_pending = [
+                *ports, *upnp.fallback_candidates(cfg, ports, reserved=reserved_b)
+            ]
+            reserved_a = frozenset(port for port, _ in self._ports_pending)
+            if ports_a is not None:
+                self._ports_pending_a = [
+                    *ports_a, *upnp.fallback_candidates(cfg, ports_a, reserved=reserved_a)
+                ]
             click = (self._clock(), self._ports_ledger.clock())
             self.state.log("port opening requested")
             self._ports_thread = threading.Thread(
                 target=self._run_opening,
-                args=(dict(cfg), ports, click),
+                args=(dict(cfg), ports, click, ports_a, reserved_b, reserved_a),
                 name="ports-open",
                 daemon=True,
             )
             self._ports_thread.start()
         return True, "opening ports"
 
+    def _invalid_opening(
+        self, invalid: dict, ports: list[tuple[int, str]], internal: list[int]
+    ) -> dict[str, Any]:
+        return {
+            **invalid,
+            "ports": [
+                {"port": p, "protocol": t, "internal": i} for (p, t), i in zip(ports, internal)
+            ],
+            "manual": upnp.manual_instruction(ports, internal),
+        }
+
+    def _side_a_opening(self, cfg: dict) -> list[tuple[int, str]] | None:
+        """Prépare l'ouverture de A (P9F14), sous `self.lock` : ses couples, ou `None` s'ils ne
+        se dérivent pas de ceux de B sans les croiser — refus annoncé sur A seul, B continue."""
+        internal_a = self._internal_ports(HOST_SIDE)
+        ports_a = upnp.side_a_couples(cfg, SIDE_A_EXTERNAL_OFFSET)
+        if ports_a is None:
+            fallback = list(zip(internal_a, (UDP, UDP, TCP)))
+            refused = {"status": upnp.INVALID_CONFIG, "key": SIDE_A_PORTS_REFUSED}
+            self._ports_opening_a = self._invalid_opening(refused, fallback, internal_a)
+            self.state.log(f"port opening (side A): {upnp.INVALID_CONFIG}", "warn")
+            return None
+        self._ports_opening_a = {"status": PORTS_IN_PROGRESS}
+        return ports_a
+
     def _run_opening(
-        self, cfg: dict, ports: list[tuple[int, str]], click: tuple[float, float]
+        self,
+        cfg: dict,
+        ports: list[tuple[int, str]],
+        click: tuple[float, float],
+        ports_a: list[tuple[int, str]] | None = None,
+        reserved_b: frozenset[int] = frozenset(),
+        reserved_a: frozenset[int] = frozenset(),
     ) -> None:
-        """Corps du fil `ports-open` : le réseau hors du verrou, la fusion sous le verrou.
+        """Corps du fil `ports-open` : B, puis A en mode arbitre (P9F14), chacun fusionné à part.
+
+        A ne commence qu'une fois B fusionné : quoi qu'il arrive à A, le résultat et les mappings
+        de B sont déjà publiés et retenus. Un arrêt engagé entre les deux n'ouvre pas A.
+        """
+        self._open_side(GUEST_SIDE, cfg, ports, click, reserved_b)
+        if ports_a is None:
+            return
+        if self._ports_cancel.is_set():
+            with self.lock:
+                if not self._ports_abandoned:
+                    # Rien n'est parti vers la box pour A : rien n'est possiblement posé.
+                    self._ports_pending_a = []
+                    self._ports_opening_a = {"status": upnp.NO_GATEWAY, "reason": upnp.CANCELLED}
+            return
+        self._open_side(HOST_SIDE, cfg, ports_a, click, reserved_a)
+
+    def _open_side(
+        self,
+        side: str,
+        cfg: dict,
+        ports: list[tuple[int, str]],
+        click: tuple[float, float],
+        reserved: frozenset[int] = frozenset(),
+    ) -> None:
+        """Une ouverture : le réseau hors du verrou, la fusion sous le verrou.
 
         `click` porte l'heure murale (affichée) et l'heure du registre (décisions) du clic. Une
         fusion qui lève ne laisse ni l'ouverture bloquée en `in_progress` ni ses mappings oubliés
         (revue I3) : `_merge_failed` retient tous ses couples, à vérifier avant tout retrait, et
         publie un statut terminal.
         """
-        internal = self._internal_ports()
+        internal = self._internal_ports(side)
         try:
             result, gateway, cleared = upnp.open_ports(
                 cfg,
@@ -2527,6 +2689,7 @@ class Engine:
                 self._ports_cancel,
                 internal=internal,
                 fallback=True,
+                reserved=reserved,
             )
         except Exception as exc:  # noqa: BLE001 - `upnp` promet de ne rien lever ; dernier filet
             LOGGER.warning("port opening failed (%s)", type(exc).__name__)
@@ -2542,10 +2705,10 @@ class Engine:
             gateway, cleared = None, []
         with self.lock:
             try:
-                self._merge_opening(result, gateway, cleared, cfg, click)
+                self._merge_opening(result, gateway, cleared, cfg, click, side)
             except Exception as exc:  # noqa: BLE001 - dernier filet : jamais d'ouverture bloquée
                 LOGGER.warning("port opening result could not be merged (%s)", type(exc).__name__)
-                self._merge_failed(ports, gateway, cfg, click)
+                self._merge_failed(ports, gateway, cfg, click, side)
 
     def _lease_terms(self, cfg: dict, click: tuple[float, float]) -> dict[str, Any]:
         wall, started = click
@@ -2556,6 +2719,17 @@ class Engine:
             "description": cfg["description"],
         }
 
+    def _settle_side(self, side: str, view: dict[str, Any]) -> None:
+        """Publie l'issue d'une ouverture de `side` : plus rien d'elle n'est en attente."""
+        if side == HOST_SIDE:
+            self._ports_pending_a = []
+            self._ports_attempted_a = True
+            self._ports_opening_a = view
+        else:
+            self._ports_pending = []
+            self._ports_attempted = True
+            self._ports_opening = view
+
     def _merge_opening(
         self,
         result: dict,
@@ -2563,6 +2737,7 @@ class Engine:
         cleared: Sequence[tuple[int, str]],
         cfg: dict,
         click: tuple[float, float],
+        side: str = GUEST_SIDE,
     ) -> None:
         """Publie le résultat et le confie au registre des mappings (P9F3).
 
@@ -2574,29 +2749,29 @@ class Engine:
         `expires_at` vaut heure du clic + `lease_s` : une borne conservatrice (C6), jamais
         postérieure à l'expiration réelle d'un mapping, puisque chaque bail ne commence qu'à son
         `AddPortMapping`, après la découverte et les requêtes précédentes. C'est l'heure affichée ;
-        les décisions, elles, se prennent sur l'horloge monotone du registre.
+        les décisions, elles, se prennent sur l'horloge monotone du registre. `side` vaut `A`
+        pour la seconde ouverture du mode arbitre (P9F14), publiée et journalisée à part.
         """
         if self._ports_abandoned:
             return
         terms = self._lease_terms(cfg, click)
         self._ports_ledger.record(result, gateway, cleared, **terms)
-        self._ports_pending = []
         status = result.get("status")
         view = dict(result)
         if status == upnp.MAPPED:
             view["expires_at"] = terms["expires_at"]
-        self._ports_attempted = True
-        self._ports_opening = view
+        self._settle_side(side, view)
         # Le dernier constat de la box fait foi (revue P9F7 A3) : une adresse publique lue efface
         # un « non publique » d'une ouverture précédente ; une adresse inconnue ne tranche pas.
         if result.get("address_note") == upnp.NOTE_NOT_PUBLIC:
             self._router_not_public = True
         elif status == upnp.MAPPED and upnp.is_public(result.get("address")):
             self._router_not_public = False
+        label = "port opening (side A)" if side == HOST_SIDE else "port opening"
         level = "info" if status == upnp.MAPPED else "warn"
-        self.state.log(f"port opening: {status}", level)
+        self.state.log(f"{label}: {status}", level)
         if result.get("first_refused"):
-            self.state.log("port opening: router refused the configured ports, fallback range used")
+            self.state.log(f"{label}: router refused the configured ports, fallback range used")
         # L'invitation porte les externes réellement ouverts (P9F7) : un repli les change. La
         # comparaison se fait avec ceux de l'invitation servie, pas avec la vue d'avant la fusion,
         # déjà passée par `in_progress` (revue P9F7 A1).
@@ -2609,6 +2784,7 @@ class Engine:
         gateway: upnp.Gateway | None,
         cfg: dict,
         click: tuple[float, float],
+        side: str = GUEST_SIDE,
     ) -> None:
         """Filet d'une fusion en échec (revue I3), sous `self.lock`, sans rien qui puisse lever.
 
@@ -2620,12 +2796,11 @@ class Engine:
         """
         if self._ports_abandoned:
             return
-        self._ports_pending = []
-        self._ports_attempted = True
+        internal = self._internal_ports(side)
+        dicts = [{"port": p, "protocol": t, "internal": i} for (p, t), i in zip(ports, internal)]
+        self._settle_side(side, self._opening(side))
         if self._stale_invite() and self.real and self.state.phase == "lobby":
             self.state.invite = self._build_invite(self._invite_mod)
-        internal = self._internal_ports()
-        dicts = [{"port": p, "protocol": t, "internal": i} for (p, t), i in zip(ports, internal)]
         if gateway is not None:
             terms = self._lease_terms(cfg, click)
             # Le repli (P9F7) a pu poser ses couples : eux aussi sont vérifiés avant tout retrait.
@@ -2639,7 +2814,7 @@ class Engine:
                 description=terms["description"],
                 internal=inner,
             )
-            self._ports_opening = {
+            view = {
                 "status": upnp.REFUSED,
                 "failure": upnp.UNREADABLE,
                 "ports": dicts,
@@ -2647,12 +2822,16 @@ class Engine:
                 "manual": upnp.manual_instruction(ports, internal),
             }
         else:
-            self._ports_opening = {
+            view = {
                 "status": upnp.NO_GATEWAY,
                 "reason": upnp.UNREADABLE,
                 "ports": dicts,
                 "manual": upnp.manual_instruction(ports, internal),
             }
+        if side == HOST_SIDE:
+            self._ports_opening_a = view
+        else:
+            self._ports_opening = view
 
     def _report_release(self, released: upnp.Released) -> None:
         """Consigne l'issue d'un retrait : port et protocole seulement, jamais d'adresse (R6)."""
@@ -2701,11 +2880,13 @@ class Engine:
             thread.join(cfg["discovery_timeout_s"] + cfg["request_timeout_s"])
         with self.lock:
             self._ports_released = True
-            pending = bool(self._ports_pending)
+            pending = bool(self._ports_pending) or bool(self._ports_pending_a)
+            # P9F14 : en mode arbitre, six mappings, et le budget de retrait suit.
+            sides = 2 if self._referee() else 1
         if cfg is None:
             return
         timeout_s, max_bytes = cfg["request_timeout_s"], cfg["max_response_bytes"]
-        deadline = upnp.deadline_in(upnp.MAPPING_COUNT * timeout_s)
+        deadline = upnp.deadline_in(sides * upnp.MAPPING_COUNT * timeout_s)
         released = self._ports_ledger.release(timeout_s, max_bytes, deadline)
         if pending and thread is not None:
             LOGGER.warning("port opening still running at shutdown")
@@ -2715,10 +2896,11 @@ class Engine:
             thread.join(timeout_s)
             deadline += time.monotonic() - waited
         with self.lock:
-            abandoned = list(self._ports_pending)
+            abandoned = [*self._ports_pending, *self._ports_pending_a]
             if abandoned:
                 self._ports_abandoned = True
                 self._ports_pending = []
+                self._ports_pending_a = []
         released.extend(self._ports_ledger.release(timeout_s, max_bytes, deadline))
         if released.tried:
             self._report_release(released)
@@ -2756,6 +2938,20 @@ class Engine:
                 raise LauncherRefused(self._launcher_refusal)
             return self._launcher
 
+    def side_launcher(self, side: str) -> bytes:
+        """Le `.bat` du camp `side` (P9F14) : B est celui de `guest_launcher` ; A n'existe qu'en
+        mode arbitre. Lève `LauncherRefused` sinon. Rien n'est écrit sur disque."""
+        if side == GUEST_SIDE:
+            return self.guest_launcher()
+        with self.lock:
+            if not self.real or self.state.phase != "lobby":
+                raise LauncherRefused(INVITE_CLOSED)
+            if side != HOST_SIDE or not self._referee():
+                raise LauncherRefused(SIDE_A_UNAVAILABLE)
+            if self._launcher_a is None:
+                raise LauncherRefused(self._launcher_refusal_a)
+            return self._launcher_a
+
     def _read_mod(self) -> tuple[str, ...] | LauncherRefused:
         """Lit et hache le mod, jamais sous `self.lock` : un disque lent figerait `/api/state`."""
         try:
@@ -2766,10 +2962,13 @@ class Engine:
     def _open_invite(self, mod: tuple[str, ...] | LauncherRefused | None) -> None:
         """Ouvre l'invitation d'un lobby : seul appel à `local_ip`, jeton neuf, revanche comprise.
 
-        `mod` vient de `_read_mod`, appelé avant le verrou ; `None` hors du vrai mode.
+        `mod` vient de `_read_mod`, appelé avant le verrou ; `None` hors du vrai mode. En mode
+        arbitre (P9F14), A reçoit son propre jeton : un lien ne sert jamais l'autre camp.
         """
         self._detected_ip = local_ip()
         self._share_token = token_hex(SHARE_TOKEN_BYTES)
+        if self._referee():
+            self._share_token_a = token_hex(SHARE_TOKEN_BYTES)
         if self.real:
             self._open_share()
         self.state.invite = self._build_invite(mod)
@@ -2777,69 +2976,115 @@ class Engine:
     def _open_share(self) -> None:
         """Un port pris laisse le lobby ouvert : le `.bat` s'enregistre encore depuis l'UI."""
         port = self.runtime["share_port"]
+        poll_s = self.runtime["tick_ms"] / MS_PER_S
+        peer_max = self.runtime["share_connections_per_peer"]
         try:
-            poll_s = self.runtime["tick_ms"] / MS_PER_S
-            peer_max = self.runtime["share_connections_per_peer"]
             self._share = ShareServer(self, self._share_token, port, poll_s, peer_max=peer_max)
         except OSError:
             self.state.log(f"share link unavailable: TCP port {port} could not be opened", "warn")
+        if not self._referee():
+            return
+        port = self._share_port(HOST_SIDE)
+        try:
+            self._share_a = ShareServer(
+                _SideShare(self, HOST_SIDE), self._share_token_a, port, poll_s, peer_max=peer_max
+            )
+        except OSError:
+            self.state.log(
+                f"share link of side A unavailable: TCP port {port} could not be opened", "warn"
+            )
 
     def _close_share(self) -> None:
         """Idempotent, à toute sortie du lobby. `close` attend l'écouteur, hors du verrou."""
         with self.lock:
             share, self._share = self._share, None
+            share_a, self._share_a = self._share_a, None
             self._share_token = None
-            if share is None:
+            self._share_token_a = None
+            if share is None and share_a is None:
                 return
             # Une copie : `snapshot` a pu rendre ce dictionnaire à un lecteur encore en cours.
             closed = {"link": None, "qr_text": None, "share_available": False}
-            self.state.invite = {**self.state.invite, **closed}
-        share.close()
+            invite = {**self.state.invite, **closed}
+            if isinstance(invite.get(HOST_SIDE), dict):
+                invite[HOST_SIDE] = {**invite[HOST_SIDE], **closed}
+            self.state.invite = invite
+        for listener in (share, share_a):
+            if listener is not None:
+                listener.close()
 
     def _build_invite(self, mod: tuple[str, ...] | LauncherRefused | None) -> dict:
         """Rend l'invitation et génère son `.bat`, une fois : le code porte sur les octets servis.
 
         Appelé sous `self.lock` : `mod`, lu et haché avant par `_read_mod`, n'y est qu'assemblé.
+        L'invitation de B reste à la racine, comme en mode hôte ; en mode arbitre (P9F14), celle
+        de A, complète elle aussi, est rangée sous la clé `A`.
         """
         self._invite_mod = mod
-        invite = self._invite_fields()
-        self._launcher = None
-        if not self.real:
+        invite, self._launcher, refusal = self._side_invite(GUEST_SIDE, mod)
+        if refusal is not None:
+            self._launcher_refusal = refusal
+        self._launcher_a = None
+        self._launcher_refusal_a = SIDE_A_UNAVAILABLE
+        if not self._referee():
             return invite
-        try:
-            self._launcher = build_launcher(
-                invite["address"], invite["port"], invite["password"], mod
-            )
-        except LauncherRefused as refused:
-            self._launcher_refusal = str(refused)
-            return invite
-        invite["launcher_code"] = launcher_code(self._launcher)
-        invite["launcher_code_text"] = LAUNCHER_CODE_TEXT.format(name=LAUNCHER_NAME)
+        invite_a, self._launcher_a, refusal_a = self._side_invite(HOST_SIDE, mod)
+        if refusal_a is not None:
+            self._launcher_refusal_a = refusal_a
+        invite["side"] = GUEST_SIDE
+        invite_a["side"] = HOST_SIDE
+        invite[HOST_SIDE] = invite_a
         return invite
 
-    def _invite_fields(self) -> dict:
-        """Seule source de l'invitation. `invite` sort par l'API : jamais `host_password`."""
+    def _side_invite(
+        self, side: str, mod: tuple[str, ...] | LauncherRefused | None
+    ) -> tuple[dict, bytes | None, str | None]:
+        """L'invitation d'un camp, son `.bat` (ou `None`) et la raison d'un refus (ou `None`)."""
+        invite = self._invite_fields(side)
+        if not self.real:
+            return invite, None, None
+        try:
+            launcher = build_launcher(invite["address"], invite["port"], invite["password"], mod)
+        except LauncherRefused as refused:
+            return invite, None, str(refused)
+        invite["launcher_code"] = launcher_code(launcher)
+        invite["launcher_code_text"] = LAUNCHER_CODE_TEXT.format(name=LAUNCHER_NAME)
+        return invite, launcher, None
+
+    def _invite_fields(self, side: str = GUEST_SIDE) -> dict:
+        """Seule source de l'invitation d'un camp.
+
+        `invite` sort par l'API. En mode hôte, jamais `host_password` : il reste l'accès de
+        l'hôte, sur cette machine. En mode arbitre (P9F14), personne ne joue ici : il devient
+        l'accès du joueur A, et l'invitation de A le porte comme celle de B porte `password`.
+        """
         config = self.state.config
-        side = GUEST_SIDE if self.real else HOST_SIDE
+        port_side = side if self.real else HOST_SIDE
+        password = config["host_password"] if side == HOST_SIDE else config["password"]
+        share = self._share_a if side == HOST_SIDE else self._share
+        token = self._share_token_a if side == HOST_SIDE else self._share_token
         invite = {
             "ip": self._detected_ip,
-            "port": self.runtime["ports"][side]["game"],
-            "password": config["password"],
+            "port": self.runtime["ports"][port_side]["game"],
+            "password": password,
             "code": config["code"],
             "address": None,
             "link": None,
             "qr_text": None,
-            "share_available": self._share is not None,
+            "share_available": share is not None,
             "needs_address": False,
             "scope": SCOPE_MOCK,
             "scope_text": SCOPE_MOCK_TEXT,
         }
         if not self.real:
             return invite
-        self._invite_built_externals = self._invite_externals()
+        if side == HOST_SIDE:
+            self._invite_built_externals_a = self._invite_externals(side)
+        else:
+            self._invite_built_externals = self._invite_externals(side)
         invite[REMATCH_NOTE] = REMATCH_NOTE_TEXT
-        if self._share is None:
-            invite[SHARE_TEXT] = SHARE_UNAVAILABLE_TEXT.format(port=self.runtime["share_port"])
+        if share is None:
+            invite[SHARE_TEXT] = SHARE_UNAVAILABLE_TEXT.format(port=self._share_port(side))
         detected = self._detected_ip if is_usable_address(self._detected_ip) else None
         address = self._entered_address or detected
         if address is None:
@@ -2848,7 +3093,7 @@ class Engine:
             invite["scope_text"] = SCOPE_NO_ADDRESS_TEXT
             return invite
         invite["ip"] = invite["address"] = address
-        share_port = self.runtime["share_port"]
+        share_port = self._share_port(side)
         if self._entered_address is None:
             invite["scope"] = SCOPE_LAN
             invite["scope_text"] = SCOPE_LAN_TEXT
@@ -2858,10 +3103,10 @@ class Engine:
             # externes (P9F7) : réellement ouverts s'il y en a, sinon configurés, et le lobby dit
             # la correspondance à recopier dans la box. Sur le réseau local (adresse détectée),
             # rien ne traduit : les ports internes restent.
-            externals = self._invite_externals()
+            externals = self._invite_externals(side)
             invite["scope"] = SCOPE_UNVERIFIED
             if externals is None:
-                ports = self.runtime["ports"][GUEST_SIDE]
+                ports = self.runtime["ports"][side]
                 invite["scope_text"] = SCOPE_UNVERIFIED_TEXT.format(
                     game=ports["game"], udp=ports["udp"], share=share_port
                 )
@@ -2870,19 +3115,19 @@ class Engine:
                 share_port = externals[2]
                 invite["scope_text"] = SCOPE_EXTERNAL_TEXT.format(
                     mapping=upnp.correspondence(
-                        zip(externals, (UDP, UDP, TCP)), self._internal_ports()
+                        zip(externals, (UDP, UDP, TCP)), self._internal_ports(side)
                     )
                 )
             reach = self._reach_note()
             if reach is not None:
                 invite["scope_text"] += " " + reach
-        if PASSWORD_ALLOWED.fullmatch(config["password"]) is None:
+        if PASSWORD_ALLOWED.fullmatch(password) is None:
             # Le mot de passe saisi ne peut pas voyager dans un `.bat` (D-H).
             invite["launcher_refused"] = PASSWORD_REFUSED
             return invite
-        if self._share is None:
+        if share is None:
             return invite  # un lien mort ne s'affiche pas
-        link = f"http://{address}:{share_port}/{self._share_token}/{LAUNCHER_NAME}"
+        link = f"http://{address}:{share_port}/{token}/{LAUNCHER_NAME}"
         invite["link"] = invite["qr_text"] = link
         return invite
 
@@ -2899,6 +3144,10 @@ class Engine:
         if not isinstance(preset_id, str):
             raise ActionRefused("preset refusé : identifiant texte attendu")
         preset = self.preset(preset_id)
+        # P9F14 : qui joue. Absent, c'est le duel d'avant ; la revanche relit celui de `config`.
+        play = payload.get("mode", PLAY_HOST)
+        if not isinstance(play, str) or play not in PLAY_MODES:
+            raise ActionRefused(PLAY_MODE_REFUSED)
         pseudo = _text_option(payload, "pseudo", "pseudo")
         password = _text_option(payload, "password", "mot de passe")
         if self.real:
@@ -2914,8 +3163,11 @@ class Engine:
             "day_length": self._day_length_of(payload, preset),
             "code": code or make_code(),
             "summary": preset["summary"],
+            "mode": play,
         }
-        # `password` ouvre B et part dans l'invitation ; `host_password` n'ouvre que A.
+        # `password` ouvre B et part dans l'invitation de B. `host_password` ouvre A : en mode
+        # hôte, il ne sert qu'à l'hôte et ne sort jamais de l'invitation ; en mode arbitre
+        # (P9F14), il est l'accès du joueur A et part dans l'invitation de A.
         cfg["password"] = password or gen_player_password()
         cfg["host_password"] = host_password or gen_player_password()
         cfg["host_address"] = f"{CLIENT_HOST}:{self.runtime['ports'][HOST_SIDE]['game']}"
@@ -3184,12 +3436,14 @@ class Engine:
         if not self._sleep(1.2):
             return self._cancel_state()
         with self.lock:
-            self.state.players["A"] = self.state.config["pseudo"] + " (toi)"
-            self.state.log("hôte connecté au serveur A (simulé)")
+            # P9F14 : en mode arbitre, personne ne joue ici ; A est un invité simulé lui aussi.
+            if not self._referee():
+                self.state.players["A"] = self.state.config["pseudo"] + " (toi)"
+                self.state.log("hôte connecté au serveur A (simulé)")
         # attente de l'adversaire (bouton « simuler » en mode mock)
         while True:
             with self.lock:
-                if self.state.players.get("B"):
+                if self.state.players.get("B") and self.state.players.get("A"):
                     break
             if not self._sleep(0.3):
                 return self._cancel_state()

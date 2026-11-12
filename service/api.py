@@ -10,7 +10,7 @@ import os
 import re
 import time
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import paths
 from .guest_launcher import LauncherRefused
@@ -66,6 +66,10 @@ PROTOCOL_REFUSED = "requête refusée"
 # Les valeurs de `Sec-Fetch-Site` qui viennent de nous : `same-site` serait un autre port de la
 # même machine, `cross-site` un site tiers. Toute autre valeur se refuse aussi.
 FETCH_SITES_OURS = ("same-origin", "none")
+# Les camps d'une invitation (P9F14) : `?side=A` n'existe qu'en mode arbitre ; sans `side`, ou
+# avec `B`, c'est l'invitation de toujours.
+LAUNCHER_SIDES = ("A", "B")
+GUEST_SIDE = "B"
 LOG = logging.getLogger(__name__)
 
 
@@ -299,13 +303,30 @@ class Handler(BaseHTTPRequestHandler):
         if any(site not in FETCH_SITES_OURS for site in sites):
             self._fail(403, "en-tête Sec-Fetch-Site refusé")
             return
+        side = self._launcher_side()
+        if side is False:
+            return
         try:
-            launcher = self.engine.guest_launcher()
+            if side is None or side == GUEST_SIDE:
+                launcher = self.engine.guest_launcher()
+            else:
+                launcher = self.engine.side_launcher(side)
         except LauncherRefused as exc:
             self._fail(409, str(exc))
             return
         disposition = f'attachment; filename="{LAUNCHER_NAME}"'
         self._send(200, launcher, LAUNCHER_TYPE, disposition)
+
+    def _launcher_side(self) -> str | None | bool:
+        """`side` de la requête du lanceur : `None` sans lui, `A` ou `B`, sinon 400 et `False`."""
+        # `_path` a déjà analysé cette même adresse : `urlparse` n'y lève plus.
+        sides = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("side")
+        if sides is None:
+            return None
+        if len(sides) != 1 or sides[0] not in LAUNCHER_SIDES:
+            self._fail(400, "side refusé : A ou B")
+            return False
+        return sides[0]
 
     def do_POST(self):
         path = self._path()

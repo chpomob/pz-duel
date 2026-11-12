@@ -23,6 +23,7 @@ let toastTimer = null;
 let lastSeen = 0;             // `Date.now()` of the last successful `/api/state`: the last heartbeat
 let idleStopped = false;      // the idle quit was due when the service went silent
 let qrOpen = false;           // the folded QR was opened by the host: it stays open across renders (P9F13)
+const qrOpenSides = {};       // the same, for each side of a referee lobby (P9F14)
 
 // Idle quit (P9F4): the warning shows during these last seconds.
 const IDLE_WARN_S = 30;
@@ -134,8 +135,9 @@ async function setupAction(path, body) {
   await refreshSetup();
 }
 
-async function saveLauncher() {
-  const res = await fetch('/api/invite/launcher');
+// P9F14: `side` asks for the launcher of one side of a referee lobby; without it, the guest's.
+async function saveLauncher(side) {
+  const res = side ? await fetch(`/api/invite/launcher?side=${side}`) : await fetch('/api/invite/launcher');
   if (!res.ok) {
     const out = await res.json();
     return toast(out.error || 'Launcher unavailable', true);
@@ -214,6 +216,7 @@ function newDraft() {
     day_length: p.day_length,
     pseudo: localStorage.getItem('pzduel.pseudo') || 'hôte',
     password: '',
+    mode: 'host',
   };
 }
 
@@ -358,6 +361,13 @@ function renderConfig() {
         </select>
       </label>
 
+      <label class="field"><span>Who plays</span>
+        <select id="f-players">
+          <option value="host" ${draft.mode !== 'referee' ? 'selected' : ''}>Me and a guest</option>
+          <option value="referee" ${draft.mode === 'referee' ? 'selected' : ''}>Two guests: this computer only hosts and referees</option>
+        </select>
+      </label>
+
       <div class="grid two">
         <label class="field"><span>Durée du match</span>
           <select id="f-duration">
@@ -404,6 +414,7 @@ function renderConfig() {
     draft.day_length = np.day_length;
     renderConfig();
   };
+  $('#f-players').onchange = (e) => { draft.mode = e.target.value; };
   $('#f-duration').onchange = (e) => { draft.duration_s = Number(e.target.value); };
   $('#f-day').onchange = (e) => { draft.day_length = Number(e.target.value); };
   $('#f-pseudo').oninput = (e) => { draft.pseudo = e.target.value; };
@@ -511,7 +522,23 @@ function portsBlock() {
         ${before}
         <div class="actions"><button class="ghost" data-action="open-ports" ${busy ? 'disabled' : ''}>${esc(label)}</button></div>
         ${result}
+        ${po.A ? sidePortsText(po.A) : ''}
       </div>`;
+}
+
+// P9F14: with two guests, the same click also opens the three ports of side A, reported apart:
+// a failure on A says so on its own line, and never hides the result of B.
+function sidePortsText(pa) {
+  if (pa.status === 'in_progress') return '<p class="hint" id="ports-a">Side A: opening ports…</p>';
+  if (pa.status === 'mapped') {
+    return `<p class="hint" id="ports-a">Side A: ports ${esc(portsMapping(pa.ports))} are open until ${esc(expiryText(pa.expires_at))}.</p>`;
+  }
+  if (['no_gateway', 'refused', 'invalid_config'].includes(pa.status)) {
+    return `<p class="err" id="ports-a">Side A: ports could not be opened automatically (${esc(portsReason(pa))}).</p>
+      ${stillActiveText(pa)}
+      ${pa.manual ? `<p class="hint">${esc(pa.manual)}</p>` : ''}`;
+  }
+  return `<p class="hint" id="ports-a">Side A: the same click also opens ${esc(portsMapping(pa.ports))}.</p>`;
 }
 
 // Two secrets the first real duel mixed up (P9F5): the guest typed the server password at the
@@ -569,6 +596,7 @@ function primaryAction() {
 // P9F13: three zones, in the order they are used: what you do now, what you read aloud, what you
 // send. The invitation token (`inv.code`) is not shown any more: it looked like the launcher code.
 function inviteCard() {
+  if (S.config && S.config.mode === 'referee') return refereeCard();
   const inv = S.invite || {};
   const real = S.mode === 'real';
   const canSave = real && inv.address && !inv.launcher_refused;
@@ -673,6 +701,76 @@ function renderLive() {
     </section>`);
 }
 
+// P9F14: referee mode. This computer hosts and referees: no game opens here, there is no
+// "open the game" button, and each side gets its own complete invitation — its own ports to
+// forward included (review P9F14 A2): A's scope text names A's ports, never B's.
+const REFEREE_WAIT = 'Nobody plays on this computer: the duel starts by itself once both guests are in.';
+function refereeSide(inv, side) {
+  const real = S.mode === 'real';
+  const canSave = real && inv.address && !inv.launcher_refused;
+  const who = (S.players || {})[side];
+  const fold = `qr-fold-${side}`;
+  return `<div class="invite side-invite" id="invite-${side}">
+      <div class="invite-body">
+        <h2>Player ${side}</h2>
+        ${inv.scope_text ? `<p class="${inv.needs_address ? 'err' : 'notice'}" id="scope-${side}">${esc(inv.scope_text)}</p>` : ''}
+        ${inv.share_text ? `<p class="err">${esc(inv.share_text)}</p>` : ''}
+        ${inv.launcher_refused ? `<p class="err">${esc(inv.launcher_refused)}</p>` : ''}
+        ${inv.launcher_code ? `<div class="secret zone say" id="launcher-code-${side}">
+          <p class="hint">${esc(LAUNCHER_CODE_LABEL)}</p>
+          <div class="big-code" title="Click to copy" data-action="copy-code" data-side="${side}"><b>${esc(inv.launcher_code)}</b></div>
+          <p class="hint">${esc(inv.launcher_code_text)}</p>
+          <p class="hint">${esc(LAUNCHER_CODE_IS_NOT)}</p>
+        </div>` : ''}
+        <div class="zone send" id="zone-send-${side}">
+          <p class="hint">${esc(SEND_LABEL)}</p>
+          ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
+          <div class="actions">
+            ${inv.link ? `<button class="ghost" data-action="copy-link" data-side="${side}">Copy link</button>` : ''}
+            ${canSave ? `<button class="ghost" data-action="save-launcher" data-side="${side}">Save launcher</button>` : ''}
+          </div>
+          ${inv.qr_text ? `<details class="qr-fold" id="${fold}" ${qrOpenSides[fold] ? 'open' : ''}>
+            <summary>Show the QR code (phone)</summary>
+            <div class="qr" id="qr-${side}"></div>
+          </details>` : ''}
+        </div>
+        ${inv.needs_address ? '' : `<div class="secret" id="server-password-${side}">
+          <p class="hint">${esc(SERVER_PASSWORD_LABEL)}</p>
+          <div class="line">${esc(inv.ip)}:${inv.port}</div>
+          <div class="line">server password: ${esc(inv.password)}</div>
+        </div>`}
+        <p class="hint">Player ${side}: ${who ? esc(who) : 'waiting…'}</p>
+      </div>
+    </div>`;
+}
+
+function refereeCard() {
+  const inv = S.invite || {};
+  const real = S.mode === 'real';
+  const ports = real ? portsBlock() : '';
+  const table = playedTable();
+  return `
+    <section class="card">
+      <h2>Two invitations</h2>
+      <div class="zone now" id="zone-now">
+        <p class="notice" id="referee-wait">${esc(REFEREE_WAIT)}</p>
+        ${S.mode === 'mock' ? '<div class="actions"><button class="ghost" data-action="simulate">Simulate a guest</button></div>' : ''}
+      </div>
+      <p class="notice">${esc(TWO_SECRETS_TEXT)}</p>
+      <div class="grid two">
+        ${refereeSide(inv.A || {}, 'A')}
+        ${refereeSide(inv, 'B')}
+      </div>
+      ${real ? `<label class="field address"><span>Public address, for guests outside your network</span>
+        <input id="f-address" value="${esc(addressDraft)}" maxlength="253" placeholder="IP address or host name">
+      </label>
+      <div class="actions"><button class="ghost" data-action="set-address">Use this address</button></div>
+      ${ports}` : ''}
+      ${inv.rematch_note ? `<p class="hint">${esc(inv.rematch_note)}</p>` : ''}
+      ${table}
+    </section>`;
+}
+
 function renderOver() {
   const a = S.score.A, b = S.score.B;
   const verdict = a === b ? 'égalité' : a > b ? 'victoire de A' : 'victoire de B';
@@ -723,8 +821,15 @@ function renderQuit() {
 
 // Le QR porte `invite.qr_text` tel quel : l'UI ne fabrique aucun lien.
 function renderQr() {
-  const box = $('#qr');
+  const inv = S.invite || {};
+  // P9F14: a referee lobby folds one QR per side.
+  qrInto($('#qr-A'), (inv.A || {}).qr_text);
+  qrInto($('#qr-B'), inv.qr_text);
   const text = (S.invite || {}).qr_text;
+  qrInto($('#qr'), text);
+}
+
+function qrInto(box, text) {
   if (!box || !text || box.dataset.text === text) return;
   box.dataset.text = text;
   try {
@@ -769,6 +874,12 @@ document.addEventListener('click', async (ev) => {
   if (a === 'retry') { return refreshSetup(); }
   if (a === 'install-mod') { return setupAction('/api/setup/install-mod', {}); }
   if (a === 'choose-folder') { return setupAction('/api/setup/pz-dir', { folder: folderDraft }); }
+  // P9F14: a referee lobby names the side of each button.
+  const invNow = (S && S.invite) || {};
+  const sideInvite = btn.dataset.side === 'A' ? (invNow.A || {}) : invNow;
+  if (a === 'copy-link' && btn.dataset.side) { return copy(sideInvite.link); }
+  if (a === 'copy-code' && btn.dataset.side) { return copy(sideInvite.launcher_code); }
+  if (a === 'save-launcher' && btn.dataset.side) { return saveLauncher(btn.dataset.side); }
   if (a === 'copy-link') { return copy(S.invite.link); }
   if (a === 'copy-code') { return copy(S.invite.launcher_code); }
   if (a === 'save-launcher') { return saveLauncher(); }
@@ -783,6 +894,7 @@ document.addEventListener('click', async (ev) => {
       day_length: draft.day_length,
       pseudo: draft.pseudo,
       password: draft.password,
+      mode: draft.mode,
     });
   }
   if (a === 'rematch') { view = 'auto'; return act('rematch'); }
@@ -794,6 +906,7 @@ document.addEventListener('click', async (ev) => {
 // The QR fold keeps the host's choice: `shell` rewrites the card at each change (P9F13).
 document.addEventListener('toggle', (ev) => {
   if (ev.target.id === 'qr-fold') qrOpen = ev.target.open;
+  if (ev.target.id.startsWith('qr-fold-')) qrOpenSides[ev.target.id] = ev.target.open;
 }, true);
 
 // Délégué : `shell` remplace ces champs, et leur saisie doit survivre à `poll`.

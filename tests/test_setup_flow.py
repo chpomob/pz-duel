@@ -1319,3 +1319,95 @@ def test_p9f13_one_primary_action_whose_label_follows_the_lobby():
     mock = _render_invite({"A": None, "B": None}, FULL_INVITE, mode="mock")
     _primary(mock)
     assert 'class="ghost" data-action="simulate"' in mock
+
+
+# -- P9F14 : mode arbitre — deux invitations, aucun bouton pour jouer ici ---------------------------
+
+HOST_PASSWORD = "mot-hote-77"
+LAUNCHER_CODE_A = "fedcba9876543210"
+
+
+def _render_referee(players: dict, scope: dict | None = None) -> str:
+    """Rend `inviteCard()` d'un lobby arbitre réel sous Node : la carte bascule sur `refereeCard`."""
+    script = ui_script()
+    esc = script[script.index("const esc = ") : script.index("const durLabel")]
+    constants = script[
+        script.index("const LAUNCHER_CODE_LABEL") : script.index("// Tout vient de `invite`")
+    ]
+    card = script[script.index("const DUEL_STARTING") : script.index("function renderLive()")]
+    referee = script[script.index("const REFEREE_WAIT") : script.index("function renderOver()")]
+    side_b = {
+        "ip": "192.168.1.20", "port": 17271, "password": GUEST_PASSWORD, "address": "192.168.1.20",
+        "launcher_code": LAUNCHER_CODE, "launcher_code_text": "Read this code aloud.",
+        "needs_address": False, "link": INVITE_LINK, "qr_text": INVITE_LINK, "side": "B",
+    }
+    side_a = {
+        **side_b, "port": 17261, "password": HOST_PASSWORD, "launcher_code": LAUNCHER_CODE_A,
+        "link": INVITE_LINK + "-a", "qr_text": INVITE_LINK + "-a", "side": "A",
+    }
+    for side, text in (scope or {}).items():
+        (side_a if side == "A" else side_b)["scope_text"] = text
+    state = {
+        "mode": "real",
+        "invite": {**side_b, "A": side_a},
+        "players": players,
+        "config": {"mode": "referee", "host_address": "127.0.0.1:17261", "host_password": HOST_PASSWORD},
+    }
+    program = (
+        f"{esc}\n{constants}\n"
+        "let addressDraft = '', qrOpen = false; const qrOpenSides = {};\n"
+        "const portsBlock = () => '', playedTable = () => '';\n"
+        f"const S = {json.dumps(state)};\n"
+        f"{card}\n{referee}\n"
+        "process.stdout.write(inviteCard());\n"
+    )
+    node = shutil.which("node")
+    assert node is not None, "node est requis pour rendre l'écran"
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    return _plain(done.stdout)
+
+
+def test_p9f14_referee_lobby_shows_two_invitations_and_no_game_button():
+    """Mutation : retirer `if (S.config && S.config.mode === 'referee') return refereeCard();` —
+    le lobby arbitre montre « Open the game » et une seule invitation, sans le code de A."""
+    for players in ({"A": None, "B": None}, {"A": "durand", "B": "dupont"}):
+        html = _render_referee(players)
+        assert 'data-action="open-game"' not in html
+        assert "Nobody plays on this computer" in html
+        code_a, code_b = _block(html, "launcher-code-A"), _block(html, "launcher-code-B")
+        assert LAUNCHER_CODE_A in code_a and LAUNCHER_CODE not in code_a
+        assert LAUNCHER_CODE in code_b and LAUNCHER_CODE_A not in code_b
+        password_a, password_b = _block(html, "server-password-A"), _block(html, "server-password-B")
+        assert HOST_PASSWORD in password_a and GUEST_PASSWORD not in password_a
+        assert GUEST_PASSWORD in password_b and HOST_PASSWORD not in password_b
+        assert 'data-action="save-launcher" data-side="A"' in html
+        assert 'data-action="save-launcher" data-side="B"' in html
+        # L'accès « à garder pour toi » du mode hôte n'existe pas : A le reçoit dans son invitation.
+        assert "Ton acc" not in html
+
+
+def test_p9f14_r1_a2_each_side_shows_its_own_ports_to_forward():
+    """Revue P9F14 A2. Mutation : la carte arbitre ne rend que `inv.scope_text` (celui de B) —
+    les ports à rediriger pour A ne s'affichent nulle part."""
+    scope = {
+        "A": "forward 49261 to 17261 (UDP), 49262 to 17262 (UDP), 49270 to 17282 (TCP)",
+        "B": "forward 49271 to 17271 (UDP), 49272 to 17272 (UDP), 49280 to 17281 (TCP)",
+    }
+    html = _render_referee({"A": None, "B": None}, scope)
+    side_a, side_b = _block(html, "scope-A"), _block(html, "scope-B")
+    assert scope["A"] in side_a and scope["B"] not in side_a
+    assert scope["B"] in side_b and scope["A"] not in side_b
+    assert html.count(scope["B"]) == 1
+
+
+def test_p9f14_start_carries_the_chosen_play_mode():
+    """Le choix « qui joue » part dans le corps du `start` ; l'hôte reste le défaut."""
+    script = ui_script()
+    config = script[script.index("function renderConfig()") : script.index("function stepsList()")]
+    assert '<option value="host"' in config and '<option value="referee"' in config
+    assert "Me and a guest" in config and "Two guests" in config
+    assert "$('#f-players').onchange = (e) => { draft.mode = e.target.value; };" in config
+    assert "mode: 'host'," in script[script.index("function newDraft()") : script.index("const canLaunch")]
+    start = script[script.index("if (a === 'start') {") :]
+    assert "mode: draft.mode," in start[: start.index("});")]
+    assert "await fetch(`/api/invite/launcher?side=${side}`)" in script

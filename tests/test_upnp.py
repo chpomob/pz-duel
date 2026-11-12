@@ -3051,3 +3051,154 @@ def test_p9f7_expired_lease_with_translated_port_is_still_recognised_as_ours(upn
     _at(engine, _lease_deadline(engine) + 1)
     assert engine.shutdown()
     assert igd.mappings == {}
+
+
+# -- P9F14 : mode arbitre — deux invités, six redirections, A annoncé à part ---------------------
+
+
+@pytest.fixture
+def referee(monkeypatch):
+    """Tout `start` de ce test demande le mode arbitre : `Lobby` ne connaît que preset et mot de passe."""
+    original = Engine.action
+
+    def action(self, name, payload=None):
+        if name == "start":
+            payload = {**(payload or {}), "mode": "referee"}
+        return original(self, name, payload)
+
+    monkeypatch.setattr(Engine, "action", action)
+
+
+def _engine_ports_a(rig) -> list[tuple[int, str]]:
+    """Les trois couples externes de A : ceux de B décalés de dix vers le bas."""
+    return [(port - 10, protocol) for port, protocol in _engine_ports(rig)]
+
+
+def _wait_both(engine: Engine, timeout_s: float = ENGINE_WAIT_S) -> dict:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        opening = engine.snapshot()["ports_opening"]
+        if "in_progress" not in (opening["status"], opening["A"]["status"]):
+            return opening
+        time.sleep(0.02)
+    raise AssertionError(f"ouverture de A ou de B toujours en cours après {timeout_s} s")
+
+
+def test_p9f14_side_a_couples_follow_b_and_never_cross_it():
+    """Dérivés des externes de B, dans la plage haute, distincts d'eux ; croisés : refusés."""
+    cfg = upnp.merged_config(RUNTIME)
+    couples = upnp.side_a_couples(cfg, engine_module.SIDE_A_EXTERNAL_OFFSET)
+    assert couples == [(49261, "UDP"), (49262, "UDP"), (49270, "TCP")]
+    assert all(port >= upnp.HIGH_RANGE_START for port, _ in couples)
+    assert not set(couples) & set(upnp.external_couples(cfg))
+    # A tomberait sur un externe de B (49272 - 1 = 49271) : rien ne doit écraser un mapping de B.
+    assert upnp.side_a_couples(cfg, -1) is None
+    # Hors de [1024, 65535] : refusé.
+    assert upnp.side_a_couples(cfg, 20000) is None
+
+
+def test_p9f14_referee_opens_six_mappings_and_two_invitations(referee, upnp_rig, igd):
+    """Mutation : `ports_a = None` au lieu de `self._side_a_opening(cfg) if referee` dans
+    `open_ports` — seules les trois redirections de B partent, et `ports_opening.A` reste neutre."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    state = lobby.state()
+    assert state["config"]["mode"] == "referee"
+    assert set(state["invite"]["A"]) >= {"launcher_code", "password", "port", "link"}
+    assert state["invite"]["launcher_code"] != state["invite"]["A"]["launcher_code"]
+    assert engine.open_ports()[0]
+    opening = _wait_both(engine)
+    assert opening["status"] == "mapped" and opening["A"]["status"] == "mapped"
+    expected = [*_engine_ports(upnp_rig), *_engine_ports_a(upnp_rig)]
+    assert sorted(igd.couples("AddPortMapping")) == sorted(expected)
+    assert len(set(expected)) == 6
+    adds = igd.actions("AddPortMapping")
+    assert len(adds) == 6
+    assert all(int(call.args["NewExternalPort"]) >= upnp.HIGH_RANGE_START for call in adds)
+    assert {call.args["NewPortMappingDescription"] for call in adds} == {"PZ Duel"}
+    # Chaque camp vers ses propres ports internes : jeu de A, partage de A à côté de celui de B.
+    inner = {(int(c.args["NewExternalPort"]), c.args["NewProtocol"]): int(c.args["NewInternalPort"]) for c in adds}
+    ports, share = upnp_rig.runtime["ports"], upnp_rig.runtime["share_port"]
+    assert [inner[c] for c in _engine_ports_a(upnp_rig)] == [ports["A"]["game"], ports["A"]["udp"], share + 1]
+    # L'invitation de A, vers une adresse saisie, porte ses externes à elle.
+    assert engine.set_invite_address(ENTERED)[0]
+    invite = lobby.state()["invite"]
+    assert invite["port"] == _engine_ports(upnp_rig)[0][0]
+    assert invite["A"]["port"] == _engine_ports_a(upnp_rig)[0][0]
+    assert f"{ENTERED}:{_engine_ports_a(upnp_rig)[2][0]}/" in invite["A"]["link"]
+    # L'arrêt retire les six.
+    assert engine.shutdown()
+    assert igd.mappings == {}
+
+
+def test_p9f14_failure_on_a_is_reported_apart_and_leaves_b_open(referee, upnp_rig, igd):
+    """Mutation : `_settle_side` qui publie l'issue de A dans `_ports_opening` — l'échec de A
+    remplace le `mapped` de B ; ou A ouvert avant B — B n'est plus publié quand A échoue."""
+    b_ports = {port for port, _ in _engine_ports(upnp_rig)}
+    igd.configure(conflict_ports=set(range(1024, 65536)) - b_ports)
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    assert engine.open_ports()[0]
+    opening = _wait_both(engine)
+    assert opening["status"] == "mapped"
+    assert opening["A"]["status"] == "refused" and opening["A"]["error_code"] == 718
+    assert sorted(igd.mappings) == sorted(_engine_ports(upnp_rig))
+    logs = [line["msg"] for line in lobby.state()["logs"]]
+    assert "port opening: mapped" in logs
+    assert "port opening (side A): refused" in logs
+    assert engine.shutdown()
+    assert igd.mappings == {}
+
+
+def test_p9f14_r1_a1_fallback_candidates_skip_reserved_ports():
+    """Mutation : `reserved` ignoré par `_fallback_slots` — le repli de B prend 49261, préféré de A."""
+    cfg = _cfg(fallback_range=[49261, 49300])
+    b_ports = [(49271, "UDP"), (49272, "UDP"), (49280, "TCP")]
+    reserved = {49261, 49262, 49270}
+    assert upnp.fallback_couples(cfg, b_ports)[0] == (49261, "UDP")
+    chosen = upnp.fallback_couples(cfg, b_ports, reserved)
+    assert chosen == [(49263, "UDP"), (49264, "UDP"), (49265, "TCP")]
+    assert not {port for port, _ in upnp.fallback_candidates(cfg, b_ports, reserved=reserved)} & reserved
+    # Un préféré dans `reserved` est refusé sans trafic : il écraserait l'autre camp.
+    result, gateway, _ = upnp.open_ports(cfg, b_ports, ("127.0.0.1", 9), reserved={49271})
+    assert result["status"] == "invalid_config" and gateway is None
+
+
+def test_p9f14_r1_a1_side_a_never_overwrites_b_fallback(referee, upnp_rig, igd):
+    """Revue P9F14 A1. Mutation : `reserved_b`/`reserved_a` vides dans `open_ports` — B se replie
+    sur 49261/49262, A les supprime puis les reprend : B annonce des ports qui mènent chez A."""
+    rig = upnp_rig
+    rig.runtime["upnp_ports"] = {**rig.runtime["upnp_ports"], "fallback_range": [49261, 49300]}
+    b_ports = _engine_ports(rig)
+    igd.configure(conflict_ports={port for port, _ in b_ports})
+    lobby = Lobby(rig, "demo")
+    engine = lobby.engine
+    assert engine.open_ports()[0]
+    opening = _wait_both(engine)
+    assert opening["status"] == "mapped" and opening["A"]["status"] == "mapped"
+    held_b = {(p["port"], p["protocol"]) for p in opening["ports"]}
+    held_a = {(p["port"], p["protocol"]) for p in opening["A"]["ports"]}
+    assert held_a == set(_engine_ports_a(rig))
+    assert not held_b & held_a and not held_b & set(b_ports)
+    assert set(igd.mappings) == held_b | held_a
+    ports, share = rig.runtime["ports"], rig.runtime["share_port"]
+    inner_b = [int(igd.mappings[(p["port"], p["protocol"])]["NewInternalPort"]) for p in opening["ports"]]
+    assert inner_b == [ports["B"]["game"], ports["B"]["udp"], share]
+    assert engine.shutdown()
+    assert igd.mappings == {}
+
+
+def test_p9f14_host_mode_opens_exactly_three_and_one_invitation(upnp_rig, igd):
+    """Le défaut, inchangé. Mutation : `_referee()` toujours vrai — six redirections, une
+    seconde invitation et `ports_opening.A` apparaissent en mode hôte."""
+    lobby = Lobby(upnp_rig, "demo")
+    engine = lobby.engine
+    state = lobby.state()
+    assert state["config"]["mode"] == "host"
+    assert "A" not in state["invite"] and "side" not in state["invite"]
+    assert "A" not in state["ports_opening"]
+    assert _click(engine)[0]["status"] == "mapped"
+    assert sorted(igd.couples("AddPortMapping")) == sorted(_engine_ports(upnp_rig))
+    assert len(igd.actions("AddPortMapping")) == 3
+    assert len(igd.msearches) == 1
+    assert "A" not in lobby.state()["ports_opening"]
