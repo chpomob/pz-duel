@@ -14,6 +14,7 @@ import pytest
 
 import test_lua_attribution as lua_mod
 from doubles.fake_mod import EMPTY_AGE_PER_BEAT, EmptyServer, FakeMod
+from doubles.mini_lua import LuaError
 from test_contract import (
     L_S,
     MS,
@@ -2798,6 +2799,11 @@ def kinds(mod: FakeMod) -> list[str]:
     return [command["kind"] for command in in_commands(mod)]
 
 
+def world_result(mod: FakeMod, seq: int, status: str, **extra: str) -> bytes:
+    """`cmd_result` d'une commande de monde, `call` compris (P9F11), comme l'écrit le mod."""
+    return mod.emit("cmd_result", {"seq": seq, "status": status, **extra})
+
+
 class HoldDuel(Duel):
     """`Duel` dont les deux mods savent tenir : la sonde ne part qu'au relâchement."""
 
@@ -2808,10 +2814,19 @@ class HoldDuel(Duel):
         self.mods[side].beat(age=age, players=(PLAYERS[side],))
         self.rig.until(lambda s: s["players"][side] == PLAYERS[side])
 
+    def confirm_release(self, side: str, status: str = "applied", **extra: str) -> dict:
+        """Attend le dernier `release_time` du camp et y répond comme le mod."""
+        self.rig.until(lambda _: "release_time" in kinds(self.mods[side]), expected="release_time")
+        release = [c for c in in_commands(self.mods[side]) if c["kind"] == "release_time"][-1]
+        world_result(self.mods[side], release["seq"], status, **extra)
+        return release
+
     def join_and_resolve(self) -> None:
         self.wait_holds()
         for side in SIDES:
             self.arrive(side)
+        for side in SIDES:
+            self.confirm_release(side)
         for side in SIDES:
             probe = wait_command(self.rig, self.mods[side], "probe_spawn")
             self.mods[side].cmd_result(probe["seq"], "applied", spawned=1)
@@ -2853,6 +2868,16 @@ def test_release_goes_once_to_both_sides_before_the_probes(engine_rig, hold_caps
     duel.wait_holds()
     duel.arrive("A")
     duel.arrive("B")
+    for side in SIDES:
+        wait_command(engine_rig, duel.mods[side], "release_time")
+    duel.sync_pump()
+    # Écrit n'est pas relâché : sans `applied` des deux mods, aucune sonde ne part.
+    for side in SIDES:
+        assert kinds(duel.mods[side]) == ["hold_time", "release_time"]
+    duel.confirm_release("A")
+    duel.sync_pump()
+    assert "probe_spawn" not in kinds(duel.mods["B"])
+    duel.confirm_release("B")
     probes = {side: wait_command(engine_rig, duel.mods[side], "probe_spawn") for side in SIDES}
 
     for side in SIDES:
@@ -2974,8 +2999,12 @@ def test_unwritten_release_is_retried_before_the_probes(engine_rig, hold_caps):
 
     duel.at(engine_rig.runtime["probe_retry_s"])
     for side in SIDES:
+        duel.confirm_release(side)
+    for side in SIDES:
         wait_command(engine_rig, duel.mods[side], "probe_spawn")
         assert kinds(duel.mods[side]) == ["hold_time", "release_time", "probe_spawn"]
+    # La sonde part en cours de passe : l'état n'est publié qu'à la fin de celle-ci.
+    duel.sync_pump()
     assert duel.state()["capabilities"]["hold"]["A"]["status"] == "released"
 
 
@@ -2990,7 +3019,7 @@ def test_release_never_written_refuses_the_lobby(engine_rig, hold_caps):
     fail_release_writes(duel, "A", None)
     duel.arrive("A")
     duel.arrive("B")
-    wait_command(engine_rig, duel.mods["B"], "release_time")
+    duel.confirm_release("B")
     duel.at(engine_rig.runtime["probe_retry_s"])
     assert duel.state()["phase"] == "lobby"
 
@@ -3024,7 +3053,11 @@ def test_without_any_hold_the_probe_leaves_at_first_sight(engine_rig):
 
     assert kinds(lobby.mods["A"]) == ["probe_spawn"]
     assert seq == 1
-    state = lobby.state()
+    # La sonde est écrite en cours de passe, l'état publié à sa fin : on attend la publication.
+    state = lobby.wait_for(
+        lambda s: s["capabilities"]["hold"]["A"]["status"] != "off",
+        expected="tenue publiée après la première passe du lobby",
+    )
     assert {side: state["capabilities"]["hold"][side]["status"] for side in SIDES} == {
         "A": "unsupported",
         "B": "unsupported",
@@ -3047,7 +3080,8 @@ def test_drift_starts_at_the_release(engine_rig, presets, hold_caps):
     duel.beat("A", age=3.0)
     duel.arrive("B", age=5.0)
     for side in SIDES:
-        wait_command(engine_rig, duel.mods[side], "release_time")
+        duel.confirm_release(side)
+    engine_rig.until(lambda s: any("relâchement confirmé" in log["msg"] for log in s["logs"]))
     duel.beat("A", age=3.0)
     duel.beat("B", age=5.0)
     for side in SIDES:
@@ -3115,12 +3149,33 @@ class FreezablePlayer(lua_mod.Player):
         super().__init__(name)
         self.blocked = False
         self.shielded = False
+        self.invulnerable = False
+        self.health = 100.0
+        # Ordre des appels du mod : protection et mobilité, pour juger leur enchaînement.
+        self.calls: list[tuple[str, bool]] = []
         self.needs = Needs()
-        body = lua_mod.Stub(getOverallBodyHealth=lambda: 100)
+        body = lua_mod.Stub(getOverallBodyHealth=lambda: self.health)
         self.getBodyDamage = lambda: body
         self.getZombieKills = lambda: 0
 
+    def bitten(self, damage: float = 10.0) -> None:
+        """Un coup de zombie tel que le jeu le règle : rien n'entame un joueur invulnérable.
+
+        `setZombiesDontAttack` n'y entre pas : un coup porté malgré lui (zombie déjà engagé,
+        dégât d'environnement) n'est arrêté que par l'invulnérabilité.
+        """
+        if not self.invulnerable:
+            self.health = max(0.0, self.health - damage)
+
+    def setInvulnerable(self, invulnerable: bool) -> None:
+        self.calls.append(("setInvulnerable", invulnerable))
+        self.invulnerable = invulnerable
+
+    def isInvulnerable(self) -> bool:
+        return self.invulnerable
+
     def setBlockMovement(self, blocked: bool) -> None:
+        self.calls.append(("setBlockMovement", blocked))
         self.blocked = blocked
 
     def setZombiesDontAttack(self, shielded: bool) -> None:
@@ -3291,7 +3346,12 @@ def test_missing_freeze_api_refuses_the_hold():
     server.send(1, "hold_time")
     server.paused_pass()
 
-    assert server.result(1) == {"seq": 1, "status": "refused", "reason": "no_hold_api"}
+    assert server.result(1) == {
+        "seq": 1,
+        "status": "refused",
+        "reason": "no_hold_api",
+        "call": "setBlockMovement",
+    }
     server.time.time = 9.5
     server.paused_pass()
     assert server.time.time == 9.5
@@ -3347,7 +3407,12 @@ def test_missing_shield_api_refuses_the_hold():
     server.send(1, "hold_time")
     server.paused_pass()
 
-    assert server.result(1) == {"seq": 1, "status": "refused", "reason": "no_hold_api"}
+    assert server.result(1) == {
+        "seq": 1,
+        "status": "refused",
+        "reason": "no_hold_api",
+        "call": "setZombiesDontAttack",
+    }
     assert not player.blocked
 
 
@@ -3374,7 +3439,7 @@ def test_late_player_that_cannot_be_frozen_drops_the_hold():
     results = [r["data"] for r in server.lines("cmd_result") if r["data"]["seq"] == 1]
     assert results == [
         {"seq": 1, "status": "applied"},
-        {"seq": 1, "status": "refused", "reason": "no_hold_api"},
+        {"seq": 1, "status": "refused", "reason": "no_hold_api", "call": "setBlockMovement"},
     ]
     assert server.paused_message[-1] is False
     server.time.time = 9.5
@@ -3431,7 +3496,10 @@ def test_hold_saved_by_a_crashed_server_resumes_at_normal_speed():
 def test_missing_step_api_refuses_the_hold():
     """Sans `setMultiplier`, la simulation tournerait : `no_hold_api`, rien n'est tenu.
 
-    Mutation : sortir `writeMultiplier` du test de `hold_time` rend `applied`.
+    Le relâchement qui suit n'a aucun pas à rendre : `applied`, sinon le service, qui attend
+    sa confirmation, annulerait le duel. Mutations : sortir `writeMultiplier` du test de
+    `hold_time` rend `applied` ; exiger de rendre le pas sans qu'il ait été posé rend
+    `release_time` `refused`.
     """
 
     class Unstoppable(WorldTime):
@@ -3444,11 +3512,20 @@ def test_missing_step_api_refuses_the_hold():
     server.send(1, "hold_time")
     server.paused_pass()
 
-    assert server.result(1) == {"seq": 1, "status": "refused", "reason": "no_hold_api"}
+    assert server.result(1) == {
+        "seq": 1,
+        "status": "refused",
+        "reason": "no_hold_api",
+        "call": "setMultiplier",
+    }
     assert not host.blocked
     server.time.time = 9.5
     server.paused_pass()
     assert server.time.time == 9.5
+
+    server.send(2, "release_time")
+    server.paused_pass()
+    assert server.result(2) == {"seq": 2, "status": "applied"}
 
 
 def test_missing_clock_api_refuses_the_hold():
@@ -3470,3 +3547,304 @@ def test_missing_clock_api_refuses_the_hold():
 
     assert server.result(1)["reason"] == "no_hold_api"
     assert not host.blocked
+
+
+# P9F11 : la tenue est complète, et le relâchement confirmé ---------------------------
+
+
+def test_held_player_loses_no_health_and_released_player_does():
+    """A1. Tenu : invulnérable, aucun coup ne lui ôte de vie ; relâché : les coups portent.
+
+    Protégé avant d'être figé, rendu mobile avant d'être rendu vulnérable. Mutations : retirer
+    `setInvulnerable(true)` de `freezePlayer` fait perdre de la vie au joueur tenu ; inverser
+    l'ordre de `thawPlayer` (vulnérable d'abord) échoue sur l'ordre des appels.
+    """
+    server = PausedServer()
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1)["status"] == "applied"
+    assert host.invulnerable and host.blocked
+    # Réappliqués à chaque passe, toujours dans cet ordre : protégé, puis figé.
+    assert host.calls[:2] == [("setInvulnerable", True), ("setBlockMovement", True)]
+    assert set(host.calls) == {("setInvulnerable", True), ("setBlockMovement", True)}
+    for _ in range(20):
+        host.bitten()
+        server.fire("OnTick")
+    assert host.health == 100.0
+
+    host.calls.clear()
+    server.send(2, "release_time")
+    server.paused_pass()
+    assert server.result(2)["status"] == "applied"
+    assert host.calls == [("setBlockMovement", False), ("setInvulnerable", False)]
+    assert not host.invulnerable and not host.blocked
+    host.bitten()
+    assert host.health == 90.0
+
+
+def test_godmode_admin_stays_invulnerable_after_the_release():
+    """La tenue rend l'invulnérabilité d'avant elle : un admin invulnérable le reste."""
+    server = PausedServer()
+    admin = FreezablePlayer("admin")
+    admin.invulnerable = True
+    server.online.append(admin)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    server.send(2, "release_time")
+    server.paused_pass()
+
+    assert server.result(2)["status"] == "applied"
+    assert admin.invulnerable and not admin.blocked
+
+
+def test_missing_invulnerable_api_refuses_the_hold():
+    """A1. Sans `setInvulnerable`, on ne prétend pas tenir un joueur qu'on ne protège pas.
+
+    Le joueur n'est pas figé : un joueur immobile et exposé est pire qu'un départ non figé.
+    Mutation : sortir `setInvulnerable` des appels exigés de `freezePlayer` rend `applied`.
+    """
+
+    class Mortal(FreezablePlayer):
+        setInvulnerable = None
+
+    server = PausedServer()
+    player = Mortal("mortel")
+    server.online.append(player)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1) == {
+        "seq": 1,
+        "status": "refused",
+        "reason": "no_hold_api",
+        "call": "setInvulnerable",
+    }
+    assert not player.blocked
+
+
+def test_player_that_cannot_move_again_keeps_its_protection():
+    """Relâchement partiel : la mobilité ne revient pas, l'invulnérabilité reste, `refused`.
+
+    Un second `release_time` (relance du service) finit le travail. Mutation : rendre la
+    vulnérabilité avant la mobilité laisse un joueur figé et exposé.
+    """
+    server = PausedServer()
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    def stuck(blocked: bool) -> None:
+        # Une exception Java du jeu, que `pcall` attrape comme une erreur Lua.
+        if not blocked:
+            raise LuaError("bloqué")
+        host.blocked = blocked
+
+    host.setBlockMovement = stuck
+    server.send(2, "release_time")
+    server.paused_pass()
+    assert server.result(2) == {
+        "seq": 2,
+        "status": "refused",
+        "reason": "no_hold_api",
+        "call": "setBlockMovement",
+    }
+    assert host.blocked and host.invulnerable
+
+    del host.setBlockMovement
+    server.send(3, "release_time")
+    server.paused_pass()
+    assert server.result(3)["status"] == "applied"
+    assert not host.blocked and not host.invulnerable
+
+
+def test_release_with_nothing_held_is_applied():
+    """Tenue refusée plus tôt (API absente) : le relâchement n'a rien à rendre, `applied`.
+
+    Sans cela, un camp sans `setBlockMovement` bloquerait le duel au lobby pour toujours.
+    """
+
+    class StiffPlayer(FreezablePlayer):
+        setBlockMovement = None
+
+    server = PausedServer()
+    player = StiffPlayer("raide")
+    server.online.append(player)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    assert server.result(1)["status"] == "refused"
+    assert not player.invulnerable
+
+    server.send(2, "release_time")
+    server.paused_pass()
+    assert server.result(2)["status"] == "applied"
+
+
+def test_player_joining_after_the_hold_is_held_at_the_next_tick():
+    """A3. Tenue posée serveur vide ; le joueur qui arrive est figé et protégé au tick suivant.
+
+    Aucune commande ne le vise : seule la réapplication à chaque passe (`holdTick`) le tient.
+    Mutation : ne figer qu'à la réception de `hold_time` laisse le retardataire libre.
+    """
+    server = PausedServer()
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    assert server.result(1)["status"] == "applied"
+
+    late = FreezablePlayer("retard")
+    server.online.append(late)
+    server.fire("OnTick")
+
+    assert late.blocked and late.invulnerable and late.shielded
+    late.bitten()
+    assert late.health == 100.0
+    assert [r["data"]["status"] for r in server.lines("cmd_result")] == ["applied"]
+
+
+def test_late_player_missing_api_is_announced_once_with_its_call():
+    """A3. API absente à l'arrivée du joueur : un seul `cmd_result`, qui nomme l'appel.
+
+    Mutation : réannoncer à chaque passe (sans remettre `heldSeq` à nil) multiplie les refus.
+    """
+
+    class Mortal(FreezablePlayer):
+        setInvulnerable = None
+
+    server = PausedServer()
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    server.online.append(Mortal("mortel"))
+    for _ in range(5):
+        server.paused_pass()
+        server.fire("OnTick")
+
+    refusals = [r["data"] for r in server.lines("cmd_result") if r["data"]["status"] != "applied"]
+    assert refusals == [
+        {"seq": 1, "status": "refused", "reason": "no_hold_api", "call": "setInvulnerable"}
+    ]
+
+
+def test_late_refusal_names_the_call_and_the_lobby_stops_claiming_a_hold(engine_rig, hold_caps):
+    """A3, côté service : `held` seulement sur `applied`, et un refus tardif l'efface.
+
+    `sent` ne vaut pas `held` : l'UI n'écrit « Start frozen » que pour `held`. Mutations :
+    poser `held` à l'écriture de `hold_time` ; garder `held` après le refus tardif.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    holds = duel.wait_holds()
+    duel.sync_pump()
+    assert duel.state()["capabilities"]["hold"]["A"]["status"] == "sent"
+
+    duel.mods["A"].cmd_result(holds["A"]["seq"], "applied")
+    engine_rig.until(lambda s: s["capabilities"]["hold"]["A"]["status"] == "held")
+    world_result(
+        duel.mods["A"], holds["A"]["seq"], "refused", reason="no_hold_api", call="setInvulnerable"
+    )
+    state = engine_rig.until(lambda s: s["capabilities"]["hold"]["A"]["status"] == "refused")
+
+    assert state["capabilities"]["hold"]["A"]["reason"] == "refused no_hold_api (setInvulnerable)"
+    assert any("setInvulnerable" in log["msg"] for log in state["logs"])
+    script = (Path(engine_module.__file__).parent.parent / "ui" / "app.js").read_text("utf-8")
+    assert "status(side) === 'held'" in script
+    assert "status !== 'off'" not in script
+
+
+def test_refused_release_is_retried_then_the_match_starts(engine_rig, hold_caps):
+    """A2. Le mod refuse le relâchement de A une fois : A reste en attente, relancé, puis confirmé.
+
+    Ni sonde ni décompte tant que A n'a pas rendu `applied`. Mutations : poser `_released_ms`
+    à l'écriture (avant la confirmation) lance les sondes vers un A encore figé ; avaler le
+    refus (le compter comme confirmé) ne relance jamais `release_time`.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.wait_holds()
+    duel.arrive("A")
+    duel.arrive("B")
+    duel.confirm_release("B")
+    first = duel.confirm_release("A", "refused", reason="no_hold_api", call="setBlockMovement")
+    state = engine_rig.until(
+        lambda s: s["capabilities"]["hold"]["A"]["status"] == "release_refused"
+    )
+    assert "setBlockMovement" in state["capabilities"]["hold"]["A"]["reason"]
+    duel.sync_pump()
+    assert kinds(duel.mods["A"]) == ["hold_time", "release_time"]
+    assert "probe_spawn" not in kinds(duel.mods["B"])
+
+    duel.at(engine_rig.runtime["probe_retry_s"])
+    engine_rig.until(lambda _: kinds(duel.mods["A"]).count("release_time") == 2)
+    second = duel.confirm_release("A")
+    assert second["seq"] > first["seq"]
+    for side in SIDES:
+        probe = wait_command(engine_rig, duel.mods[side], "probe_spawn")
+        duel.mods[side].cmd_result(probe["seq"], "applied", spawned=1)
+    duel.t0_s = engine_rig.runtime["probe_retry_s"] + engine_rig.runtime["countdown_s"]
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    duel.at_match(0)
+    state = engine_rig.wait("running", "error")
+    assert state["phase"] == "running", state["error"]
+    assert state["capabilities"]["hold"]["A"]["status"] == "released"
+
+
+def test_release_never_confirmed_refuses_the_match_and_names_the_side(engine_rig, hold_caps):
+    """A2. A refuse toujours son relâchement : relancé, jamais confirmé, le match ne démarre pas.
+
+    Mutation : relancer sans borne laisse le lobby attendre ; avaler le refus lance le duel.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.wait_holds()
+    duel.arrive("A")
+    duel.arrive("B")
+    duel.confirm_release("B")
+    duel.confirm_release("A", "refused", reason="no_hold_api", call="setBlockMovement")
+    retry_s = engine_rig.runtime["probe_retry_s"]
+    for count in (2, 3):
+        duel.at(retry_s * (count - 1))
+        engine_rig.until(lambda _, n=count: kinds(duel.mods["A"]).count("release_time") == n)
+        duel.confirm_release("A", "refused", reason="no_hold_api", call="setBlockMovement")
+    assert duel.state()["phase"] == "lobby"
+
+    duel.at(PROBE_TIMEOUT_S)
+    state = engine_rig.wait("error", "running")
+
+    assert state["phase"] == "error"
+    assert "relâchement impossible du camp A après 30 s" in state["error"]
+    assert "probe_spawn" not in kinds(duel.mods["A"]) + kinds(duel.mods["B"])
+
+
+def test_countdown_never_ends_in_running_with_a_side_still_held(engine_rig, hold_caps):
+    """A2, dernier verrou : à la fin du décompte, un camp tenu non relâché annule le duel.
+
+    Le chemin normal n'y mène pas (sondes et décompte attendent la confirmation) : l'état est
+    forcé ici pour éprouver le garde de `_countdown_over`. Mutation : retirer
+    `_unreleased_refusal` du passage en `running` lance le duel avec A figé.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.join_and_resolve()
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    match = duel.engine._match
+    match._awaiting_release.add("A")
+    match._released_ms = None
+
+    duel.t0_s = engine_rig.runtime["countdown_s"]
+    duel.at_match(0)
+    state = engine_rig.wait("error", "running")
+
+    assert state["phase"] == "error"
+    assert "camp A encore tenu à la fin du décompte" in state["error"]
+    assert "running" not in duel.phases()

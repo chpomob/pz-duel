@@ -839,34 +839,44 @@ handlers.supply_drop = function(cmd, player)
     return { status = "applied" }
 end
 
--- Tenue d'avant-match (P9F10) -------------------------------------------------------
+-- Tenue d'avant-match (P9F10, complétée en P9F11) ---------------------------------------
 --
 -- Tant que l'adversaire manque, le monde est forcé en pause : `hold_time` capte l'heure du
 -- jour, la réapplique à chaque passe (`holdTick`), et fige les joueurs présents ou à venir.
 -- `release_time` rend la main. Ce sont des commandes de monde : elles ne visent aucun joueur
 -- et passent sans `refusalReason`. Tout appel au jeu est sous `pcall` : une fonction absente
--- rend `refused`, `no_hold_api`, et le match continue sans verrou, annoncé par le service.
+-- rend `refused`, `no_hold_api`, avec le nom de l'appel (`call`), et le match continue sans
+-- verrou, annoncé par le service.
 --
--- Le drapeau `paused` du jeu n'a pas de prise Lua : `IngameState.updateInternal` le recalcule
--- à chaque passe depuis `GameServer.Players.isEmpty()` (javap, offsets 895-930). La simulation
--- est donc arrêtée par le pas de temps : `GameTime:setMultiplier`, le levier de la commande
--- serveur `setTimeSpeedMultiplier` (javap), entre dans `getMultiplier`, que zombies, besoins
--- et horloge du serveur lisent à chaque passe. Posé à `HOLD_MULTIPLIER`, exigé comme le gel
--- (absent : `no_hold_api`), rendu à sa valeur d'avant au relâchement. Pas zéro : `getInvMultiplier`
--- divise par lui. Filets en plus, le pas pouvant ne pas tout couvrir (client) : les zombies
--- n'attaquent plus le joueur tenu (`setZombiesDontAttack`, exigé), et ses besoins (faim, soif,
--- fatigue, endurance) sont reposés à chaque passe à leur valeur d'entrée en tenue
--- (`Stats:set`, best-effort : `CharacterStat` peut manquer à Lua).
-local HOLD_REFUSED = { status = "refused", reason = "no_hold_api" }
+-- Il n'existe aucune pause générale d'un serveur où quelqu'un joue : `GameTime.isGamePaused`
+-- n'est vrai que serveur vide et `PauseEmpty` (bytecode). La tenue se construit donc avec des
+-- leviers, tous exigés :
+--   * le pas de temps (`GameTime:setMultiplier`, levier de `setTimeSpeedMultiplier`), lu par
+--     zombies, besoins et horloge à chaque passe : posé à `HOLD_MULTIPLIER`, rendu au relâchement.
+--     Pas zéro : `getInvMultiplier` divise par lui ;
+--   * l'heure du jour, réappliquée à chaque passe ;
+--   * le joueur : invulnérable (`setInvulnerable`, P9F11 : aucun coup ne lui ôte de vie), hors
+--     d'atteinte des zombies (`setZombiesDontAttack`), puis figé (`setBlockMovement`). Protégé
+--     d'abord, figé ensuite ; au relâchement, rendu mobile d'abord, vulnérable ensuite : si la
+--     mobilité ne revient pas, la protection reste. Jamais un joueur figé et exposé.
+-- Best-effort en plus : ses besoins (faim, soif, fatigue, endurance) sont reposés à chaque
+-- passe à leur valeur d'entrée en tenue (`Stats:set` : `CharacterStat` peut manquer à Lua).
+local function holdRefused(call)
+    return { status = "refused", reason = "no_hold_api", call = call }
+end
 -- Pas de temps du monde sous tenue : dix mille fois plus lent, trois minutes y durent 18 ms.
 local HOLD_MULTIPLIER = 0.0001
 -- Pas d'avant la tenue, rendu au relâchement ; nil hors tenue.
 local heldMultiplier = nil
+-- Vrai dès que la tenue a réellement posé `HOLD_MULTIPLIER` : seul ce cas exige de rendre le
+-- pas. Un `setMultiplier` absent ne change rien, et ne doit pas bloquer le relâchement.
+local multiplierChanged = false
 -- Heure du jour figée, nil hors tenue.
 local heldTime = nil
--- `seq` de la dernière `hold_time` appliquée : un échec ultérieur s'y rapporte.
+-- `seq` de la dernière `hold_time` appliquée : un échec ultérieur s'y rapporte, une fois.
 local heldSeq = nil
--- Par joueur tenu (nom) : protection d'avant la tenue, et besoins captés à l'entrée.
+-- Par joueur tenu (nom) : le joueur, ce que la tenue lui a posé, sa protection d'avant, et
+-- ses besoins captés à l'entrée. Une entrée ne part qu'une fois le joueur entièrement rendu.
 local heldPlayers = {}
 local FROZEN_STATS = { "HUNGER", "THIRST", "FATIGUE", "ENDURANCE" }
 -- Déclarée ici, définie avec les commandes : un échec différé de la tenue s'y annonce.
@@ -897,45 +907,100 @@ local function restoreStats(player, stats)
     end)
 end
 
--- Fige un joueur et le met hors d'atteinte des zombies ; rend faux si l'un des deux manque.
+-- Les appels du jeu, chacun nommé : son absence s'annonce sous ce nom. Écrits en `:` explicite,
+-- comme partout dans le mod, plutôt que par indexation dynamique de l'objet Java.
+local PLAYER_SETTERS = {
+    setInvulnerable = function(player, value) player:setInvulnerable(value) end,
+    setZombiesDontAttack = function(player, value) player:setZombiesDontAttack(value) end,
+    setBlockMovement = function(player, value) player:setBlockMovement(value) end,
+}
+local PLAYER_GETTERS = {
+    isInvulnerable = function(player) return player:isInvulnerable() end,
+    isZombiesDontAttack = function(player) return player:isZombiesDontAttack() end,
+}
+
+local function readFlag(player, getter)
+    local ok, value = pcall(PLAYER_GETTERS[getter], player)
+    return ok and value == true
+end
+
+local function callPlayer(player, setter, value)
+    return pcall(PLAYER_SETTERS[setter], player, value)
+end
+
+-- Protège puis fige un joueur, à chaque passe : un joueur arrivé après la commande l'est à sa
+-- première passe. Rend faux et le nom de l'appel manquant ; ce qui a été posé est noté dans
+-- l'entrée, pour être rendu tel quel.
 local function freezePlayer(player)
     local key = playerKey(player)
     local entry = heldPlayers[key]
     if not entry then
-        local ok, shielded = pcall(function() return player:isZombiesDontAttack() end)
-        entry = { shielded = ok and shielded == true, stats = captureStats(player) }
+        entry = {
+            player = player,
+            invulnerable = readFlag(player, "isInvulnerable"),
+            shielded = readFlag(player, "isZombiesDontAttack"),
+            stats = captureStats(player),
+            set = {},
+        }
         heldPlayers[key] = entry
     end
-    local ok = pcall(function()
-        player:setBlockMovement(true)
-        player:setZombiesDontAttack(true)
-    end)
-    restoreStats(player, entry.stats)
-    return ok
-end
-
-local function thawPlayer(player)
-    local key = playerKey(player)
-    local entry = heldPlayers[key]
-    heldPlayers[key] = nil
-    local shielded = entry ~= nil and entry.shielded or false
-    return pcall(function()
-        player:setBlockMovement(false)
-        player:setZombiesDontAttack(shielded)
-    end)
-end
-
--- Rend faux si un seul joueur n'a pu être figé ou rendu : la tenue n'est alors pas tenue.
-local function blockPlayers(blocked)
-    local all = true
-    local players = onlinePlayers()
-    for i = 1, #players do
-        local ok
-        if blocked then ok = freezePlayer(players[i]) else ok = thawPlayer(players[i]) end
-        if not ok then all = false end
+    entry.player = player
+    -- Protégé d'abord : un joueur n'est jamais figé sans être hors d'atteinte.
+    if not callPlayer(player, "setInvulnerable", true) then return false, "setInvulnerable" end
+    entry.set.setInvulnerable = true
+    if not callPlayer(player, "setZombiesDontAttack", true) then
+        return false, "setZombiesDontAttack"
     end
-    if not blocked then heldPlayers = {} end
-    return all
+    entry.set.setZombiesDontAttack = true
+    if not callPlayer(player, "setBlockMovement", true) then return false, "setBlockMovement" end
+    entry.set.setBlockMovement = true
+    restoreStats(player, entry.stats)
+    return true
+end
+
+-- Rend un joueur dans l'ordre inverse : mobile d'abord, vulnérable ensuite. Si la mobilité ne
+-- revient pas, la protection reste et l'entrée aussi : un prochain `release_time` réessaie.
+local function thawPlayer(key, entry)
+    local player = entry.player
+    if entry.set.setBlockMovement then
+        if not callPlayer(player, "setBlockMovement", false) then return false, "setBlockMovement" end
+        entry.set.setBlockMovement = nil
+    end
+    if entry.set.setZombiesDontAttack then
+        if not callPlayer(player, "setZombiesDontAttack", entry.shielded) then
+            return false, "setZombiesDontAttack"
+        end
+        entry.set.setZombiesDontAttack = nil
+    end
+    if entry.set.setInvulnerable then
+        if not callPlayer(player, "setInvulnerable", entry.invulnerable) then
+            return false, "setInvulnerable"
+        end
+        entry.set.setInvulnerable = nil
+    end
+    heldPlayers[key] = nil
+    return true
+end
+
+-- Fige les joueurs en ligne, ou rend tous ceux que la tenue a touchés, en ligne ou non. Rend
+-- faux et le premier appel manquant si un seul joueur n'a pu être figé ou rendu.
+local function blockPlayers(blocked)
+    local missing = nil
+    if blocked then
+        local players = onlinePlayers()
+        for i = 1, #players do
+            local ok, call = freezePlayer(players[i])
+            if not ok and missing == nil then missing = call end
+        end
+    else
+        local keys = {}
+        for key in pairs(heldPlayers) do keys[#keys + 1] = key end
+        for _, key in ipairs(keys) do
+            local ok, call = thawPlayer(key, heldPlayers[key])
+            if not ok and missing == nil then missing = call end
+        end
+    end
+    return missing == nil, missing
 end
 
 -- Best-effort : l'écran de pause dit au joueur qu'on l'attend ; son échec ne lève pas le gel.
@@ -966,32 +1031,48 @@ local function writeMultiplier(value)
 end
 
 -- Lève toute la tenue : plus d'heure réappliquée, pas de temps rendu, joueurs rendus, écran
--- de pause retiré. Rend faux si le pas ou un joueur n'a pu être rendu.
+-- de pause retiré. Rend faux et l'appel manquant si le pas ou un joueur n'a pu être rendu.
 local function dropHold()
     heldTime = nil
-    local resumed = true
+    local missing = nil
     if heldMultiplier ~= nil then
-        resumed = writeMultiplier(heldMultiplier)
-        heldMultiplier = nil
+        if not multiplierChanged then
+            heldMultiplier = nil
+        elseif writeMultiplier(heldMultiplier) then
+            heldMultiplier = nil
+            multiplierChanged = false
+        else
+            missing = "setMultiplier"
+        end
     end
     showPaused(false)
-    return blockPlayers(false) and resumed
+    local thawed, call = blockPlayers(false)
+    if not thawed and missing == nil then missing = call end
+    return missing == nil, missing
+end
+
+-- Tous les leviers de la passe ; rend faux et le premier appel manquant.
+local function applyHold(time)
+    if not writeTimeOfDay(time) then return false, "setTimeOfDay" end
+    if not writeMultiplier(HOLD_MULTIPLIER) then return false, "setMultiplier" end
+    multiplierChanged = true
+    return blockPlayers(true)
 end
 
 -- Réappliquée à chaque passe, même monde en pause : un joueur arrivé pendant la tenue est
--- figé dès sa première passe, et l'heure ne garde jamais plus d'une passe d'avance. Un joueur
--- qu'on ne peut figer (API absente à son arrivée) fait tomber la tenue entière, rendue
--- `refused`, `no_hold_api` sous le `seq` de `hold_time` : le service annonce un départ non figé.
+-- protégé et figé dès sa première passe, et l'heure ne garde jamais plus d'une passe d'avance.
+-- Un joueur qu'on ne peut tenir (API absente à son arrivée) fait tomber la tenue entière,
+-- rendue une seule fois `refused`, `no_hold_api` et l'appel, sous le `seq` de `hold_time` :
+-- le service annonce un départ non figé.
 local function holdTick()
     if heldTime == nil then return end
-    if writeTimeOfDay(heldTime) and writeMultiplier(HOLD_MULTIPLIER) and blockPlayers(true) then
-        return
-    end
+    local ok, call = applyHold(heldTime)
+    if ok then return end
     local seq = heldSeq
     heldSeq = nil
     dropHold()
     if seq ~= nil then
-        emitResult(seq, HOLD_REFUSED)
+        emitResult(seq, holdRefused(call))
         flushOut()
     end
 end
@@ -999,11 +1080,13 @@ end
 -- Idempotente : renvoyée sur une tenue déjà active, elle garde l'heure captée la première fois.
 handlers.hold_time = function(cmd)
     local time = heldTime or readTimeOfDay()
-    if time == nil or not writeTimeOfDay(time) then return HOLD_REFUSED end
+    if time == nil then return holdRefused("getTimeOfDay") end
     if heldMultiplier == nil then heldMultiplier = readMultiplier() end
-    if not writeMultiplier(HOLD_MULTIPLIER) or not blockPlayers(true) then
+    local ok, call = applyHold(time)
+    if not ok then
+        heldSeq = nil
         dropHold()
-        return HOLD_REFUSED
+        return holdRefused(call)
     end
     heldTime = time
     heldSeq = cmd.seq
@@ -1011,9 +1094,12 @@ handlers.hold_time = function(cmd)
     return { status = "applied" }
 end
 
+-- Rien de tenu : `applied`. Un joueur qu'on ne peut rendre mobile garde sa protection, et le
+-- relâchement rend `refused` : le service le relance, et ne lance pas le duel sans lui.
 handlers.release_time = function()
     heldSeq = nil
-    if not dropHold() then return HOLD_REFUSED end
+    local ok, call = dropHold()
+    if not ok then return holdRefused(call) end
     return { status = "applied" }
 end
 
@@ -1137,6 +1223,8 @@ emitResult = function(seq, result)
         spawned = result.spawned,
         spread = result.spread,
         targeted = result.targeted,
+        -- P9F11 : l'appel du jeu qui manque, pour `no_hold_api`.
+        call = result.call,
     }, side)
 end
 

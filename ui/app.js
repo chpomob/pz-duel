@@ -523,20 +523,33 @@ const OPEN_GAME_WAIT = 'The game button unlocks as soon as your opponent is conn
 
 // Tout vient de `invite` : le service décide de ce qui existe et le dit en anglais.
 // P9F10: while a player is missing, the service freezes both worlds; the lobby says when a side
-// refused. A refusal never blocks anything: it is written here.
-const HOLD_FAILED = { unsupported: true, refused: true, release_refused: true };
+// refused. A refused hold never blocks anything: it is written here.
+// P9F11: "frozen" is only shown for a side whose game answered `applied` (status `held`): a hold
+// merely sent proves nothing. A release not yet confirmed blocks the duel, and says so.
+const HOLD_FAILED = { unsupported: true, refused: true };
 function holdNotice() {
   const hold = (S.capabilities && S.capabilities.hold) || {};
-  const failed = ['A', 'B'].filter((side) => hold[side] && HOLD_FAILED[hold[side].status]);
+  const status = (side) => hold[side] && hold[side].status;
+  const why = (side) => `${side} (${hold[side].reason || hold[side].status})`;
+  const parts = [];
+  const failed = ['A', 'B'].filter((side) => HOLD_FAILED[status(side)]);
   if (failed.length) {
-    const parts = failed.map((side) => `${side} (${hold[side].reason || hold[side].status})`);
-    return `<p class="err">Start not frozen on side ${esc(parts.join(', '))}: the duel still runs,
-      but a player who arrives first can move and their world ages while waiting.</p>`;
+    parts.push(`<p class="err">Start not frozen on side ${esc(failed.map(why).join(', '))}: the duel
+      still runs, but a player who arrives first can move and their world ages while waiting.</p>`);
   }
-  const held = ['A', 'B'].some((side) => hold[side] && hold[side].status !== 'off');
-  return held
-    ? '<p class="notice">Start frozen: whoever arrives first stays still, clock stopped, until the other is in.</p>'
-    : '';
+  const stuck = ['A', 'B'].filter((side) => status(side) === 'release_refused');
+  if (stuck.length) {
+    parts.push(`<p class="err">Release not confirmed on side ${esc(stuck.map(why).join(', '))}:
+      retrying; the duel will not start while a player is still held.</p>`);
+  }
+  const held = ['A', 'B'].filter((side) => status(side) === 'held');
+  if (held.length) {
+    parts.push(`<p class="notice">Start frozen on side ${esc(held.join(', '))}: whoever arrives
+      first stays still and cannot be hurt, clock stopped, until the other is in.</p>`);
+  } else if (['A', 'B'].some((side) => status(side) === 'sent')) {
+    parts.push('<p class="notice">Freeze requested: waiting for the game to confirm it.</p>');
+  }
+  return parts.join('');
 }
 
 function inviteCard() {

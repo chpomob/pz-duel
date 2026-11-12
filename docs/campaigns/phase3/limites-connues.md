@@ -213,9 +213,82 @@ ignore.
   `release_refused`, l'écriture est relancée tous les `probe_retry_s`, et aucune sonde ne part
   tant qu'un camp tenu n'est pas relâché ; passé `probe_timeout_s`, le lobby refuse le match
   (« relâchement impossible du camp … ») plutôt que de lancer un joueur figé. Un `release_time`
-  écrit mais rendu `refused` par le mod (heure lâchée, joueur peut-être encore figé) n'est
-  qu'annoncé : non vérifié en jeu.
+  écrit mais rendu `refused` par le mod n'était qu'annoncé — corrigé en P9F11 : relancé comme
+  une écriture ratée, et le relâchement n'est confirmé qu'au `applied` (voir plus bas).
 - **Un départ entre le relâchement et le décompte ne re-tient rien** (« une seule fois ») : le
   décompte attend son retour, l'autre joueur est libre pendant ce temps.
 - **Un mod d'avant P9F10 (sans `hold` dans `caps`)** donne le comportement d'avant : sonde à
   l'arrivée, pas de tenue, annoncé au lobby.
+
+## P9F11 — tenue complète, relâchement confirmé (2026-11-12)
+
+Fait du bytecode, à ne plus chercher : `GameTime.isGamePaused()` n'est vrai que si
+`GameServer.server && Players.isEmpty() && ServerOptions.pauseEmpty`. Il n'existe aucune pause
+générale d'un serveur où quelqu'un joue : « tenir » est la somme de leviers, tous exigés.
+
+**Quel levier protège quoi.**
+
+| Levier (mod) | Ce qu'il tient | Absent |
+|---|---|---|
+| `GameTime:setMultiplier(0.0001)`, réappliqué à chaque passe | le pas de la simulation serveur : zombies, besoins, horloge | `no_hold_api` (`setMultiplier`) |
+| `GameTime:setTimeOfDay`, réappliqué | l'heure du jour | `no_hold_api` (`setTimeOfDay`) |
+| `IsoGameCharacter.setInvulnerable(true)` (P9F11) | la vie : aucun coup ne l'entame, même porté | `no_hold_api` (`setInvulnerable`) |
+| `setZombiesDontAttack(true)` | les zombies ne choisissent pas le joueur pour cible | `no_hold_api` (`setZombiesDontAttack`) |
+| `setBlockMovement(true)` | le déplacement | `no_hold_api` (`setBlockMovement`) |
+| `Stats:set(CharacterStat.*)`, à chaque passe | faim, soif, fatigue, endurance | best-effort, muet |
+
+Ordre : protégé (invulnérable, puis hors cible) **avant** d'être figé ; au relâchement, rendu
+mobile **avant** d'être rendu vulnérable. Si `setBlockMovement(false)` échoue, la protection reste
+posée et le relâchement rend `refused` : jamais un joueur figé et exposé. La tenue rend la valeur
+d'avant elle (un admin invulnérable le reste). Chaque refus porte `call`, le nom de l'appel
+manquant, lu par le service (`refused no_hold_api (setInvulnerable)`).
+
+**A3 — un joueur arrivé après la tenue.** La tenue est réappliquée à chaque passe (`holdTick`,
+sous `OnTickEvenPaused` comme `OnTick`) à tous les joueurs en ligne : le retardataire est protégé
+et figé au tick suivant son arrivée, sans commande. Si une API lui manque, la tenue tombe et un
+**seul** `cmd_result` part, sous le `seq` de `hold_time`. Côté service, `held` n'est posé qu'au
+`applied` du mod (`sent` ne prouve rien), et l'UI n'écrit *Start frozen* que pour `held`.
+
+**A2 — le relâchement est une confirmation, pas un envoi.** `_released_ms` (origine de la dérive)
+n'est posé qu'une fois chaque camp tenu revenu `applied` sur `release_time`. Une écriture ratée
+(journal, `in`) ou un `refused` du mod laisse le camp en attente ; il est relancé tous les
+`probe_retry_s` (pas à chaque passe : chaque essai consomme un `seq` journalisé), et ni sonde ni
+décompte ne partent avant la confirmation. Passé `probe_timeout_s` depuis la demande, le lobby
+refuse le match (« relâchement impossible du camp A… : son joueur reste tenu »). Dernier verrou, la
+fin du décompte ne passe jamais en `running` avec un camp tenu non confirmé (« camp A encore tenu
+à la fin du décompte : duel annulé »). Côté mod, un `release_time` sans rien à rendre (tenue
+refusée plus tôt) rend `applied`, pour ne pas bloquer un camp dont l'API manque.
+
+**Tests et mutations (tous dans `tests/test_match.py`, mutations vérifiées tuées) :**
+
+- A1 `test_held_player_loses_no_health_and_released_player_does` — retirer `setInvulnerable(true)`
+  de `freezePlayer` : le joueur tenu perd de la vie ; rendre la vulnérabilité avant la mobilité :
+  l'ordre des appels échoue. Aussi `test_missing_invulnerable_api_refuses_the_hold`,
+  `test_player_that_cannot_move_again_keeps_its_protection`,
+  `test_godmode_admin_stays_invulnerable_after_the_release`, `test_release_with_nothing_held_is_applied`.
+- A2 `test_refused_release_is_retried_then_the_match_starts` — remettre `_released_ms` à
+  l'écriture : les sondes partent vers un A encore figé ; avaler le refus : jamais de relance.
+  `test_release_never_confirmed_refuses_the_match_and_names_the_side` — même mutations, le duel
+  démarrerait. `test_countdown_never_ends_in_running_with_a_side_still_held` — retirer
+  `_unreleased_refusal` du passage en `running`. Les tests P9F10 d'écriture ratée
+  (`test_unwritten_release_is_retried_before_the_probes`, `test_release_never_written_refuses_the_lobby`)
+  restent verts.
+- A3 `test_player_joining_after_the_hold_is_held_at_the_next_tick` — ne tenir qu'à la réception
+  de `hold_time` : le retardataire reste libre. `test_late_player_missing_api_is_announced_once_with_its_call`
+  — réannoncer à chaque passe multiplie les refus. `test_late_refusal_names_the_call_and_the_lobby_stops_claiming_a_hold`
+  — poser `held` à l'écriture, ou le garder après le refus tardif.
+
+**Ouvert, manette en main (un joueur entré trois minutes avant l'autre) :**
+
+- Il **ne bouge pas** : `setBlockMovement` est posé sur l'`IsoPlayer` du serveur ; que le client,
+  maître de son déplacement en multijoueur, s'y plie reste à voir.
+- Il **ne perd pas de vie** : `setInvulnerable` est un champ serveur ; en multijoueur, les dégâts
+  de zombie sont en partie calculés côté client. À vérifier : laisser un zombie l'atteindre (si le
+  pas de temps ne l'arrête pas) et lire la barre de vie des deux côtés.
+- Il **n'a pas faim** : faim/soif/fatigue reposées côté serveur à chaque passe ; vérifier
+  l'affichage client après trois minutes, et l'ennui, le stress, la température, non tenus.
+- L'invulnérabilité est-elle écrite dans la sauvegarde du joueur ? Si oui, un serveur tombé sous
+  tenue rendrait un joueur invulnérable au redémarrage : la tenue suivante capterait `true` comme
+  valeur d'avant. Non vérifié.
+- Un joueur tenu qui se déconnecte est rendu au relâchement par son objet gardé ; s'il revient
+  entre-temps sous un nouvel objet, il est re-tenu à la passe suivante. Non vérifié en jeu.
