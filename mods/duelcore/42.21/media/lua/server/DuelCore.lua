@@ -856,8 +856,10 @@ end
 --     Pas zéro : `getInvMultiplier` divise par lui ;
 --   * l'heure du jour, réappliquée à chaque passe ;
 --   * le joueur : invulnérable (`setInvulnerable`, P9F11 : aucun coup ne lui ôte de vie), hors
---     d'atteinte des zombies (`setZombiesDontAttack`), puis figé (`setBlockMovement`). Protégé
---     d'abord, figé ensuite ; au relâchement, rendu mobile d'abord, vulnérable ensuite : si la
+--     d'atteinte des zombies (`setZombiesDontAttack`), caché (`setInvisible`, P9F12 : un
+--     personnage invisible n'est ni vu ni entendu, `addWorldSoundUnlessInvisible` ne fait plus
+--     de bruit de monde), puis figé (`setBlockMovement`). Protégé d'abord, caché ensuite, figé
+--     en dernier ; au relâchement, l'ordre inverse : visible, mobile, puis vulnérable. Si la
 --     mobilité ne revient pas, la protection reste. Jamais un joueur figé et exposé.
 -- Best-effort en plus : ses besoins (faim, soif, fatigue, endurance) sont reposés à chaque
 -- passe à leur valeur d'entrée en tenue (`Stats:set` : `CharacterStat` peut manquer à Lua).
@@ -912,11 +914,13 @@ end
 local PLAYER_SETTERS = {
     setInvulnerable = function(player, value) player:setInvulnerable(value) end,
     setZombiesDontAttack = function(player, value) player:setZombiesDontAttack(value) end,
+    setInvisible = function(player, value) player:setInvisible(value) end,
     setBlockMovement = function(player, value) player:setBlockMovement(value) end,
 }
 local PLAYER_GETTERS = {
     isInvulnerable = function(player) return player:isInvulnerable() end,
     isZombiesDontAttack = function(player) return player:isZombiesDontAttack() end,
+    isInvisible = function(player) return player:isInvisible() end,
 }
 
 local function readFlag(player, getter)
@@ -939,6 +943,7 @@ local function freezePlayer(player)
             player = player,
             invulnerable = readFlag(player, "isInvulnerable"),
             shielded = readFlag(player, "isZombiesDontAttack"),
+            invisible = readFlag(player, "isInvisible"),
             stats = captureStats(player),
             set = {},
         }
@@ -952,16 +957,25 @@ local function freezePlayer(player)
         return false, "setZombiesDontAttack"
     end
     entry.set.setZombiesDontAttack = true
+    -- Caché ensuite : ni vu ni entendu, il n'attire plus personne vers l'endroit où il attend.
+    if not callPlayer(player, "setInvisible", true) then return false, "setInvisible" end
+    entry.set.setInvisible = true
     if not callPlayer(player, "setBlockMovement", true) then return false, "setBlockMovement" end
     entry.set.setBlockMovement = true
     restoreStats(player, entry.stats)
     return true
 end
 
--- Rend un joueur dans l'ordre inverse : mobile d'abord, vulnérable ensuite. Si la mobilité ne
+-- Rend un joueur dans l'ordre inverse : visible, mobile, puis vulnérable. Si la mobilité ne
 -- revient pas, la protection reste et l'entrée aussi : un prochain `release_time` réessaie.
 local function thawPlayer(key, entry)
     local player = entry.player
+    if entry.set.setInvisible then
+        if not callPlayer(player, "setInvisible", entry.invisible) then
+            return false, "setInvisible"
+        end
+        entry.set.setInvisible = nil
+    end
     if entry.set.setBlockMovement then
         if not callPlayer(player, "setBlockMovement", false) then return false, "setBlockMovement" end
         entry.set.setBlockMovement = nil

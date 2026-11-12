@@ -292,3 +292,42 @@ refusée plus tôt) rend `applied`, pour ne pas bloquer un camp dont l'API manqu
   valeur d'avant. Non vérifié.
 - Un joueur tenu qui se déconnecte est rendu au relâchement par son objet gardé ; s'il revient
   entre-temps sous un nouvel objet, il est re-tenu à la passe suivante. Non vérifié en jeu.
+
+## P9F12 — le joueur tenu est invisible et muet (2026-11-12)
+
+Décision du propriétaire : protégé, il restait visible et audible ; les zombies s'attroupaient
+autour de lui pendant l'attente et ne repartaient pas au départ du duel. La tenue le cache donc
+aussi, par `IsoGameCharacter.setInvisible(true)` (javap). Le même jar porte
+`addWorldSoundUnlessInvisible` : un personnage invisible n'émet plus de bruit de monde (pas,
+gestes), donc n'attire ni par la vue ni par le son.
+
+| Levier (mod) | Ce qu'il tient | Absent |
+|---|---|---|
+| `setInvisible(true)` (P9F12) | la vue et le bruit de monde : le joueur n'attire plus de zombies | `no_hold_api` (`setInvisible`) |
+
+Ordre à la tenue, réappliqué à chaque passe : `setInvulnerable(true)`, `setZombiesDontAttack(true)`,
+`setInvisible(true)`, `setBlockMovement(true)`. Au relâchement, l'inverse : `setInvisible`,
+`setBlockMovement`, `setZombiesDontAttack`, `setInvulnerable`, chacun rendu à sa valeur d'avant la
+tenue (`false` pour un joueur ordinaire ; un admin déjà invisible le reste). Un échec garde le camp
+en attente comme en P9F11. Un retardataire est caché au tick suivant son arrivée.
+
+**Tests et mutations (`tests/test_match.py`, vérifiées tuées) :**
+`test_held_player_is_invisible_before_frozen_and_visible_after_release` (retirer
+`setInvisible(true)`, le poser après le gel, ne pas le défaire),
+`test_player_joining_during_the_hold_is_invisible_at_the_next_tick`,
+`test_missing_invisible_api_refuses_the_hold` (ignorer l'échec du `pcall`),
+`test_already_invisible_admin_stays_invisible_after_the_release` (`false` en dur). L'ordre complet
+est aussi tenu par `test_held_player_loses_no_health_and_released_player_does`.
+
+**Ouvert, à confirmer manette en main :**
+
+- `setInvisible` est posé sur l'`IsoPlayer` du serveur. Que le client et les zombies simulés côté
+  client s'y plient en multijoueur (aucun zombie ne vient vers le joueur en trois minutes) reste à
+  voir.
+- Le joueur invisible l'est probablement **pour lui-même** (personnage transparent ou absent à
+  l'écran) : attendu, c'est l'invisibilité telle que le jeu la propose ; seul l'écran de pause
+  (`setShowPausedMessage`) signale la tenue. À confirmer manette en main.
+- Les zombies déjà en route vers le joueur avant la tenue perdent-ils leur cible, ou finissent-ils
+  leur trajet ? Non vérifié.
+- L'invisibilité est-elle écrite dans la sauvegarde du joueur ? Même question que pour
+  l'invulnérabilité : un serveur tombé sous tenue capterait `true` comme valeur d'avant. Non vérifié.

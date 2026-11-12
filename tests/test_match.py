@@ -3150,6 +3150,7 @@ class FreezablePlayer(lua_mod.Player):
         self.blocked = False
         self.shielded = False
         self.invulnerable = False
+        self.invisible = False
         self.health = 100.0
         # Ordre des appels du mod : protection et mobilité, pour juger leur enchaînement.
         self.calls: list[tuple[str, bool]] = []
@@ -3180,6 +3181,17 @@ class FreezablePlayer(lua_mod.Player):
 
     def setZombiesDontAttack(self, shielded: bool) -> None:
         self.shielded = shielded
+
+    def setInvisible(self, invisible: bool) -> None:
+        self.calls.append(("setInvisible", invisible))
+        self.invisible = invisible
+
+    def isInvisible(self) -> bool:
+        return self.invisible
+
+    def attracts_zombies(self) -> bool:
+        """Ce que le jeu en fait : un invisible n'est ni vu ni entendu (`addWorldSoundUnlessInvisible`)."""
+        return not self.invisible
 
     def isZombiesDontAttack(self) -> bool:
         return self.shielded
@@ -3568,9 +3580,17 @@ def test_held_player_loses_no_health_and_released_player_does():
 
     assert server.result(1)["status"] == "applied"
     assert host.invulnerable and host.blocked
-    # Réappliqués à chaque passe, toujours dans cet ordre : protégé, puis figé.
-    assert host.calls[:2] == [("setInvulnerable", True), ("setBlockMovement", True)]
-    assert set(host.calls) == {("setInvulnerable", True), ("setBlockMovement", True)}
+    # Réappliqués à chaque passe, toujours dans cet ordre : protégé, caché (P9F12), puis figé.
+    assert host.calls[:3] == [
+        ("setInvulnerable", True),
+        ("setInvisible", True),
+        ("setBlockMovement", True),
+    ]
+    assert set(host.calls) == {
+        ("setInvulnerable", True),
+        ("setInvisible", True),
+        ("setBlockMovement", True),
+    }
     for _ in range(20):
         host.bitten()
         server.fire("OnTick")
@@ -3580,7 +3600,11 @@ def test_held_player_loses_no_health_and_released_player_does():
     server.send(2, "release_time")
     server.paused_pass()
     assert server.result(2)["status"] == "applied"
-    assert host.calls == [("setBlockMovement", False), ("setInvulnerable", False)]
+    assert host.calls == [
+        ("setInvisible", False),
+        ("setBlockMovement", False),
+        ("setInvulnerable", False),
+    ]
     assert not host.invulnerable and not host.blocked
     host.bitten()
     assert host.health == 90.0
@@ -3848,3 +3872,100 @@ def test_countdown_never_ends_in_running_with_a_side_still_held(engine_rig, hold
     assert state["phase"] == "error"
     assert "camp A encore tenu à la fin du décompte" in state["error"]
     assert "running" not in duel.phases()
+
+
+# P9F12 : le joueur tenu est invisible et muet -----------------------------------------
+
+
+def test_held_player_is_invisible_before_frozen_and_visible_after_release():
+    """Tenu : invisible, posé après la protection et avant le gel ; relâché : visible d'abord.
+
+    Mutations : retirer `setInvisible(true)` de `freezePlayer` laisse le joueur attirer les
+    zombies ; le poser après `setBlockMovement` échoue sur l'ordre ; ne pas le défaire dans
+    `thawPlayer` laisse un joueur invisible pendant le duel.
+    """
+    server = PausedServer()
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1)["status"] == "applied"
+    assert host.invisible and not host.attracts_zombies()
+    order = [call for call, value in host.calls if value]
+    assert order[:3] == ["setInvulnerable", "setInvisible", "setBlockMovement"]
+
+    host.calls.clear()
+    server.send(2, "release_time")
+    server.paused_pass()
+    assert server.result(2)["status"] == "applied"
+    assert host.calls[0] == ("setInvisible", False)
+    assert not host.invisible and host.attracts_zombies()
+
+
+def test_player_joining_during_the_hold_is_invisible_at_the_next_tick():
+    """Un joueur qui arrive pendant la tenue est caché au tick suivant, sans commande.
+
+    Mutation : retirer `setInvisible(true)` de `freezePlayer` le laisse visible.
+    """
+    server = PausedServer()
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    late = FreezablePlayer("retard")
+    server.online.append(late)
+    server.fire("OnTick")
+
+    assert late.invisible and late.blocked
+    assert [r["data"]["status"] for r in server.lines("cmd_result")] == ["applied"]
+
+
+def test_missing_invisible_api_refuses_the_hold():
+    """Sans `setInvisible`, on ne prétend pas cacher le joueur : `no_hold_api` nommant l'appel.
+
+    Le joueur n'est pas figé, et l'heure n'est pas tenue. Mutation : sortir `setInvisible` des
+    appels exigés de `freezePlayer` (ignorer l'échec du `pcall`) rend `applied`.
+    """
+
+    class Seen(FreezablePlayer):
+        setInvisible = None
+
+    server = PausedServer()
+    player = Seen("vu")
+    server.online.append(player)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1) == {
+        "seq": 1,
+        "status": "refused",
+        "reason": "no_hold_api",
+        "call": "setInvisible",
+    }
+    assert not player.blocked
+    server.time.time = 9.5
+    server.paused_pass()
+    assert server.time.time == 9.5
+
+
+def test_already_invisible_admin_stays_invisible_after_the_release():
+    """La tenue rend l'invisibilité d'avant elle : un admin déjà invisible le reste.
+
+    Mutation : rendre `setInvisible(false)` en dur dans `thawPlayer` démasque l'admin.
+    """
+    server = PausedServer()
+    admin = FreezablePlayer("admin")
+    admin.invisible = True
+    server.online.append(admin)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    server.send(2, "release_time")
+    server.paused_pass()
+
+    assert server.result(2)["status"] == "applied"
+    assert admin.invisible and not admin.blocked
+
