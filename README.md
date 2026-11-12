@@ -61,7 +61,8 @@ ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is pr
    PC". Click **More info**, then **Run anyway**.
 3. **Check the Setup card** in the page that opens. For any line marked ✕, use the button offered:
    `Install mod`, `Choose folder` or `Check again`.
-4. **Start a duel**: `Configurer un duel`, pick a preset, then `Launch duel`.
+4. **Start a duel**: `Configurer un duel`, pick a preset, adjust the settings if you want (see
+   [Settings before the start](#settings-before-the-start)), then `Launch duel`.
 5. **Answer the Windows Firewall prompt.** Windows may ask whether PZ Duel or the game's server can use
    the network: click **Allow access**. PZ Duel cannot do this for you. If you dismissed the prompt,
    your guest will not get in: open *Windows Security*, *Firewall & network protection*, *Allow an app
@@ -225,6 +226,32 @@ says so above the button: no port forwarding will make the duel reachable from t
 
 **Do not post or distribute the `.bat`.** It holds your address and the password of the guest's server,
 so anyone who has it can join. Send it to your opponent only, in a private message.
+
+### Settings before the start
+
+`Configurer un duel` shows every setting, flat, in two blocks: **Monde** (written to the servers'
+`SandboxVars`) and **Règles** (applied to the played preset). No file to edit. The page knows no
+setting: it reads the catalogue served by `GET /api/settings` (`?preset=` gives that preset's
+defaults), and `Valeurs par défaut` puts them back.
+
+- **Monde**: base population (`Zombies`, 1 Hardcore … 6 None, default 3 *Élevé*; it also writes the
+  `ZombieConfig` multipliers, the ones a dedicated server reads), zombie sight, hearing, strength,
+  toughness (default *Normaux*), cognition, memory, infection (unchanged: blood and saliva), start
+  hour (9 h), start month (July), day length (4 h, 15 min to 4 h), and **Monde neuf** (on by default).
+- **Règles**: zombies per kill (10, up to 30), sprinter % (1), pop distance (12–20 tiles), aggressiveness
+  (0.6), spacing (4), warning (6 s), healing crate on injury (on), match length (25 min).
+- **Refusals**: a value out of bounds, of the wrong type or an unknown key refuses the start before
+  anything happens, with a message naming the key, the bound and the value received. Nothing is
+  silently clamped.
+- **Monde neuf** deletes `Saves/Multiplayer/duelA|duelB`, `db/duelA|duelB.db` and their snapshots
+  before the servers start; PZ then creates both worlds again. The deletion is logged (paths, sizes)
+  in the page logs and in the match journal (`world_reset`). Off, nothing is touched: start hour,
+  start month and starting population only take effect on a new world.
+- **Locked**: `ZombieLore.Speed = 4` and `ZombieLore.SprinterPercentage = 0` are written on every
+  set start and never offered: sprinters come only from the mod's deterministic count.
+- The settings are sealed with the table and written as is in the journal (`settings` and `sandbox`
+  in `match_start`); `service/presets/*.json` is never rewritten. `/api/state` gives a one-line
+  `config.settings_summary`, shown under the panel.
 
 ### Rematch or new duel
 

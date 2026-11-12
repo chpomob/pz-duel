@@ -170,3 +170,18 @@ button.wide { width: 100%; padding: 14px; font-size: 17px; }
 .ports.mapped { border-left-color: var(--green); background: #1b2416; }
 .ports.no_gateway, .ports.refused { border-left-color: var(--amber); background: #2a2416; }
 .ports.invalid_config { border-left-color: var(--red); background: #2a1a16; }
+
+/* Réglages avant le départ (P9F15) : deux blocs à plat, rendus depuis le catalogue du service. */
+.settings-head { margin: 14px 0 6px; font-size: 13px; letter-spacing: 1px; text-transform: uppercase; color: var(--dim); }
+.grid.settings { align-items: start; }
+label.field span.hint { display: inline; font-size: 11.5px; margin: 4px 0 0; }
+label.field small.help { display: block; color: var(--dim); font-size: 11.5px; margin-top: 3px; }
+label.field span.pair { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--text); }
+label.field span.pair span { display: inline; margin: 0; }
+label.field span.pair input { min-width: 0; }
+label.field.check { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+label.field.check span { display: inline; margin: 0; color: var(--text); font-size: 13px; }
+label.field.check input { width: auto; }
+label.field.check small.help { flex-basis: 100%; }
+.summary-line { margin: 12px 0 0; padding: 9px 12px; border: 1px dashed var(--line); border-radius: 7px; font-size: 13px; overflow-wrap: anywhere; }
+.summary-line .k { color: var(--dim); }

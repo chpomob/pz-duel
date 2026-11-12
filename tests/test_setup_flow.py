@@ -1411,3 +1411,64 @@ def test_p9f14_start_carries_the_chosen_play_mode():
     start = script[script.index("if (a === 'start') {") :]
     assert "mode: draft.mode," in start[: start.index("});")]
     assert "await fetch(`/api/invite/launcher?side=${side}`)" in script
+
+
+# -- P9F15 : réglages servis par le service, rendus à plat ------------------------------------
+
+
+def _render_settings_panel(catalog: dict) -> str:
+    """Rend `settingsPanel()` de `ui/app.js` sous Node, sur le catalogue du vrai service."""
+    script = ui_script()
+    esc = script[script.index("const esc = ") :]
+    esc = esc[: esc.index("));\n") + 4]
+    panel = script[script.index("function catalogDefaults()") : script.index("async function loadCatalog(")]
+    panel += script[script.index("const fieldId = ") : script.index("// An empty or unreadable box")]
+    panel += script[script.index("function settingsPanel()") :]
+    panel = panel[: panel.index("\n}\n", panel.index("function settingsPanel()")) + 3]
+    program = (
+        f"{esc}\n{panel}\n"
+        f"const catalog = {json.dumps(catalog)};\n"
+        "const draft = { settings: catalogDefaults() };\n"
+        "process.stdout.write(settingsPanel());\n"
+    )
+    node = shutil.which("node")
+    assert node is not None
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
+    return done.stdout
+
+
+def test_p9f15_settings_panel_is_flat_and_built_from_the_served_catalog():
+    """Deux blocs à plat, un contrôle par champ du catalogue, aucun `<details>`, le bouton de remise.
+
+    Mutation : un champ retiré du rendu (`settingControl` qui saute les booléens) ou un bloc
+    replié dans `<details>` échoue.
+    """
+    if shutil.which("node") is None:
+        pytest.skip("node absent")
+    catalog = Engine("mock").settings_catalog()
+    html = _render_settings_panel(catalog)
+    assert "<details" not in html
+    assert [g["label"] for g in catalog["groups"]] == ["Monde", "Règles"]
+    assert html.index(">Monde</h3>") < html.index(">Règles</h3>")
+    for field in catalog["fields"]:
+        assert esc_html(field["label"]) in html, field["key"]
+    assert html.count('type="checkbox"') == sum(f["type"] == "bool" for f in catalog["fields"])
+    assert 'id="set-pop_distance-0"' in html and 'id="set-pop_distance-1"' in html
+    assert 'data-action="settings-defaults"' in html and "Valeurs par défaut" in html
+
+
+def esc_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("'", "&#39;").replace('"', "&quot;")
+
+
+def test_p9f15_start_sends_the_settings_and_no_loose_duration():
+    """Le départ envoie `settings` tels que saisis ; plus de `duration_s` ni `day_length` à part.
+
+    Mutation : l'ancien payload (`duration_s: draft.duration_s`) revient, ou `settings` est oublié.
+    """
+    script = ui_script()
+    start = script[script.index("if (a === 'start') {") :]
+    start = start[: start.index("\n  }\n")]
+    assert "start.settings = draft.settings;" in start
+    assert "duration_s" not in start and "day_length" not in start
+    assert "'/api/settings'" in script or "'/api/settings' +" in script

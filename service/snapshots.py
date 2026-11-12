@@ -232,12 +232,14 @@ class SnapshotStore:
 
 
 def prepare_worlds(
-    pair: ServerPair, store: SnapshotStore, *, prepare_launch: Callable[[], None]
+    pair: ServerPair, store: SnapshotStore, *, prepare_launch: Callable[[], bool | None]
 ) -> None:
     """Amène les deux mondes à une même origine, ou refuse le lancement (`SnapshotError`).
 
     `prepare_launch` n'est appelé que par la passe de création : l'appelant le rejoue
     après ce retour, sur tous les chemins (D23). Les serveurs sont alors arrêtés.
+    Il rend `False` quand un fichier qu'il doit régler manque encore (le `SandboxVars`
+    d'une installation neuve) : voir `_creation_pass`.
     """
     sides = list(pair.servers)
     snapshots = [side for side in sides if store.has(side)]
@@ -268,22 +270,46 @@ def prepare_worlds(
 
 
 def _creation_pass(
-    pair: ServerPair, store: SnapshotStore, prepare_launch: Callable[[], None]
+    pair: ServerPair, store: SnapshotStore, prepare_launch: Callable[[], bool | None]
 ) -> None:
-    prepare_launch()
-    store.begin_creation()
-    ready = pair.start() and pair.wait_ready()
-    # Aussi après un échec ou une annulation : au retour, plus aucun serveur ne tourne.
-    stopped = pair.stop()
-    failure = None if ready else f"passe de création en échec : {pair.failure or 'interrompue'}"
-    if not stopped:
-        # Rien ne s'efface sous un serveur : le marqueur reste, le lancement suivant reprend.
-        raise SnapshotError(failure or "passe de création en échec : arrêt des serveurs incomplet")
+    """Crée les deux mondes avec les réglages du match, puis les capture.
+
+    Un monde garde ce que son `SandboxVars` disait à sa création (date de départ,
+    population…). Sur une installation neuve, ce fichier n'existe pas encore : PZ l'écrit
+    à son premier départ, avec ses défauts. Une passe d'amorçage le fait donc naître, son
+    monde est invalidé sans capture, et la vraie passe crée les mondes une fois réglés (P9F15).
+    """
+    if prepare_launch() is False:
+        _run_pass(pair, store, " (amorçage du sandbox)")
+        store.discard_creation(pair)
+        if prepare_launch() is False:
+            raise SnapshotError(
+                "lancement refusé : réglages du monde toujours inapplicables après "
+                "l'amorçage du sandbox (SandboxVars absent)"
+            )
+    _run_pass(pair, store, "")
     try:
-        if failure is not None:
-            raise SnapshotError(failure)
         store.capture(pair)
     except SnapshotError as exc:
         store.discard_creation(pair)
         raise SnapshotError(f"{exc} ; monde partiel invalidé") from exc
     store.end_creation()
+
+
+def _run_pass(pair: ServerPair, store: SnapshotStore, stage: str) -> None:
+    """Démarre puis arrête la paire sous le marqueur ; sur échec, invalide et refuse.
+
+    L'amorçage est une étape de la passe de création : son échec en porte le nom.
+    """
+    label = f"passe de création en échec{stage}"
+    store.begin_creation()
+    ready = pair.start() and pair.wait_ready()
+    # Aussi après un échec ou une annulation : au retour, plus aucun serveur ne tourne.
+    stopped = pair.stop()
+    failure = None if ready else f"{label} : {pair.failure or 'interrompue'}"
+    if not stopped:
+        # Rien ne s'efface sous un serveur : le marqueur reste, le lancement suivant reprend.
+        raise SnapshotError(failure or f"{label} : arrêt des serveurs incomplet")
+    if failure is not None:
+        store.discard_creation(pair)
+        raise SnapshotError(f"{failure} ; monde partiel invalidé")

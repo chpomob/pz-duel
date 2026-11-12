@@ -154,6 +154,35 @@ def read_ini(path: str | Path) -> dict[str, str]:
     return values
 
 
+def _key_span(text: str, key: str) -> tuple[int, int, str]:
+    """Rend où chercher `key` dans `text`, et son nom dans ce bloc.
+
+    Sans point, tout le texte. Avec, le corps du bloc `Bloc = { … }`, accolades équilibrées,
+    commentaires `--` sautés ; un bloc introuvable rend une zone vide : la clé y manque.
+    """
+    block, dot, name = key.partition(".")
+    if not dot:
+        return 0, len(text), key
+    opening = re.search(rf"^[ \t]*{re.escape(block)}[ \t]*=[ \t]*\{{", text, flags=re.MULTILINE)
+    if opening is None:
+        return 0, 0, name
+    depth, index = 1, opening.end()
+    while index < len(text):
+        if text.startswith("--", index):
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline
+            continue
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if not depth:
+                return opening.end(), index, name
+        index += 1
+    return opening.end(), len(text), name
+
+
 def write_sandbox(
     path: str | Path,
     day_length: int,
@@ -164,17 +193,24 @@ def write_sandbox(
 ) -> None:
     """Fixe `DayLength` et les clés de `start`, nommées exactement et en début de ligne.
 
-    Une clé introuvable refuse l'écriture : le contrat ne pourrait pas tenir.
+    Une clé pointée, `ZombieLore.Sight`, ne s'écrit que dans son bloc `ZombieLore = { … }` :
+    `Strength` existe aussi sous `MultiplierConfig` (P9F15). Une clé introuvable refuse
+    l'écriture : le contrat ne pourrait pas tenir.
     """
     path = Path(path)
     text = _read_text(path)
     for key, value in {DAY_LENGTH_KEY: day_length, **start}.items():
-        pattern = rf"^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)[^,\r\n]*"
-        text, count = re.subn(
-            pattern, lambda match: f"{match[1]}{value}", text, flags=re.MULTILINE
+        start_at, end_at, name = _key_span(text, key)
+        pattern = rf"^([ \t]*{re.escape(name)}[ \t]*=[ \t]*)[^,\r\n]*"
+        part, count = re.subn(
+            pattern,
+            lambda match: f"{match[1]}{value}",
+            text[start_at:end_at],
+            flags=re.MULTILINE,
         )
         if not count:
             raise ValueError(f"clé {key} introuvable dans {path.name}")
+        text = text[:start_at] + part + text[end_at:]
     mode = stat.S_IMODE(path.stat().st_mode)
     _replace_file(path, text, mode, policy=policy, platform=platform)
 
@@ -656,8 +692,9 @@ def read_sandbox(path: str | Path, keys: Iterable[str]) -> dict[str, str]:
     text = _read_text(Path(path))
     values = {}
     for key in keys:
-        pattern = rf"^[ \t]*{re.escape(key)}[ \t]*=[ \t]*([^,\r\n]*)"
-        if found := re.findall(pattern, text, flags=re.MULTILINE):
+        start_at, end_at, name = _key_span(text, key)
+        pattern = rf"^[ \t]*{re.escape(name)}[ \t]*=[ \t]*([^,\r\n]*)"
+        if found := re.findall(pattern, text[start_at:end_at], flags=re.MULTILINE):
             values[key] = found[-1].strip()
     return values
 
@@ -738,8 +775,12 @@ def verify_contract(
     runtime: Mapping[str, Any],
     caps: Mapping[str, Mapping[str, Any] | None],
     builds: Mapping[str, str | None],
+    sandbox: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Rend un message par écart, sur les fichiers relus ; une liste vide vaut conformité.
+
+    `sandbox` ajoute les clés que les réglages du départ ont écrites (P9F15) : elles se
+    relisent comme celles de `sandbox_start`.
 
     `caps` donne par camp le `data` reçu ; un camp à `None` ou absent de `caps` compte comme
     non reçu, et ses fichiers sont relus quand même : le contrat porte toujours sur `SIDES`.
@@ -747,7 +788,7 @@ def verify_contract(
     du contrat figurent dans les messages.
     """
     server_dir = Path(zomboid_dir) / "Server"
-    expected_sandbox = {DAY_LENGTH_KEY: day_length, **runtime["sandbox_start"]}
+    expected_sandbox = {DAY_LENGTH_KEY: day_length, **runtime["sandbox_start"], **(sandbox or {})}
     failures: list[str] = []
     inis: dict[str, dict[str, str]] = {}
     for side in SIDES:

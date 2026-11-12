@@ -64,7 +64,8 @@ sert de `StartServer64.bat` quand ce script existe.
    même**.
 3. **Vérifiez la carte Setup** de la page qui s'ouvre. Pour toute ligne marquée ✕, utilisez le bouton
    proposé : `Install mod`, `Choose folder` ou `Check again`.
-4. **Lancez un duel** : `Configurer un duel`, choisissez un preset, puis `Launch duel`.
+4. **Lancez un duel** : `Configurer un duel`, choisissez un preset, ajustez les réglages si vous le
+   voulez (voir [Réglages avant le départ](#réglages-avant-le-départ)), puis `Launch duel`.
 5. **Répondez à l'invite du pare-feu Windows.** Windows peut demander si PZ Duel ou le serveur du jeu a
    le droit d'utiliser le réseau : cliquez sur **Autoriser l'accès**. PZ Duel ne peut pas le faire à
    votre place. Si vous avez refermé l'invite, votre invité n'entrera pas : ouvrez *Sécurité Windows*,
@@ -238,6 +239,33 @@ dit au-dessus du bouton : aucune redirection ne rendra le duel joignable depuis 
 
 **Ne publiez pas et ne diffusez pas le `.bat`.** Il contient votre adresse et le mot de passe du serveur
 de l'invité : quiconque l'a peut entrer. Envoyez-le à votre adversaire seul, en message privé.
+
+### Réglages avant le départ
+
+`Configurer un duel` montre tous les réglages, à plat, en deux blocs : **Monde** (écrit dans le
+`SandboxVars` des serveurs) et **Règles** (appliqué au preset joué). Aucun fichier à éditer. La page
+ne connaît aucun réglage : elle lit le catalogue servi par `GET /api/settings` (`?preset=` en donne
+les défauts de ce preset), et `Valeurs par défaut` les remet.
+
+- **Monde** : population de base (`Zombies`, 1 Hardcore … 6 Aucun, défaut 3 *Élevé* ; écrit aussi
+  les multiplicateurs de `ZombieConfig`, ceux que lit un serveur dédié), vision, ouïe, force,
+  résistance (défaut *Normaux*), intelligence, mémoire des zombies, infection (inchangée : sang et
+  salive), heure de départ (9 h), mois de départ (juillet), durée du jour (4 h, de 15 min à 4 h), et **Monde neuf**
+  (coché par défaut).
+- **Règles** : zombies par kill (10, jusqu'à 30), % de sprinters (1), distance des pops (12–20 cases),
+  agressivité (0,6), espacement (4), préavis (6 s), caisse de soin sur blessure (oui), durée du
+  match (25 min).
+- **Refus** : une valeur hors bornes, d'un type faux ou une clé inconnue refuse le départ avant tout
+  effet, avec un message qui nomme la clé, la borne et la valeur reçue. Rien n'est écrêté en silence.
+- **Monde neuf** efface `Saves/Multiplayer/duelA|duelB`, `db/duelA|duelB.db` et leurs snapshots
+  avant le lancement des serveurs ; PZ recrée alors les deux mondes. L'effacement est journalisé
+  (chemins, tailles) dans les logs de la page et dans le journal du match (`world_reset`). Décoché,
+  rien n'est touché : heure, mois et population de départ ne comptent qu'avec un monde neuf.
+- **Verrouillés** : `ZombieLore.Speed = 4` et `ZombieLore.SprinterPercentage = 0` sont écrits à
+  chaque départ réglé et jamais proposés : les sprinters ne viennent que du comptage du mod.
+- Les réglages sont scellés avec la table et écrits tels quels au journal (`settings` et `sandbox`
+  dans `match_start`) ; `service/presets/*.json` n'est jamais réécrit. `/api/state` donne une ligne
+  `config.settings_summary`, affichée sous le panneau.
 
 ### Revanche ou nouveau duel
 

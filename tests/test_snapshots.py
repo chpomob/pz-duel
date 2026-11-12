@@ -80,7 +80,8 @@ CREATED_BYTES = b"created\n"
 
 
 # Double d'un vrai lancement : relève le disque, puis agit comme PZ et comme le mod. Sans
-# monde, c'est la passe de création : elle crée monde et sandbox, et son `caps` est périmé.
+# monde, c'est la passe de création : elle crée le monde et, comme PZ, le sandbox s'il manque ;
+# son `caps` est périmé.
 ENGINE_SCRIPT = """side="${{2#duel}}"
 mkdir -p "{launches}/$2"
 seen="{launches}/$2/$(ls "{launches}/$2" | wc -l)"
@@ -97,7 +98,7 @@ else
   mkdir -p "{zomboid}/Saves/Multiplayer/$2/map"
   echo created > "{zomboid}/Saves/Multiplayer/$2/map/chunk.bin"
   echo created > "{zomboid}/db/$2.db"
-  printf '{sandbox}' > "{zomboid}/Server/$2_SandboxVars.lua"
+  [ -f "{zomboid}/Server/$2_SandboxVars.lua" ] || printf '{sandbox}' > "{zomboid}/Server/$2_SandboxVars.lua"
   echo 'Mods=rewritten by PZ' >> "{zomboid}/Server/$2.ini"
   cat "{caps}/stale_$side" >> "$out"
 fi
@@ -131,7 +132,7 @@ goto write_caps
 mkdir "{zomboid}\Saves\Multiplayer\%2\map"
 copy /b /y "{created}" "{zomboid}\Saves\Multiplayer\%2\map\chunk.bin" >nul
 copy /b /y "{created}" "{zomboid}\db\%2.db" >nul
-copy /b /y "{sandbox_file}" "{zomboid}\Server\%2_SandboxVars.lua" >nul
+if not exist "{zomboid}\Server\%2_SandboxVars.lua" copy /b /y "{sandbox_file}" "{zomboid}\Server\%2_SandboxVars.lua" >nul
 echo Mods=rewritten by PZ>> "{zomboid}\Server\%2.ini"
 type "{caps}\stale_%side%" >> "%out%"
 :launch
@@ -820,6 +821,47 @@ def test_creation_pass_order_on_prepare_worlds(rig):
     assert "prepare_launch" not in rig.events
 
 
+def test_seed_pass_when_prepare_launch_is_incomplete(rig):
+    """P9F15 : sans `SandboxVars`, une passe d'amorçage précède la création, sans capture."""
+    pair = rig.pair(create_world=CREATE_WORLD)
+    store = rig.store()
+    answers = iter([False, True])
+
+    def prepare_launch() -> bool:
+        rig.prepare_launch()
+        return next(answers)
+
+    prepare_worlds(pair, store, prepare_launch=prepare_launch)
+
+    assert rig.events.count("prepare_launch") == 2
+    assert [event for event in rig.events if event[0] == "starting"] == [
+        ("starting", "A"), ("starting", "B"), ("starting", "A"), ("starting", "B")
+    ]
+    # Seule la seconde passe est capturée, une fois.
+    captures = [event for event in rig.events if event[0] == "capture"]
+    assert captures == [("capture", "duelA"), ("capture", "duelB")]
+    assert not store.creation_pending()
+    assert all(store.has(side) for side in SIDES)
+
+
+def test_seed_pass_still_incomplete_is_refused(rig):
+    pair = rig.pair(create_world=CREATE_WORLD)
+    store = rig.store()
+
+    def prepare_launch() -> bool:
+        rig.prepare_launch()
+        return False
+
+    with pytest.raises(SnapshotError) as refusal:
+        prepare_worlds(pair, store, prepare_launch=prepare_launch)
+
+    assert "amorçage du sandbox" in str(refusal.value)
+    assert not store.creation_pending()
+    for side in SIDES:
+        assert not store.has(side)
+        assert not store.has_world(side)
+
+
 def test_first_run_creation_pass(engine_rig):
     rig = engine_rig
     engine = rig.build()
@@ -836,9 +878,11 @@ def test_first_run_creation_pass(engine_rig):
     for side in SIDES:
         assert (rig.zomboid / "duel-snapshots" / f"duel{side}").is_dir()
         launches = rig.seen(side)
-        assert len(launches) == 2
+        # Installation neuve : l'amorçage fait naître le sandbox, la création part réglée.
+        assert len(launches) == 3
         snapshots_seen = [(seen / "snapshots").read_text().split() for seen in launches]
-        assert snapshots_seen == [[], ["duelA", "duelB"]]
+        assert snapshots_seen == [[], [], ["duelA", "duelB"]]
+        assert not (launches[0] / f"duel{side}_SandboxVars.lua").exists()
         ports = rig.runtime["ports"][side]
         for seen in launches:
             ini = read_ini(seen / f"duel{side}.ini")
@@ -854,11 +898,13 @@ def test_first_run_creation_pass(engine_rig):
             assert (session["side"], session["boot"], session["cmd_floor"]) == (side, 1, 0)
             for name in ("in", "out", "ack"):
                 assert (seen / "Lua" / f"duel_{side}_{name}.txt").read_bytes() == b""
-        # La passe a créé le sandbox et réécrit le `.ini` : le second lancement les corrige.
-        assert "rewritten" not in (launches[1] / f"duel{side}.ini").read_text()
+        # Chaque passe réécrit le `.ini` : le lancement suivant le corrige.
         day_length = engine.state.config["day_length"]
-        sandbox = (launches[1] / f"duel{side}_SandboxVars.lua").read_text()
-        assert f"DayLength = {day_length}," in sandbox
+        for seen in launches[1:]:
+            assert "rewritten" not in (seen / f"duel{side}.ini").read_text()
+            # Le monde capturé naît du sandbox réglé, pas des défauts de PZ.
+            sandbox = (seen / f"duel{side}_SandboxVars.lua").read_text()
+            assert f"DayLength = {day_length}," in sandbox
     # Lu par le contrat, le `caps` de la passe refuserait le match : son `mod` diffère par camp.
     assert {step["id"]: step["state"] for step in state["steps"]} == {
         "preflight": "ok",
@@ -912,7 +958,8 @@ def test_next_match_restores_without_creation_pass(engine_rig):
     assert second["match_id"] != first["match_id"]
     assert chunk.read_bytes() == b"created\n"
     for side in SIDES:
-        assert len(rig.seen(side)) == 3
+        # Amorçage et création au premier match, puis deux lancements de match.
+        assert len(rig.seen(side)) == 4
     secrets_by_match = {cfg["rcon_password"] for cfg in rig.configs}
     assert len(secrets_by_match) == 2
 

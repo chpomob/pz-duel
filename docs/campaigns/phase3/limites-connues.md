@@ -439,3 +439,76 @@ retiré de `_open_game`), `test_p9f14_each_invitation_carries_the_password_of_it
 - Le préflight ne contrôle pas 17281 ; un port pris ne bloque rien mais coupe le lien de A.
 - Le texte du lanceur (`LAUNCHER_CODE_TEXT`) dit « your guest » pour les deux camps : juste pour
   l'arbitre, qui a deux invités.
+
+## P9F15 — réglages du monde et des règles avant le départ (2026-11-12)
+
+**Ce qui a changé :** `Configurer un duel` montre vingt réglages, à plat, en deux blocs (« Monde »,
+« Règles »), rendus depuis le catalogue que sert `GET /api/settings` (`service/settings.py`) ; la page
+ne connaît aucun champ. `POST /api/action {"action":"start", "settings":{…}}` contrôle tout avant le
+premier effet : clé inconnue, type faux ou valeur hors bornes refusent le départ, message qui nomme
+la clé, la borne et la valeur reçue, sans écrêtage. Le preset effectif est construit en mémoire,
+repasse par `load_table`, est scellé comme avant (le recontrôle du décompte refait la table réglée
+depuis le fichier), et part au journal avec `settings` et `sandbox` dans `match_start`. Sans
+`settings`, le départ est celui d'avant (preset tel quel, monde gardé) : la revanche relit ceux du
+départ précédent.
+
+**Écarts assumés avec la fiche, sur relevé du vrai `duelA_SandboxVars.lua` (PZ 42) :**
+
+- `Zombies` est une option énumérée (1 Hardcore … 6 Aucun), pas un multiplicateur : bornes 1–6, défaut
+  3 « Élevé » (le « Élevé (3) » du résumé). Le fichier relevé avait `Zombies = 3` avec
+  `PopulationMultiplier = 0.65` (Normal) : un serveur dédié ne synchronise pas les deux. Le réglage
+  écrit donc aussi `ZombieConfig.PopulationMultiplier` et `PopulationStartMultiplier`, valeurs tirées
+  des commentaires du fichier (1,2 et 1,5 pour Élevé).
+- `StartTime` est un indice (2 = 9 h) : le défaut « 9 » de la fiche est l'heure, gardée, écrite `2`.
+  La page propose les neuf heures que PZ connaît (0, 2, 5, 7, 9, 12, 14, 17, 21 h).
+- `Sight` et `Hearing` vont de 1 à 3 (aiguisée, normale, pauvre), `Memory` de 1 à 4 (longue à
+  aucune) : 0 n'existe pas dans PZ, et les options aléatoires sont laissées de côté.
+- `DayLength` 1–7, pas 1–20 : la dérive convertit par `runtime.json/day_length_minutes`, qui ne
+  connaît que 1 à 7, et trois tests hors du périmètre de l'étape (`test_modes`, `test_api_security`,
+  `test_rules_load`) fixent le refus de 8. Étendre la table (8 = 5 h … 20 = 17 h, relevé dans le
+  `SandboxVars`) est une étape à part.
+- `zombies_par_kill` 1–30, pas 1–50 : `limits.max_n` vaut 30, et `test_rules_load` (hors périmètre)
+  fixe le refus de 31. Le relever à 50 est une étape à part ; le service découpe déjà en tranches
+  de 30.
+- `settings_summary` est dans `config` de `/api/state` (`config.settings_summary`), pas à sa racine :
+  `test_modes` fixe l'ensemble exact des clés de l'état. Au repos, la page montre le résumé des
+  défauts, servi avec le catalogue.
+- `settings` est classé à la frontière comme champ objet (`api.OBJECT_FIELDS`, 400 sinon) et lu par
+  le moteur sous `SETTINGS_FIELD` : la table `NOT_IDENTIFIERS` de `test_api_security` (hors
+  périmètre) ne le connaît pas encore, à y ajouter.
+- Le bouton « Valeurs par défaut » prend son texte dans le catalogue (`reset_label`) : les lignes
+  ajoutées à `ui/app.js` restent en anglais (AC29).
+- Les défauts des règles suivent le preset choisi (`?preset=`) : ceux de `duel_rapide` sont ceux de
+  la fiche ; `demo` garde 2 zombies par kill, et un preset sans `sprinter_percent` propose 0 %.
+
+**Monde neuf :** efface `Saves/Multiplayer/duelA|duelB`, `db/duelA|duelB.db`, `duel-snapshots/duelA|
+duelB` et le marqueur de création, serveurs arrêtés, avant `prepare_worlds`. Sans les snapshots, la
+restauration rendrait l'ancien monde. L'effacement se dit dans les logs de la page et dans
+`world_reset` (chemin, existait, octets). Il coûte une passe de création à chaque départ.
+
+**Tests et mutations :** `tests/test_settings.py` — `test_catalog_defaults_are_the_owner_values`
+(`Toughness` à 4), `test_catalog_is_served_by_the_api` (route retirée),
+`test_out_of_bounds_refuses_the_start_and_names_the_key` (borne ramenée au lieu de refuser),
+`test_refused_settings_touch_no_world`, `test_speed_and_sprinter_percentage_are_never_settable`
+(`LOCKED_SANDBOX` retiré de `sandbox_values`), `test_dotted_key_is_written_inside_its_block_only`,
+`test_effective_preset_carries_the_requested_values` (`effect["n"]` oublié),
+`test_summary_matches_the_settings`, `test_new_world_erases_then_journals` (`_reset_worlds` retiré),
+`test_kept_world_is_left_alone` (effacement inconditionnel),
+`test_settled_table_passes_the_seal_at_countdown` (recontrôle sur le fichier brut),
+`test_settings_must_be_an_object_at_the_api` (`OBJECT_FIELDS` vidé) ;
+`tests/test_setup_flow.py::test_p9f15_settings_panel_is_flat_and_built_from_the_served_catalog`
+(rendu sous Node : deux blocs, un contrôle par champ, aucun `<details>`),
+`test_p9f15_start_sends_the_settings_and_no_loose_duration`.
+
+**Ouvert, à vérifier manette en main :**
+
+- Un match réglé à la main de bout en bout, sans éditer un fichier : par exemple 20 z par kill, 5 %
+  de sprinters, pops à 15–30, monde neuf ; relire `match_start` et compter les sprinters.
+- Que PZ 42 relise bien, à la création, `Zombies` et les deux multiplicateurs écrits, et que la
+  population de départ change à vue entre « Faible » et « Hardcore ».
+- Que la passe de création d'un monde neuf garde les clés écrites (PZ réécrit le fichier) : le
+  contrat les relit et refuserait sinon.
+- Premier départ sur une machine sans `SandboxVars` : la passe de création se fait avec les défauts
+  du jeu, les réglages ne sont écrits qu'après ; heure, mois et population de départ ne comptent
+  alors qu'au monde neuf suivant.
+- La durée de la passe de création, refaite à chaque monde neuf, sur une vraie machine.

@@ -46,6 +46,8 @@ SERVER_TOKEN = "PZduel/"
 JSON_TYPE = "application/json"
 # Tout champ qui nomme une chose s'ajoute ici : `test_api_security` balaie le service.
 IDENTIFIER_FIELDS = ("action", "preset", "mode", "side")
+# Champs objets : un objet JSON, rien d'autre ; le moteur en contrôle chaque clé (P9F15).
+OBJECT_FIELDS = ("settings",)
 IDENTIFIER_MAX = 64
 IDENTIFIER = re.compile(rf"[A-Za-z0-9_-]{{1,{IDENTIFIER_MAX}}}")
 # Une action tient en quelques centaines d'octets : ce plafond borne la lecture, rien de plus.
@@ -263,6 +265,9 @@ class Handler(BaseHTTPRequestHandler):
         for field in IDENTIFIER_FIELDS:
             if field in payload and not is_identifier(payload[field]):
                 return field
+        for field in OBJECT_FIELDS:
+            if field in payload and not isinstance(payload[field], dict):
+                return field
         return None
 
     # -- routes ----------------------------------------------------------
@@ -286,6 +291,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/setup":
             self._json(200, self.engine.setup_state())
             return
+        if path == "/api/settings":
+            self._get_settings()
+            return
         if path == "/api/invite/launcher":
             self._get_launcher()
             return
@@ -293,6 +301,18 @@ class Handler(BaseHTTPRequestHandler):
             self._static("index.html")
             return
         self._static(path)
+
+    def _get_settings(self) -> None:
+        """Le catalogue des réglages (P9F15) ; `?preset=` en donne les défauts de ce preset."""
+        chosen = parse_qs(urlparse(self.path).query).get("preset")
+        if chosen is not None and (len(chosen) != 1 or not is_identifier(chosen[0])):
+            self._fail(400, "champ refusé : preset")
+            return
+        catalog = self.engine.settings_catalog(None if chosen is None else chosen[0])
+        if catalog is None:
+            self._fail(404, "preset inconnu")
+            return
+        self._json(200, catalog)
 
     def _get_launcher(self) -> None:
         # `_refused` a déjà jugé `Host` et `Origin`. Une navigation de haut niveau n'envoie pas
@@ -362,6 +382,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": "objet JSON attendu"})
             return None
         field = self._bad_identifier(payload)
+        if field in OBJECT_FIELDS:
+            self._json(400, {"ok": False, "error": f"{field} refusé : objet JSON attendu"})
+            return None
         if field is not None:
             error = f"{field} refusé : lettres, chiffres, _ ou -, {IDENTIFIER_MAX} au plus"
             self._json(400, {"ok": False, "error": error})

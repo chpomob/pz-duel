@@ -5,6 +5,7 @@ const app = $('#app');
 
 let S = null;                 // dernier état du service
 let presets = [];             // presets chargés
+let catalog = null;           // settings served by `/api/settings` (P9F15): the page knows none of them
 let view = 'auto';            // 'auto' | 'config'
 let draft = null;             // brouillon de configuration
 let setup = null;             // dernier contrôle de `/api/setup`, `null` tant qu'il manque
@@ -209,15 +210,114 @@ const mmss = (s) => {
 };
 
 function newDraft() {
-  const p = presets[0] || { id: 'duel_rapide', duration_s: 1500, day_length: 1 };
+  const p = presets[0] || {};
   return {
-    preset: p.id,
-    duration_s: p.duration_s,
-    day_length: p.day_length,
+    preset: (catalog && catalog.preset) || p.id,
+    settings: catalogDefaults(),
     pseudo: localStorage.getItem('pzduel.pseudo') || 'hôte',
     password: '',
     mode: 'host',
   };
+}
+
+// ---------------------------------------------------------------- settings (P9F15)
+// Every field, bound and default comes from the service: nothing here names a setting.
+function catalogDefaults() {
+  const out = {};
+  for (const f of (catalog && catalog.fields) || []) out[f.key] = JSON.parse(JSON.stringify(f.defaut));
+  return out;
+}
+
+async function loadCatalog(presetId) {
+  try {
+    const q = presetId ? `?preset=${encodeURIComponent(presetId)}` : '';
+    const res = await api('/api/settings' + q);
+    if (res && Array.isArray(res.fields)) catalog = res;
+  } catch (e) {
+    /* no catalogue: the panel stays empty and the start carries no settings */
+  }
+}
+
+const fieldId = (f, part = '') => 'set-' + f.key.replace(/[^A-Za-z0-9_-]/g, '-') + part;
+
+function fieldHint(f) {
+  const bits = [];
+  if (f.type !== 'bool' && !f.choices && f.min !== null) bits.push(`${f.min}–${f.max}`);
+  if (f.unit) bits.push(f.unit);
+  const head = bits.length ? `<span class="hint">${esc(bits.join(' '))}</span>` : '';
+  return head + (f.help ? `<small class="help">${esc(f.help)}</small>` : '');
+}
+
+function numberInput(f, id, value, step) {
+  return `<input id="${id}" type="number" min="${f.min}" max="${f.max}" step="${step}" value="${esc(value === null || value === undefined ? '' : String(value))}">`;
+}
+
+function settingControl(f) {
+  const v = draft.settings[f.key];
+  const id = fieldId(f);
+  if (f.type === 'bool') {
+    return `<label class="field check"><input id="${id}" type="checkbox" ${v ? 'checked' : ''}>
+      <span>${esc(f.label)}</span>${fieldHint(f)}</label>`;
+  }
+  let control;
+  if (f.choices) {
+    control = `<select id="${id}">${f.choices.map((c) =>
+      `<option value="${c.value}" ${c.value === v ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select>`;
+  } else if (f.type === 'range') {
+    const pair = Array.isArray(v) ? v : [null, null];
+    control = `<span class="pair">${numberInput(f, fieldId(f, '-0'), pair[0], 1)}
+      <span>to</span>${numberInput(f, fieldId(f, '-1'), pair[1], 1)}</span>`;
+  } else {
+    control = numberInput(f, id, v, f.type === 'float' ? 'any' : 1);
+  }
+  return `<label class="field"><span>${esc(f.label)}</span>${control}${fieldHint(f)}</label>`;
+}
+
+// An empty or unreadable box is sent as is: the service names the key in its refusal.
+function readNumber(raw) {
+  if (raw === '') return null;
+  const n = Number(raw);
+  return Number.isNaN(n) ? raw : n;
+}
+
+function bindSettings() {
+  for (const f of (catalog && catalog.fields) || []) {
+    if (f.type === 'range') {
+      [0, 1].forEach((i) => {
+        const el = document.getElementById(fieldId(f, '-' + i));
+        if (el) el.oninput = (e) => {
+          const pair = Array.isArray(draft.settings[f.key]) ? draft.settings[f.key].slice() : [null, null];
+          pair[i] = readNumber(e.target.value);
+          draft.settings[f.key] = pair;
+        };
+      });
+      continue;
+    }
+    const el = document.getElementById(fieldId(f));
+    if (!el) continue;
+    if (f.type === 'bool') el.onchange = (e) => { draft.settings[f.key] = e.target.checked; };
+    else if (f.choices) el.onchange = (e) => { draft.settings[f.key] = Number(e.target.value); };
+    else el.oninput = (e) => { draft.settings[f.key] = readNumber(e.target.value); };
+  }
+}
+
+// The service writes the summary: the last set start, or the defaults before any.
+function summaryLine() {
+  const last = S && S.config && S.config.settings_summary;
+  const text = last || (catalog && catalog.summary);
+  if (!text) return '';
+  return `<p class="summary-line"><span class="k">${last ? 'Last start' : 'Defaults'}:</span> ${esc(text)}</p>`;
+}
+
+function settingsPanel() {
+  if (!catalog) return '<p class="sub">Settings unavailable: the service did not serve them.</p>';
+  const blocks = catalog.groups.map((g) => {
+    const fields = catalog.fields.filter((f) => f.group === g.id);
+    return `<h3 class="settings-head">${esc(g.label)}</h3>
+      <div class="grid three settings">${fields.map(settingControl).join('')}</div>`;
+  }).join('');
+  return `${blocks}
+    <div class="actions"><button class="ghost" data-action="settings-defaults">${esc(catalog.reset_label)}</button></div>`;
 }
 
 // Sans mesure, on ne sait rien : le bouton reste désactivé.
@@ -333,21 +433,14 @@ function renderHome() {
     ${cfg ? `<section class="card"><h2>Dernier réglage</h2>
       <div class="row"><span class="k">Preset</span><span class="v">${esc(cfg.preset_label || cfg.preset)}</span></div>
       <div class="row"><span class="k">Durée</span><span class="v">${durLabel(cfg.duration_s)}</span></div>
-      <div class="row"><span class="k">Jour de jeu</span><span class="v">${dayLabel(cfg.day_length)}</span></div>
+      ${cfg.settings_summary ? `<div class="row"><span class="k">Settings</span><span class="v">${esc(cfg.settings_summary)}</span></div>` : ''}
     </section>` : ''}
   `);
-}
-
-function dayLabel(v) {
-  return { 1: '15 min', 2: '30 min', 3: '1 h', 4: '1 h 30' }[v] || `${v}`;
 }
 
 function renderConfig() {
   if (!draft) draft = newDraft();
   const p = presetOf(draft.preset);
-  const durations = [300, 600, 900, 1200, 1500, 1800];
-  if (!durations.includes(draft.duration_s)) durations.unshift(draft.duration_s);
-  durations.sort((a, b) => a - b);
 
   shell(`
     ${canLaunch(setup) ? '' : setupCard()}
@@ -369,19 +462,6 @@ function renderConfig() {
       </label>
 
       <div class="grid two">
-        <label class="field"><span>Durée du match</span>
-          <select id="f-duration">
-            ${durations.map((d) => `<option value="${d}" ${d === draft.duration_s ? 'selected' : ''}>${d < 120 ? d + ' s' : Math.round(d / 60) + ' min'}</option>`).join('')}
-          </select>
-        </label>
-        <label class="field"><span>Jour de jeu</span>
-          <select id="f-day">
-            ${[1, 2, 3, 4].map((d) => `<option value="${d}" ${d === draft.day_length ? 'selected' : ''}>${dayLabel(d)}</option>`).join('')}
-          </select>
-        </label>
-      </div>
-
-      <div class="grid two">
         <label class="field"><span>Ton pseudo</span>
           <input id="f-pseudo" value="${esc(draft.pseudo)}" maxlength="20">
         </label>
@@ -394,11 +474,10 @@ function renderConfig() {
         <span class="v">duelcore <span style="color:var(--green)">✓</span> · duelhud <span style="color:var(--green)">✓</span>
         <span class="hint"> (lecture seule)</span></span></div>
 
-      <h2 style="margin-top:18px">Règles — ${esc(p.label)}</h2>
-      <p class="sub">Aperçu du preset. Le lobby annonce la table jouée, réduite si un atome est retiré.</p>
-      <ul class="feed">
-        ${(p.summary || []).map((line) => `<li>• ${esc(line)}</li>`).join('')}
-      </ul>
+      <h2 style="margin-top:18px">Settings — ${esc(p.label || draft.preset || '')}</h2>
+      <p class="sub">Chosen before the start, sealed with the table. The lobby announces the played table, narrowed if an atom is withdrawn.</p>
+      ${settingsPanel()}
+      ${summaryLine()}
 
       <div class="actions">
         <button class="ghost" data-action="back">Annuler</button>
@@ -407,16 +486,15 @@ function renderConfig() {
     </section>
   `);
 
-  $('#f-preset').onchange = (e) => {
+  $('#f-preset').onchange = async (e) => {
     draft.preset = e.target.value;
-    const np = presetOf(draft.preset);
-    draft.duration_s = np.duration_s;
-    draft.day_length = np.day_length;
+    // The rules defaults follow the preset: the service reads them in it.
+    await loadCatalog(draft.preset);
+    draft.settings = catalogDefaults();
     renderConfig();
   };
   $('#f-players').onchange = (e) => { draft.mode = e.target.value; };
-  $('#f-duration').onchange = (e) => { draft.duration_s = Number(e.target.value); };
-  $('#f-day').onchange = (e) => { draft.day_length = Number(e.target.value); };
+  bindSettings();
   $('#f-pseudo').oninput = (e) => { draft.pseudo = e.target.value; };
   $('#f-password').oninput = (e) => { draft.password = e.target.value; };
 }
@@ -888,15 +966,19 @@ document.addEventListener('click', async (ev) => {
   if (a === 'start') {
     localStorage.setItem('pzduel.pseudo', draft.pseudo);
     view = 'auto';
-    return act('start', {
-      preset: draft.preset,
-      duration_s: draft.duration_s,
-      day_length: draft.day_length,
+    const start = { preset: draft.preset };
+    if (catalog) start.settings = draft.settings;
+    const out = await act('start', {
+      ...start,
       pseudo: draft.pseudo,
       password: draft.password,
       mode: draft.mode,
     });
+    // A refusal names the faulty setting: the panel stays open, values kept, to fix it.
+    if (!out.ok) { view = 'config'; render(); }
+    return out;
   }
+  if (a === 'settings-defaults') { draft.settings = catalogDefaults(); return renderConfig(); }
   if (a === 'rematch') { view = 'auto'; return act('rematch'); }
   if (a === 'cancel') { return act('cancel'); }
   if (a === 'simulate') { return act('simulate_join'); }
@@ -927,6 +1009,7 @@ $('#logstoggle').addEventListener('click', () => $('#logsbox').classList.toggle(
   } catch (e) {
     presets = [];
   }
+  await loadCatalog(null);
   draft = newDraft();
   await poll();
   pollTimer = setInterval(poll, 700);

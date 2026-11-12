@@ -16,6 +16,7 @@ import math
 import os
 import queue
 import random
+import shutil
 import socket
 import string
 import subprocess
@@ -86,8 +87,17 @@ from .servers import (
     write_ini,
     write_sandbox,
 )
+from . import settings as world_settings
 from .share import ShareServer
-from .snapshots import SnapshotError, SnapshotStore, prepare_worlds
+from .snapshots import (
+    CREATION_MARKER,
+    DB_DIR,
+    SNAPSHOTS_DIR,
+    WORLDS_DIR,
+    SnapshotError,
+    SnapshotStore,
+    prepare_worlds,
+)
 from .state import MatchState
 from .transport import Anomaly, CommandChannel, OutReader, PollResult
 from .verdict import (
@@ -116,6 +126,8 @@ PRESETS_DIR = str(paths.resource_root() / "service" / "presets")
 MATCHES_DIR = paths.matches_dir()
 
 ACTIONS = {"start", "cancel", "rematch", "simulate_join", "open_game"}
+# Le champ objet des réglages (P9F15) : `api.OBJECT_FIELDS` le classe à la frontière.
+SETTINGS_FIELD = "settings"
 DEFAULT_PRESET = "duel_rapide"
 MODE_MOCK = "mock"
 MODE_REAL = "real"
@@ -410,6 +422,50 @@ def _redacted(redactor: Redactor, value: Any) -> Any:
     return value
 
 
+WORLD_RESET = "world_reset"
+
+
+def _size_of(path: Path) -> int:
+    """Octets sous `path`, liens non suivis ; un chemin absent pèse zéro."""
+    if path.is_symlink() or path.is_file():
+        return path.lstat().st_size
+    if not path.is_dir():
+        return 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            total += Path(root, name).lstat().st_size
+    return total
+
+
+def reset_worlds(zomboid_dir: Path, sides: Sequence[str]) -> dict[str, Any]:
+    """Efface les mondes de `sides`, leurs bases et leurs snapshots (P9F15, « monde neuf »).
+
+    Sans les snapshots, `prepare_worlds` restaurerait l'ancien monde : il fait au contraire
+    une passe de création, avec le `SandboxVars` déjà réécrit. Rend ce qui a été retiré,
+    chemin et taille, absent compris (`existed` faux), pour le journal.
+    """
+    targets: list[Path] = []
+    for side in sides:
+        name = server_name(side)
+        targets += [
+            zomboid_dir / WORLDS_DIR / name,
+            zomboid_dir / DB_DIR / f"{name}.db",
+            zomboid_dir / SNAPSHOTS_DIR / name,
+        ]
+    targets.append(zomboid_dir / SNAPSHOTS_DIR / CREATION_MARKER)
+    removed = []
+    for target in targets:
+        existed = os.path.lexists(target)
+        size = _size_of(target) if existed else 0
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif existed:
+            target.unlink()
+        removed.append({"path": str(target), "existed": existed, "bytes": size})
+    return {"removed": removed, "bytes": sum(item["bytes"] for item in removed)}
+
+
 class ContractWindow:
     """Fenêtre de contrat : ce que les camps ont montré, jusqu'à une décision figée.
 
@@ -691,6 +747,7 @@ class RealMatch:
         Le second `_prepare_launch` efface aussi ce que la passe de création a laissé :
         `caps`, `out` et toute réécriture du `.ini` par PZ. Les serveurs sont alors arrêtés.
         """
+        reset = self._reset_worlds() if self._settings.get("monde_neuf") else None
         prepare_worlds(self.pair, self._store, prepare_launch=self._prepare_launch)
         self._prepare_launch()
         self._journal = Journal(self.match_dir, lambda: self._clock() * MS_PER_S)
@@ -707,15 +764,54 @@ class RealMatch:
                 "effects": self.effects,
                 "duration_s": self.config["duration_s"],
                 "day_length": self.config["day_length"],
+                # P9F15 : les réglages reçus, contrôlés, et ce qu'ils écrivent dans le sandbox.
+                "settings": self.config.get("settings"),
+                "sandbox": self._sandbox,
             },
         )
+        if reset is not None:
+            # Gardé comme le reste : l'effacement est déjà dans les logs de la page.
+            self._write_safely(WORLD_RESET, reset, None, None)
 
-    def _prepare_launch(self) -> None:
+    @property
+    def _settings(self) -> Mapping[str, Any]:
+        return self.config.get("settings") or {}
+
+    @property
+    def _sandbox(self) -> dict[str, Any]:
+        """Clés de `SandboxVars` posées par les réglages, verrous compris ; vide sans réglages."""
+        return dict(self.config.get("sandbox") or {})
+
+    def _reset_worlds(self) -> dict[str, Any]:
+        """« Monde neuf » : rien ne s'efface sous un serveur, et l'effacement se dit (P9F15)."""
+        running = [side for side, server in self.pair.servers.items() if server.running]
+        if running:
+            raise SnapshotError(f"monde neuf refusé : serveur {', '.join(running)} en marche")
+        try:
+            reset = reset_worlds(self.zomboid_dir, SIDES)
+        except OSError as exc:
+            raise SnapshotError(f"monde neuf impossible : {exc}") from exc
+        gone = [item for item in reset["removed"] if item["existed"]]
+        lines = [f"monde neuf : {item['path']} effacé ({item['bytes']} octets)" for item in gone]
+        if not gone:
+            lines = ["monde neuf : aucun monde ni snapshot à effacer"]
+        LOGGER.info("; ".join(lines))
+
+        def change(state: MatchState) -> None:
+            for line in lines:
+                state.log(line, "warn")
+
+        self._on_state(change)
+        return reset
+
+    def _prepare_launch(self) -> bool:
         """Idempotent, mêmes secrets à chaque appel, et jamais avec un serveur en marche.
 
-        Un `SandboxVars` absent n'existe pas encore : PZ le crée à la passe de création.
-        S'il manque encore au lancement du match, la relecture du contrat refuse.
+        Un `SandboxVars` absent n'existe pas encore : PZ le crée à son premier départ. Rend
+        alors `False`, et `prepare_worlds` amorce les fichiers avant de créer les mondes,
+        qui naissent ainsi réglés. S'il manque encore au lancement du match, le contrat refuse.
         """
+        complete = True
         server_dir = self.zomboid_dir / SERVER_DIR
         passwords = {
             HOST_SIDE: self.config["host_password"],
@@ -739,13 +835,14 @@ class RealMatch:
                 write_sandbox(
                     server_dir / f"{name}_SandboxVars.lua",
                     self.config["day_length"],
-                    self.runtime["sandbox_start"],
+                    {**self.runtime["sandbox_start"], **self._sandbox},
                     policy=self.runtime,
                 )
             except FileNotFoundError:
-                pass
+                complete = False
             channel.write_session(self.match_id, FIRST_BOOT, FIRST_CMD_FLOOR)
             channel.reset()
+        return complete
 
     def launch(self) -> bool:
         """Démarre les serveurs du match ; rend faux sur échec (`pair.failure`) ou annulation."""
@@ -1778,8 +1875,11 @@ class RealMatch:
         try:
             with open(path, encoding="utf-8") as fh:
                 raw = json.load(fh)
+            if self._settings:
+                # P9F15 : le preset joué est le fichier, réglé ; le refaire en dit le hash.
+                raw = world_settings.effective_table(raw, self._settings)
             found = rules_hash(raw)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             cause = self.redactor.redact_exception(exc)
             message = f"preset illisible, hash {self.preset_hash} non recontrôlé : {cause}"
             return _Refusal(STEP_LOBBY, message)
@@ -1885,6 +1985,7 @@ class RealMatch:
             self.runtime,
             caps,
             builds,
+            self._sandbox,
         )
         return [self.redactor.redact(failure) for failure in failures]
 
@@ -2084,6 +2185,8 @@ class Engine:
         self._presets = load_presets(
             self.runtime, self.effects, lambda message: self.state.log(message, "error")
         )
+        # La table du départ en cours, réglages appliqués (P9F15) : `_run_real` la joue.
+        self._table: dict = {}
 
     @property
     def real(self) -> bool:
@@ -3154,17 +3257,27 @@ class Engine:
             for label, value in (("pseudo", pseudo), ("mot de passe", password)):
                 if value:
                     _check_ini_value(label, value)
-        duration = _duration_of(payload, preset)
+        table, settings = self._settled_table(payload, preset)
+        if settings is None:
+            duration = _duration_of(payload, preset)
+            day_length = self._day_length_of(payload, preset)
+        else:
+            duration = settings["duration_s"]
+            day_length = self._day_length_of({"day_length": settings["DayLength"]}, preset)
         cfg = {
             "pseudo": (pseudo or "hôte")[:20],
             "preset": preset["id"],
             "preset_label": preset["label"],
             "duration_s": duration,
-            "day_length": self._day_length_of(payload, preset),
+            "day_length": day_length,
             "code": code or make_code(),
-            "summary": preset["summary"],
+            "summary": table["summary"],
             "mode": play,
         }
+        if settings is not None:
+            cfg["settings"] = settings
+            cfg["settings_summary"] = world_settings.summary(settings)
+            cfg["sandbox"] = world_settings.sandbox_values(settings)
         # `password` ouvre B et part dans l'invitation de B. `host_password` ouvre A : en mode
         # hôte, il ne sert qu'à l'hôte et ne sort jamais de l'invitation ; en mode arbitre
         # (P9F14), il est l'accès du joueur A et part dans l'invitation de A.
@@ -3172,6 +3285,7 @@ class Engine:
         cfg["host_password"] = host_password or gen_player_password()
         cfg["host_address"] = f"{CLIENT_HOST}:{self.runtime['ports'][HOST_SIDE]['game']}"
         self.state = MatchState(mode=self.mode, config=cfg)
+        self._table = table
         self.state.reset_steps()
         # Dès ici et non dans le fil : un second `start` ne doit pas passer entre les deux.
         self.state.phase = "preflight"
@@ -3182,6 +3296,63 @@ class Engine:
             target=self._guarded, args=(run,), name="duel-engine", daemon=True
         )
         self._thread.start()
+
+    def _settled_table(
+        self, payload: Mapping[str, Any], preset: Mapping[str, Any]
+    ) -> tuple[dict, dict | None]:
+        """Rend la table à jouer et les réglages complets, ou le preset seul sans `settings`.
+
+        Tout se contrôle ici, avant le premier effet (P9F15) : un réglage refusé nomme sa clé,
+        sa borne et la valeur reçue ; la table réglée repasse par `load_table`, comme un
+        preset livré. Une durée ou un `day_length` donnés à part doivent dire la même chose.
+        """
+        raw = payload.get(SETTINGS_FIELD)
+        if raw is None:
+            return dict(preset), None
+        try:
+            settings = world_settings.validate(raw, preset)
+            table = world_settings.effective_table(preset, settings)
+        except world_settings.SettingsRefused as exc:
+            raise ActionRefused(str(exc)) from exc
+        for key, setting in (("duration_s", "duration_s"), ("day_length", "DayLength")):
+            given = payload.get(key)
+            if given is not None and given != settings[setting]:
+                raise ActionRefused(
+                    f"réglage « {setting} » refusé : {settings[setting]!r} dans les réglages, "
+                    f"{given!r} dans « {key} »"
+                )
+        try:
+            table = load_table(
+                table, self.effects, self.runtime["limits"], file_stem=preset["id"]
+            )
+        except TableError as exc:
+            raise ActionRefused(f"réglages refusés par la table : {exc}") from exc
+        return table, settings
+
+    def settings_catalog(self, preset_id: str | None = None) -> dict | None:
+        """Le catalogue des réglages, défauts de `preset_id` (sinon du preset par défaut).
+
+        Rend `None` pour un preset inconnu : l'API répond 404.
+        """
+        try:
+            preset = self._catalog_preset(preset_id)
+        except ActionRefused:
+            return None
+        return {
+            "preset": None if preset is None else preset["id"],
+            "groups": [{"id": key, "label": label} for key, label in world_settings.GROUPS],
+            "fields": world_settings.catalog(preset),
+            "summary": world_settings.summary(world_settings.defaults(preset)),
+            "reset_label": world_settings.RESET_LABEL,
+        }
+
+    def _catalog_preset(self, preset_id: str | None) -> Mapping[str, Any] | None:
+        try:
+            return self.preset(DEFAULT_PRESET if preset_id is None else preset_id)
+        except ActionRefused:
+            if preset_id is not None:
+                raise
+            return None
 
     def _day_length_of(self, payload: Mapping[str, Any], preset: Mapping[str, Any]) -> int:
         """Contrôle la valeur effective : c'est elle que la dérive cherchera dans la table."""
@@ -3211,7 +3382,7 @@ class Engine:
             self.state.phase = "preflight"
             self.state.set_step("preflight", "running")
             self.state.log("préflight : installation, ports, mémoire, mod, réglages, table")
-            table = self.preset(self.state.config["preset"])
+            table = self._table
         with self._setup_lock:
             result = self._measure(table)
         if self._aborted():
