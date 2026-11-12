@@ -157,6 +157,19 @@ SECONDS_PER_MINUTE = 60
 MIN_DURATION_S = 30
 MAX_DURATION_S = 3600
 VERDICT_FAILED = "verdict_failed"
+# Tenue d'avant-match (P9F10) : le monde du joueur arrivé le premier reste figé jusqu'à l'autre.
+HOLD_KIND = "hold_time"
+RELEASE_KIND = "release_time"
+# Journalisées sous leur propre type : le rejeu ne connaît que les `command` du cœur et les
+# sondes. Elles prennent leur `seq` avant toute sonde, donc sous la réserve du cœur.
+HOLD_RECORD = "hold_command"
+HOLD_OFF = "off"
+HOLD_UNSUPPORTED = "unsupported"
+HOLD_SENT = "sent"
+HOLD_HELD = "held"
+HOLD_REFUSED = "refused"
+HOLD_RELEASED = "released"
+HOLD_RELEASE_REFUSED = "release_refused"
 # 128 bits (AC38).
 SHARE_TOKEN_BYTES = 16
 SCOPE_LAN = "lan"
@@ -575,6 +588,20 @@ class RealMatch:
         # Camps sans joueur ou muets : leur monde est figé (`PauseEmpty=true`), dérive suspendue.
         self._paused: set[str] = set()
         self._drift_s: float | None = None
+        # Tenue (P9F10). `_hold_opened` : la première passe du lobby a décidé. `_held_sides` :
+        # camps qui ont reçu `hold_time`. `_released_ms` : instant du relâchement, origine de la
+        # dérive. `_world_seqs` : `(camp, seq)` → `kind`, pour lire leurs `cmd_result`.
+        self._hold_opened = False
+        self._held_sides: list[str] = []
+        self._released_ms: int | None = None
+        # Camps dont `release_time` n'a pu être écrit : relancé tous les `probe_retry_s`, il
+        # retient les sondes, donc le décompte ; au-delà de `probe_timeout_s`, le lobby refuse.
+        self._pending_release: list[str] = []
+        self._release_retry_ms: int | None = None
+        self._world_seqs: dict[tuple[str, int], str] = {}
+        self._hold_view: dict[str, dict[str, Any]] = {
+            side: {"status": HOLD_OFF, "reason": None} for side in SIDES
+        }
         self._threats: deque[float] = deque()
         # Commandes écrites sans `cmd_result` lu : ce qu'un redémarrage rendrait perdu.
         self._unresolved: dict[str, set[int]] = {side: set() for side in SIDES}
@@ -1040,11 +1067,18 @@ class RealMatch:
         est mis de côté, comme pour une relance, et un repère neuf s'ouvre au retour du
         joueur. L'absence reste jugée par `_absence_end`, depuis le dernier joueur vu.
         """
-        if self._core is None or side in self._paused:
+        if not self._drift_open() or side in self._paused:
             return
         self._paused.add(side)
         self._bank_drift()
         self._last_age.pop(side, None)
+
+    def _drift_open(self) -> bool:
+        """La dérive se mesure dès le relâchement (P9F10) : l'attente du lobby n'en est pas.
+
+        Sans tenue, faute de relâchement, elle part de `running`, comme avant.
+        """
+        return self._released_ms is not None or self._core is not None
 
     def _track_age(self, side: str, age: float) -> None:
         """Suit l'âge du monde d'un camp, et repose le repère au retour d'une relance.
@@ -1244,6 +1278,7 @@ class RealMatch:
         elif kind == CMD_RESULT:
             self._unresolved[side].discard(data["seq"])
             self._take_probe_result(side, data, now_ms)
+            self._take_hold_result(side, data)
 
     def _take_early_death(self, event: Mapping[str, Any], now_ms: int) -> None:
         """Retient une mort d'avant `running` : l'`event` s'écrira au tick qui la juge.
@@ -1305,7 +1340,7 @@ class RealMatch:
         self._beat_ms[side] = now_ms
         if self.players[side] is not None:
             self._seen_ms[side] = now_ms
-        if self._core is None:
+        if not self._drift_open():
             return
         if self.players[side] is None:
             self._suspend_drift(side)
@@ -1371,6 +1406,8 @@ class RealMatch:
         if self._countdown_end_ms is not None:
             self._tick_countdown(self._countdown_end_ms - now_ms)
             return None
+        if refusal := self._hold_or_release(now_ms):
+            return refusal
         self._send_probes(now_ms)
         if refusal := self._failed_probes(now_ms):
             return refusal
@@ -1387,7 +1424,12 @@ class RealMatch:
         """Une sonde par camp à sa première connexion, hors du cœur : `mt` nul, `seq` réservé.
 
         Un essai suivant garde l'échéance du premier : `probe_timeout_s` borne toute la sonde.
+        Sous tenue, les sondes attendent le relâchement : un zombie ne naît pas près d'un joueur
+        figé, et `hold_time` comme `release_time` prennent leur `seq` avant toute sonde. Le
+        dernier `seq` d'avant `running` reste donc celui d'une sonde, seul que le rejeu réserve.
         """
+        if self._held_sides and (self._released_ms is None or self._pending_release):
+            return
         for side, player in self.players.items():
             probe = self._probes.get(side)
             if player is None or not (probe is None or self._retry_due(probe, now_ms)):
@@ -1408,6 +1450,132 @@ class RealMatch:
                 self._probes[side] = _Probe(seq, deadline_ms)
             else:
                 self._probes[side] = probe._replace(seq=seq, retry_ms=None)
+
+    def _hold_or_release(self, now_ms: int) -> _Refusal | None:
+        """Tient les mondes tant qu'un joueur manque, puis les relâche ensemble, une seule fois.
+
+        La décision se prend à la première passe du lobby : un joueur absent, et chaque camp dont
+        le mod sait tenir reçoit `hold_time` ; un camp qui ne le sait pas est annoncé, jamais
+        bloqué. Le relâchement part à la passe qui voit les deux joueurs, avant leurs sondes :
+        le décompte suit leur résultat. Un départ après lui ne re-tient rien : avant `running`,
+        le décompte attend son retour ; pendant le match, la règle de déconnexion s'applique.
+
+        Un `release_time` qui n'a pu être écrit (journal ou `in`) laisse son monde tenu : il
+        est relancé, et les sondes l'attendent. Passé `probe_timeout_s`, le lobby refuse le
+        match plutôt que de le lancer avec un joueur figé.
+        """
+        if self._released_ms is not None:
+            return self._retry_releases(now_ms)
+        both_here = all(self.players.values())
+        if not self._hold_opened:
+            self._hold_opened = True
+            if both_here:
+                return None
+            for side in SIDES:
+                caps = self.window.caps.get(side) or {}
+                if caps.get("hold") is True:
+                    self._send_world(side, HOLD_KIND)
+                else:
+                    self._hold_failed(side, HOLD_UNSUPPORTED, "mod sans tenue")
+            if self._held_sides:
+                message = "monde tenu en pause tant qu'un joueur manque"
+                self._on_state(lambda state: state.log(message))
+            return None
+        if not self._held_sides or not both_here:
+            return None
+        self._released_ms = now_ms
+        self._pending_release = [
+            side for side in self._held_sides if not self._send_world(side, RELEASE_KIND)
+        ]
+        self._release_retry_ms = now_ms + self.runtime["probe_retry_s"] * MS_PER_S
+        self._on_state(lambda state: state.log("les deux joueurs sont là : les mondes repartent"))
+        return None
+
+    def _retry_releases(self, now_ms: int) -> _Refusal | None:
+        """Relance les `release_time` non écrits ; refuse le match s'ils ne passent jamais."""
+        if not self._pending_release:
+            return None
+        assert self._released_ms is not None and self._release_retry_ms is not None
+        if now_ms >= self._release_retry_ms:
+            self._release_retry_ms = now_ms + self.runtime["probe_retry_s"] * MS_PER_S
+            self._pending_release = [
+                side for side in self._pending_release if not self._send_world(side, RELEASE_KIND)
+            ]
+            if not self._pending_release:
+                return None
+        timeout_s = self.runtime["probe_timeout_s"]
+        if now_ms < self._released_ms + timeout_s * MS_PER_S:
+            return None
+        named = ", ".join(self._pending_release)
+        return _Refusal(
+            STEP_LOBBY, f"relâchement impossible du camp {named} après {timeout_s} s"
+        )
+
+    def _send_world(self, side: str, kind: str) -> bool:
+        """Écrit une commande de monde, journalisée d'abord, hors du cœur : `mt` nul.
+
+        Rend faux si elle n'est pas partie. Un échec répété ne se réannonce pas.
+        """
+        self._last_cmd_seq += 1
+        seq = self._last_cmd_seq
+        command = {"v": PROTOCOL_VERSION, "seq": seq, "kind": kind, "origin": {"rule": kind}}
+        failed = HOLD_REFUSED if kind == HOLD_KIND else HOLD_RELEASE_REFUSED
+        cause = None
+        if not self._write_safely(HOLD_RECORD, {COMMAND: command}, side, None):
+            cause = "journal indisponible"
+        else:
+            try:
+                self._channels[side].write(command)
+            except (OSError, ValueError) as exc:
+                cause = self.redactor.redact_exception(exc)
+        if cause is not None:
+            if self._hold_view[side]["status"] != failed:
+                self._hold_failed(side, failed, cause)
+            return False
+        self._world_seqs[side, seq] = kind
+        if kind == HOLD_KIND:
+            self._held_sides.append(side)
+            self._hold_view[side] = {"status": HOLD_SENT, "reason": None}
+        elif self._hold_view[side]["status"] != HOLD_REFUSED:
+            # Un refus reste affiché : ce départ-là n'a pas été figé, relâché ou non.
+            self._hold_view[side] = {"status": HOLD_RELEASED, "reason": None}
+        return True
+
+    def _take_hold_result(self, side: str, result: Mapping[str, Any]) -> None:
+        """Lit le résultat d'une commande de monde : un refus s'annonce, et rien n'attend.
+
+        Une tenue appliquée garde son `seq` jusqu'au relâchement : le mod la rend `refused`
+        plus tard s'il ne peut figer un joueur arrivé après elle. Après le relâchement, ce
+        refus tardif ne dit plus rien du départ et s'ignore.
+        """
+        key = (side, result["seq"])
+        kind = self._world_seqs.get(key)
+        if kind is None:
+            return
+        if kind == RELEASE_KIND or result["status"] != APPLIED:
+            del self._world_seqs[key]
+        if kind == HOLD_KIND and self._released_ms is not None:
+            return
+        if result["status"] == APPLIED:
+            if kind == HOLD_KIND:
+                self._hold_view[side] = {"status": HOLD_HELD, "reason": None}
+            return
+        reason = self.redactor.redact(f"{result['status']} {result.get('reason') or ''}".rstrip())
+        failed = HOLD_REFUSED if kind == HOLD_KIND else HOLD_RELEASE_REFUSED
+        self._hold_failed(side, failed, reason)
+
+    def _hold_failed(self, side: str, status: str, reason: str) -> None:
+        self._hold_view[side] = {"status": status, "reason": reason}
+        if status == HOLD_RELEASE_REFUSED:
+            message = f"camp {side} : relâchement refusé ({reason}), le joueur peut rester figé"
+        else:
+            message = f"camp {side} : départ non figé ({reason}), le duel continue sans verrou"
+
+        def change(state: MatchState) -> None:
+            state.log(message, "warn")
+            state.event(message, side)
+
+        self._on_state(change)
 
     @staticmethod
     def _retry_due(probe: _Probe, now_ms: int) -> bool:
@@ -1587,6 +1755,7 @@ class RealMatch:
             "table": self._announced_table(),
             "attribution": self._attribution,
             "spawn": spawn,
+            "hold": copy.deepcopy(self._hold_view),
             # L'attribution ne se mesure qu'en fin de match : rien à en conclure avant.
             "fallback": fallback(combined_spawn(spawn), self._attribution or INSUFFICIENT),
         }

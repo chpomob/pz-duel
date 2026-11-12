@@ -522,6 +522,23 @@ const TWO_SECRETS_TEXT = 'The launcher code is not the server password: type the
 const OPEN_GAME_WAIT = 'The game button unlocks as soon as your opponent is connected: your world stays frozen until then.';
 
 // Tout vient de `invite` : le service décide de ce qui existe et le dit en anglais.
+// P9F10: while a player is missing, the service freezes both worlds; the lobby says when a side
+// refused. A refusal never blocks anything: it is written here.
+const HOLD_FAILED = { unsupported: true, refused: true, release_refused: true };
+function holdNotice() {
+  const hold = (S.capabilities && S.capabilities.hold) || {};
+  const failed = ['A', 'B'].filter((side) => hold[side] && HOLD_FAILED[hold[side].status]);
+  if (failed.length) {
+    const parts = failed.map((side) => `${side} (${hold[side].reason || hold[side].status})`);
+    return `<p class="err">Start not frozen on side ${esc(parts.join(', '))}: the duel still runs,
+      but a player who arrives first can move and their world ages while waiting.</p>`;
+  }
+  const held = ['A', 'B'].some((side) => hold[side] && hold[side].status !== 'off');
+  return held
+    ? '<p class="notice">Start frozen: whoever arrives first stays still, clock stopped, until the other is in.</p>'
+    : '';
+}
+
 function inviteCard() {
   const inv = S.invite || {};
   const real = S.mode === 'real';
@@ -603,7 +620,7 @@ function renderLive() {
 
   if (phase === 'lobby') {
     body = inviteCard();
-    shell(`<section class="card"><h2>Lancement</h2>${stepsList()}</section>` + body +
+    shell(`<section class="card"><h2>Lancement</h2>${stepsList()}${holdNotice()}</section>` + body +
       `<section class="card"><div class="actions"><button class="danger" data-action="cancel">Annuler le duel</button></div></section>`);
     renderQr();
     return;

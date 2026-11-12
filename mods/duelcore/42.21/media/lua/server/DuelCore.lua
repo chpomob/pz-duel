@@ -839,6 +839,187 @@ handlers.supply_drop = function(cmd, player)
     return { status = "applied" }
 end
 
+-- Tenue d'avant-match (P9F10) -------------------------------------------------------
+--
+-- Tant que l'adversaire manque, le monde est forcé en pause : `hold_time` capte l'heure du
+-- jour, la réapplique à chaque passe (`holdTick`), et fige les joueurs présents ou à venir.
+-- `release_time` rend la main. Ce sont des commandes de monde : elles ne visent aucun joueur
+-- et passent sans `refusalReason`. Tout appel au jeu est sous `pcall` : une fonction absente
+-- rend `refused`, `no_hold_api`, et le match continue sans verrou, annoncé par le service.
+--
+-- Le drapeau `paused` du jeu n'a pas de prise Lua : `IngameState.updateInternal` le recalcule
+-- à chaque passe depuis `GameServer.Players.isEmpty()` (javap, offsets 895-930). La simulation
+-- est donc arrêtée par le pas de temps : `GameTime:setMultiplier`, le levier de la commande
+-- serveur `setTimeSpeedMultiplier` (javap), entre dans `getMultiplier`, que zombies, besoins
+-- et horloge du serveur lisent à chaque passe. Posé à `HOLD_MULTIPLIER`, exigé comme le gel
+-- (absent : `no_hold_api`), rendu à sa valeur d'avant au relâchement. Pas zéro : `getInvMultiplier`
+-- divise par lui. Filets en plus, le pas pouvant ne pas tout couvrir (client) : les zombies
+-- n'attaquent plus le joueur tenu (`setZombiesDontAttack`, exigé), et ses besoins (faim, soif,
+-- fatigue, endurance) sont reposés à chaque passe à leur valeur d'entrée en tenue
+-- (`Stats:set`, best-effort : `CharacterStat` peut manquer à Lua).
+local HOLD_REFUSED = { status = "refused", reason = "no_hold_api" }
+-- Pas de temps du monde sous tenue : dix mille fois plus lent, trois minutes y durent 18 ms.
+local HOLD_MULTIPLIER = 0.0001
+-- Pas d'avant la tenue, rendu au relâchement ; nil hors tenue.
+local heldMultiplier = nil
+-- Heure du jour figée, nil hors tenue.
+local heldTime = nil
+-- `seq` de la dernière `hold_time` appliquée : un échec ultérieur s'y rapporte.
+local heldSeq = nil
+-- Par joueur tenu (nom) : protection d'avant la tenue, et besoins captés à l'entrée.
+local heldPlayers = {}
+local FROZEN_STATS = { "HUNGER", "THIRST", "FATIGUE", "ENDURANCE" }
+-- Déclarée ici, définie avec les commandes : un échec différé de la tenue s'y annonce.
+local emitResult
+
+local function playerKey(player)
+    local ok, name = pcall(function() return player:getUsername() end)
+    if ok and name ~= nil then return tostring(name) end
+    return tostring(player)
+end
+
+local function captureStats(player)
+    local stats = {}
+    pcall(function()
+        local holder = player:getStats()
+        for _, name in ipairs(FROZEN_STATS) do
+            local stat = CharacterStat[name]
+            stats[#stats + 1] = { stat = stat, value = holder:get(stat) }
+        end
+    end)
+    return stats
+end
+
+local function restoreStats(player, stats)
+    pcall(function()
+        local holder = player:getStats()
+        for _, entry in ipairs(stats) do holder:set(entry.stat, entry.value) end
+    end)
+end
+
+-- Fige un joueur et le met hors d'atteinte des zombies ; rend faux si l'un des deux manque.
+local function freezePlayer(player)
+    local key = playerKey(player)
+    local entry = heldPlayers[key]
+    if not entry then
+        local ok, shielded = pcall(function() return player:isZombiesDontAttack() end)
+        entry = { shielded = ok and shielded == true, stats = captureStats(player) }
+        heldPlayers[key] = entry
+    end
+    local ok = pcall(function()
+        player:setBlockMovement(true)
+        player:setZombiesDontAttack(true)
+    end)
+    restoreStats(player, entry.stats)
+    return ok
+end
+
+local function thawPlayer(player)
+    local key = playerKey(player)
+    local entry = heldPlayers[key]
+    heldPlayers[key] = nil
+    local shielded = entry ~= nil and entry.shielded or false
+    return pcall(function()
+        player:setBlockMovement(false)
+        player:setZombiesDontAttack(shielded)
+    end)
+end
+
+-- Rend faux si un seul joueur n'a pu être figé ou rendu : la tenue n'est alors pas tenue.
+local function blockPlayers(blocked)
+    local all = true
+    local players = onlinePlayers()
+    for i = 1, #players do
+        local ok
+        if blocked then ok = freezePlayer(players[i]) else ok = thawPlayer(players[i]) end
+        if not ok then all = false end
+    end
+    if not blocked then heldPlayers = {} end
+    return all
+end
+
+-- Best-effort : l'écran de pause dit au joueur qu'on l'attend ; son échec ne lève pas le gel.
+local function showPaused(shown)
+    pcall(function() setShowPausedMessage(shown) end)
+end
+
+local function readTimeOfDay()
+    local ok, time = pcall(function() return getGameTime():getTimeOfDay() end)
+    if ok and type(time) == "number" then return time end
+    return nil
+end
+
+local function writeTimeOfDay(time)
+    return pcall(function() getGameTime():setTimeOfDay(time) end)
+end
+
+-- Pas d'avant la tenue. Un pas déjà au ralenti (tenue sauvée par un serveur tombé) n'est pas
+-- une valeur d'avant : on rend alors le pas normal, 1.
+local function readMultiplier()
+    local ok, value = pcall(function() return getGameTime():getTrueMultiplier() end)
+    if ok and type(value) == "number" and value > HOLD_MULTIPLIER then return value end
+    return 1
+end
+
+local function writeMultiplier(value)
+    return pcall(function() getGameTime():setMultiplier(value) end)
+end
+
+-- Lève toute la tenue : plus d'heure réappliquée, pas de temps rendu, joueurs rendus, écran
+-- de pause retiré. Rend faux si le pas ou un joueur n'a pu être rendu.
+local function dropHold()
+    heldTime = nil
+    local resumed = true
+    if heldMultiplier ~= nil then
+        resumed = writeMultiplier(heldMultiplier)
+        heldMultiplier = nil
+    end
+    showPaused(false)
+    return blockPlayers(false) and resumed
+end
+
+-- Réappliquée à chaque passe, même monde en pause : un joueur arrivé pendant la tenue est
+-- figé dès sa première passe, et l'heure ne garde jamais plus d'une passe d'avance. Un joueur
+-- qu'on ne peut figer (API absente à son arrivée) fait tomber la tenue entière, rendue
+-- `refused`, `no_hold_api` sous le `seq` de `hold_time` : le service annonce un départ non figé.
+local function holdTick()
+    if heldTime == nil then return end
+    if writeTimeOfDay(heldTime) and writeMultiplier(HOLD_MULTIPLIER) and blockPlayers(true) then
+        return
+    end
+    local seq = heldSeq
+    heldSeq = nil
+    dropHold()
+    if seq ~= nil then
+        emitResult(seq, HOLD_REFUSED)
+        flushOut()
+    end
+end
+
+-- Idempotente : renvoyée sur une tenue déjà active, elle garde l'heure captée la première fois.
+handlers.hold_time = function(cmd)
+    local time = heldTime or readTimeOfDay()
+    if time == nil or not writeTimeOfDay(time) then return HOLD_REFUSED end
+    if heldMultiplier == nil then heldMultiplier = readMultiplier() end
+    if not writeMultiplier(HOLD_MULTIPLIER) or not blockPlayers(true) then
+        dropHold()
+        return HOLD_REFUSED
+    end
+    heldTime = time
+    heldSeq = cmd.seq
+    showPaused(true)
+    return { status = "applied" }
+end
+
+handlers.release_time = function()
+    heldSeq = nil
+    if not dropHold() then return HOLD_REFUSED end
+    return { status = "applied" }
+end
+
+-- Commandes qui visent le monde, pas un joueur : elles s'appliquent serveur vide.
+local WORLD_COMMANDS = { hold_time = true, release_time = true }
+
 -- Les capacités publiées : un effet n'existe que si sa fonction de jeu existe.
 local EFFECT_FUNCTIONS = {
     spawn_pop = "addZombiesInOutfit",
@@ -873,6 +1054,9 @@ local function emitCaps()
         build = getCore():getGameAndBuildVersion(),
         mod = MOD_VERSION,
         protocol = PROTOCOL,
+        -- Le mod comprend `hold_time` et `release_time` (P9F10) ; le jeu, lui, peut encore les
+        -- refuser par `no_hold_api`.
+        hold = true,
         hooks = hooks,
         functions = functions,
         atoms = jsonArray(atoms),
@@ -936,6 +1120,7 @@ local function applyCommand(cmd)
     if not handler then
         return { status = "failed", reason = "unknown_kind" }
     end
+    if WORLD_COMMANDS[cmd.kind] then return handler(cmd) end
     local player = onlinePlayers()[1]
     local reason = refusalReason(player, cmd)
     if reason then
@@ -944,7 +1129,7 @@ local function applyCommand(cmd)
     return handler(cmd, player)
 end
 
-local function emitResult(seq, result)
+emitResult = function(seq, result)
     emit("cmd_result", {
         seq = seq,
         status = result.status,
@@ -969,6 +1154,8 @@ local function applyDueCommands(now)
                 logError(result)
                 emitResult(entry.cmd.seq, { status = "failed", reason = "lua_error" })
             end
+            -- Le service attend ce résultat au lobby pour annoncer un départ non figé.
+            if WORLD_COMMANDS[entry.cmd.kind] then flushOut() end
         else
             index = index + 1
         end
@@ -1089,8 +1276,49 @@ local function step()
     end
 end
 
-hooks.OnTick = Events.OnTick ~= nil
-Events.OnTick.Add(function()
+local function runStep()
     local ok, err = pcall(step)
     if not ok then logError(err) end
+    ok, err = pcall(holdTick)
+    if not ok then logError(err) end
+end
+
+-- Point d'entrée hors tick (P9F10) : avec `PauseEmpty=true`, un serveur vide ne tique pas,
+-- et `caps` doit pourtant partir pour que le contrat aboutisse. `OnServerStarted` tire une
+-- fois, après le chargement du monde, dans `GameServer.startServer` : la session y est lue et
+-- `caps` vidé dans `out` sur-le-champ. Le tiqueur reste la voie de secours.
+local function startSession()
+    if session then return end
+    openSession(getTimestampMs())
+    if session then flushOut() end
+end
+
+if Events.OnServerStarted and Events.OnServerStarted.Add then
+    pcall(Events.OnServerStarted.Add, function()
+        local ok, err = pcall(startSession)
+        if not ok then logError(err) end
+    end)
+end
+
+-- Tiqueur. `OnTickEvenPaused` tire en tête de `IngameState.updateInternal`, avant que le
+-- serveur ne teste `PauseEmpty` : il passe donc monde en pause, et la boucle lit `in`,
+-- acquitte et bat même serveur vide. `OnTick`, sauté en pause, n'en est que le secours : dès
+-- qu'`OnTickEvenPaused` a tiré une fois, il ne fait plus que réappliquer la tenue, après la
+-- mise à jour de l'heure de la passe.
+local evenPaused = false
+if Events.OnTickEvenPaused and Events.OnTickEvenPaused.Add then
+    pcall(Events.OnTickEvenPaused.Add, function()
+        evenPaused = true
+        runStep()
+    end)
+end
+
+hooks.OnTick = Events.OnTick ~= nil
+Events.OnTick.Add(function()
+    if evenPaused then
+        local ok, err = pcall(holdTick)
+        if not ok then logError(err) end
+        return
+    end
+    runStep()
 end)

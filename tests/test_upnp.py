@@ -1022,8 +1022,13 @@ def igd():
 
 
 @pytest.fixture
-def upnp_rig(engine_rig, monkeypatch, igd):
-    """Banc moteur dont chaque `Engine` vise le faux IGD ; délais UPnP courts."""
+def upnp_rig(igd, engine_rig, monkeypatch):
+    """Banc moteur dont chaque `Engine` vise le faux IGD ; délais UPnP courts.
+
+    `igd` passe avant `engine_rig` : le faux IGD lie son socket SSDP sur un port UDP
+    éphémère. Lié après le tirage des ports du banc (`free_ports`, sockets rendus aussitôt),
+    il pouvait prendre l'`udp` de B, et le préflight refusait le port « déjà lié ».
+    """
     rig = engine_rig
     rig.runtime["share_port"] = free_port(socket.SOCK_STREAM)
     rig.runtime["upnp"] = {**rig.runtime["upnp"], **FAST}

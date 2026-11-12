@@ -8,9 +8,11 @@ import math
 import threading
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import test_lua_attribution as lua_mod
 from doubles.fake_mod import EMPTY_AGE_PER_BEAT, EmptyServer, FakeMod
 from test_contract import (
     L_S,
@@ -37,9 +39,9 @@ from service import engine as engine_module
 from service.api import make_server
 from service.journal import JOURNAL_NAME, JournalError
 from service.proofs import PROOFS_NAME
-from service.protocol import dump_line, parse_session
+from service.protocol import dump_line, parse_event, parse_session
 from service.replay import main as replay_main
-from service.rules import narrow_table, rules_hash
+from service.rules import load_effects, narrow_table, rules_hash
 from service.servers import read_ini
 from service.state import PHASE_LABELS, MatchState
 from service.transport import DRAIN_PASSES, POLL_MAX
@@ -2759,3 +2761,712 @@ def test_rematch(engine_rig, presets):
     state = duel.finish()
     assert state["config"]["code"] == first["config"]["code"]
     assert duel.replays()
+
+
+# P9F10 : pause forcée tant qu'un joueur manque, relâchée quand les deux sont là ----------
+
+
+@pytest.fixture
+def hold_caps(monkeypatch):
+    """Les `caps` des camps donnés disent `hold`, comme le vrai mod : le service peut les tenir."""
+
+    def announce(sides: tuple[str, ...] = SIDES) -> None:
+        line = FakeMod.line
+
+        def with_hold(self, kind, data, **envelope):
+            if kind == "caps" and self.side in sides:
+                data = {**data, "hold": True}
+            return line(self, kind, data, **envelope)
+
+        monkeypatch.setattr(FakeMod, "line", with_hold)
+
+    return announce
+
+
+def in_commands(mod: FakeMod) -> list[dict]:
+    return [json.loads(line) for line in mod.in_path.read_bytes().splitlines()]
+
+
+def wait_command(rig, mod: FakeMod, kind: str) -> dict:
+    """Attend la commande `kind` dans `in` et la rend ; le double n'acquitte rien."""
+    rig.until(lambda _: any(c["kind"] == kind for c in in_commands(mod)), expected=kind)
+    [command] = [c for c in in_commands(mod) if c["kind"] == kind]
+    return command
+
+
+def kinds(mod: FakeMod) -> list[str]:
+    return [command["kind"] for command in in_commands(mod)]
+
+
+class HoldDuel(Duel):
+    """`Duel` dont les deux mods savent tenir : la sonde ne part qu'au relâchement."""
+
+    def wait_holds(self) -> dict[str, dict]:
+        return {side: wait_command(self.rig, self.mods[side], "hold_time") for side in SIDES}
+
+    def arrive(self, side: str, age: float = 0.0) -> None:
+        self.mods[side].beat(age=age, players=(PLAYERS[side],))
+        self.rig.until(lambda s: s["players"][side] == PLAYERS[side])
+
+    def join_and_resolve(self) -> None:
+        self.wait_holds()
+        for side in SIDES:
+            self.arrive(side)
+        for side in SIDES:
+            probe = wait_command(self.rig, self.mods[side], "probe_spawn")
+            self.mods[side].cmd_result(probe["seq"], "applied", spawned=1)
+
+
+def test_hold_is_sent_to_both_sides_while_a_player_is_missing(engine_rig, hold_caps):
+    """Lobby ouvert, personne : `hold_time` part aux deux camps, et rien d'autre.
+
+    Mutation : retirer l'envoi de `hold_time` dans `_hold_or_release` laisse `in` vide.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    holds = duel.wait_holds()
+
+    assert [holds[side]["seq"] for side in SIDES] == [1, 2]
+    assert holds["A"]["origin"] == {"rule": "hold_time"}
+    duel.arrive("A")
+    duel.sync_pump()
+    # Le joueur seul reste tenu : ni relâchement, ni sonde qui ferait naître un zombie près de lui.
+    assert kinds(duel.mods["A"]) == kinds(duel.mods["B"]) == ["hold_time"]
+    duel.mods["A"].cmd_result(holds["A"]["seq"], "applied")
+    state = engine_rig.until(lambda s: s["capabilities"]["hold"]["A"]["status"] == "held")
+    assert state["phase"] == "lobby"
+    assert any("tenu en pause" in log["msg"] for log in state["logs"])
+    [record] = [r for r in duel.records("hold_command") if r["side"] == "A"]
+    assert record["mt"] is None
+    assert record["data"]["command"] == holds["A"]
+
+
+def test_release_goes_once_to_both_sides_before_the_probes(engine_rig, hold_caps):
+    """Les deux joueurs identifiés : `release_time` aux deux camps, une fois, puis les sondes.
+
+    Un départ au lobby puis un retour ne re-tiennent ni ne relâchent une seconde fois.
+    Mutation : relâcher à chaque passe où les deux sont là (sans le garde de `_released_ms`)
+    multiplie `release_time`.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.wait_holds()
+    duel.arrive("A")
+    duel.arrive("B")
+    probes = {side: wait_command(engine_rig, duel.mods[side], "probe_spawn") for side in SIDES}
+
+    for side in SIDES:
+        assert kinds(duel.mods[side]) == ["hold_time", "release_time", "probe_spawn"]
+    releases = [in_commands(duel.mods[side])[1]["seq"] for side in SIDES]
+    assert releases == [3, 4]
+    assert [probes[side]["seq"] for side in SIDES] == [5, 6]
+    assert any("repartent" in log["msg"] for log in duel.state()["logs"])
+
+    duel.mods["A"].beat(players=())
+    engine_rig.until(lambda s: s["players"]["A"] is None)
+    duel.arrive("A")
+    duel.sync_pump()
+    for side in SIDES:
+        assert kinds(duel.mods[side]) == ["hold_time", "release_time", "probe_spawn"]
+    assert len(duel.records("hold_command")) == 4
+
+
+def test_held_match_replays_with_commands_after_the_probes(engine_rig, hold_caps):
+    """Le dernier `seq` d'avant `running` est une sonde : le rejeu réserve ce que le cœur a réservé.
+
+    Mutation : sondes envoyées dès l'arrivée et relâchement après elles (`_send_probes` sans
+    attente, puis `_hold_or_release`) : le cœur réserve un `release_time`, le rejeu la seule
+    sonde, et `replays` échoue sur le `seq` de la première commande.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.start_match()
+    duel.at_match(1)
+    duel.kills("A", 1)
+    [command] = [c for c in in_commands(duel.mods["B"]) if c["kind"] == "spawn_pop"]
+    assert command["seq"] == 7
+    duel.at_match(duel.state()["config"]["duration_s"])
+    state = duel.finish()
+
+    assert state["result"]["winner"] == "A"
+    assert duel.replays()
+
+
+def test_refused_hold_is_announced_and_never_blocks(engine_rig, hold_caps):
+    """`no_hold_api` sur A : le lobby l'écrit, et le duel part quand même.
+
+    Mutations : ne pas annoncer le refus (`_take_hold_result` muet) ; faire attendre le décompte
+    sur une tenue confirmée (`held` ou `released`) bloque ce match au lobby.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    holds = duel.wait_holds()
+    duel.mods["A"].cmd_result(holds["A"]["seq"], "refused", reason="no_hold_api")
+    state = engine_rig.until(lambda s: s["capabilities"]["hold"]["A"]["status"] == "refused")
+
+    assert state["capabilities"]["hold"]["A"]["reason"] == "refused no_hold_api"
+    assert state["capabilities"]["hold"]["B"]["status"] == "sent"
+    warning = next(log for log in state["logs"] if "départ non figé" in log["msg"])
+    assert warning["level"] == "warn"
+    assert "no_hold_api" in warning["msg"]
+
+    duel.start_match()
+    state = duel.state()
+    assert state["phase"] == "running"
+    assert state["capabilities"]["hold"]["A"]["status"] == "refused"
+    assert state["capabilities"]["hold"]["B"]["status"] == "released"
+
+
+def test_late_hold_refusal_is_announced(engine_rig, hold_caps):
+    """Tenue appliquée, puis rendue `refused` par le mod (joueur arrivé non figeable) : annoncé.
+
+    Mutation : oublier le `seq` de la tenue dès son `applied` ignore le refus différé.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    holds = duel.wait_holds()
+    duel.mods["A"].cmd_result(holds["A"]["seq"], "applied")
+    engine_rig.until(lambda s: s["capabilities"]["hold"]["A"]["status"] == "held")
+
+    duel.mods["A"].cmd_result(holds["A"]["seq"], "refused", reason="no_hold_api")
+    state = engine_rig.until(lambda s: s["capabilities"]["hold"]["A"]["status"] == "refused")
+
+    assert state["capabilities"]["hold"]["A"]["reason"] == "refused no_hold_api"
+    assert any("camp A : départ non figé" in log["msg"] for log in state["logs"])
+
+
+def fail_release_writes(duel: Duel, side: str, times: int | None) -> None:
+    """`in` du camp refuse `release_time` `times` fois (toujours si `None`), le reste passe."""
+    channel = duel.engine._match._channels[side]
+    write = channel.write
+    left = [times]
+
+    def failing(command):
+        if command["kind"] == "release_time" and (left[0] is None or left[0] > 0):
+            if left[0] is not None:
+                left[0] -= 1
+            raise TRANSPORT_FAILURE
+        return write(command)
+
+    channel.write = failing
+
+
+def test_unwritten_release_is_retried_before_the_probes(engine_rig, hold_caps):
+    """`release_time` vers A non écrit : A reste tenu, aucune sonde ne part, puis il est relancé.
+
+    Mutation : oublier le camp en échec (sans `_pending_release`) laisse A figé et lance les
+    sondes, donc le match, avec un joueur qui ne peut pas bouger.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.wait_holds()
+    fail_release_writes(duel, "A", 1)
+    duel.arrive("A")
+    duel.arrive("B")
+    wait_command(engine_rig, duel.mods["B"], "release_time")
+    state = engine_rig.until(
+        lambda s: s["capabilities"]["hold"]["A"]["status"] == "release_refused"
+    )
+    duel.sync_pump()
+    assert kinds(duel.mods["A"]) == ["hold_time"]
+    assert kinds(duel.mods["B"]) == ["hold_time", "release_time"]
+    assert any("relâchement refusé" in log["msg"] for log in state["logs"])
+
+    duel.at(engine_rig.runtime["probe_retry_s"])
+    for side in SIDES:
+        wait_command(engine_rig, duel.mods[side], "probe_spawn")
+        assert kinds(duel.mods[side]) == ["hold_time", "release_time", "probe_spawn"]
+    assert duel.state()["capabilities"]["hold"]["A"]["status"] == "released"
+
+
+def test_release_never_written_refuses_the_lobby(engine_rig, hold_caps):
+    """`release_time` vers A jamais écrit : passé `probe_timeout_s`, le lobby refuse le match.
+
+    Mutation : relancer sans borne laisse le lobby attendre pour toujours.
+    """
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.wait_holds()
+    fail_release_writes(duel, "A", None)
+    duel.arrive("A")
+    duel.arrive("B")
+    wait_command(engine_rig, duel.mods["B"], "release_time")
+    duel.at(engine_rig.runtime["probe_retry_s"])
+    assert duel.state()["phase"] == "lobby"
+
+    duel.at(PROBE_TIMEOUT_S)
+    state = engine_rig.wait("error")
+
+    assert "relâchement impossible du camp A après 30 s" in state["error"]
+    assert kinds(duel.mods["A"]) == ["hold_time"]
+    assert "probe_spawn" not in kinds(duel.mods["B"])
+
+
+def test_mod_without_hold_is_announced_and_keeps_the_early_probe(engine_rig, hold_caps):
+    """B ne sait pas tenir : annoncé, jamais bloqué ; A seul reçoit `hold_time`.
+
+    Mutation : envoyer `hold_time` sans regarder `caps` écrit une commande que B ne connaît pas.
+    """
+    hold_caps(("A",))
+    duel = HoldDuel(engine_rig)
+    wait_command(engine_rig, duel.mods["A"], "hold_time")
+    state = engine_rig.until(lambda s: s["capabilities"]["hold"]["B"]["status"] == "unsupported")
+
+    assert any("camp B : départ non figé" in log["msg"] for log in state["logs"])
+    duel.sync_pump()
+    assert kinds(duel.mods["B"]) == []
+
+
+def test_without_any_hold_the_probe_leaves_at_first_sight(engine_rig):
+    """Aucun mod ne sait tenir : comportement d'avant P9F10, la sonde part à l'arrivée du joueur."""
+    lobby = Lobby(engine_rig, PRESET)
+    seq = lobby.join("A")
+
+    assert kinds(lobby.mods["A"]) == ["probe_spawn"]
+    assert seq == 1
+    state = lobby.state()
+    assert {side: state["capabilities"]["hold"][side]["status"] for side in SIDES} == {
+        "A": "unsupported",
+        "B": "unsupported",
+    }
+
+
+def test_drift_starts_at_the_release(engine_rig, presets, hold_caps):
+    """La dérive part du premier `beat` d'après le relâchement, pas du lobby ni de `t0`.
+
+    A, tenu sans succès, vieillit au lobby (1,0 → 3,0) : ce n'est pas une dérive. Après le
+    relâchement, A avance de 0,01 h de plus que B avant `t0` : c'en est une, de 0,375 s à
+    `day_length` 1. Mutations : mesurer depuis le lobby invalide le match ; mesurer depuis
+    `running` rend 0.
+    """
+    edit_preset(presets, day_length=1)
+    hold_caps()
+    duel = HoldDuel(engine_rig)
+    duel.wait_holds()
+    duel.arrive("A", age=1.0)
+    duel.beat("A", age=3.0)
+    duel.arrive("B", age=5.0)
+    for side in SIDES:
+        wait_command(engine_rig, duel.mods[side], "release_time")
+    duel.beat("A", age=3.0)
+    duel.beat("B", age=5.0)
+    for side in SIDES:
+        probe = wait_command(engine_rig, duel.mods[side], "probe_spawn")
+        duel.mods[side].cmd_result(probe["seq"], "applied", spawned=1)
+    duel.t0_s = duel.rig.runtime["countdown_s"]
+    state = engine_rig.wait("countdown", "error")
+    assert state["phase"] == "countdown", state["error"]
+    duel.beat("A", age=3.01)
+    duel.beat("B", age=5.0)
+    duel.at_match(0)
+    engine_rig.wait("running")
+
+    duel.at_match(1)
+    duel.beat("A", age=3.02)
+    duel.beat("B", age=5.01)
+    state = duel.reach(2)
+
+    assert state["phase"] == "running"
+    assert state["clock"]["drift_s"] == 0.375
+
+
+# Le vrai `DuelCore.lua`, monde en pause : rien ne tire `OnTick` -----------------------
+
+
+class WorldTime:
+    """`GameTime` réduit à l'heure du jour, que le test avance comme le ferait le jeu."""
+
+    def __init__(self, time: float = 9.0, multiplier: float = 1.0) -> None:
+        self.time = time
+        self.multiplier = multiplier
+
+    def getTrueMultiplier(self) -> float:
+        return self.multiplier
+
+    def setMultiplier(self, multiplier: float) -> None:
+        self.multiplier = multiplier
+
+    def getTimeOfDay(self) -> float:
+        return self.time
+
+    def setTimeOfDay(self, time: float) -> None:
+        self.time = time
+
+    def getWorldAgeHours(self) -> float:
+        return self.time
+
+
+class Needs:
+    """`Stats` réduit à `get` et `set`, indexé par le nom de `CharacterStat`."""
+
+    def __init__(self) -> None:
+        self.values = dict.fromkeys(("HUNGER", "THIRST", "FATIGUE", "ENDURANCE"), 0.25)
+
+    def get(self, stat: str) -> float:
+        return self.values[stat]
+
+    def set(self, stat: str, value: float) -> bool:
+        self.values[stat] = value
+        return True
+
+
+class FreezablePlayer(lua_mod.Player):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.blocked = False
+        self.shielded = False
+        self.needs = Needs()
+        body = lua_mod.Stub(getOverallBodyHealth=lambda: 100)
+        self.getBodyDamage = lambda: body
+        self.getZombieKills = lambda: 0
+
+    def setBlockMovement(self, blocked: bool) -> None:
+        self.blocked = blocked
+
+    def setZombiesDontAttack(self, shielded: bool) -> None:
+        self.shielded = shielded
+
+    def isZombiesDontAttack(self) -> bool:
+        return self.shielded
+
+    def getStats(self) -> Needs:
+        return self.needs
+
+
+class PausedServer:
+    """Serveur A vide et en pause : seuls `OnServerStarted` et `OnTickEvenPaused` tirent."""
+
+    def __init__(self, time: WorldTime | None = None) -> None:
+        self.now = lua_mod.START_MS
+        self.hooks = lua_mod.Hooks()
+        self.out: list[str] = []
+        self.acks: list[str] = []
+        self.commands = b""
+        self.online: list[Any] = []
+        self.time = time or WorldTime()
+        self.paused_message: list[bool] = []
+        lua_mod.Lua(
+            {
+                "Events": self.hooks,
+                "getCore": lambda: lua_mod.Stub(getGameAndBuildVersion=lambda: "42.21.0"),
+                "getFileReader": self._reader,
+                "getFileWriter": self._writer,
+                "getGameTime": lambda: self.time,
+                "getOnlinePlayers": lambda: lua_mod.Online(self.online),
+                "getServerName": lambda: "duelA",
+                "getTimestampMs": lambda: self.now,
+                "instanceof": lambda value, name: isinstance(value, lua_mod.Player),
+                "isServer": lambda: True,
+                "setShowPausedMessage": self.paused_message.append,
+                "CharacterStat": lua_mod.Stub(
+                    HUNGER="HUNGER", THIRST="THIRST", FATIGUE="FATIGUE", ENDURANCE="ENDURANCE"
+                ),
+            }
+        ).run(lua_mod.MOD.read_text(encoding="utf-8"))
+
+    def _reader(self, name: str, _create: bool) -> lua_mod.Reader | None:
+        if name == "duel_A_in.txt":
+            return lua_mod.Reader(self.commands)
+        if name == "duel_A_session.txt":
+            return lua_mod.Reader(dump_line(lua_mod.SESSION))
+        return None
+
+    def _writer(self, name: str, _create: bool, _append: bool) -> lua_mod.Writer:
+        sinks = {"duel_A_out.txt": self.out, "duel_A_ack.txt": self.acks}
+        return lua_mod.Writer(sinks.get(name, []))
+
+    def fire(self, event: str) -> None:
+        self.hooks.get(event).fire()
+
+    def send(self, seq: int, kind: str) -> None:
+        command = {"v": 1, "seq": seq, "kind": kind, "origin": {"rule": kind}}
+        self.commands += dump_line(command)
+
+    def paused_pass(self) -> None:
+        """Une seconde de jeu en pause : la boucle relit `in` à ce rythme."""
+        self.now += lua_mod.READ_MS
+        self.fire("OnTickEvenPaused")
+
+    def lines(self, kind: str) -> list[dict]:
+        catalog = load_effects()
+        events = [parse_event(line, catalog) for line in "".join(self.out).splitlines()]
+        return [event for event in events if event["kind"] == kind]
+
+    def result(self, seq: int) -> dict:
+        [result] = [r["data"] for r in self.lines("cmd_result") if r["data"]["seq"] == seq]
+        return result
+
+
+def test_caps_leave_at_server_start_with_pause_empty(runtime):
+    """`PauseEmpty=true` est livré, et `caps` part sans un seul `OnTick` : le contrat aboutit.
+
+    Mutation : retirer l'enregistrement sur `OnServerStarted` laisse `out` vide.
+    """
+    assert runtime["managed_ini"]["PauseEmpty"] == "true"
+    server = PausedServer()
+    assert server.lines("caps") == []
+
+    server.fire("OnServerStarted")
+
+    [caps] = server.lines("caps")
+    assert caps["src"] == "A"
+    assert caps["data"]["hold"] is True
+    assert caps["data"]["hooks"]["OnTick"] is True
+    # Un second démarrage ne réémet rien : la session est ouverte une fois.
+    server.fire("OnServerStarted")
+    assert len(server.lines("caps")) == 1
+
+
+def test_paused_ticker_reads_applies_and_acks(runtime):
+    """Monde en pause : `OnTickEvenPaused` lit `in`, tient le monde et acquitte, sans `OnTick`.
+
+    Mutation : retirer l'enregistrement sur `OnTickEvenPaused` : ni `ack` ni `cmd_result`.
+    """
+    server = PausedServer()
+    server.paused_pass()
+    assert len(server.lines("caps")) == 1
+
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert json.loads(server.acks[-1])["seq"] == 1
+    assert server.result(1)["status"] == "applied"
+
+
+def test_hold_freezes_players_and_time_until_release():
+    """`hold_time` fige le joueur présent, puis celui qui arrive, et l'heure ; `release_time` rend.
+
+    Mutation : ne plus réappliquer l'heure dans `holdTick` laisse l'heure filer à 9,5.
+    """
+    server = PausedServer()
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1)["status"] == "applied"
+    assert host.blocked
+    assert server.paused_message == [True]
+    server.time.time = 9.5
+    server.fire("OnTick")
+    assert server.time.time == 9.0
+    late = FreezablePlayer("retard")
+    server.online.append(late)
+    server.paused_pass()
+    assert late.blocked
+    assert server.time.time == 9.0
+
+    # Renvoyée, la tenue garde l'heure captée la première fois.
+    server.time.time = 9.25
+    server.send(2, "hold_time")
+    server.paused_pass()
+    assert server.result(2)["status"] == "applied"
+    assert server.time.time == 9.0
+
+    server.send(3, "release_time")
+    server.paused_pass()
+    assert server.result(3)["status"] == "applied"
+    assert not host.blocked and not late.blocked
+    assert server.paused_message[-1] is False
+    server.time.time = 9.75
+    server.fire("OnTick")
+    server.paused_pass()
+    assert server.time.time == 9.75
+
+
+def test_missing_freeze_api_refuses_the_hold():
+    """Sans `setBlockMovement`, `hold_time` rend `refused`, `no_hold_api`, et ne tient rien.
+
+    Mutation : ignorer l'échec de `blockPlayers` rend `applied` et fige l'heure quand même.
+    """
+
+
+    class StiffPlayer(FreezablePlayer):
+        setBlockMovement = None
+
+    server = PausedServer()
+    server.online.append(StiffPlayer("ancien"))
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1) == {"seq": 1, "status": "refused", "reason": "no_hold_api"}
+    server.time.time = 9.5
+    server.paused_pass()
+    assert server.time.time == 9.5
+
+
+def test_hold_shields_players_and_freezes_their_needs():
+    """Le monde tourne encore sous le joueur figé : zombies sans prise sur lui, besoins figés.
+
+    Mutations : retirer `setZombiesDontAttack(true)` de `freezePlayer` laisse le joueur
+    attaquable ; retirer `restoreStats` laisse la faim filer ; ne pas rendre la protection
+    d'avant la tenue laisse un joueur invulnérable pendant le duel.
+    """
+    server = PausedServer()
+    host = FreezablePlayer("hote")
+    admin = FreezablePlayer("admin")
+    admin.shielded = True
+    server.online.extend([host, admin])
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1)["status"] == "applied"
+    assert host.shielded and admin.shielded
+    host.needs.values["HUNGER"] = 0.6
+    host.needs.values["THIRST"] = 0.7
+    server.fire("OnTick")
+    assert host.needs.values["HUNGER"] == 0.25
+    assert host.needs.values["THIRST"] == 0.25
+
+    server.send(2, "release_time")
+    server.paused_pass()
+    assert server.result(2)["status"] == "applied"
+    assert not host.shielded
+    assert admin.shielded
+    host.needs.values["HUNGER"] = 0.6
+    server.fire("OnTick")
+    assert host.needs.values["HUNGER"] == 0.6
+
+
+def test_missing_shield_api_refuses_the_hold():
+    """Sans `setZombiesDontAttack`, un joueur figé serait une proie : `no_hold_api`.
+
+    Mutation : sortir `setZombiesDontAttack` du `pcall` exigé de `freezePlayer` rend `applied`.
+    """
+
+    class Exposed(FreezablePlayer):
+        setZombiesDontAttack = None
+
+    server = PausedServer()
+    player = Exposed("nu")
+    server.online.append(player)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1) == {"seq": 1, "status": "refused", "reason": "no_hold_api"}
+    assert not player.blocked
+
+
+def test_late_player_that_cannot_be_frozen_drops_the_hold():
+    """Tenue posée serveur vide ; le joueur arrivé ensuite ne peut être figé : refus différé.
+
+    Le mod rend `refused`, `no_hold_api` sous le `seq` de `hold_time`, lâche l'heure et rend
+    les joueurs déjà figés. Mutation : ignorer le retour de `blockPlayers` dans `holdTick`
+    ne produit qu'un seul résultat, `applied`, et garde l'heure figée.
+    """
+
+    class StiffPlayer(FreezablePlayer):
+        setBlockMovement = None
+
+    server = PausedServer()
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    assert server.result(1)["status"] == "applied"
+
+    server.online.append(StiffPlayer("tard"))
+    server.paused_pass()
+
+    results = [r["data"] for r in server.lines("cmd_result") if r["data"]["seq"] == 1]
+    assert results == [
+        {"seq": 1, "status": "applied"},
+        {"seq": 1, "status": "refused", "reason": "no_hold_api"},
+    ]
+    assert server.paused_message[-1] is False
+    server.time.time = 9.5
+    server.paused_pass()
+    assert server.time.time == 9.5
+    # Une seule annonce : la tenue tombée ne se réannonce pas.
+    assert len([r for r in server.lines("cmd_result") if r["data"]["seq"] == 1]) == 2
+
+
+def test_hold_stops_the_simulation_step_and_release_restores_it():
+    """La simulation elle-même s'arrête : le pas de temps du monde tombe, puis revient.
+
+    Mutations : retirer `writeMultiplier(HOLD_MULTIPLIER)` de `hold_time` laisse le pas à 1,5 ;
+    ne pas le réappliquer dans `holdTick` le laisse à la valeur remise par le jeu ; ne pas rendre
+    `heldMultiplier` dans `dropHold` laisse le duel au ralenti.
+    """
+    server = PausedServer(time=WorldTime(multiplier=1.5))
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1)["status"] == "applied"
+    assert 0 < server.time.multiplier <= 0.0001
+    server.time.multiplier = 1.0
+    server.fire("OnTick")
+    assert 0 < server.time.multiplier <= 0.0001
+
+    # Renvoyée, la tenue garde le pas d'avant capté la première fois.
+    server.send(2, "hold_time")
+    server.paused_pass()
+    assert server.result(2)["status"] == "applied"
+
+    server.send(3, "release_time")
+    server.paused_pass()
+    assert server.result(3)["status"] == "applied"
+    assert server.time.multiplier == 1.5
+
+
+def test_hold_saved_by_a_crashed_server_resumes_at_normal_speed():
+    """Un pas resté au ralenti (serveur tombé sous tenue) n'est pas rendu tel quel : 1."""
+    server = PausedServer(time=WorldTime(multiplier=0.0001))
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+    server.send(2, "release_time")
+    server.paused_pass()
+
+    assert server.result(2)["status"] == "applied"
+    assert server.time.multiplier == 1
+
+
+def test_missing_step_api_refuses_the_hold():
+    """Sans `setMultiplier`, la simulation tournerait : `no_hold_api`, rien n'est tenu.
+
+    Mutation : sortir `writeMultiplier` du test de `hold_time` rend `applied`.
+    """
+
+    class Unstoppable(WorldTime):
+        setMultiplier = None
+
+    server = PausedServer(time=Unstoppable())
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1) == {"seq": 1, "status": "refused", "reason": "no_hold_api"}
+    assert not host.blocked
+    server.time.time = 9.5
+    server.paused_pass()
+    assert server.time.time == 9.5
+
+
+def test_missing_clock_api_refuses_the_hold():
+    """Sans `setTimeOfDay`, même refus : le duel part sans verrou, et le service l'annonce."""
+
+    class FixedTime:
+        def getTimeOfDay(self) -> float:
+            return 9.0
+
+        def getWorldAgeHours(self) -> float:
+            return 9.0
+
+    server = PausedServer(time=FixedTime())
+    host = FreezablePlayer("hote")
+    server.online.append(host)
+    server.fire("OnServerStarted")
+    server.send(1, "hold_time")
+    server.paused_pass()
+
+    assert server.result(1)["reason"] == "no_hold_api"
+    assert not host.blocked

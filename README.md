@@ -77,6 +77,12 @@ ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is pr
    `Ouvrir PZ` stays greyed out until your opponent is connected: each world is frozen while nobody
    plays in it (`PauseEmpty=true`), and joining yours earlier would let it run alone. As soon as the
    guest is identified, `Ouvrir PZ` joins your own server.
+   **Whoever arrives first waits frozen.** While a player is missing, PZ Duel holds both worlds
+   (`hold_time`): the player already in cannot move and the clock does not advance. As soon as both
+   players are identified, both worlds are released together (`release_time`), once, just before the
+   countdown, and the drift check starts from that release. If a side's game refuses the hold
+   (`no_hold_api`) or its mod cannot do it, the lobby says *Start not frozen* and the duel still
+   runs, without that lock.
 7. **Leave with `Quit`** in the page. If you just close the browser tab, PZ Duel closes by itself
    once nobody has looked at it for `idle_quit_s` (120 s by default, set in `service/runtime.json`;
    `0` turns it off): closing the tab is enough to start that countdown. It **never** happens during

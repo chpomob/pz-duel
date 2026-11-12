@@ -151,3 +151,71 @@ l'atteindre. Un journal d'avant P9F9, sans la clé, se rejoue sans borne.
 - **Le lot du tick de fin part** avant `match_end`, vers un serveur que l'arbitre arrête
   ensuite : la commande est dans le journal, le pop peut ne jamais apparaître. Un camp en
   relance à la fin garde son `effect_dropped`, faute de serveur.
+
+## P9F10 — pause forcée tant qu'un joueur manque (2026-11-12)
+
+**Le handshake survit à la pause.** Lu dans `projectzomboid.jar` (javap) : `GameServer.startServer`
+tire `OnServerStarted` une fois, après le chargement du monde ; le mod y lit sa session et vide
+`caps` dans `out` sur-le-champ. `IngameState.updateInternal` tire `OnTickEvenPaused` en tête de
+chaque passe, avant de calculer `paused = Players.isEmpty() && pauseEmpty && readyToPause()` et de
+sauter `onTick` : la boucle du mod (lecture de `in`, `ack`, `beat`) y tourne donc serveur vide.
+`OnTick` reste le secours, et ne fait plus que réappliquer la tenue dès qu'`OnTickEvenPaused` a
+tiré. `PauseEmpty` était déjà livré à `"true"` depuis P9F5 ; un test le relit et prouve `caps` sans
+un seul `OnTick`, sur le vrai `DuelCore.lua` sous `mini_lua`.
+
+**Tenue et relâchement.** Les `caps` du mod portent `hold: true`. À la première passe du lobby, un
+joueur manquant, chaque camp qui l'annonce reçoit `hold_time` ; un camp qui ne l'annonce pas est
+écrit au lobby (*Start not frozen*), jamais bloqué. Le mod capte `getTimeOfDay`, le réapplique à
+chaque passe (`setTimeOfDay`), fige tout joueur présent ou arrivant (`setBlockMovement(true)`) et
+demande l'écran de pause (`setShowPausedMessage`, best-effort). La passe qui voit les deux joueurs
+envoie `release_time` aux camps tenus, une seule fois, puis les sondes ; le décompte suit leur
+résultat, d'une à deux secondes. La dérive part du premier `beat` d'après ce relâchement.
+
+**Écart à la fiche, assumé : le relâchement précède les sondes, pas le décompte.** Le rejeu
+(`service/replay.py`, hors du périmètre de l'étape) ne réserve que les `seq` des sondes. Un
+`release_time` écrit après elles décalerait la numérotation du cœur et rendrait le journal
+non rejouable. Sous tenue, les sondes attendent donc le relâchement : `hold_time` et
+`release_time` prennent leur `seq` avant la première sonde, et le dernier `seq` d'avant
+`running` reste celui d'une sonde. Bénéfice annexe : le zombie de la sonde ne naît plus près d'un
+joueur figé. Les commandes de monde sont journalisées sous le type `hold_command`, que le rejeu
+ignore.
+
+**Ouvert, à vérifier manette en main (un joueur entré trois minutes avant l'autre) :**
+
+- **`setBlockMovement` est posé sur l'`IsoPlayer` du serveur.** Le jar montre un simple champ ;
+  rien ne prouve que le client, maître de son déplacement en multijoueur, s'y plie. Si le joueur
+  bouge encore, la tenue de l'heure reste vraie, pas le gel du joueur.
+- **`setShowPausedMessage` passe par `UIManager` du processus serveur.** Aucun envoi réseau n'y
+  est visible : l'écran de pause n'apparaîtra probablement pas chez le client.
+- **La simulation est arrêtée par le pas de temps, pas par le drapeau de pause.**
+  `IngameState.updateInternal` recalcule `paused` à chaque passe depuis
+  `GameServer.Players.isEmpty() && PauseEmpty && readyToPause()` (javap, offsets 895-930) : aucun
+  appel Lua ne le force joueur présent. Le mod pose donc `GameTime:setMultiplier(0.0001)` — le
+  levier de la commande serveur `setTimeSpeedMultiplier` (javap) — que `getMultiplier` applique au
+  pas de zombies, besoins et horloge du serveur : trois minutes d'attente y durent 18 ms. Exigé
+  comme le gel (absent : `no_hold_api`), réappliqué à chaque passe, rendu au relâchement à sa
+  valeur d'avant (`getTrueMultiplier`, ou 1 si elle était déjà au ralenti : tenue sauvée par un
+  serveur tombé, le champ étant écrit dans la sauvegarde). Pas zéro : `getInvMultiplier` divise
+  par lui. **Non prouvé en jeu :** la commande serveur diffuse aussi `SetMultiplier` aux clients ;
+  le mod, sans prise Lua sur ce paquet, ne le fait pas : le client garde son pas. Filets pour ce
+  qui tournerait encore côté client, la tenue protège aussi le joueur : `setZombiesDontAttack(true)`, exigé comme
+  `setBlockMovement` (absent : `no_hold_api`), et rendu à sa valeur d'avant au relâchement ; faim,
+  soif, fatigue et endurance reposées à chaque passe à leur valeur d'entrée en tenue
+  (`Stats:set(CharacterStat.*)`, best-effort). À mesurer sur trois minutes : que le client
+  respecte ces écritures serveur en multijoueur (pas de temps compris : les zombies proches
+  doivent rester immobiles), et qu'aucun autre besoin (ennui, stress,
+  température) ne dérive.
+- **Un joueur arrivé non figeable fait tomber la tenue.** Posée serveur vide, `hold_time` rend
+  `applied` sans avoir touché un joueur ; si le premier arrivé ne peut être figé ni protégé, le mod
+  lâche toute la tenue et rend, sous le même `seq`, `refused`, `no_hold_api` : l'arbitre garde le
+  `seq` d'une tenue appliquée jusqu'au relâchement et annonce ce refus différé.
+- **Un `release_time` non écrit retient le départ.** Journal ou `in` en panne : le camp reste en
+  `release_refused`, l'écriture est relancée tous les `probe_retry_s`, et aucune sonde ne part
+  tant qu'un camp tenu n'est pas relâché ; passé `probe_timeout_s`, le lobby refuse le match
+  (« relâchement impossible du camp … ») plutôt que de lancer un joueur figé. Un `release_time`
+  écrit mais rendu `refused` par le mod (heure lâchée, joueur peut-être encore figé) n'est
+  qu'annoncé : non vérifié en jeu.
+- **Un départ entre le relâchement et le décompte ne re-tient rien** (« une seule fois ») : le
+  décompte attend son retour, l'autre joueur est libre pendant ce temps.
+- **Un mod d'avant P9F10 (sans `hold` dans `caps`)** donne le comportement d'avant : sonde à
+  l'arrivée, pas de tenue, annoncé au lobby.

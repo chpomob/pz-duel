@@ -81,6 +81,12 @@ sert de `StartServer64.bat` quand ce script existe.
    `Ouvrir PZ` reste grisé tant que votre adversaire n'est pas connecté : chaque monde est figé tant
    que personne n'y joue (`PauseEmpty=true`), et rejoindre le vôtre plus tôt le ferait tourner seul.
    Dès que l'invité est identifié, `Ouvrir PZ` vous connecte à votre propre serveur.
+   **Le premier arrivé attend figé.** Tant qu'un joueur manque, PZ Duel tient les deux mondes
+   (`hold_time`) : le joueur déjà connecté ne peut plus bouger et l'heure n'avance pas. Dès que les
+   deux joueurs sont identifiés, les deux mondes sont relâchés ensemble (`release_time`), une seule
+   fois, juste avant le décompte, et la mesure de dérive part de ce relâchement. Si le jeu d'un camp
+   refuse la tenue (`no_hold_api`) ou que son mod ne la connaît pas, le lobby écrit *Start not
+   frozen* et le duel part quand même, sans ce verrou.
 7. **Partez par `Quit`** dans la page. Si vous fermez simplement l'onglet du navigateur, PZ Duel se
    ferme seul quand plus personne ne l'a regardé depuis `idle_quit_s` (120 s par défaut, réglé dans
    `service/runtime.json` ; `0` le désactive) : fermer l'onglet suffit à déclencher ce compte à
