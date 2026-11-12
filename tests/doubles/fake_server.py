@@ -33,8 +33,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -68,7 +70,13 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STILL_ACTIVE = 259
 # Le compilateur du .NET Framework, livré avec Windows et présent sur `windows-latest`.
 CSC = Path("Microsoft.NET") / "Framework64" / "v4.0.30319" / "csc.exe"
-COMPILE_TIMEOUT_S = 120
+# Borne d'une compilation à froid : un runner chargé dépasse deux minutes (P9F16). Un runner plus
+# lent se règle par `PZDUEL_COMPILE_TIMEOUT_S`, sans toucher au code.
+COMPILE_TIMEOUT_S = 900
+COMPILE_TIMEOUT_ENV = "PZDUEL_COMPILE_TIMEOUT_S"
+COMPILE_ATTEMPTS = 2
+# Le premier PE compilé dans ce processus ; les appels suivants le copient (une compilation par session).
+_COMPILED: dict[str, Path] = {}
 # Double de `ProjectZomboid64.exe`, lancé détaché comme le vrai : il doit donc être un vrai PE.
 # `<exe>.plan` porte le code de sortie, la tenue en ms et le fichier des arguments : un seul
 # binaire sert ainsi à tous les tests.
@@ -259,22 +267,69 @@ def windows_pid_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def compile_windows_client(target: Path) -> Path:
-    """Compile le double du client en un vrai PE. Sans `csc.exe`, c'est une erreur, pas un skip."""
+def compile_timeout_s() -> float:
+    """`PZDUEL_COMPILE_TIMEOUT_S` s'il est posé, `COMPILE_TIMEOUT_S` sinon."""
+    raw = os.environ.get(COMPILE_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return COMPILE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{COMPILE_TIMEOUT_ENV}={raw!r}: expected a positive number of seconds")
+    return value
+
+
+def report_compile(message: str) -> None:
+    """Imprime la durée : pytest la montre avec l'erreur du fixture, ou toujours sous `-s`."""
+    print(f"compile_windows_client: {message}", flush=True)
+
+
+def compile_windows_client(
+    target: Path, run: Callable[..., subprocess.CompletedProcess] = subprocess.run
+) -> Path:
+    """Compile le double du client en un vrai PE. Sans `csc.exe`, c'est une erreur, pas un skip.
+
+    Un dépassement de la borne est réessayé une fois, `client.exe` partiel supprimé ; deux
+    dépassements lèvent un `RuntimeError` qui dit quelle variable monter. Le PE compilé une
+    première fois dans le processus est copié aux appels suivants.
+    """
+    previous = _COMPILED.get("client")
+    if previous is not None and previous.is_file():
+        if previous != target:
+            shutil.copyfile(previous, target)
+        return target
     compiler = Path(os.environ["WINDIR"]) / CSC
     if not compiler.is_file():
         raise FileNotFoundError(f"{compiler} is required to build the client double")
+    timeout = compile_timeout_s()
     source = target.with_suffix(".cs")
     source.write_text(CLIENT_SOURCE, encoding="utf-8")
-    done = subprocess.run(
-        [str(compiler), "/nologo", f"/out:{target}", str(source)],
-        capture_output=True,
-        text=True,
-        timeout=COMPILE_TIMEOUT_S,
-    )
-    if done.returncode:
-        raise RuntimeError(f"{compiler} failed: {done.stdout}{done.stderr}")
-    return target
+    command = [str(compiler), "/nologo", f"/out:{target}", str(source)]
+    for attempt in range(1, COMPILE_ATTEMPTS + 1):
+        started = time.monotonic()
+        try:
+            done = run(command, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            report_compile(
+                f"attempt {attempt}/{COMPILE_ATTEMPTS} timed out after {elapsed:.1f}s "
+                f"(limit {timeout:g}s)"
+            )
+            target.unlink(missing_ok=True)
+            if attempt == COMPILE_ATTEMPTS:
+                raise RuntimeError(
+                    f"{compiler} did not finish within {timeout:g}s, {COMPILE_ATTEMPTS} times: "
+                    f"the runner is too slow; raise {COMPILE_TIMEOUT_ENV} (seconds) and rerun"
+                ) from exc
+            continue
+        report_compile(f"compiled in {time.monotonic() - started:.1f}s (limit {timeout:g}s)")
+        if done.returncode:
+            raise RuntimeError(f"{compiler} failed: {done.stdout}{done.stderr}")
+        _COMPILED["client"] = target
+        return target
+    raise AssertionError("unreachable")
 
 
 def plan_windows_client(client: Path, args_file: Path, code: int = 0, stay_ms: int = 0) -> None:

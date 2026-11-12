@@ -2032,9 +2032,14 @@ if not kernel32.CreateRemoteThread(process, None, 0, routine, 2, 0, None):
         assert "OSError" in server.log_error
         assert server.stop()
 
-    def test_windows_client_double_is_a_real_pe(tmp_path):
+    @pytest.fixture(scope="session")
+    def compiled_client(tmp_path_factory):
+        """Une compilation par session (P9F16) ; sans `csc.exe`, elle lève, rien ne saute."""
+        return compile_windows_client(tmp_path_factory.mktemp("client") / "client.exe")
+
+    def test_windows_client_double_is_a_real_pe(compiled_client, tmp_path):
         """Sans `csc.exe`, la compilation lève : ce test échoue, il ne saute pas."""
-        client = compile_windows_client(tmp_path / "client.exe")
+        client = compiled_client
         args_file = tmp_path / "args"
         plan_windows_client(client, args_file, code=3)
 
@@ -2165,6 +2170,168 @@ if not kernel32.CreateRemoteThread(process, None, 0, routine, 2, 0, None):
             assert closer.returncode == 0, closer.stderr
 
             assert_tree_ends_with_the_service(service, pids)
+
+
+# P9F16 : la compilation du double Windows, bornée, réessayée et lisible ---------------------
+# Ces tests remplacent `csc.exe` par un fichier et son appel par un enregistreur : ils tournent
+# sous Linux comme sous Windows, sans rien compiler.
+
+COMPILE_CALLERS = ("test_platform_windows.py", "test_guest_launcher.py", "test_modes.py")
+
+
+class RecordedCompiler:
+    """Tient lieu de `subprocess.run` pour `csc.exe` : chaque issue est jouée dans l'ordre.
+
+    `"timeout"` laisse un `client.exe` partiel puis lève `TimeoutExpired` ; `"ok"` écrit un PE.
+    """
+
+    def __init__(self, *outcomes: str) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[dict] = []
+
+    def __call__(self, command: list[str], **options) -> subprocess.CompletedProcess:
+        target = Path(command[2].removeprefix("/out:"))
+        self.calls.append({"command": command, "target_existed": target.exists(), **options})
+        if self.outcomes.pop(0) == "timeout":
+            target.write_bytes(b"MZ partial")
+            raise subprocess.TimeoutExpired(command, options["timeout"])
+        target.write_bytes(b"MZ\x90\x00 fake client")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
+@pytest.fixture
+def fake_csc(tmp_path, monkeypatch):
+    """Un `%WINDIR%` où `csc.exe` existe, et aucun PE déjà compilé dans le processus."""
+    windir = tmp_path / "Windows"
+    compiler = windir / fake_server.CSC
+    compiler.parent.mkdir(parents=True)
+    compiler.write_bytes(b"")
+    monkeypatch.setenv("WINDIR", str(windir))
+    monkeypatch.delenv(fake_server.COMPILE_TIMEOUT_ENV, raising=False)
+    monkeypatch.setattr(fake_server, "_COMPILED", {})
+    return compiler
+
+
+def test_compile_bound_is_900_s_and_read_from_the_environment(fake_csc, tmp_path, monkeypatch):
+    """Mutation : `COMPILE_TIMEOUT_S = 120`, ou la variable ignorée, fait échouer ce test."""
+    assert fake_server.COMPILE_TIMEOUT_ENV == "PZDUEL_COMPILE_TIMEOUT_S"
+    default = RecordedCompiler("ok")
+    (tmp_path / "a").mkdir()
+    compile_windows_client(tmp_path / "a" / "client.exe", run=default)
+    assert default.calls[0]["timeout"] == 900
+
+    monkeypatch.setattr(fake_server, "_COMPILED", {})
+    monkeypatch.setenv(fake_server.COMPILE_TIMEOUT_ENV, "1800")
+    tuned = RecordedCompiler("ok")
+    (tmp_path / "b").mkdir()
+    compile_windows_client(tmp_path / "b" / "client.exe", run=tuned)
+    assert tuned.calls[0]["timeout"] == 1800
+
+
+@pytest.mark.parametrize("raw", ["soon", "0", "-5", "nan", "inf", "1e309"])
+def test_compile_bound_refuses_a_meaningless_value(fake_csc, tmp_path, monkeypatch, raw):
+    """Mutation : sans `math.isfinite`, `nan`/`inf` passent jusqu'à `subprocess.run`."""
+    monkeypatch.setenv(fake_server.COMPILE_TIMEOUT_ENV, raw)
+    with pytest.raises(ValueError, match="PZDUEL_COMPILE_TIMEOUT_S"):
+        compile_windows_client(tmp_path / "client.exe", run=RecordedCompiler("ok"))
+
+
+def test_compile_timeout_is_retried_once_on_a_clean_target(fake_csc, tmp_path):
+    """Mutation : sans la reprise, le `TimeoutExpired` remonte et ce test échoue."""
+    compiler = RecordedCompiler("timeout", "ok")
+
+    client = compile_windows_client(tmp_path / "client.exe", run=compiler)
+
+    assert len(compiler.calls) == 2
+    assert compiler.calls[0]["command"] == compiler.calls[1]["command"]
+    assert compiler.calls[1]["target_existed"] is False
+    assert client.read_bytes() == b"MZ\x90\x00 fake client"
+
+
+def test_two_compile_timeouts_say_which_variable_to_raise(fake_csc, tmp_path):
+    """Mutation : laisser filer le `TimeoutExpired` brut fait échouer ce test."""
+    compiler = RecordedCompiler("timeout", "timeout", "ok")
+
+    with pytest.raises(RuntimeError) as caught:
+        compile_windows_client(tmp_path / "client.exe", run=compiler)
+
+    message = str(caught.value)
+    assert "PZDUEL_COMPILE_TIMEOUT_S" in message
+    assert str(fake_csc) in message
+    assert "900s" in message
+    assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
+    assert len(compiler.calls) == 2
+    assert not (tmp_path / "client.exe").exists()
+
+
+def test_compile_duration_is_printed(fake_csc, tmp_path, monkeypatch, capsys):
+    """Mutation : retirer `report_compile` après le succès fait échouer ce test."""
+    ticks = iter([10.0, 13.25])
+    monkeypatch.setattr(fake_server.time, "monotonic", lambda: next(ticks))
+
+    compile_windows_client(tmp_path / "client.exe", run=RecordedCompiler("ok"))
+
+    line = "compile_windows_client: compiled in 3.2s (limit 900s)"
+    assert line in capsys.readouterr().out
+
+
+def test_second_compile_in_a_session_copies_the_first(fake_csc, tmp_path):
+    """Une compilation par processus : le deuxième point d'appel n'invoque pas `csc.exe`."""
+    compiler = RecordedCompiler("ok")
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    first = compile_windows_client(tmp_path / "one" / "client.exe", run=compiler)
+
+    second = compile_windows_client(tmp_path / "two" / "client.exe", run=compiler)
+
+    assert len(compiler.calls) == 1
+    assert second != first
+    assert second.read_bytes() == first.read_bytes()
+
+
+def compile_calls_outside_session_fixtures(source: str) -> list[str]:
+    """Les fonctions qui lancent le vrai `csc.exe` sans être un fixture de session.
+
+    Un appel qui passe `run=` joue un compilateur double : il ne compile rien.
+    """
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        calls = any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "compile_windows_client"
+            and not any(kw.arg == "run" for kw in inner.keywords)
+            for inner in ast.walk(node)
+        )
+        session = any(
+            isinstance(deco, ast.Call)
+            and ast.unparse(deco.func) == "pytest.fixture"
+            and any(
+                kw.arg == "scope" and ast.literal_eval(kw.value) == "session"
+                for kw in deco.keywords
+            )
+            for deco in node.decorator_list
+        )
+        if calls and not session:
+            offenders.append(node.name)
+    return offenders
+
+
+@pytest.mark.parametrize("module", COMPILE_CALLERS)
+def test_real_compilation_happens_in_a_session_fixture(module):
+    """Mutation : rendre à `test_windows_client_double_is_a_real_pe` sa compilation propre."""
+    source = (Path(__file__).parent / module).read_text(encoding="utf-8")
+    assert "compile_windows_client(" in source
+    assert compile_calls_outside_session_fixtures(source) == []
+
+
+def test_session_fixture_check_sees_a_per_test_compilation():
+    per_test = (
+        "def test_x(tmp_path):\n    compile_windows_client(tmp_path / 'c.exe')\n"
+    )
+    assert compile_calls_outside_session_fixtures(per_test) == ["test_x"]
 
 
 # AC53 et AC62 : la suite ne perd aucun test, et chaque skip nomme un test qui existe ---------

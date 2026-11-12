@@ -512,3 +512,41 @@ restauration rendrait l'ancien monde. L'effacement se dit dans les logs de la pa
   du jeu, les réglages ne sont écrits qu'après ; heure, mois et population de départ ne comptent
   alors qu'au monde neuf suivant.
 - La durée de la passe de création, refaite à chaque monde neuf, sur une vraie machine.
+
+## P9F16 — compilation du double Windows bornée, réessayée et lisible (2026-11-12)
+
+**Cause :** CI Windows rouge sur `392f4df` (commit purement Markdown) : 36 erreurs au setup, toutes
+`subprocess.TimeoutExpired` sur `csc.exe` après 120 s. La compilation à froid du double
+`ProjectZomboid64.exe` dépassait la borne sur un runner chargé ; l'outillage, pas le produit,
+décidait de la couleur du dépôt.
+
+**Fait :**
+
+- `COMPILE_TIMEOUT_S` vaut 900 s ; `PZDUEL_COMPILE_TIMEOUT_S` (secondes, > 0) le remplace sans
+  toucher au code. Une valeur absurde lève un `ValueError` qui nomme la variable.
+- Un `TimeoutExpired` est réessayé une fois, après suppression du `client.exe` partiel. Deux
+  dépassements lèvent un `RuntimeError` qui nomme le compilateur, la borne et la variable à monter.
+  Ni `skip` ni `xfail` : Windows cassé reste rouge.
+- Chaque tentative imprime `compile_windows_client: compiled in X.Xs (limit 900s)` ou
+  `... timed out after X.Xs`.
+- Une compilation par processus : les trois points d'appel sont des fixtures `scope="session"`
+  (`test_platform_windows.py` compilait dans son test), et le premier PE compilé est copié aux
+  appels suivants, chaque copie gardant son propre `.plan`.
+
+**Tests et mutations :** `tests/test_platform_windows.py` —
+`test_compile_bound_is_900_s_and_read_from_the_environment` (`COMPILE_TIMEOUT_S = 120`, variable
+ignorée), `test_compile_bound_refuses_a_meaningless_value`,
+`test_compile_timeout_is_retried_once_on_a_clean_target` (`COMPILE_ATTEMPTS = 1`, `unlink` retiré),
+`test_two_compile_timeouts_say_which_variable_to_raise` (`TimeoutExpired` relancé brut),
+`test_compile_duration_is_printed` (impression retirée),
+`test_second_compile_in_a_session_copies_the_first` (copie retirée),
+`test_real_compilation_happens_in_a_session_fixture` (compilation rendue au test
+`test_windows_client_double_is_a_real_pe`), `test_session_fixture_check_sees_a_per_test_compilation`.
+Le compilateur y est un fichier vide et son appel un enregistreur : rien ne lance `csc.exe`.
+
+**Ouvert :**
+
+- La preuve finale est la CI Windows verte sur ce commit, à relire après le push.
+- La durée imprimée est capturée par pytest : elle paraît dans le journal quand le fixture échoue,
+  ou sous `-s` ; un run vert ne la montre pas. La faire paraître toujours demanderait de toucher
+  `tests.yml`, que `test_ci_workflows` veut identique à la publication, hors du périmètre.
