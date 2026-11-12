@@ -2502,7 +2502,9 @@ def test_preset_modified_under_a_withdrawal_is_still_refused(engine_rig, presets
     lobby = Lobby(engine_rig, "duel_rapide", failed_sides=("B",))
     sealed = preset_hash("duel_rapide")
     path = presets / "duel_rapide.json"
-    path.write_bytes(path.read_bytes().replace(b'"n": 2', b'"n": 3'))
+    content = path.read_bytes()
+    assert content.count(b'"n": 10') == 1
+    path.write_bytes(content.replace(b'"n": 10', b'"n": 3'))
 
     lobby.join_and_resolve()
     state = engine_rig.wait("error", "countdown")

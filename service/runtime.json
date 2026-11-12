@@ -21,6 +21,7 @@
   "tick_ms": 250,
   "rate_window_s": 60,
   "max_units_per_command": 30,
+  "direct_units_per_window": 6000,
   "min_free_ram_mb": 6144,
   "max_drift_s": 60,
   "drift_factor": 2.5,

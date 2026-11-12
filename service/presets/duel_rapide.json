@@ -7,7 +7,7 @@
   "mods": ["duelcore"],
   "atoms": ["zombie_kill", "damage_taken"],
   "rules": [
-    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "effects": [{"kind": "spawn_pop", "n": 2, "distance": [12, 20], "warn_s": 6, "cap_per_min": 60}]},
+    {"id": "kill_baseline", "when": "atom(zombie_kill)", "every": 1, "direct": true, "effects": [{"kind": "spawn_pop", "n": 10, "distance": [12, 20], "warn_s": 6}]},
     {"id": "hurt_supply", "when": "atom(damage_taken)", "effects": [{"kind": "supply_drop", "distance": [25, 40], "warn_s": 3, "items": [{"item": "Base.Bandage", "count": 2}, {"item": "Base.Disinfectant", "count": 1}], "target": "self"}]}
   ],
   "sprinter_percent": 1,
@@ -18,7 +18,7 @@
   "score": {"points": {"zombie_kill": 1}},
   "disconnect_grace_s": 120,
   "summary": [
-    "1 zombie tué → 2 zombies chez l'adversaire (max 60/min)",
+    "1 zombie tué, même un zombie envoyé par l'adversaire → 10 zombies chez lui, tout de suite, sans plafond",
     "1 zombie sur 100 envoyés est un rôdeur rapide (le 100e, le 200e…), à la place d'un zombie, jamais en plus",
     "1 blessure reçue → caisse de soin à proximité"
   ]

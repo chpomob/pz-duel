@@ -311,12 +311,12 @@ def test_shipped_presets_and_data_driven(runtime):
         load_table(read_preset(name), catalog, runtime["limits"], file_stem=name)
 
     edited = read_preset("duel_rapide")
-    assert kills_effect(edited)["n"] == 2
+    assert kills_effect(edited)["n"] == 10
     kills_effect(edited)["n"] = 5
     loaded = load_table(edited, catalog, runtime["limits"], file_stem="duel_rapide")
     assert kills_effect(loaded)["n"] == 5
     assert rules_hash(loaded) != rules_hash(read_preset("duel_rapide"))
-    assert first_command_n(read_preset("duel_rapide"), catalog, runtime) == 2
+    assert first_command_n(read_preset("duel_rapide"), catalog, runtime) == 10
     assert first_command_n(edited, catalog, runtime) == 5
 
 
@@ -628,8 +628,12 @@ class Duel:
 
     def __init__(self, runtime: dict, name: str = "duel_rapide", **changes) -> None:
         raw = read_preset(name)
+        self.raw = raw
         budget = changes.pop("budget", {})
         raw["budget"].update(budget)
+        if changes.pop("undirect", False):
+            # La règle ordinaire d'avant P9F9 : budget et `cap_per_min` s'y appliquent.
+            del raw["rules"][0]["direct"]
         kill_effect = changes.pop("kill_effect", {})
         kills_effect(raw).update(kill_effect)
         for key in changes.pop("drop", ()):
@@ -641,8 +645,13 @@ class Duel:
         self.records: list[dict] = []
         self.seq = {"A": 0, "B": 0}
 
-    def kill(self, te_s: float, side: str = "A") -> None:
+    def kill(self, te_s: float, side: str = "A", origin: str = "world") -> None:
         self.to(te_s - 0.25)
+        self.submit_kill(te_s, side, origin)
+        self.to(te_s)
+
+    def submit_kill(self, te_s: float, side: str = "A", origin: str = "world") -> None:
+        """Remet un kill daté de `te_s` sans avancer : il ira au prochain tick exécuté."""
         self.seq[side] += 1
         line = {
             "v": 1,
@@ -652,10 +661,9 @@ class Duel:
             "src": side,
             "side": side,
             "kind": "zombie_kill",
-            "data": {"origin": "world"},
+            "data": {"origin": origin},
         }
         self.core.submit_event(parse_event(line, self.catalog))
-        self.to(te_s)
 
     def to(self, mt_s: float) -> None:
         self.records += self.core.advance(T0_MS + round(mt_s * 1000))
@@ -678,73 +686,89 @@ class Duel:
         ]
 
 
-def test_duel_rapide_ships_one_percent_and_two_per_kill():
+def test_duel_rapide_ships_one_percent_and_ten_per_kill_direct():
+    """P9F9 : « quand on reçoit kill, on fait pop 10, direct » — règle directe, sans plafond."""
     preset = read_preset("duel_rapide")
     assert preset["sprinter_percent"] == 1
-    assert kills_effect(preset)["n"] == 2 and kills_effect(preset)["kind"] == "spawn_pop"
+    assert kills_effect(preset)["n"] == 10 and kills_effect(preset)["kind"] == "spawn_pop"
+    assert preset["rules"][0]["direct"] is True
+    assert "cap_per_min" not in kills_effect(preset)
 
 
-def test_one_kill_pops_exactly_two_zombies_at_the_opponent(runtime):
-    """Le contrat « 1 kill = 2 zombies », envoyé au tick même du kill : rien n'attend le budget.
+def test_one_kill_pops_exactly_ten_zombies_at_the_opponent(runtime):
+    """Le contrat « 1 kill = 10 zombies », envoyé au tick même du kill : rien n'attend le budget.
 
-    Mutation : un sprinter ajouté au pop au lieu d'en remplacer un zombie donnerait 3 au
-    pop du 100e zombie (test suivant) ; ici, un `n` du preset changé donne autre chose que 2.
+    Mutation : un sprinter ajouté au pop au lieu d'en remplacer un zombie donnerait 11 au
+    pop du 100e zombie (test suivant) ; ici, un `n` du preset changé donne autre chose que 10.
     """
     duel = Duel(runtime)
     duel.kill(1)
-    assert duel.sent_at(1) == [("B", "spawn_pop", 2)]
+    assert duel.sent_at(1) == [("B", "spawn_pop", 10)]
 
 
 def test_the_hundredth_zombie_is_a_sprinter_in_place_of_one(runtime):
-    """À 1 %, le 50e kill porte les zombies 99 et 100 : un pop, un sprinter, deux en tout.
+    """À 1 %, le 10e kill porte les zombies 91 à 100 : 9 en pop, 1 sprinter, dix en tout.
 
-    Kills espacés de 21 s : chacun part à son tick, hors du cooldown de 20 s. Mutation : un
-    sprinter ajouté (`n` gardé à 2 pour `spawn_pop`) envoie 3 zombies ; un tirage au hasard
+    Kills à 1 s d'écart : chacun part à son tick, la règle étant directe. Mutation : un
+    sprinter ajouté (`n` gardé à 10 pour `spawn_pop`) envoie 11 zombies ; un tirage au hasard
     ou une cadence par kill déplace le sprinter.
     """
     duel = Duel(runtime)
-    for kill in range(1, 51):
-        duel.kill(21 * kill)
-        expected = [("B", "spawn_pop", 2)]
-        if kill == 50:
-            expected = [("B", "spawn_pop", 1), ("B", "spawn_sprinter", 1)]
-        assert duel.sent_at(21 * kill) == expected, kill
+    for kill in range(1, 11):
+        duel.kill(kill)
+        expected = [("B", "spawn_pop", 10)]
+        if kill == 10:
+            expected = [("B", "spawn_pop", 9), ("B", "spawn_sprinter", 1)]
+        assert duel.sent_at(kill) == expected, kill
     fired = duel.of_type("rule_fired")
-    assert [r["data"]["index"] for r in fired] == list(range(2, 101, 2))
-    assert [r["data"]["sprinter"] for r in fired] == [False] * 49 + [True]
+    assert [r["data"]["index"] for r in fired] == list(range(10, 101, 10))
+    assert [r["data"]["sprinter"] for r in fired] == [False] * 9 + [True]
 
 
-@pytest.mark.parametrize("cooldown_s", [0, 20, 45])
-def test_every_kill_is_two_zombies_whatever_the_budget(runtime, cooldown_s):
-    """100 kills à 5 s d'écart donnent 200 zombies chez B, 198 pops et 2 sprinters, quel que
-    soit `per_effect_cooldown_s` : le budget regroupe les unités en lots, il n'en jette
-    aucune avant la fin du match. Mutation : un lot servi qui garde `n` au lieu de le cumuler.
+@pytest.mark.parametrize(
+    "budget",
+    [
+        {"per_effect_cooldown_s": 0},
+        {"per_effect_cooldown_s": 20},
+        {"per_effect_cooldown_s": 45, "threats_per_minute": 1, "concurrent_effects": 1},
+    ],
+    ids=["sans-cooldown", "livre", "le-plus-serre"],
+)
+def test_every_kill_is_ten_zombies_at_its_tick_whatever_the_budget(runtime, budget):
+    """100 kills à 5 s d'écart donnent 1 000 zombies chez B, 990 pops et 10 sprinters, chaque
+    lot parti au tick de son kill, quel que soit le budget : il ne s'applique pas à la règle
+    directe. Mutation : servir `_direct_lots` par `_may_send`, ou ranger leurs lots dans
+    `_lots`, retient le second kill derrière le cooldown et le total n'est plus atteint à 500 s.
     """
-    duel = Duel(runtime, budget={"per_effect_cooldown_s": cooldown_s})
+    duel = Duel(runtime, budget=budget)
     for kill in range(1, 101):
         duel.kill(5 * kill)
-    duel.to(1400)
-    assert duel.units("B", "spawn_pop") == 198
-    assert duel.units("B", "spawn_sprinter") == 2
+        assert pop_units_at(duel, 5 * kill) == 10, kill
+    assert duel.units("B", "spawn_pop") == 990
+    assert duel.units("B", "spawn_sprinter") == 10
     assert duel.of_type("effect_capped") == []
     assert duel.units("A", "spawn_pop") == duel.units("A", "spawn_sprinter") == 0
+
+
+def pop_units_at(duel: Duel, mt_s: float) -> int:
+    return sum(n for _, kind, n in duel.sent_at(mt_s) if kind in rules.POP_KINDS)
 
 
 def test_the_sprinter_count_is_per_target_side(runtime):
     """Chaque camp a son propre `k` : les kills de B ne rapprochent pas le sprinter de B.
 
-    Mutation : un compteur unique pour les deux camps place le premier sprinter au 25e kill
+    Mutation : un compteur unique pour les deux camps place le premier sprinter au 5e kill
     de chacun.
     """
     duel = Duel(runtime)
-    for kill in range(1, 51):
-        duel.kill(21 * kill, "A")
-        duel.kill(21 * kill + 10, "B")
+    for kill in range(1, 11):
+        duel.kill(2 * kill, "A")
+        duel.kill(2 * kill + 1, "B")
     fired = duel.of_type("rule_fired")
     for side, target in (("A", "B"), ("B", "A")):
         mine = [r["data"] for r in fired if r["side"] == side]
-        assert [data["index"] for data in mine] == list(range(2, 101, 2))
-        assert [data["sprinter"] for data in mine].index(True) == 49
+        assert [data["index"] for data in mine] == list(range(10, 101, 10))
+        assert [data["sprinter"] for data in mine].index(True) == 9
         assert duel.units(target, "spawn_sprinter") == 1
 
 
@@ -757,26 +781,32 @@ def test_the_count_starts_again_with_each_match(runtime):
             duel.kill(21 * kill)
         duel.to(200)
         seen.append([r["data"]["index"] for r in duel.of_type("rule_fired")])
-        assert duel.units("B", "spawn_sprinter") == 3
-    assert seen == [[2, 4, 6], [2, 4, 6]]
+        assert duel.units("B", "spawn_sprinter") == 15
+    assert seen == [[10, 20, 30], [10, 20, 30]]
 
 
-@pytest.mark.parametrize("percent, sprinters", [(0, 0), (100, 2)])
+@pytest.mark.parametrize("percent, sprinters", [(0, 0), (100, 10)])
 def test_zero_never_and_hundred_always(runtime, percent, sprinters):
     duel = Duel(runtime, sprinter_percent=percent)
     duel.kill(1)
     assert duel.units("B", "spawn_sprinter") == sprinters
-    assert duel.units("B", "spawn_pop") == 2 - sprinters
+    assert duel.units("B", "spawn_pop") == 10 - sprinters
     assert duel.of_type("rule_fired")[0]["data"]["sprinter"] is bool(sprinters)
 
 
 def test_cap_per_min_counts_sprinters_in_the_total(runtime):
     """40 kills dans la même seconde : 80 zombies demandés, 60 admis, tous sprinters à 100 %.
 
-    Mutation : découper la part sprinter avant `_admit`, ou la lui faire contourner, en
-    laisserait passer 80.
+    Règle ordinaire, d'avant P9F9 : `cap_per_min` vaut encore pour elle. Mutation : découper
+    la part sprinter avant `_admit`, ou la lui faire contourner, en laisserait passer 80.
     """
-    duel = Duel(runtime, sprinter_percent=100, budget={"per_effect_cooldown_s": 0})
+    duel = Duel(
+        runtime,
+        undirect=True,
+        kill_effect={"n": 2, "cap_per_min": 60},
+        sprinter_percent=100,
+        budget={"per_effect_cooldown_s": 0},
+    )
     for kill in range(40):
         duel.kill(1 + kill * 0.001)
     duel.to(120)
@@ -827,7 +857,7 @@ def test_pop_commands_carry_spacing_and_aggro(runtime):
     duel = Duel(runtime, spacing=7, aggro=0.25)
     duel.kill(1)
     (command,) = pop_commands(duel)
-    assert command["kind"] == "spawn_pop" and command["n"] == 2
+    assert command["kind"] == "spawn_pop" and command["n"] == 10
     assert (command["spacing"], command["aggro"]) == (7, 0.25)
     assert list(command)[-1] == "origin"
 
@@ -866,8 +896,9 @@ def test_a_table_without_the_settings_sends_none(runtime):
 
 def test_a_pop_held_by_the_cooldown_keeps_the_settings(runtime):
     """Le second kill attend le cooldown dans un lot, servi à 21 s : sa commande porte les
-    mêmes réglages que la première. Mutation : réglages ajoutés au seul envoi immédiat."""
-    duel = Duel(runtime)
+    mêmes réglages que la première. Règle ordinaire : la directe n'attend aucun cooldown.
+    Mutation : réglages ajoutés au seul envoi immédiat."""
+    duel = Duel(runtime, undirect=True, kill_effect={"n": 2})
     duel.kill(1)
     duel.kill(2)
     duel.to(30)
@@ -1083,3 +1114,251 @@ def test_mod_still_refuses_too_close_with_the_new_settings(monkeypatch):
     spawn.game.flush()
     (result,) = spawn.game.lines("cmd_result")
     assert result["data"]["reason"] == "too_close" and spawn.spawns == []
+
+
+# P9F9 : un kill, un lot de dix, sans budget ni perte ---------------------------------------
+
+LOT = 10
+# (écart entre deux rafales en s, kills par rafale, rafales) : 2 s, 1 s (vidage du mod),
+# 250 ms (un tick), et 5 kills dans le même tick.
+CADENCES = {
+    "2s": (2.0, 1, 12),
+    "1s": (1.0, 1, 12),
+    "250ms": (0.25, 1, 12),
+    "rafale": (1.0, 5, 3),
+}
+
+
+def pop_units(duel: Duel, target: str) -> int:
+    return duel.units(target, "spawn_pop") + duel.units(target, "spawn_sprinter")
+
+
+def kill_rules(duel: Duel, side: str) -> list[dict]:
+    fired = duel.of_type("rule_fired")
+    return [r for r in fired if r["side"] == side and r["data"]["rule"] == "kill_baseline"]
+
+
+def play_cadence(duel: Duel, cadence: str, side: str, origins: tuple[str, ...]) -> int:
+    """Joue la cadence pour `side`, origines en alternance ; rend le nombre de kills."""
+    period_s, per_tick, bursts = CADENCES[cadence]
+    count = 0
+    for burst in range(bursts):
+        te_s = 1 + burst * period_s
+        duel.to(te_s - 0.25)
+        for _ in range(per_tick):
+            duel.submit_kill(te_s, side, origins[count % len(origins)])
+            count += 1
+        duel.to(te_s)
+    return count
+
+
+@pytest.mark.parametrize(
+    "origins", [("world",), ("duel",), ("world", "duel")], ids=["monde", "duel", "mixte"]
+)
+@pytest.mark.parametrize("cadence", list(CADENCES))
+def test_every_kill_fires_its_lot_of_ten_at_its_tick(runtime, cadence, origins):
+    """N kills donnent N `kill_baseline` et 10 × N zombies chez l'adversaire, envoyés au tick
+    du dernier kill : rien n'attend un budget, rien n'est plafonné, limité ni jeté.
+
+    `origins` couvre la perte mesurée sur 734610ca : 21 des 35 kills y visaient des zombies
+    envoyés par le duel, et aucun n'a déclenché. Le sprinter remplace un zombie du lot (P9F5) :
+    le total compte `spawn_pop` et `spawn_sprinter`, `spawn_pop` seul vaut 10 × N moins eux.
+    Mutations : rendre le filtre `origin: duel` à une règle `direct` (zéro règle sur un kill du
+    duel) ; servir les lots directs par `_may_send` (le cooldown de 20 s les retient) ; remettre
+    `n: 2` ou `cap_per_min` au preset.
+    """
+    duel = Duel(runtime)
+    kills = play_cadence(duel, cadence, "A", origins)
+    percent = read_preset("duel_rapide")["sprinter_percent"]
+    sprinters = len(rules.sprinter_ranks(1, LOT * kills, percent))
+    assert len(kill_rules(duel, "A")) == kills
+    assert pop_units(duel, "B") == LOT * kills
+    assert duel.units("B", "spawn_pop") == LOT * kills - sprinters
+    assert pop_units(duel, "A") == 0
+    for limited in ("effect_capped", "effect_limited", "effect_dropped"):
+        assert duel.of_type(limited) == [], limited
+
+
+@pytest.mark.parametrize(
+    "origins", [("world", "duel"), ("duel", "world"), ("world", "world")], ids=str
+)
+@pytest.mark.parametrize("cadence", list(CADENCES))
+def test_both_sides_get_exactly_the_same(runtime, cadence, origins):
+    """N kills de A et N kills de B aux mêmes instants : mêmes règles, mêmes lots, mêmes ticks,
+    chacun chez l'autre, même si l'un ne tue que des zombies envoyés par le duel (6bebf6c6 :
+    25 kills de A → 331 zombies chez B, 10 kills de B → 1 chez A).
+
+    Mutation : rendre le filtre `origin: duel` à la règle directe laisse le camp aux kills
+    « duel » sans règle ni zombie ; servir les lots directs de B derrière la file budgétée
+    décale ses commandes.
+    """
+    duel = Duel(runtime)
+    period_s, per_tick, bursts = CADENCES[cadence]
+    for burst in range(bursts):
+        te_s = 1 + burst * period_s
+        duel.to(te_s - 0.25)
+        for _ in range(per_tick):
+            for side, origin in zip("AB", origins):
+                duel.submit_kill(te_s, side, origin)
+        duel.to(te_s)
+    kills = per_tick * bursts
+
+    def mirror(side: str, target: str) -> tuple:
+        fired = [
+            (r["mt"], r["data"]["index"], r["data"]["sprinter"]) for r in kill_rules(duel, side)
+        ]
+        sent = [
+            (r["mt"], r["data"]["command"]["kind"], r["data"]["command"]["n"])
+            for r in duel.of_type("command")
+            if r["side"] == target
+        ]
+        return fired, sent
+
+    assert mirror("A", "B") == mirror("B", "A")
+    assert len(kill_rules(duel, "A")) == len(kill_rules(duel, "B")) == kills
+    assert pop_units(duel, "A") == pop_units(duel, "B") == LOT * kills
+
+
+def test_a_late_kill_still_fires_its_lot(runtime):
+    """Un kill lu deux secondes après son tick est journalisé `late_event`, et fait son lot de
+    dix au tick qui le traite. Mutation : un retour anticipé sur `_is_late` le perdrait."""
+    duel = Duel(runtime)
+    duel.to(3)
+    duel.submit_kill(1, "B", "duel")
+    duel.to(3.25)
+    assert len(duel.of_type("late_event")) == 1
+    assert len(kill_rules(duel, "B")) == 1
+    assert duel.sent_at(3.25) == [("A", "spawn_pop", 10)]
+
+
+@pytest.mark.parametrize("ending", ["timer", "submitted"])
+def test_a_kill_of_the_conclusion_tick_sends_its_lot(runtime, ending):
+    """Le kill traité au tick de fin part avant `match_end`, au lieu d'un `effect_dropped`.
+
+    Mutation : ne plus appeler `_serve_direct` dans `_finish` rend le `effect_dropped` de
+    10 unités.
+    """
+    duel = Duel(runtime, duration_s=60)
+    duel.to(59.75)
+    duel.submit_kill(60 if ending == "timer" else 59.9, "A", "duel")
+    if ending == "submitted":
+        duel.core.submit_end({"outcome": "forfeit", "winner": "A", "reason": "absence de B"})
+    duel.to(60)
+    tail = [(r["type"], r["side"]) for r in duel.records if r["mt"] == 60]
+    assert tail == [("event", "A"), ("rule_fired", "A"), ("command", "B"), ("match_end", None)]
+    assert duel.sent_at(60) == [("B", "spawn_pop", 10)]
+
+
+def test_a_restarting_target_gets_its_lots_when_back(runtime):
+    """Une relance retient les lots directs, sans en rien jeter : ils partent à son retour."""
+    duel = Duel(runtime)
+    duel.to(1)
+    duel.core.submit_state("B", "restarting")
+    duel.kill(2)
+    duel.kill(3)
+    assert pop_units(duel, "B") == 0
+    duel.core.submit_state("B", "running")
+    duel.to(3.25)
+    assert duel.sent_at(3.25) == [("B", "spawn_pop", 20)]
+    assert duel.of_type("effect_dropped") == []
+
+
+def test_direct_pops_leave_the_budget_to_the_other_effects(runtime):
+    """Vingt lots directs chez A, puis une blessure de A : sa caisse part au tick, le budget le
+    plus serré (1 menace/min, 1 effet en cours) lui étant resté entier. Mutation : compter un envoi
+    direct dans `_sent`, ou un effet direct dans `concurrent_effects`, la retient."""
+    duel = Duel(runtime, budget={"threats_per_minute": 1, "concurrent_effects": 1})
+    for kill in range(1, 21):
+        duel.kill(kill * 0.25, "B")
+    hurt = {
+        "v": 1, "boot": 1, "seq": 99, "t_ms": T0_MS + 6000, "src": "A", "side": "A",
+        "kind": "damage_taken", "data": {"hp": 80, "delta": -20},
+    }  # fmt: skip
+    duel.to(5.75)
+    duel.core.submit_event(parse_event(hurt, duel.catalog))
+    duel.to(6)
+    sent = [(r["side"], r["data"]["command"]["kind"]) for r in duel.of_type("command")]
+    assert [entry for entry in sent if entry[1] == "supply_drop"] == [("A", "supply_drop")]
+    assert [r["mt"] for r in duel.of_type("command")][-1] == 6
+    assert pop_units(duel, "A") == 200
+
+
+def test_the_safety_bound_is_far_above_any_kill_rate(runtime):
+    """Borne livrée : 6 000 zombies par camp visé et par minute, soit 10 kills par seconde
+    pendant une minute. Deux minutes à un kill par tick (4/s), des deux camps, n'y touchent
+    pas. Mutation : une borne ramenée sous 2 400 journalise un `effect_limited` ici."""
+    assert runtime[rules.DIRECT_SAFETY] == 6000
+    duel = Duel(runtime)
+    ticks = 2 * 60 * 4
+    for tick in range(1, ticks + 1):
+        duel.to(tick * 0.25 - 0.25)
+        for side in "AB":
+            duel.submit_kill(tick * 0.25, side, "duel")
+        duel.to(tick * 0.25)
+    assert duel.of_type("effect_limited") == []
+    assert pop_units(duel, "A") == pop_units(duel, "B") == LOT * ticks
+
+
+def test_the_safety_bound_limits_and_says_from_which_volume(runtime):
+    """Borne ramenée à 25 : trois kills d'un tick en demandent 30, 25 partent, 5 sont
+    journalisés `effect_limited` avec la borne ; une minute plus tard, la fenêtre est libre.
+    Mutation : une borne qui jette sans journaliser, ou qui compte les deux camps ensemble."""
+    duel = Duel({**runtime, rules.DIRECT_SAFETY: 25})
+    duel.to(0.75)
+    for _ in range(3):
+        duel.submit_kill(1, "A")
+    duel.submit_kill(1, "B")
+    duel.to(1)
+    assert pop_units(duel, "B") == 25 and pop_units(duel, "A") == 10
+    (limited,) = duel.of_type("effect_limited")
+    assert limited["side"] == "B"
+    assert limited["data"] == {
+        "rule": "kill_baseline", "kind": "spawn_pop", "units": 5, "limit": 25, "window_s": 60,
+    }  # fmt: skip
+    assert len(kill_rules(duel, "A")) == 3
+    duel.kill(61, "A")
+    assert duel.sent_at(61) == [("B", "spawn_pop", 10)]
+
+
+def test_a_journal_without_the_bound_replays_without_one(runtime):
+    """Un runtime d'avant P9F9, sans la clé, rejoue sans borne : rien n'y est limité."""
+    old = {key: value for key, value in runtime.items() if key != rules.DIRECT_SAFETY}
+    duel = Duel(old)
+    duel.to(0.75)
+    for _ in range(30):
+        duel.submit_kill(1, "A")
+    duel.to(1)
+    assert pop_units(duel, "B") == 300
+    assert duel.of_type("effect_limited") == []
+
+
+@pytest.mark.parametrize(
+    "change, field",
+    [
+        ({"direct": False}, "direct"),
+        ({"direct": 1}, "direct"),
+        ({"cap": 60}, "effects[0].cap_per_min"),
+    ],
+)
+def test_a_direct_rule_is_true_and_has_no_cap(catalog, limits, change, field):
+    """`direct` vaut `true`, et une règle directe refuse `cap_per_min` : rien ne tronque son
+    lot dans la table. Mutation : retirer `_check_direct` laisse passer le plafond."""
+    raw = read_preset("duel_rapide")
+    rule = raw["rules"][0]
+    if "cap" in change:
+        rule["effects"][0]["cap_per_min"] = change["cap"]
+    else:
+        rule.update(change)
+    with pytest.raises(TableError) as refused:
+        load_table(raw, catalog, limits, file_stem="duel_rapide")
+    assert field in str(refused.value)
+
+
+def test_an_ordinary_rule_still_ignores_duel_spawns(runtime):
+    """Sans `direct`, le zombie du duel ne déclenche rien, comme avant : la boucle reste un
+    choix de la table. Mutation : supprimer le filtre pour toutes les règles."""
+    duel = Duel(runtime, undirect=True)
+    duel.kill(1, origin="duel")
+    assert kill_rules(duel, "A") == []
+    duel.kill(2, origin="world")
+    assert len(kill_rules(duel, "A")) == 1

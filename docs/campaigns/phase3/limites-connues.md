@@ -115,3 +115,39 @@ dans la bande et espacées ; faute de place, le nombre est gardé en superposant
 - que la superposition, quand elle arrive (`spread` < `spawned`), reste rare à 4 cases d'écart.
 
 `horde_area` n'est pas concernée : elle disperse déjà par `radius`, et n'est pas ciblée.
+
+## P9F9 — un kill, un lot de dix : ce qui a changé, et ce qui reste ouvert
+
+**Où se perdaient les kills.** Dans `RuleEvaluator.feed` (`service/rules.py`, ancienne ligne
+674–676) : un `zombie_kill` d'`origin: "duel"` — un zombie envoyé par le duel — sortait avant toute
+règle. Sur `734610ca`, 21 des 35 kills étaient de ce type ; les 14 kills `world` ont tous donné
+leur `kill_baseline` (14 règles, plus une `hurt_supply` : les 15 `rule_fired`). Les
+`late_event` (78 lignes dans ce journal) n'y sont pour rien : un événement en retard était déjà traité. Le budget non plus,
+pour les règles ; il comprimait en revanche les zombies (cooldown de 20 s, `cap_per_min: 60`).
+
+**Ce que fait la règle directe.** `kill_baseline` de `duel_rapide` porte `"direct": true` et
+`n: 10`, sans `cap_per_min` (refusé par le chargeur sur une règle directe). Chaque kill reçu, du
+monde ou du duel, en retard ou au tick de fin, déclenche la règle ; son lot part au tick même,
+hors de `threats_per_minute`, `per_effect_cooldown_s` et `concurrent_effects`, qu'il n'entame
+pas : la caisse de soin garde tout son budget. Le sprinter à 1 % remplace toujours un zombie du
+lot, jamais en plus. Les autres presets et toute règle sans `direct` gardent le filtre `duel`
+et le budget, inchangés.
+
+**Borne technique, hors règle.** `runtime.json` : `direct_units_per_window: 6000`, soit 6 000
+zombies directs par camp visé sur `rate_window_s` (60 s) — 10 kills par seconde tenus une
+minute. Au-delà, le reste est journalisé `effect_limited` avec `limit` et `window_s`. Un test
+joue deux minutes à un kill par tick des deux côtés (2 400 par minute et par camp) sans
+l'atteindre. Un journal d'avant P9F9, sans la clé, se rejoue sans borne.
+
+**Ouvert, à voir en jeu :**
+
+- **La boucle est voulue, et elle croît.** Un kill de zombie du duel renvoie dix zombies : deux
+  joueurs efficaces se renvoient une pression qui grandit. C'est la règle demandée ; la borne
+  ne protège que le serveur, pas l'équilibre. Si la partie devient injouable, c'est `n` qu'il
+  faut baisser, pas un budget à remettre.
+- **Dix zombies tous les kills, à 12–20 cases.** Ni la tenue du serveur sous ce débit, ni la
+  lisibilité pour le joueur ne sont mesurées : la superposition de P9F8 (`spread` < `spawned`)
+  peut devenir fréquente.
+- **Le lot du tick de fin part** avant `match_end`, vers un serveur que l'arbitre arrête
+  ensuite : la commande est dans le journal, le pop peut ne jamais apparaître. Un camp en
+  relance à la fin garde son `effect_dropped`, faute de serveur.

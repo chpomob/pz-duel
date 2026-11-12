@@ -58,6 +58,14 @@ MAX_SPACING = 20
 AGGRO = "aggro"
 POP_SETTINGS = (SPACING, AGGRO)
 POP_KINDS = (POP_KIND, SPRINTER_KIND)
+# Règle directe (P9F9) : « quand on reçoit kill, on fait pop 10, direct ». Chaque atome reçu
+# la déclenche, zombie du duel compris, et ses lots partent au tick même, hors de tout budget
+# (`threats_per_minute`, `per_effect_cooldown_s`, `concurrent_effects`) qu'ils n'entament pas
+# non plus ; `cap_per_min` y est refusé. Seule borne : `DIRECT_SAFETY`, technique, hors table.
+DIRECT = "direct"
+# Clé de `runtime.json` : unités directes admises par camp visé sur `rate_window_s`. Absente
+# (journal d'avant P9F9), aucune borne : une telle table n'a pas de règle directe.
+DIRECT_SAFETY = "direct_units_per_window"
 
 TABLE_KEYS = (
     "id",
@@ -128,6 +136,7 @@ class FiredEffect:
     params: Mapping[str, Any]
     cap_per_min: int | None = None
     defender_bonus: bool = False
+    direct: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +191,8 @@ class _RunningEffect:
     duration_ms: int
     timeout_ms: int
     release_ms: int | None = None
+    # Effet d'une règle directe : il ne compte pas dans `concurrent_effects`.
+    direct: bool = False
 
 
 def load_runtime() -> dict:
@@ -488,7 +499,7 @@ def _check_rules(
     for index, rule in enumerate(rules):
         named = isinstance(rule, dict) and isinstance(rule.get("id"), str)
         where = f"règle « {rule['id']} »" if named else f"règle n°{index + 1}"
-        _check_keys(rule, where, "", ("id", "when", "effects"), ("every", "sides"))
+        _check_keys(rule, where, "", ("id", "when", "effects"), ("every", "sides", DIRECT))
         _check_identifier(rule["id"], where, "id")
         if rule["id"] in seen:
             _fail(where, "id", "identifiant déjà utilisé dans la table")
@@ -499,6 +510,18 @@ def _check_rules(
         _check_list(rule["effects"], where, "effects")
         for position, effect in enumerate(rule["effects"]):
             _check_effect(effect, where, f"effects[{position}]", catalog, limits)
+        if DIRECT in rule:
+            _check_direct(rule, where)
+
+
+def _check_direct(rule: dict, where: str) -> None:
+    """Une règle directe vaut `true` et ne porte aucun plafond : sa borne est hors de la table."""
+    if rule[DIRECT] is not True:
+        _fail(where, DIRECT, f"true attendu, reçu {rule[DIRECT]!r}")
+    for position, effect in enumerate(rule["effects"]):
+        if "cap_per_min" in effect:
+            field = f"effects[{position}].cap_per_min"
+            _fail(where, field, "interdit sur une règle directe : rien ne tronque son lot")
 
 
 def _check_when(rule: dict, where: str, atoms: set[str]) -> None:
@@ -671,12 +694,19 @@ class RuleEvaluator:
         if event["side"] != self.side or te_ms < 0:
             return []
         self._scores[self.side] += self._points.get(kind, 0)
-        duel_spawn = kind == KILL_ATOM and event["data"].get("origin") == DUEL_ORIGIN
-        if duel_spawn or kind not in self._atoms:
+        if kind not in self._atoms:
             return []
-        self._update_combo(kind)
-        self._record(kind, te_ms)
-        return [self._fire(state, event) for state in self._rules if self._fires(state, te_ms)]
+        states = self._rules
+        duel_spawn = kind == KILL_ATOM and event["data"].get("origin") == DUEL_ORIGIN
+        if duel_spawn:
+            # Le zombie d'un duel ne nourrit ni combo, ni absence, ni règle ordinaire : seule
+            # une règle directe le compte, puisque chaque kill reçu y est un lot (P9F9).
+            states = [state for state in self._rules if state.rule.get(DIRECT)]
+        else:
+            self._update_combo(kind)
+            self._record_history(kind, te_ms)
+        self._record(kind, te_ms, states)
+        return [self._fire(state, event) for state in states if self._fires(state, te_ms)]
 
     def _update_combo(self, kind: str) -> None:
         if self._combo is None:
@@ -686,10 +716,12 @@ class RuleEvaluator:
         elif kind == self._combo["on"]:
             self.combo_series += 1
 
-    def _record(self, kind: str, te_ms: int) -> None:
+    def _record_history(self, kind: str, te_ms: int) -> None:
         if kind in self._history:
             insort(self._history[kind], te_ms)
-        for state in self._rules:
+
+    def _record(self, kind: str, te_ms: int, states: list[_RuleState]) -> None:
+        for state in states:
             if kind == state.when.atom:
                 insort(state.occurrences, te_ms)
             if kind == state.when.then_atom:
@@ -770,9 +802,10 @@ class RuleEvaluator:
         multipliers = self._multipliers()
         product = math.prod(multipliers.values(), start=Fraction(1))
         declared = state.rule["effects"]
-        effects = [self._resolve(effect, product) for effect in declared]
+        direct = bool(state.rule.get(DIRECT))
+        effects = [self._resolve(effect, product, direct) for effect in declared]
         if "score_gap" in multipliers and any("n" in effect for effect in declared):
-            bonus = self._resolve(self._gap["defender_bonus"], Fraction(1))
+            bonus = self._resolve(self._gap["defender_bonus"], Fraction(1), False)
             effects.append(replace(bonus, defender_bonus=True))
         return FiredRule(
             rule=state.rule["id"],
@@ -782,7 +815,9 @@ class RuleEvaluator:
             effects=tuple(effects),
         )
 
-    def _resolve(self, effect: Mapping[str, Any], product: Fraction) -> FiredEffect:
+    def _resolve(
+        self, effect: Mapping[str, Any], product: Fraction, direct: bool
+    ) -> FiredEffect:
         params = {
             key: copy.deepcopy(value)
             for key, value in effect.items()
@@ -791,7 +826,7 @@ class RuleEvaluator:
         if "n" in params:
             params["n"] = max(1, math.floor(params["n"] * product))
         target = self.side if effect.get("target") == "self" else _opponent(self.side)
-        return FiredEffect(target, params, effect.get("cap_per_min"))
+        return FiredEffect(target, params, effect.get("cap_per_min"), direct=direct)
 
 
 class MatchCore:
@@ -843,6 +878,15 @@ class MatchCore:
         self._records: list[dict[str, Any]] = []
         # Un dict garde l'ordre d'insertion : c'est la file FIFO, indexée par clé de lot.
         self._lots: dict[str, dict[str, _Lot]] = {side: {} for side in SIDES}
+        # Lots des règles directes, servis à chaque tick hors budget : jamais derrière une tête
+        # de `_lots` bloquée, jamais cumulés avec elle.
+        self._direct_lots: dict[str, dict[str, _Lot]] = {side: {} for side in SIDES}
+        # Borne technique des règles directes, hors table : `None` sans la clé au runtime.
+        self._direct_safety: int | None = runtime.get(DIRECT_SAFETY)
+        # Unités directes admises `(tick en ms, unités)` par camp visé, sur `rate_window_s`.
+        self._direct_admitted: dict[str, deque[tuple[int, int]]] = {
+            side: deque() for side in SIDES
+        }
         self._running: dict[int, _RunningEffect] = {}
         # Commandes écrites sans `cmd_result` reçu, `cmd_timeout` ou non : `seq` → cible.
         self._unanswered: dict[int, str] = {}
@@ -914,8 +958,8 @@ class MatchCore:
     def run_tick(self) -> list[dict[str, Any]]:
         """Exécute le tick suivant : événements, intrants, échéances, puis émission.
 
-        Un tick de fin n'émet rien. Une mort du tick passe avant une fin soumise, qui
-        passe elle-même avant le minuteur : c'est l'ordre du traitement dans le tick.
+        Un tick de fin n'émet que les lots directs. Une mort du tick passe avant une fin
+        soumise, qui passe elle-même avant le minuteur : c'est l'ordre du traitement dans le tick.
         """
         if self.result is not None:
             return []
@@ -1076,6 +1120,31 @@ class MatchCore:
             self._record("effect_capped", data, effect.target)
         return taken
 
+    def _within_safety(self, fired: FiredRule, effect: FiredEffect, units: int) -> int:
+        """Rend les unités directes que la borne technique admet chez la cible sur la fenêtre.
+
+        Ce n'est pas une règle du jeu : elle protège le serveur d'une boucle sans fin et ne se
+        déclenche sur aucun rythme de kills humain. Le reste se journalise en `effect_limited`,
+        avec la borne atteinte, pour que le journal dise à partir de quel volume.
+        """
+        admitted = self._direct_admitted[effect.target]
+        while admitted and admitted[0][0] <= self._now_ms - self._rate_window_ms:
+            admitted.popleft()
+        room = max(0, self._direct_safety - sum(count for _, count in admitted))
+        taken = min(units, room)
+        if taken:
+            admitted.append((self._now_ms, taken))
+        if taken < units:
+            data = {
+                "rule": fired.rule,
+                "kind": effect.params["kind"],
+                "units": units - taken,
+                "limit": self._direct_safety,
+                "window_s": self._rate_window_ms // MS_PER_S,
+            }
+            self._record("effect_limited", data, effect.target)
+        return taken
+
     def _enqueue(
         self, fired: FiredRule, effect: FiredEffect, rank: int
     ) -> list[tuple[int | None, int]]:
@@ -1086,6 +1155,10 @@ class MatchCore:
         """
         params = dict(effect.params)
         units = params.pop("n", None)
+        if units is not None and effect.direct and self._direct_safety is not None:
+            units = self._within_safety(fired, effect, units)
+            if units == 0:
+                return [(None, 0)] if self._counts_pops(params) else []
         if units is not None and effect.cap_per_min is not None:
             units = self._admit(fired, effect, rank, units)
             if units == 0:
@@ -1106,7 +1179,7 @@ class MatchCore:
         units: int | None,
     ) -> None:
         key = json.dumps(params, sort_keys=True)
-        lots = self._lots[effect.target]
+        lots = (self._direct_lots if effect.direct else self._lots)[effect.target]
         t_ms = fired.event["t_ms"]
         lot = lots.get(key)
         if lot is None:
@@ -1165,18 +1238,42 @@ class MatchCore:
         return {"outcome": "death", "winner": _opponent(side), "reason": reason}
 
     def _finish(self, result: Mapping[str, Any]) -> None:
-        """Jette les lots restants, puis clôt le match sur son unique `match_end`."""
+        """Envoie les lots directs, jette le reste, puis clôt le match sur son `match_end`.
+
+        Un kill du tick de fin a déclenché sa règle directe : son lot part avec lui (P9F9).
+        Seul un camp en relance le perd, faute de serveur pour le recevoir.
+        """
         for target in SIDES:
-            for lot in self._lots[target].values():
-                data = {"rule": lot.rule, "kind": lot.params["kind"], "units": lot.params.get("n")}
-                self._record("effect_dropped", data, target)
-            self._lots[target].clear()
+            self._serve_direct(target)
+        for target in SIDES:
+            for lots in (self._direct_lots[target], self._lots[target]):
+                for lot in lots.values():
+                    units = lot.params.get("n")
+                    data = {"rule": lot.rule, "kind": lot.params["kind"], "units": units}
+                    self._record("effect_dropped", data, target)
+                lots.clear()
         self.result = result
         self._record("match_end", {"result": result, "score": dict(self.scores)}, None)
 
+    def _serve_direct(self, target: str) -> None:
+        """Envoie les lots directs de `target` par tranches : seule une relance les retient."""
+        lots = self._direct_lots[target]
+        if target in self._restarting:
+            return
+        while lots:
+            key, lot = next(iter(lots.items()))
+            units = lot.params.get("n")
+            if units is not None and units > self._max_units:
+                lot.params["n"] = units - self._max_units
+                self._send(target, lot, {**lot.params, "n": self._max_units}, direct=True)
+            else:
+                del lots[key]
+                self._send(target, lot, lot.params, direct=True)
+
     def _serve_queues(self) -> None:
-        """Sert A puis B ; la première tête bloquée n'arrête que sa propre file."""
+        """Sert A puis B, lots directs d'abord ; une tête bloquée n'arrête que sa propre file."""
         for target in SIDES:
+            self._serve_direct(target)
             lots = self._lots[target]
             while lots:
                 key, lot = next(iter(lots.items()))
@@ -1202,10 +1299,15 @@ class MatchCore:
             sent.popleft()
         if len(sent) >= self._threats_per_window:
             return False
-        running = sum(effect.target == target for effect in self._running.values())
+        running = sum(
+            effect.target == target and not effect.direct for effect in self._running.values()
+        )
         return running < self._concurrent_effects
 
-    def _send(self, target: str, lot: _Lot, params: Mapping[str, Any]) -> None:
+    def _send(
+        self, target: str, lot: _Lot, params: Mapping[str, Any], direct: bool = False
+    ) -> None:
+        """Écrit la commande ; un envoi direct n'entame ni cooldown, ni menaces, ni places."""
         self._last_seq += 1
         origin = {"rule": lot.rule, "boot": lot.event["boot"], "event_seq": lot.event["seq"]}
         settings = self._pop_settings if params["kind"] in POP_KINDS else {}
@@ -1218,9 +1320,11 @@ class MatchCore:
         }
         latency_ms = self._t0_ms + self._now_ms - lot.oldest_t_ms
         self._record("command", {"command": command, "latency_ms": latency_ms}, target)
-        self._last_sent[target, params["kind"]] = self._now_ms
-        self._sent[target].append(self._now_ms)
+        if not direct:
+            self._last_sent[target, params["kind"]] = self._now_ms
+            self._sent[target].append(self._now_ms)
         duration_ms = params.get("duration_s", 0) * MS_PER_S
         timeout_ms = self._now_ms + self._cmd_timeout_ms
-        self._running[self._last_seq] = _RunningEffect(target, duration_ms, timeout_ms)
+        running = _RunningEffect(target, duration_ms, timeout_ms, direct=direct)
+        self._running[self._last_seq] = running
         self._unanswered[self._last_seq] = target
