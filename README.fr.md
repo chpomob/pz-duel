@@ -78,9 +78,16 @@ sert de `StartServer64.bat` quand ce script existe.
    saisit l'adresse à la main dans Project Zomboid. **Le code du lanceur n'est pas le mot de passe du
    serveur** ; le lobby le dit en anglais : « The launcher code is not the server password ». Tapé
    dans le lanceur, le mot de passe est refusé (`This is not the code of this file`).
-   `Ouvrir PZ` reste grisé tant que votre adversaire n'est pas connecté : chaque monde est figé tant
-   que personne n'y joue (`PauseEmpty=true`), et rejoindre le vôtre plus tôt le ferait tourner seul.
-   Dès que l'invité est identifié, `Ouvrir PZ` vous connecte à votre propre serveur.
+   La carte du lobby se lit de haut en bas dans l'ordre où l'on s'en sert : **un seul bouton
+   principal** (ce que vous faites maintenant), puis le **code du lanceur** en gros (ce que vous
+   dictez — un clic le copie), puis le lien avec `Copy link` et `Save launcher` (ce que vous envoyez).
+   Le QR est replié derrière *Show the QR code (phone)* : il ne sert qu'à un téléphone. Le jeton
+   d'invitation n'est plus affiché.
+   Le bouton principal indique `Waiting for your opponent…` (grisé) tant que votre adversaire n'est
+   pas connecté : chaque monde est figé tant que personne n'y joue (`PauseEmpty=true`), et rejoindre
+   le vôtre plus tôt le ferait tourner seul. Dès que l'invité est identifié, il devient
+   `Open the game` et vous connecte à votre propre serveur ; quand vous êtes tous les deux là, il
+   indique `Starting the duel…` : le duel part tout seul.
    **Le premier arrivé attend figé.** Tant qu'un joueur manque, PZ Duel tient les deux mondes
    (`hold_time`) : le joueur déjà connecté ne peut plus bouger et l'heure n'avance pas. Dès que les
    deux joueurs sont identifiés, les deux mondes sont relâchés ensemble (`release_time`), une seule

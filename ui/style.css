@@ -112,7 +112,20 @@ input:focus, select:focus { outline: 1px solid var(--amber); }
 /* Taille naturelle : 4 px par module, même pour un long lien. Le blanc est la marge du QR. */
 .qr { background: #fff; padding: 16px; border-radius: 8px; max-width: 100%; }
 .qr svg { display: block; max-width: 100%; height: auto; }
-.invite .code { font-size: 26px; letter-spacing: 4px; font-weight: 700; color: var(--amber); }
+/* P9F13 : trois zones dans l'ordre d'usage — l'action, le code à dicter, ce qu'on envoie. */
+.zone { margin: 0 0 16px; }
+.zone.now { margin-top: 10px; }
+button.wide { width: 100%; padding: 14px; font-size: 17px; }
+.zone.say { padding: 12px 14px; border: 1px solid var(--amber); border-radius: 8px; background: #2a2416; }
+.big-code {
+  font-family: ui-monospace, monospace; font-size: 32px; letter-spacing: 3px; color: var(--amber);
+  margin: 6px 0; overflow-wrap: anywhere; cursor: copy; user-select: all;
+}
+.zone.send .link { color: var(--dim); }
+.qr-fold { margin-top: 10px; }
+.qr-fold summary { cursor: pointer; color: var(--dim); font-size: 12.5px; }
+.qr-fold .qr { margin-top: 10px; display: inline-block; }
+.secret { margin: 12px 0 0; }
 .invite .line { font-family: ui-monospace, monospace; font-size: 15px; margin: 6px 0; overflow-wrap: anywhere; }
 .invite .link { font-size: 13px; }
 .address { margin: 14px 0 0; }

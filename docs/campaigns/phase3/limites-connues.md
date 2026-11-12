@@ -331,3 +331,35 @@ est aussi tenu par `test_held_player_loses_no_health_and_released_player_does`.
   leur trajet ? Non vérifié.
 - L'invisibilité est-elle écrite dans la sauvegarde du joueur ? Même question que pour
   l'invulnérabilité : un serveur tombé sous tenue capterait `true` comme valeur d'avant. Non vérifié.
+
+## P9F13 — lobby lisible (2026-11-12)
+
+Retour d'une vraie session : le QR et le jeton d'invitation en gros occupaient le haut de la carte,
+le code du lanceur et le bouton de jeu étaient noyés. La carte d'invitation (`ui/app.js`,
+`inviteCard`) suit désormais l'ordre d'usage : une seule action primaire (`primaryAction` :
+`Waiting for your opponent…` grisé avec sa raison, `Open the game`, puis `Starting the duel…` grisé
+quand les deux joueurs sont là), le code du lanceur en gros et en monospace (copié d'un clic), le
+lien avec `Copy link` / `Save launcher`, et le QR replié dans un `<details>` fermé par défaut, dont
+l'ouverture survit aux rendus (`qrOpen`). `inv.code` reste dans l'API mais n'est plus rendu. Les deux
+secrets restent dans deux blocs distincts, avec leurs libellés et la phrase qui les sépare. Aucun
+changement de service ni de protocole.
+
+**Tests et mutations (`tests/test_setup_flow.py`, vérifiées tuées) :**
+`test_p9f13_invitation_token_is_not_rendered` (remettre `<div class="code">`),
+`test_p9f13_launcher_code_comes_before_the_link` (remonter le bloc du lien au-dessus du code),
+`test_p9f13_qr_is_folded_in_a_closed_details` (rendre le `<details>` ouvert d'office),
+`test_p9f13_one_primary_action_whose_label_follows_the_lobby` (libellé fixe ; `disabled` retiré
+quand les deux joueurs sont là).
+
+**Ouvert, à confirmer en session réelle :**
+
+- Lisibilité mesurée seulement par la structure du HTML : aucun testeur non technique n'a encore
+  vu la page. À vérifier : comprend-il en dix secondes quoi cliquer et quel code dicter ?
+- `Starting the duel…` s'affiche dès que les deux joueurs sont identifiés ; si une sonde tarde ou
+  un relâchement n'est pas confirmé, le décompte attend et le bouton reste sur ce libellé (la raison
+  détaillée est dans la carte `Lancement`, `holdNotice`).
+- Le clic sur le code passe par `navigator.clipboard`, qui exige un contexte sûr : sur
+  `http://127.0.0.1` les navigateurs l'acceptent, à confirmer sur le navigateur réel de l'hôte ;
+  à défaut, le code reste sélectionnable d'un clic (`user-select: all`).
+- Les textes ajoutés sont en anglais (règle AC29) ; le reste de la carte mêle encore français et
+  anglais.

@@ -74,9 +74,15 @@ ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is pr
    types when their launcher asks for it, and the **server password**, only for a guest who types
    the address by hand in Project Zomboid. **The launcher code is not the server password**: typed
    into the launcher, the password is refused (`This is not the code of this file`).
-   `Ouvrir PZ` stays greyed out until your opponent is connected: each world is frozen while nobody
-   plays in it (`PauseEmpty=true`), and joining yours earlier would let it run alone. As soon as the
-   guest is identified, `Ouvrir PZ` joins your own server.
+   The lobby card reads top to bottom in the order you use it: **one primary button** (what you do
+   now), then the **launcher code** in large type (what you read aloud — click it to copy it), then
+   the link with `Copy link` and `Save launcher` (what you send). The QR code is folded away behind
+   *Show the QR code (phone)*: it only helps a phone. The invitation token is no longer shown.
+   The primary button reads `Waiting for your opponent…` (greyed out) until your opponent is
+   connected: each world is frozen while nobody plays in it (`PauseEmpty=true`), and joining yours
+   earlier would let it run alone. As soon as the guest is identified, it becomes `Open the game` and
+   joins your own server; once both of you are in, it reads `Starting the duel…`: the duel starts by
+   itself.
    **Whoever arrives first waits frozen.** While a player is missing, PZ Duel holds both worlds
    (`hold_time`): the player already in cannot move and the clock does not advance. As soon as both
    players are identified, both worlds are released together (`release_time`), once, just before the

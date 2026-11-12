@@ -22,6 +22,7 @@ let pollTimer = null;
 let toastTimer = null;
 let lastSeen = 0;             // `Date.now()` of the last successful `/api/state`: the last heartbeat
 let idleStopped = false;      // the idle quit was due when the service went silent
+let qrOpen = false;           // the folded QR was opened by the host: it stays open across renders (P9F13)
 
 // Idle quit (P9F4): the warning shows during these last seconds.
 const IDLE_WARN_S = 30;
@@ -349,7 +350,7 @@ function renderConfig() {
     ${canLaunch(setup) ? '' : setupCard()}
     <section class="card">
       <h2>Nouveau duel</h2>
-      <p class="sub">Tu héberges les deux serveurs. Ton adversaire n'aura qu'à scanner le QR.</p>
+      <p class="sub">You host both servers. Your opponent gets the launcher from you, and types the code you read aloud.</p>
 
       <label class="field"><span>Preset</span>
         <select id="f-preset">
@@ -520,6 +521,9 @@ const SERVER_PASSWORD_LABEL = 'Server password: only for a guest who types the a
 const TWO_SECRETS_TEXT = 'The launcher code is not the server password: type the code into the launcher, and the password into Project Zomboid only when joining by hand.';
 // `open_game` waits for the guest (P9F5): the host's world stays frozen until they join.
 const OPEN_GAME_WAIT = 'The game button unlocks as soon as your opponent is connected: your world stays frozen until then.';
+// P9F13: what the big code is for, and what it is not.
+const LAUNCHER_CODE_IS_NOT = 'Click the code to copy it. It is not a password, and not something to send with the file.';
+const SEND_LABEL = 'Send the link to your opponent (or the saved launcher), never in the same message as the code.';
 
 // Tout vient de `invite` : le service décide de ce qui existe et le dit en anglais.
 // P9F10: while a player is missing, the service freezes both worlds; the lobby says when a side
@@ -552,41 +556,60 @@ function holdNotice() {
   return parts.join('');
 }
 
+// P9F13: one primary action, its label follows the lobby. Disabled when it can do nothing, and
+// then it says why. The duel itself starts on its own once both players are in.
+const DUEL_STARTING = 'Both players are in: the duel starts by itself.';
+function primaryAction() {
+  const players = S.players || {};
+  if (!players.B) return { label: 'Waiting for your opponent…', disabled: true, why: OPEN_GAME_WAIT, id: 'open-game-wait' };
+  if (!players.A) return { label: 'Open the game', disabled: false, why: '', id: '' };
+  return { label: 'Starting the duel…', disabled: true, why: DUEL_STARTING, id: 'duel-starting' };
+}
+
+// P9F13: three zones, in the order they are used: what you do now, what you read aloud, what you
+// send. The invitation token (`inv.code`) is not shown any more: it looked like the launcher code.
 function inviteCard() {
   const inv = S.invite || {};
   const real = S.mode === 'real';
   const canSave = real && inv.address && !inv.launcher_refused;
-  const guestHere = Boolean(S.players && S.players.B);
+  const act = primaryAction();
   return `
     <section class="card">
       <h2>Invitation</h2>
-      <p class="sub">Send the link, the QR code or the launcher to your opponent.</p>
+      <div class="zone now" id="zone-now">
+        <button class="primary wide" data-action="open-game" ${act.disabled ? 'disabled' : ''}>${esc(act.label)}</button>
+        ${act.why ? `<p class="hint" id="${act.id}">${esc(act.why)}</p>` : ''}
+        ${S.mode === 'mock' ? '<div class="actions"><button class="ghost" data-action="simulate">Simuler l\'adversaire</button></div>' : ''}
+      </div>
       ${inv.scope_text ? `<p class="${inv.needs_address ? 'err' : 'notice'}">${esc(inv.scope_text)}</p>` : ''}
       ${inv.share_text ? `<p class="err">${esc(inv.share_text)}</p>` : ''}
       ${inv.launcher_refused ? `<p class="err">${esc(inv.launcher_refused)}</p>` : ''}
       <div class="invite">
-        ${inv.qr_text ? '<div class="qr" id="qr"></div>' : ''}
         <div class="invite-body">
-          ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
-          <div class="code">${esc(inv.code || '')}</div>
-          ${inv.launcher_code ? `<div class="secret" id="launcher-code">
+          ${inv.launcher_code ? `<div class="secret zone say" id="launcher-code">
             <p class="hint">${esc(LAUNCHER_CODE_LABEL)}</p>
-            <div class="line"><b>${esc(inv.launcher_code)}</b></div>
+            <div class="big-code" title="Click to copy" data-action="copy-code"><b>${esc(inv.launcher_code)}</b></div>
             <p class="hint">${esc(inv.launcher_code_text)}</p>
+            <p class="hint">${esc(LAUNCHER_CODE_IS_NOT)}</p>
           </div>` : ''}
+          <div class="zone send" id="zone-send">
+            <p class="hint">${esc(SEND_LABEL)}</p>
+            ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
+            <div class="actions">
+              ${inv.link ? '<button class="ghost" data-action="copy-link">Copy link</button>' : ''}
+              ${canSave ? '<button class="ghost" data-action="save-launcher">Save launcher</button>' : ''}
+            </div>
+            ${inv.qr_text ? `<details class="qr-fold" id="qr-fold" ${qrOpen ? 'open' : ''}>
+              <summary>Show the QR code (phone)</summary>
+              <div class="qr" id="qr"></div>
+            </details>` : ''}
+          </div>
           ${inv.needs_address ? '' : `<div class="secret" id="server-password">
             <p class="hint">${esc(SERVER_PASSWORD_LABEL)}</p>
             <div class="line">${esc(inv.ip)}:${inv.port}</div>
             <div class="line">server password: ${esc(inv.password)}</div>
           </div>`}
           ${inv.launcher_code && !inv.needs_address ? `<p class="notice">${esc(TWO_SECRETS_TEXT)}</p>` : ''}
-          <div class="actions">
-            ${inv.link ? '<button class="ghost" data-action="copy-link">Copy link</button>' : ''}
-            ${canSave ? '<button class="ghost" data-action="save-launcher">Save launcher</button>' : ''}
-            <button class="ghost" data-action="open-game" ${guestHere ? '' : 'disabled'}>Ouvrir PZ</button>
-            ${S.mode === 'mock' ? '<button class="ghost" data-action="simulate">Simuler l\'adversaire</button>' : ''}
-          </div>
-          ${guestHere ? '' : `<p class="hint" id="open-game-wait">${esc(OPEN_GAME_WAIT)}</p>`}
           ${real ? `<p class="hint" style="margin-top:10px">Ton accès, à garder pour toi : ${esc(S.config.host_address)}, mot de passe <b>${esc(S.config.host_password)}</b></p>` : ''}
           <p class="hint" style="margin-top:10px">Adversaire : ${S.players.B ? esc(S.players.B) : 'en attente…'}</p>
         </div>
@@ -747,6 +770,7 @@ document.addEventListener('click', async (ev) => {
   if (a === 'install-mod') { return setupAction('/api/setup/install-mod', {}); }
   if (a === 'choose-folder') { return setupAction('/api/setup/pz-dir', { folder: folderDraft }); }
   if (a === 'copy-link') { return copy(S.invite.link); }
+  if (a === 'copy-code') { return copy(S.invite.launcher_code); }
   if (a === 'save-launcher') { return saveLauncher(); }
   if (a === 'open-ports') { return answered(await api('/api/ports/open', {})); }
   if (a === 'set-address') { return answered(await api('/api/invite/address', { address: addressDraft })); }
@@ -766,6 +790,11 @@ document.addEventListener('click', async (ev) => {
   if (a === 'simulate') { return act('simulate_join'); }
   if (a === 'open-game') { return act('open_game'); }
 });
+
+// The QR fold keeps the host's choice: `shell` rewrites the card at each change (P9F13).
+document.addEventListener('toggle', (ev) => {
+  if (ev.target.id === 'qr-fold') qrOpen = ev.target.open;
+}, true);
 
 // Délégué : `shell` remplace ces champs, et leur saisie doit survivre à `poll`.
 document.addEventListener('input', (ev) => {

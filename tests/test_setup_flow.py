@@ -1091,14 +1091,17 @@ LAUNCHER_CODE = "0123456789abcdef"
 GUEST_PASSWORD = "mot-invite-42"
 
 
-def _render_invite(players: dict, invite: dict | None = None) -> str:
+def _render_invite(
+    players: dict, invite: dict | None = None, mode: str = "real", qr_open: bool = False
+) -> str:
     """Rend `inviteCard()` de `ui/app.js` sous Node, avec un état de lobby réel."""
     script = ui_script()
     esc = script[script.index("const esc = ") : script.index("const durLabel")]
     constants = script[
         script.index("const LAUNCHER_CODE_LABEL") : script.index("// Tout vient de `invite`")
     ]
-    card = script[script.index("function inviteCard()") : script.index("function renderLive()")]
+    # P9F13 : l'action primaire se décide juste avant la carte.
+    card = script[script.index("const DUEL_STARTING") : script.index("function renderLive()")]
     invite = {
         "ip": "192.168.1.20",
         "port": 17271,
@@ -1111,14 +1114,14 @@ def _render_invite(players: dict, invite: dict | None = None) -> str:
         **(invite or {}),
     }
     state = {
-        "mode": "real",
+        "mode": mode,
         "invite": invite,
         "players": players,
         "config": {"host_address": "127.0.0.1:17261", "host_password": "hote"},
     }
     program = (
         f"{esc}\n{constants}\n"
-        "let addressDraft = '';\n"
+        f"let addressDraft = '', qrOpen = {json.dumps(qr_open)};\n"
         "const portsBlock = () => '', playedTable = () => '';\n"
         f"const S = {json.dumps(state)};\n"
         f"{card}\n"
@@ -1214,3 +1217,105 @@ def test_p9f7_lobby_says_not_public_and_warning_before_the_button_and_shows_the_
     )
     done = subprocess.run([node, "-e", program], capture_output=True, text=True, timeout=30, check=True)
     assert done.stdout == "49271 -> 17271/UDP, 49280/TCP, 1/TCP"
+
+
+# -- P9F13 : un lobby lisible — l'action, le code du lanceur en gros, le lien, le QR replié ---------
+
+INVITE_TOKEN = "PZ-9876"
+INVITE_LINK = "http://192.168.1.20:17280/join/abcdef"
+FULL_INVITE = {"code": INVITE_TOKEN, "link": INVITE_LINK, "qr_text": INVITE_LINK}
+
+
+def test_p9f13_invitation_token_is_not_rendered():
+    """Le jeton d'invitation ressemblait au code du lanceur : il ne s'affiche plus.
+
+    Mutation : remettre `<div class="code">${esc(inv.code || '')}</div>` dans `inviteCard`.
+    """
+    for players in ({"A": None, "B": None}, {"A": None, "B": "dupont"}):
+        html = _render_invite(players, FULL_INVITE)
+        assert INVITE_TOKEN not in html
+        assert 'class="code"' not in html
+        assert LAUNCHER_CODE in html
+
+
+def test_p9f13_launcher_code_comes_before_the_link():
+    """Ordre d'usage : action primaire, code du lanceur, lien, QR replié.
+
+    Mutation : remonter le bloc `id="zone-send"` (lien, Copy link) au-dessus de `id="launcher-code"`.
+    """
+    html = _render_invite({"A": None, "B": None}, FULL_INVITE)
+    action = html.index('data-action="open-game"')
+    code = html.index(f"<b>{LAUNCHER_CODE}</b>")
+    link = html.index(INVITE_LINK)
+    copy_link = html.index('data-action="copy-link"')
+    fold = html.index('id="qr-fold"')
+    assert action < code < link < copy_link < fold
+    # Le code est en gros, monospace et copiable d'un clic.
+    assert f'class="big-code" title="Click to copy" data-action="copy-code"><b>{LAUNCHER_CODE}</b>' in html
+    script = ui_script()
+    assert "if (a === 'copy-code') { return copy(S.invite.launcher_code); }" in script
+    css = (UI_DIR / "style.css").read_text("utf-8")
+    big = css[css.index(".big-code {") :]
+    big = big[: big.index("}")]
+    assert "monospace" in big and "user-select: all" in big
+
+
+def test_p9f13_qr_is_folded_in_a_closed_details():
+    """Le QR ne sert qu'à un téléphone : replié, fermé par défaut, hors du flux principal.
+
+    Mutation : retirer le `<details>` autour de `<div class="qr" id="qr">`, ou le rendre `open`
+    d'office.
+    """
+    html = _render_invite({"A": None, "B": None}, FULL_INVITE)
+    (opening,) = re.findall(r'<details class="qr-fold" id="qr-fold"[^>]*>', html)
+    assert "open" not in opening
+    start = html.index(opening)
+    end = html.index("</details>", start)
+    assert html.count('id="qr"') == 1
+    assert start < html.index('id="qr"') < end
+    assert "Show the QR code (phone)" in html[start:end]
+    # Ouvert par l'hôte, il le reste d'un rendu à l'autre.
+    reopened = _render_invite({"A": None, "B": None}, FULL_INVITE, qr_open=True)
+    (opening,) = re.findall(r'<details class="qr-fold" id="qr-fold"[^>]*>', reopened)
+    assert "open" in opening
+    script = ui_script()
+    assert "if (ev.target.id === 'qr-fold') qrOpen = ev.target.open;" in script
+    # La phrase qui envoyait scanner le QR a disparu.
+    assert "scanner le QR" not in script
+
+
+def _primary(html: str) -> str:
+    (button,) = re.findall(r'<button class="primary[^"]*"[^>]*>[^<]*</button>', html)
+    return button
+
+
+def test_p9f13_one_primary_action_whose_label_follows_the_lobby():
+    """Une seule action accentuée, premier élément cliquable ; libellé selon la phase du lobby,
+    désactivée avec sa raison quand elle ne peut rien faire.
+
+    Mutation : un libellé fixe (`Open the game` partout), ou `disabled` retiré quand les deux
+    joueurs sont là, fait échouer ce test.
+    """
+    cases = (
+        ({"A": None, "B": None}, "Waiting for your opponent", True, "unlocks as soon as your opponent"),
+        ({"A": None, "B": "dupont"}, "Open the game", False, None),
+        ({"A": "hote", "B": "dupont"}, "Starting the duel", True, "the duel starts by itself"),
+    )
+    labels = set()
+    for players, label, disabled, reason in cases:
+        html = _plain(_render_invite(players, FULL_INVITE))
+        button = _primary(html)
+        assert label in button
+        labels.add(button.split(">")[1])
+        assert ("disabled" in button) is disabled
+        assert html.index(button) == html.index("<button")
+        if reason:
+            after = html[html.index(button) : html.index('id="launcher-code"')]
+            assert reason in after
+        else:
+            assert "unlocks as soon as" not in html and "starts by itself" not in html
+    assert len(labels) == len(cases)
+    # En mode simulé, l'action reste seule accentuée, le bouton de simulation est secondaire.
+    mock = _render_invite({"A": None, "B": None}, FULL_INVITE, mode="mock")
+    _primary(mock)
+    assert 'class="ghost" data-action="simulate"' in mock
