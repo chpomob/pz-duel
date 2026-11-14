@@ -1521,3 +1521,87 @@ def test_p9f15_start_sends_the_settings_and_no_loose_duration():
     assert "start.settings = draft.settings;" in start
     assert "duration_s" not in start and "day_length" not in start
     assert "'/api/settings'" in script or "'/api/settings' +" in script
+
+
+# -- Écran de fin : le vainqueur est celui que dit l'arbitre, nommé par son pseudo -------------
+
+
+def _verdict(state: dict) -> dict:
+    """Rend `matchVerdict(state)` de `ui/app.js` sous Node."""
+    script = ui_script()
+    code = script[script.index("const sideName = ") : script.index("function renderOver()")]
+    node = shutil.which("node")
+    assert node is not None, "node est requis pour rendre l'écran"
+    program = f"{code}\nprocess.stdout.write(JSON.stringify(matchVerdict({json.dumps(state)})));\n"
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
+    return json.loads(done.stdout)
+
+
+PSEUDOS = {"A": "durand", "B": "naylo"}
+
+
+def test_result_screen_names_the_referee_winner_not_the_best_score():
+    """Mort subite : le mort perd, même devant au score.
+
+    Mutation : relire le vainqueur sur `score` (`a > b ? 'A' : 'B'`) — `durand`, mort, gagnerait.
+    """
+    result = {"outcome": "death", "winner": "B", "reason": "mort subite du camp A"}
+    verdict = _verdict({"players": PSEUDOS, "score": {"A": 57, "B": 48}, "result": result})
+
+    assert verdict["winner"] == "B"
+    assert verdict["title"] == "naylo wins"
+    assert verdict["why"] == "durand died: sudden death."
+    assert verdict["detail"] == "mort subite du camp A"
+
+
+@pytest.mark.parametrize(
+    ("result", "title", "why"),
+    [
+        ({"outcome": "win", "winner": "A", "reason": "r"}, "durand wins", "Time is up: best score."),
+        ({"outcome": "draw", "winner": None, "reason": "r"}, "Draw", "Time is up: same score."),
+        (
+            {"outcome": "forfeit", "winner": "A", "reason": "r"},
+            "durand wins",
+            "naylo left the game for too long.",
+        ),
+        (
+            {"outcome": "invalidated", "winner": None, "reason": "r"},
+            "No winner",
+            "This match does not count.",
+        ),
+    ],
+)
+def test_result_screen_says_each_outcome_in_plain_words(result, title, why):
+    """Mutation : rendre `'Draw'` pour tout résultat sans vainqueur — un match invalidé
+    s'afficherait comme une égalité."""
+    verdict = _verdict({"players": PSEUDOS, "score": {"A": 3, "B": 3}, "result": result})
+
+    assert (verdict["title"], verdict["why"]) == (title, why)
+
+
+def test_result_screen_without_a_result_falls_back_on_the_score():
+    """Le mode simulé ne rend pas de `result` : le score tranche, sans pseudo s'il manque."""
+    state = {"players": {"A": None, "B": None}, "score": {"A": 1, "B": 4}, "result": None}
+
+    assert _verdict(state)["title"] == "Player B wins"
+    assert _verdict({**state, "score": {"A": 2, "B": 2}})["title"] == "Draw"
+
+
+def test_result_screen_is_built_from_the_verdict():
+    """Mutation : remettre `a > b ? 'victoire de A'` dans `renderOver`."""
+    script = ui_script()
+    over = script[script.index("function renderOver()") : script.index("function renderError()")]
+
+    assert "const verdict = matchVerdict(S);" in over
+    assert "${esc(verdict.title)}" in over and "verdict.why" in over
+    assert "victoire" not in script
+
+
+def test_config_screen_lists_no_mod_that_does_not_exist():
+    """`duelhud ✓` était écrit en dur : ce mod n'existe pas, la page ne l'annonce plus.
+
+    Mutation : remettre la ligne « Mods requis » de `renderConfig`.
+    """
+    assert "duelhud" not in ui_script()

@@ -470,10 +470,6 @@ function renderConfig() {
         </label>
       </div>
 
-      <div class="row"><span class="k">Mods requis</span>
-        <span class="v">duelcore <span style="color:var(--green)">✓</span> · duelhud <span style="color:var(--green)">✓</span>
-        <span class="hint"> (lecture seule)</span></span></div>
-
       <h2 style="margin-top:18px">Settings — ${esc(p.label || draft.preset || '')}</h2>
       <p class="sub">Chosen before the start, sealed with the table. The lobby announces the played table, narrowed if an atom is withdrawn.</p>
       ${settingsPanel()}
@@ -849,18 +845,47 @@ function refereeCard() {
     </section>`;
 }
 
+// The service decides who won (`result`): a player who dies loses, even ahead on kills. The page
+// only falls back on the score when no result came (simulated mode).
+const sideName = (state, side) => (state.players && state.players[side]) || `Player ${side}`;
+const OUTCOME_WHY = {
+  death: (state, loser) => `${sideName(state, loser)} died: sudden death.`,
+  forfeit: (state, loser) => `${sideName(state, loser)} left the game for too long.`,
+  win: () => 'Time is up: best score.',
+  draw: () => 'Time is up: same score.',
+  invalidated: () => 'This match does not count.',
+};
+function matchVerdict(state) {
+  const result = state.result;
+  const score = state.score || { A: 0, B: 0 };
+  if (!result) {
+    if (score.A === score.B) return { title: 'Draw', why: '', winner: null };
+    const side = score.A > score.B ? 'A' : 'B';
+    return { title: `${sideName(state, side)} wins`, why: '', winner: side };
+  }
+  const winner = result.winner === 'A' || result.winner === 'B' ? result.winner : null;
+  const loser = winner === 'A' ? 'B' : 'A';
+  const why = OUTCOME_WHY[result.outcome];
+  const title = winner ? `${sideName(state, winner)} wins`
+    : result.outcome === 'invalidated' ? 'No winner' : 'Draw';
+  return { title, why: why ? why(state, loser) : '', winner, detail: result.reason || '' };
+}
+
 function renderOver() {
   const a = S.score.A, b = S.score.B;
-  const verdict = a === b ? 'égalité' : a > b ? 'victoire de A' : 'victoire de B';
+  const verdict = matchVerdict(S);
+  const won = (side) => (verdict.winner === side ? ' winner' : '');
   shell(`
     <section class="card">
-      <h2>Match terminé</h2>
+      <h2 id="verdict">${esc(verdict.title)}</h2>
+      ${verdict.why ? `<p class="notice" id="verdict-why">${esc(verdict.why)}</p>` : ''}
       <p class="sub">${esc(S.config.preset_label || '')} · ${durLabel(S.config.duration_s || 0)}</p>
       <div class="scorebar">
-        <div class="side"><div class="n">${a}</div><div class="who">${esc(S.players.A || 'A')}</div></div>
-        <div class="vs">${esc(verdict)}</div>
-        <div class="side"><div class="n">${b}</div><div class="who">${esc(S.players.B || 'B')}</div></div>
+        <div class="side${won('A')}"><div class="n">${a}</div><div class="who">${esc(sideName(S, 'A'))}</div></div>
+        <div class="vs">VS</div>
+        <div class="side${won('B')}"><div class="n">${b}</div><div class="who">${esc(sideName(S, 'B'))}</div></div>
       </div>
+      ${verdict.detail ? `<details class="fold"><summary>Referee's note</summary><p class="hint">${esc(verdict.detail)}</p></details>` : ''}
       ${playedTable()}
       <div class="actions">
         <button class="primary" data-action="rematch">Revanche</button>
