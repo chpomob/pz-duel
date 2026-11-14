@@ -1663,3 +1663,88 @@ def test_both_feeds_go_through_the_readable_text():
 
     assert "esc(e.text)" not in script
     assert script.count("${feedList()}") == 2
+
+
+# -- Le jargon est replié : la table jouée, le hash et la dérive ne sont pas pour le joueur ----
+
+
+def _played_table(state: dict, fold_open: dict | None = None) -> str:
+    """Rend `playedTable()` de `ui/app.js` sous Node."""
+    script = ui_script()
+    esc = script[script.index("const esc = ") : script.index("const durLabel")]
+    code = script[script.index("function playedTable()") : script.index("// ------", script.index("function playedTable()"))]
+    node = shutil.which("node")
+    assert node is not None, "node est requis pour rendre l'écran"
+    program = (
+        f"{esc}\nconst foldOpen = {json.dumps(fold_open or {})};\n"
+        f"const S = {json.dumps(state)};\n{code}\nprocess.stdout.write(playedTable());\n"
+    )
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
+    return done.stdout
+
+
+TABLE_STATE = {
+    "phase": "running",
+    "capabilities": {
+        "table": {"atoms": ["zombie_kill"], "rules": ["kill_baseline"]},
+        "disabled_rules": [],
+    },
+    "config": {"rules_hash": "abc123"},
+    "threats_per_min": 4.5,
+    "clock": {"drift_s": 1.5},
+}
+
+
+def test_technical_lines_are_folded_and_closed_by_default():
+    """Mutation : sortir les lignes du `<details>` — le lobby réaffiche atomes et hash au joueur."""
+    html = _played_table(TABLE_STATE)
+    fold = html[html.index("<details") : html.index("</details>")]
+
+    assert '<details class="fold" id="fold-tech" >' in html
+    for technical in ("zombie_kill", "kill_baseline", "abc123", "Threats per minute: 4.5", "Clock drift: 1.5 s"):
+        assert technical in fold
+        assert technical not in html.replace(fold, "")
+
+
+def test_opened_fold_stays_open_across_renders():
+    """`shell` réécrit la carte à chaque changement de score : le choix du spectateur tient.
+
+    Mutation : retirer `foldOpen['fold-tech']` du gabarit — le pli se referme à chaque kill.
+    """
+    assert '<details class="fold" id="fold-tech" open>' in _played_table(TABLE_STATE, {"fold-tech": True})
+    script = ui_script()
+    assert (
+        "if (ev.target.classList.contains('fold') && ev.target.id) foldOpen[ev.target.id] = ev.target.open;"
+        in script
+    )
+
+
+def test_withdrawn_rule_is_said_outside_the_fold():
+    """Une règle retirée change la partie : elle ne se cache pas dans les détails techniques."""
+    state = json.loads(json.dumps(TABLE_STATE))
+    state["capabilities"]["disabled_rules"] = ["hurt_supply"]
+    html = _played_table(state)
+
+    assert html.index("Rules withdrawn from this match: hurt_supply") < html.index("<details")
+
+
+def test_drift_and_threats_only_show_while_the_match_runs():
+    html = _played_table({**TABLE_STATE, "phase": "lobby"})
+
+    assert "Clock drift" not in html and "Threats per minute" not in html
+    assert _played_table({**TABLE_STATE, "capabilities": {}}) == ""
+
+
+def test_config_screen_says_what_the_preset_does():
+    """Le résumé du preset existait dans l'API sans être affiché nulle part.
+
+    Mutation : retirer le bloc `preset-rules` de `renderConfig`.
+    """
+    script = ui_script()
+    config = script[script.index("function renderConfig()") : script.index("function stepsList()")]
+
+    assert 'id="preset-rules"' in config
+    assert "p.summary.map((line) => `<li>${esc(line)}</li>`)" in config
+    assert config.index('id="f-preset"') < config.index('id="preset-rules"') < config.index('id="f-players"')

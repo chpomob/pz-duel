@@ -25,6 +25,7 @@ let lastSeen = 0;             // `Date.now()` of the last successful `/api/state
 let idleStopped = false;      // the idle quit was due when the service went silent
 let qrOpen = false;           // the folded QR was opened by the host: it stays open across renders (P9F13)
 const qrOpenSides = {};       // the same, for each side of a referee lobby (P9F14)
+const foldOpen = {};          // any other fold the viewer opened, by id: a render keeps it open
 
 // Idle quit (P9F4): the warning shows during these last seconds.
 const IDLE_WARN_S = 30;
@@ -454,6 +455,11 @@ function renderConfig() {
         </select>
       </label>
 
+      ${(p.summary || []).length ? `<div class="preset-rules" id="preset-rules">
+        <p class="hint">What this preset does, before you change any setting:</p>
+        <ul>${p.summary.map((line) => `<li>${esc(line)}</li>`).join('')}</ul>
+      </div>` : ''}
+
       <label class="field"><span>Who plays</span>
         <select id="f-players">
           <option value="host" ${draft.mode !== 'referee' ? 'selected' : ''}>Me and a guest</option>
@@ -507,13 +513,21 @@ function stepsList() {
 }
 
 // La table que le service joue : ni le preset, ni un calcul de l'UI. Le hash vient de la même table.
+// A player needs none of this to play: it is folded, for whoever referees or debugs. A rule
+// withdrawn from this match changes the game, so that one line stays in the open.
 function playedTable() {
   const table = S.capabilities && S.capabilities.table;
   if (!table) return '';
   const rules = S.capabilities.disabled_rules || [];
-  return `<p class="hint">Table jouée : atomes ${esc(table.atoms.join(', '))} ; règles ${esc(table.rules.join(', ') || 'aucune')}</p>
-    ${rules.length ? `<p class="hint">Règles retirées de ce match : ${esc(rules.join(', '))}</p>` : ''}
-    <p class="hint">Hash des règles : ${esc(S.config.rules_hash || '')}</p>`;
+  const live = S.phase === 'running';
+  return `${rules.length ? `<p class="notice" id="rules-withdrawn">Rules withdrawn from this match: ${esc(rules.join(', '))}</p>` : ''}
+    <details class="fold" id="fold-tech" ${foldOpen['fold-tech'] ? 'open' : ''}>
+      <summary>Technical details</summary>
+      <p class="hint">Played table: atoms ${esc(table.atoms.join(', '))}; rules ${esc(table.rules.join(', ') || 'none')}</p>
+      <p class="hint">Rules hash: ${esc(S.config.rules_hash || '')}</p>
+      ${live ? `<p class="hint">Threats per minute: ${esc(S.threats_per_min)}</p>
+      <p class="hint">Clock drift: ${esc(S.clock.drift_s ?? '—')} s</p>` : ''}
+    </details>`;
 }
 
 // ---------------------------------------------------------------- ports (UPnP, R8)
@@ -739,8 +753,6 @@ function renderLive() {
           <div class="vs">VS</div>
           <div class="side"><div class="n">${S.score.B}</div><div class="who">${esc(S.players.B || 'B')}</div></div>
         </div>
-        <div class="row"><span class="k">Menaces / min</span><span class="v">${S.threats_per_min}</span></div>
-        <div class="row"><span class="k">Dérive d'horloge</span><span class="v">${S.clock.drift_s ?? '—'} s</span></div>
         ${playedTable()}
         <div class="actions">${phase === 'running' ? '<button class="danger" data-action="cancel">Arrêter le match</button>' : ''}</div>
       </section>`;
@@ -914,7 +926,7 @@ function renderOver() {
         <div class="vs">VS</div>
         <div class="side${won('B')}"><div class="n">${b}</div><div class="who">${esc(sideName(S, 'B'))}</div></div>
       </div>
-      ${verdict.detail ? `<details class="fold"><summary>Referee's note</summary><p class="hint">${esc(verdict.detail)}</p></details>` : ''}
+      ${verdict.detail ? `<details class="fold" id="fold-note" ${foldOpen['fold-note'] ? 'open' : ''}><summary>Referee's note</summary><p class="hint">${esc(verdict.detail)}</p></details>` : ''}
       ${playedTable()}
       <div class="actions">
         <button class="primary" data-action="rematch">Revanche</button>
@@ -1043,6 +1055,7 @@ document.addEventListener('click', async (ev) => {
 document.addEventListener('toggle', (ev) => {
   if (ev.target.id === 'qr-fold') qrOpen = ev.target.open;
   if (ev.target.id.startsWith('qr-fold-')) qrOpenSides[ev.target.id] = ev.target.open;
+  if (ev.target.classList.contains('fold') && ev.target.id) foldOpen[ev.target.id] = ev.target.open;
 }, true);
 
 // Délégué : `shell` remplace ces champs, et leur saisie doit survivre à `poll`.

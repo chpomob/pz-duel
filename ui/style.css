@@ -188,3 +188,7 @@ label.field.check input { width: auto; }
 label.field.check small.help { flex-basis: 100%; }
 .summary-line { margin: 12px 0 0; padding: 9px 12px; border: 1px dashed var(--line); border-radius: 7px; font-size: 13px; overflow-wrap: anywhere; }
 .summary-line .k { color: var(--dim); }
+
+.preset-rules { margin: 4px 0 12px; }
+.preset-rules ul { margin: 4px 0 0; padding-left: 18px; color: var(--text, inherit); font-size: 13.5px; }
+.preset-rules li { margin: 2px 0; }
