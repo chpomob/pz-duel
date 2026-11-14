@@ -32,6 +32,7 @@ from secrets import token_hex
 from typing import Any, NamedTuple
 
 from . import paths, upnp
+from .announce import AnnounceError, MatchAnnouncer
 from .guest_launcher import (
     ADDRESS_REFUSED,
     PASSWORD_ALLOWED,
@@ -179,6 +180,8 @@ HOLD_OFF = "off"
 HOLD_UNSUPPORTED = "unsupported"
 HOLD_SENT = "sent"
 HOLD_HELD = "held"
+# Annonce de fin : temps laissé à la file d'annonces pour partir avant le préavis.
+END_FLUSH_S = 3.0
 HOLD_REFUSED = "refused"
 HOLD_RELEASED = "released"
 HOLD_RELEASE_REFUSED = "release_refused"
@@ -630,9 +633,12 @@ class RealMatch:
         proofs: HookProofs,
         mod_print: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        announcer: MatchAnnouncer | None = None,
     ) -> None:
         self.config = config
         self.table = table
+        # Annonces en jeu : jamais requises, jamais attendues. `None` : le match n'en fait pas.
+        self._announcer = announcer
         self.preset_hash = rules_hash(table)
         # Seule source de vérité : le cœur la joue, `rules_hash` en dérive, l'UI la publie.
         # Le lobby la suit au fil des échecs connus ; `_close_window` la fige avant le décompte.
@@ -901,6 +907,8 @@ class RealMatch:
         self._poll_acks()
         refusal = None if self._reading_behind() else self._advance(now_ms)
         self._publish(now_ms)
+        held = [side for side in SIDES if self._hold_view[side]["status"] == HOLD_HELD]
+        self._announce(lambda announcer: announcer.waiting(now_ms, dict(self.players), held))
         if refusal is None:
             return None
         self._on_state(lambda state: state.set_step(refusal.step, STATUS_ERROR, refusal.message))
@@ -934,6 +942,42 @@ class RealMatch:
             state.event("le duel commence")
 
         self._on_state(change)
+        self._announce(
+            lambda announcer: announcer.started(self._names(), duration_s, self._played_table)
+        )
+
+    def _names(self) -> dict[str, str | None]:
+        """Le nom de chaque camp pour les annonces : celui lié au camp, même une fois parti.
+
+        `players` dit qui est là maintenant ; un joueur mort ou déconnecté n'y est plus, et la
+        fin doit encore le nommer à son adversaire.
+        """
+        return {side: self.players[side] or self._identities.get(side) for side in SIDES}
+
+    def _announce(self, say: Callable[[MatchAnnouncer], None]) -> None:
+        """Passe une annonce en jeu ; une panne d'annonce ne touche jamais au match."""
+        if self._announcer is None:
+            return
+        try:
+            say(self._announcer)
+        except Exception as exc:
+            LOGGER.warning("annonce en jeu : %s", self.redactor.redact_exception(exc))
+
+    def end_notice(self, wait: Callable[[float], Any]) -> None:
+        """Laisse au joueur le temps de lire la fin avant que son serveur ne s'arrête.
+
+        Sans match jugé, ou si aucune annonce n'est jamais arrivée, personne ne lit : rien
+        n'attend. `wait` est celui de l'annulation : `Quit` ou `cancel` coupent court.
+        """
+        if self._announcer is None or self.result is None:
+            return
+        notice_s = self._announcer.end_notice_s
+
+        def flush(announcer: MatchAnnouncer) -> None:
+            if announcer.flush(END_FLUSH_S) and notice_s > 0:
+                wait(notice_s)
+
+        self._announce(flush)
 
     def _settle_conclusion(self, now_ms: int) -> None:
         """Laisse retomber le tampon du mod, puis relit `out` à sa fin, une seule fois par fin due.
@@ -1313,6 +1357,7 @@ class RealMatch:
             notes.append(f"journal incomplet : {self._lost_lines} lignes perdues")
         self.result = result
         score = record["data"]["score"]
+        self._announce(lambda announcer: announcer.ended(result, self._names(), score))
 
         def change(state: MatchState) -> None:
             state.result = result
@@ -1345,6 +1390,12 @@ class RealMatch:
                 state.event(text, side, what)
 
         self._on_state(change)
+        if self.result is None:
+            self._announce(
+                lambda announcer: announcer.tick(
+                    int(mt * MS_PER_S), records, self._names(), score, clock["remaining_s"]
+                )
+            )
 
     def _now_ms(self) -> int:
         return int(self._monotonic() * MS_PER_S)
@@ -2058,6 +2109,7 @@ class RealMatch:
                 with self._relaunch_lock:
                     self._closing.set()
                 self._stopped = self.pair.close()
+                self._announce(lambda announcer: announcer.close())
             return self._stopped
 
     def close(self) -> None:
@@ -2085,7 +2137,11 @@ class Engine:
         server_factory: Callable[..., ServerProcess] | None = None,
         platform: Platform | None = None,
         upnp_target: tuple[str, int] | None = None,
+        announcer_factory: Callable[[Mapping[str, Any], str], MatchAnnouncer | None] | None = None,
     ) -> None:
+        # Annonces en jeu : seul `service.main` en donne une fabrique. Sans elle, aucun match
+        # n'ouvre de connexion RCON hors de l'arrêt.
+        self._announcer_factory = announcer_factory
         if mode not in MODES:
             raise ValueError(f"mode inconnu : {mode}")
         self.mode = mode
@@ -3421,6 +3477,7 @@ class Engine:
                 return None
             secrets = MatchSecrets(gen_secret(), gen_secret())
             self._redactor = Redactor(secrets)
+            announcer = self._open_announcer(secrets.rcon_password)
             self._match = RealMatch(
                 self.state.config,
                 table,
@@ -3438,12 +3495,26 @@ class Engine:
                 server_factory=self._server_factory,
                 on_status=self._on_server_status,
                 on_state=self._change_state,
+                announcer=announcer,
             )
             self.state.match_id = self._match.match_id
             self.state.config["rules_hash"] = self._match.rules_hash
             self.state.phase = "starting"
             self.state.log("préparation des mondes et des réglages")
             return self._match
+
+    def _open_announcer(self, rcon_password: str) -> MatchAnnouncer | None:
+        """Rend les annonces du match, `None` sans fabrique, coupées, ou mal réglées.
+
+        Un réglage `announce` invalide ne refuse pas le duel : il se dit dans les logs.
+        """
+        if self._announcer_factory is None:
+            return None
+        try:
+            return self._announcer_factory(self.runtime, rcon_password)
+        except AnnounceError as exc:
+            self.state.log(f"annonces en jeu coupées : {exc}", "warn")
+            return None
 
     def _on_server_status(self, side: str, status: str, detail: str) -> None:
         with self.lock:
@@ -3502,6 +3573,7 @@ class Engine:
         """Toute sortie passe ici : arrêt d'abord, puis état final, puis fermeture du journal."""
         self._close_share()
         match.enter_phase("stopping")
+        match.end_notice(self._stop.wait)
         stopped = match.shutdown()
         with self.lock:
             self._match = None
@@ -3671,6 +3743,8 @@ class Engine:
                                 f"{side} tue {n} zombie{'s' if n > 1 else ''} → "
                                 f"{n * 2} chez {other}",
                                 side,
+                                # Le même fait qu'en réel : la démo montre le fil lisible.
+                                {"command": "spawn_pop", "to": other, "n": n * 2},
                             )
                     self.state.threats_per_min = round(random.uniform(1.5, 6.5), 1)
         with self.lock:

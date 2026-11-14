@@ -32,6 +32,13 @@
   "replace_retry_ms": 100,
   "instance_wait_s": 10,
   "idle_quit_s": 120,
+  "announce": {
+    "enabled": true,
+    "lang": "fr",
+    "wave_gap_s": 10,
+    "waiting_repeat_s": 45,
+    "end_notice_s": 8
+  },
   "day_length_minutes": {
     "1": 15,
     "2": 30,

@@ -21,6 +21,7 @@ from typing import IO, Any
 
 from . import paths, platforms
 from .api import BODY_MAX, LOCAL_NAMES, SERVER_TOKEN, claim_address, make_server
+from .announce import rcon_announcer
 from .engine import STOP_INCOMPLETE, Engine
 from .preflight import MOD_SRC, detect_pz, install_mod, mod_fingerprint
 from .rules import load_runtime
@@ -280,7 +281,11 @@ def serve(
             sys.exit(detection.message)
         report(detection.message)
 
-    engine = (Engine if make_engine is None else make_engine)(mode=args.mode, pz_dir=args.pz_dir)
+    if make_engine is None:
+        # Le vrai service annonce en jeu ; un moteur fourni (tests) n'ouvre aucun RCON d'annonce.
+        engine = Engine(mode=args.mode, pz_dir=args.pz_dir, announcer_factory=rcon_announcer)
+    else:
+        engine = make_engine(mode=args.mode, pz_dir=args.pz_dir)
     port = free_port(args.port)
     httpd = make_server(engine, port=port)
     # Avant toute requête : aucun serveur ne peut partir sans que le signal l'arrête. La sortie

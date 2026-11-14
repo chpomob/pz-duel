@@ -138,6 +138,37 @@ dossier `matches` et le verrou d'instance unique (avec le port où il écoute).
    succès, le mod `duelcore` qu'il a remplacé n'est pas supprimé : il est gardé dans
    `Zomboid\duelcore.previous`, dans votre dossier utilisateur, et la fenêtre dit comment y revenir.
 
+### Ce que le joueur voit en jeu
+
+> ⚠️ **Pas encore constaté en jeu.** La commande `servermsg` existe dans le build 42.22.2 et les
+> annonces sont testées contre un faux serveur ; personne n'a encore vérifié à l'écran qu'elles
+> s'affichent, ni comment, pendant que le monde est figé.
+
+Pendant un duel, personne ne regarde la page, et l'invité ne la voit jamais. PZ Duel dit donc
+l'essentiel dans la partie de chaque joueur, par le message serveur du jeu (`servermsg`, envoyé par
+RCON). Chaque serveur n'a qu'un joueur : ce qu'on lui dit n'est lu que par lui.
+
+- **En attendant l'adversaire** : « en attente de ton adversaire. Ton monde est fige jusqu'a son
+  arrivee, c'est normal », redit toutes les 45 s.
+- **Au départ** : l'adversaire, la durée, et la règle de base quand elle est simple (« Chaque zombie
+  que tu tues en envoie 10 chez naylo »).
+- **Quand on t'envoie des zombies** : « naylo t'envoie 30 zombies ! Score : toi 12 - 9 naylo. Reste
+  18 min ». Les envois se cumulent : au plus une annonce toutes les 10 s par joueur, qui part au
+  moment où la commande part, donc avant le préavis des pops.
+- **Une caisse de soin** larguée près de toi, et **le temps restant** à 10, 5 et 1 minute.
+- **À la fin** : gagné, perdu, égalité ou match annulé, avec la raison (« naylo est mort ») et le
+  score. Si une annonce est arrivée pendant le duel, les serveurs attendent 8 s avant de se fermer,
+  le temps de lire ; `Quit` ou `Annuler` coupent cette attente.
+
+Les textes sont sans accent : rien ne garantit l'encodage d'un accent jusqu'à l'écran du jeu. Une
+annonce qui ne part pas (serveur occupé, RCON muet) est perdue sans conséquence : elle ne touche ni
+au score, ni au journal, ni au rejeu.
+
+Réglages, dans `service/runtime.json`, clé `announce` : `enabled` (`false` coupe tout), `lang`
+(`fr` ou `en`), `wave_gap_s` (10), `waiting_repeat_s` (45, `0` : une seule fois), `end_notice_s`
+(8, `0` : pas d'attente). Une valeur invalide coupe les annonces et le dit dans les logs de la
+page ; elle ne refuse jamais un duel.
+
 ### Deux invités (mode arbitre)
 
 Le PC qui lance PZ Duel n'est pas obligé de jouer. Dans `Configurer un duel`, **Who plays** propose

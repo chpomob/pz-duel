@@ -1082,6 +1082,10 @@ class StoppingMatch:
     def enter_phase(self, phase: str) -> None:
         self.closed_first.append(self.share.closed == 1)
 
+    def end_notice(self, wait) -> None:
+        # Le préavis de fin dure aussi : l'écouteur doit être fermé avant lui.
+        self.closed_first.append(self.share.closed == 1)
+
     def shutdown(self) -> bool:
         self.closed_first.append(self.share.closed == 1)
         return True
@@ -1117,7 +1121,8 @@ def test_ac40_finish_closes_before_stopping_the_servers(open_share):
 
     engine._finish_match(match, None)
 
-    assert match.closed_first and all(match.closed_first)
+    # Trois passages : la phase d'arrêt, le préavis de fin, puis l'arrêt des serveurs.
+    assert len(match.closed_first) == 3 and all(match.closed_first)
     assert share.closed == 1
 
 

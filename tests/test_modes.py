@@ -226,7 +226,12 @@ def test_pz_dir_option_reaches_the_real_engine(tmp_path, monkeypatch):
     with pytest.raises(Built):
         main_module.main()
 
-    assert built == {"mode": "real", "pz_dir": str(install)}
+    # Le vrai service branche aussi les annonces en jeu (voir `tests/test_announce.py`).
+    assert built == {
+        "mode": "real",
+        "pz_dir": str(install),
+        "announcer_factory": main_module.rcon_announcer,
+    }
 
 
 @pytest.mark.parametrize(
