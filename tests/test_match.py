@@ -719,6 +719,10 @@ def test_full_real_path(engine_rig, presets, runtime, monkeypatch):
     assert state["threats_per_min"] == 1.0
     assert state["clock"]["remaining_s"] < state["config"]["duration_s"]
     assert any("spawn_pop" in event["text"] for event in state["events"])
+    # Le fil porte aussi le fait, sans phrase : la page en tire « 2 zombies sent to … ».
+    facts = [event.get("what") for event in state["events"]]
+    assert {"command": "spawn_pop", "to": "B", "n": 2} in facts
+    assert {"event": "zombie_kill", "by": "A"} in facts
 
     duel.at_match(state["config"]["duration_s"])
     state = duel.finish()
@@ -4116,3 +4120,29 @@ def test_p9f14_unknown_play_mode_is_refused_before_any_effect(engine_rig):
     ok, message = engine.action("start", {"preset": PRESET, "mode": "spectator"})
     assert not ok and "host ou referee" in message
     assert engine.snapshot()["phase"] == "idle"
+
+
+def test_feed_line_names_the_fact_beside_its_text():
+    """Mutation : rendre `{}` pour `what` — la page retombe sur `spawn_pop × 10 vers B`."""
+    feed = engine_module._feed_line
+    command = {"kind": "spawn_pop", "n": 10, "seq": 4}
+    sent = {"type": "command", "side": "B", "data": {"command": command}}
+    assert feed(sent) == ("spawn_pop × 10 vers B", "B", {"command": "spawn_pop", "to": "B", "n": 10})
+
+    rain = {"type": "command", "side": "A", "data": {"command": {"kind": "weather_rain", "seq": 5}}}
+    assert feed(rain) == ("weather_rain vers A", "A", {"command": "weather_rain", "to": "A"})
+
+    kill = {"type": "event", "side": "A", "data": {"kind": "zombie_kill"}}
+    assert feed(kill) == ("A : zombie_kill", "A", {"event": "zombie_kill", "by": "A"})
+
+    for silent in ("beat", "caps", "hook_seen"):
+        assert feed({"type": "event", "side": "A", "data": {"kind": silent}}) is None
+
+
+def test_event_without_a_fact_keeps_its_three_keys():
+    state = MatchState()
+    state.event("le duel commence")
+    state.event("A : zombie_kill", "A", {"event": "zombie_kill", "by": "A"})
+
+    assert set(state.events[0]) == {"t", "side", "text"}
+    assert state.events[1]["what"] == {"event": "zombie_kill", "by": "A"}

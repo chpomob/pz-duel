@@ -542,15 +542,22 @@ class ContractWindow:
         )
 
 
-def _feed_line(record: Mapping[str, Any]) -> tuple[str, str] | None:
-    """Rend le texte et le camp d'une ligne du fil de match, `None` si elle n'y figure pas."""
+def _feed_line(record: Mapping[str, Any]) -> tuple[str, str, dict[str, Any]] | None:
+    """Rend le texte, le camp et le fait d'une ligne du fil de match, `None` si elle n'y figure pas.
+
+    Le fait (`what`) nomme ce qui s'est passé sans phrase : la page en tire une ligne lisible,
+    avec les pseudos ; le texte reste, pour les logs et pour un fait qu'elle ne connaît pas.
+    """
     data, side = record["data"], record["side"]
     if record["type"] == COMMAND:
         command = data[COMMAND]
         units = f" × {command['n']}" if "n" in command else ""
-        return f"{command['kind']}{units} vers {side}", side
+        what = {"command": command["kind"], "to": side}
+        if "n" in command:
+            what["n"] = command["n"]
+        return f"{command['kind']}{units} vers {side}", side, what
     if record["type"] == EVENT and side is not None and data["kind"] not in (BEAT, CAPS, HOOK_SEEN):
-        return f"{side} : {data['kind']}", side
+        return f"{side} : {data['kind']}", side, {"event": data["kind"], "by": side}
     return None
 
 
@@ -1334,8 +1341,8 @@ class RealMatch:
             state.score = score
             state.clock = clock
             state.threats_per_min = threats
-            for text, side in feed:
-                state.event(text, side)
+            for text, side, what in feed:
+                state.event(text, side, what)
 
         self._on_state(change)
 

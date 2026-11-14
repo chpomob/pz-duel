@@ -1605,3 +1605,61 @@ def test_config_screen_lists_no_mod_that_does_not_exist():
     Mutation : remettre la ligne « Mods requis » de `renderConfig`.
     """
     assert "duelhud" not in ui_script()
+
+
+# -- Fil du match : des phrases avec les pseudos, pas des noms de commandes --------------------
+
+
+def _feed(events: list[dict], players: dict) -> list[str]:
+    """Rend `feedText` de `ui/app.js` sous Node pour chaque ligne du fil."""
+    script = ui_script()
+    code = script[script.index("const sideName = ") : script.index("const OUTCOME_WHY")]
+    code += script[script.index("const FEED_COMMANDS") : script.index("const feedList")]
+    node = shutil.which("node")
+    assert node is not None, "node est requis pour rendre l'écran"
+    program = (
+        f"{code}\nconst state = {json.dumps({'players': players})};\n"
+        f"process.stdout.write(JSON.stringify({json.dumps(events)}.map((e) => feedText(e, state))));\n"
+    )
+    done = subprocess.run(
+        [node, "-e", program], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
+    return json.loads(done.stdout)
+
+
+def test_feed_says_what_happened_with_the_players_names():
+    """Mutation : rendre `e.text` dans `feedText` — le fil redit `spawn_pop × 10 vers B`."""
+    events = [
+        {"text": "A : zombie_kill", "what": {"event": "zombie_kill", "by": "A"}},
+        {"text": "spawn_pop × 10 vers B", "what": {"command": "spawn_pop", "to": "B", "n": 10}},
+        {"text": "spawn_pop × 1 vers A", "what": {"command": "spawn_pop", "to": "A", "n": 1}},
+        {"text": "supply_drop vers B", "what": {"command": "supply_drop", "to": "B"}},
+        {"text": "B : player_death", "what": {"event": "player_death", "by": "B"}},
+    ]
+
+    assert _feed(events, PSEUDOS) == [
+        "durand killed a zombie",
+        "10 zombies sent to naylo",
+        "1 zombie sent to durand",
+        "A medical crate dropped near naylo",
+        "naylo died",
+    ]
+
+
+def test_feed_keeps_the_service_text_for_a_fact_it_does_not_know():
+    """Un atome ajouté au mod sans phrase ici reste visible, tel que le service l'écrit."""
+    events = [
+        {"text": "le duel commence"},
+        {"text": "A : new_atom", "what": {"event": "new_atom", "by": "A"}},
+        {"text": "new_cmd vers B", "what": {"command": "new_cmd", "to": "B"}},
+    ]
+
+    assert _feed(events, {"A": None, "B": None}) == ["le duel commence", "A : new_atom", "new_cmd vers B"]
+
+
+def test_both_feeds_go_through_the_readable_text():
+    """Mutation : remettre `esc(e.text)` dans le fil du match en cours ou de l'écran de fin."""
+    script = ui_script()
+
+    assert "esc(e.text)" not in script
+    assert script.count("${feedList()}") == 2

@@ -750,7 +750,7 @@ function renderLive() {
     }
     if (S.events.length) {
       body += `<section class="card"><h2>Fil du match</h2>
-        <ul class="feed">${S.events.slice().reverse().map((e) => `<li><span class="t">${e.t}</span>${esc(e.text)}</li>`).join('')}</ul>
+        ${feedList()}
       </section>`;
     }
     return shell(body + `<section class="card">${serverChips()}</section>`);
@@ -871,6 +871,35 @@ function matchVerdict(state) {
   return { title, why: why ? why(state, loser) : '', winner, detail: result.reason || '' };
 }
 
+// The feed says what happened with the players' names. The service sends the fact (`what`); a
+// fact this page does not know keeps the service's own text.
+const FEED_COMMANDS = {
+  spawn_pop: (n, who) => `${n} zombie${n > 1 ? 's' : ''} sent to ${who}`,
+  probe_spawn: (n, who) => `A first zombie shows up near ${who}`,
+  spawn_sprinter: (n, who) => `${n} sprinter${n > 1 ? 's' : ''} sent to ${who}`,
+  horde_area: (n, who) => `A horde is heading for ${who}`,
+  noise: (n, who) => `A loud noise near ${who}`,
+  weather_rain: (n, who) => `Rain is falling on ${who}`,
+  supply_drop: (n, who) => `A medical crate dropped near ${who}`,
+};
+const FEED_EVENTS = {
+  zombie_kill: (who) => `${who} killed a zombie`,
+  damage_taken: (who) => `${who} got hurt`,
+  player_death: (who) => `${who} died`,
+  craft: (who) => `${who} crafted something`,
+  explosion: (who) => `${who} set off an explosion`,
+};
+function feedText(e, state) {
+  const what = e.what || {};
+  const command = FEED_COMMANDS[what.command];
+  if (command) return command(what.n || 1, sideName(state, what.to));
+  const event = FEED_EVENTS[what.event];
+  if (event) return event(sideName(state, what.by));
+  return e.text;
+}
+const feedList = () => `<ul class="feed">${S.events.slice().reverse().map((e) =>
+  `<li><span class="t">${e.t}</span>${esc(feedText(e, S))}</li>`).join('')}</ul>`;
+
 function renderOver() {
   const a = S.score.A, b = S.score.B;
   const verdict = matchVerdict(S);
@@ -893,7 +922,7 @@ function renderOver() {
       </div>
     </section>
     <section class="card"><h2>Fil du match</h2>
-      <ul class="feed">${S.events.slice().reverse().map((e) => `<li><span class="t">${e.t}</span>${esc(e.text)}</li>`).join('')}</ul>
+      ${feedList()}
     </section>`);
 }
 

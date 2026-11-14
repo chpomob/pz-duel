@@ -69,8 +69,12 @@ class MatchState:
         if len(self.logs) > 400:
             del self.logs[: len(self.logs) - 400]
 
-    def event(self, text: str, side: str = "-") -> None:
-        self.events.append({"t": time.strftime("%H:%M:%S"), "side": side, "text": text})
+    def event(self, text: str, side: str = "-", what: dict | None = None) -> None:
+        """Ajoute une ligne au fil ; `what`, s'il est donné, dit le fait sans phrase."""
+        line = {"t": time.strftime("%H:%M:%S"), "side": side, "text": text}
+        if what:
+            line["what"] = what
+        self.events.append(line)
         if len(self.events) > 60:
             del self.events[: len(self.events) - 60]
 
