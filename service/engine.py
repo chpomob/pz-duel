@@ -273,6 +273,9 @@ LAUNCHER_CODE_TEXT = (
     "This invitation is meant for a trusted network: "
     "the code is the only protection against a replaced file."
 )
+# P9F18 : le code du lanceur est une option du `start`, éteinte par défaut.
+LAUNCHER_CHECK = "launcher_check"
+LAUNCHER_CHECK_REFUSED = "launcher_check refusé : true ou false attendu"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -3209,12 +3212,17 @@ class Engine:
         invite = self._invite_fields(side)
         if not self.real:
             return invite, None, None
+        # P9F18 : sans l'option, le `.bat` ne demande rien et l'invitation ne porte aucun code.
+        check = self.state.config.get(LAUNCHER_CHECK) is True
         try:
-            launcher = build_launcher(invite["address"], invite["port"], invite["password"], mod)
+            launcher = build_launcher(
+                invite["address"], invite["port"], invite["password"], mod, check=check
+            )
         except LauncherRefused as refused:
             return invite, None, str(refused)
-        invite["launcher_code"] = launcher_code(launcher)
-        invite["launcher_code_text"] = LAUNCHER_CODE_TEXT.format(name=LAUNCHER_NAME)
+        if check:
+            invite["launcher_code"] = launcher_code(launcher)
+            invite["launcher_code_text"] = LAUNCHER_CODE_TEXT.format(name=LAUNCHER_NAME)
         return invite, launcher, None
 
     def _invite_fields(self, side: str = GUEST_SIDE) -> dict:
@@ -3314,6 +3322,11 @@ class Engine:
         play = payload.get("mode", PLAY_HOST)
         if not isinstance(play, str) or play not in PLAY_MODES:
             raise ActionRefused(PLAY_MODE_REFUSED)
+        # P9F18 : absent, pas de code. La revanche relit celui de `config`, pour que le `.bat`
+        # déjà donné reste le bon.
+        launcher_check = payload.get(LAUNCHER_CHECK, False)
+        if not isinstance(launcher_check, bool):
+            raise ActionRefused(LAUNCHER_CHECK_REFUSED)
         pseudo = _text_option(payload, "pseudo", "pseudo")
         password = _text_option(payload, "password", "mot de passe")
         if self.real:
@@ -3336,6 +3349,7 @@ class Engine:
             "code": code or make_code(),
             "summary": table["summary"],
             "mode": play,
+            LAUNCHER_CHECK: launcher_check,
         }
         if settings is not None:
             cfg["settings"] = settings

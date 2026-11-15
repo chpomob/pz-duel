@@ -1094,10 +1094,22 @@ LAUNCHER_CODE = "0123456789abcdef"
 GUEST_PASSWORD = "mot-invite-42"
 
 
+def _without_code(invite: dict) -> dict:
+    """L'invitation du défaut (P9F18) : le service n'y met ni code ni texte du code."""
+    return {key: value for key, value in invite.items() if not key.startswith("launcher_code")}
+
+
 def _render_invite(
-    players: dict, invite: dict | None = None, mode: str = "real", qr_open: bool = False
+    players: dict,
+    invite: dict | None = None,
+    mode: str = "real",
+    qr_open: bool = False,
+    code: bool = True,
 ) -> str:
-    """Rend `inviteCard()` de `ui/app.js` sous Node, avec un état de lobby réel."""
+    """Rend `inviteCard()` de `ui/app.js` sous Node, avec un état de lobby réel.
+
+    `code` faux : l'invitation est celle d'un duel lancé sans le code du lanceur (P9F18).
+    """
     script = ui_script()
     esc = script[script.index("const esc = ") : script.index("const durLabel")]
     constants = script[
@@ -1116,6 +1128,8 @@ def _render_invite(
         "needs_address": False,
         **(invite or {}),
     }
+    if not code:
+        invite = _without_code(invite)
     state = {
         "mode": mode,
         "invite": invite,
@@ -1335,7 +1349,7 @@ HOST_PASSWORD = "mot-hote-77"
 LAUNCHER_CODE_A = "fedcba9876543210"
 
 
-def _render_referee(players: dict, scope: dict | None = None) -> str:
+def _render_referee(players: dict, scope: dict | None = None, code: bool = True) -> str:
     """Rend `inviteCard()` d'un lobby arbitre réel sous Node : la carte bascule sur `refereeCard`."""
     script = ui_script()
     esc = script[script.index("const esc = ") : script.index("const durLabel")]
@@ -1355,6 +1369,8 @@ def _render_referee(players: dict, scope: dict | None = None) -> str:
     }
     for side, text in (scope or {}).items():
         (side_a if side == "A" else side_b)["scope_text"] = text
+    if not code:
+        side_a, side_b = _without_code(side_a), _without_code(side_b)
     state = {
         "mode": "real",
         "invite": {**side_b, "A": side_a},
@@ -1421,6 +1437,136 @@ def test_p9f14_start_carries_the_chosen_play_mode():
     start = script[script.index("if (a === 'start') {") :]
     assert "mode: draft.mode," in start[: start.index("});")]
     assert "await fetch(`/api/invite/launcher?side=${side}`)" in script
+
+
+# -- P9F18 : le code du lanceur est une option, éteinte par défaut -----------------------------
+
+CHECKBOX_LABEL = "Check the launcher code (paranoid)"
+# AC29 : tout texte ajouté à l'interface est en anglais ; c'est la phrase de l'étape, traduite.
+FILE_WARNING = (
+    "This file contains the server password: send it through a private channel, "
+    "and delete it after the game."
+)
+
+
+def test_p9f18_start_screen_sends_launcher_check_unchecked_by_default():
+    """Une case, à côté de « qui joue », décochée ; son état part dans le corps du `start`.
+
+    Mutation : retirer `launcher_check: draft.launcherCheck === true,` du corps du `start` —
+    cocher la case ne change plus rien ; ou `launcherCheck: true` dans `newDraft` — le code
+    redevient le défaut.
+    """
+    script = ui_script()
+    config = script[script.index("function renderConfig()") : script.index("function stepsList()")]
+    box = config[config.index('id="launcher-check"') :]
+    box = box[: box.index("</label>")]
+    assert '<input type="checkbox" id="f-launcher-check" ${draft.launcherCheck ? \'checked\' : \'\'}>' in box
+    assert f"<span>{CHECKBOX_LABEL}</span>" in box
+    # Une ligne, une phrase : le libellé, et ce que la case protège.
+    assert box.count("<span>") == 1 and box.count('<small class="help">') == 1
+    assert config.index('id="f-players"') < config.index('id="launcher-check"') < config.index('id="f-pseudo"')
+    assert "$('#f-launcher-check').onchange = (e) => { draft.launcherCheck = e.target.checked; };" in config
+    draft = script[script.index("function newDraft()") : script.index("const canLaunch")]
+    assert "launcherCheck: false," in draft
+    start = script[script.index("if (a === 'start') {") :]
+    assert "launcher_check: draft.launcherCheck === true," in start[: start.index("});")]
+    help_line = next(line for line in script.splitlines() if line.startswith("const LAUNCHER_CHECK_HELP"))
+    assert "file replaced" in help_line and help_line.count(". ") <= 1
+    # L'écran ne promet plus un code à lire quand il n'y en a pas par défaut.
+    assert "types the code you read aloud" not in config
+
+
+def test_p9f18_lobby_without_code_shows_one_sentence_and_no_big_code():
+    """Sans `launcher_code` : le lien, « Copy link », le `.bat` à enregistrer, le mot de passe
+    serveur, et une phrase unique à la place des avertissements sur le code.
+
+    Mutation : rendre le bloc `launcher-code` sans condition, ou retirer `LAUNCHER_FILE_WARNING`
+    de `sendZone` — le lobby montre un code vide, ou ne dit plus que le fichier porte le mot
+    de passe.
+    """
+    html = _plain(_render_invite({"A": None, "B": None}, FULL_INVITE, code=False))
+
+    assert 'id="launcher-code"' not in html and "big-code" not in html
+    assert 'data-action="copy-code"' not in html
+    for gone in ("Launcher code", "read it aloud", "not the server password", "same message as the code"):
+        assert gone not in html, gone
+    assert html.count(FILE_WARNING) == 1
+    assert f'<p class="notice" id="launcher-file-warning">{FILE_WARNING}</p>' in html
+    link = html.index(INVITE_LINK)
+    assert html.index(FILE_WARNING) < link < html.index('data-action="copy-link"')
+    assert 'data-action="save-launcher"' in html
+    password = _block(html, "server-password")
+    assert GUEST_PASSWORD in password and "by hand" in password
+
+    # Avec le code, rien ne change : le gros code, ses avertissements, et pas cette phrase.
+    checked = _plain(_render_invite({"A": None, "B": None}, FULL_INVITE))
+    assert FILE_WARNING not in checked
+    assert f"<b>{LAUNCHER_CODE}</b>" in checked and "same message as the code" in checked
+    # Sans lanceur à envoyer (duel simulé), la phrase n'a pas d'objet.
+    mock = _plain(_render_invite({"A": None, "B": None}, mode="mock", code=False))
+    assert FILE_WARNING not in mock
+
+
+def test_p9f18_referee_lobby_without_code_warns_once_per_side():
+    """Mutation : `sendZone` oublié dans `refereeSide` — le lobby arbitre garde la consigne
+    « never in the same message as the code » pour un code qui n'existe pas.
+
+    Revue P9F18 A1. Mutation : rendre `TWO_SECRETS_TEXT` sans condition dans `refereeCard` — le
+    lobby arbitre par défaut demande de taper dans le lanceur un code qui n'existe pas."""
+    html = _render_referee({"A": None, "B": None}, code=False)
+
+    assert "launcher-code-" not in html and "big-code" not in html
+    assert "same message as the code" not in html
+    assert "not the server password" not in html and "type the code" not in html
+    # Avec le code, la consigne reste, une seule fois pour les deux invitations.
+    assert _render_referee({"A": None, "B": None}).count("The launcher code is not the server password") == 1
+    assert html.count(FILE_WARNING) == 2
+    for side in ("A", "B"):
+        assert f'id="launcher-file-warning-{side}">{FILE_WARNING}' in html
+        assert f'data-action="save-launcher" data-side="{side}"' in html
+    assert HOST_PASSWORD in _block(html, "server-password-A")
+    assert FILE_WARNING not in _render_referee({"A": None, "B": None})
+
+
+def test_p9f18_docs_say_the_code_is_off_and_what_is_lost():
+    """Les trois documents disent : éteint par défaut, ce qu'il protège, ce qu'il ne protège pas,
+    comment l'allumer — et sans formule rassurante : un fichier remplacé, code éteint, s'exécute.
+
+    Mutation : retirer de l'un d'eux la phrase « un fichier remplacé s'exécute » (« A replaced
+    file runs »), ou la façon d'allumer l'option.
+    """
+    root = UI_DIR.parent
+    expected = {
+        "README.md": (
+            "**off by default**",
+            "**A replaced file runs**",
+            "an **intercepted** link or file",
+            "can start the game and connect",
+            '`"launcher_check": true`',
+            CHECKBOX_LABEL,
+            "delete it after the game",
+        ),
+        "README.fr.md": (
+            "**éteint par défaut**",
+            "**Un fichier remplacé s'exécute**",
+            "un lien ou un fichier **intercepté**",
+            "lancer le jeu et se connecter",
+            '`"launcher_check": true`',
+            CHECKBOX_LABEL,
+            "supprimez-le après la partie",
+        ),
+        "docs/campaigns/phase3/limites-connues.md": (
+            "**faux par défaut**",
+            "**Un fichier remplacé s'exécute.**",
+            "**un lien ou un fichier intercepté reste utilisable**",
+            "lancer le jeu et à se connecter",
+            "`launcher_check`",
+        ),
+    }
+    for name, sentences in expected.items():
+        text = " ".join((root / name).read_text("utf-8").split())
+        for sentence in sentences:
+            assert sentence in text, (name, sentence)
 
 
 # -- P9F15 : réglages servis par le service, rendus à plat ------------------------------------

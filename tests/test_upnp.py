@@ -1002,7 +1002,7 @@ def test_ac25_no_config_literal_in_upnp_module():
 
 import test_snapshots  # noqa: E402
 from test_contract import Lobby  # noqa: E402
-from test_match import Duel  # noqa: E402
+from test_match import Duel, launcher_checked  # noqa: E402,F401
 from test_modes import FastClock, settle, wait_phase  # noqa: E402
 from test_servers import stopped_for_good  # noqa: E402
 from test_share import LAN_ADDRESS, detect  # noqa: E402
@@ -3097,6 +3097,7 @@ def test_p9f14_side_a_couples_follow_b_and_never_cross_it():
     assert upnp.side_a_couples(cfg, 20000) is None
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_p9f14_referee_opens_six_mappings_and_two_invitations(referee, upnp_rig, igd):
     """Mutation : `ports_a = None` au lieu de `self._side_a_opening(cfg) if referee` dans
     `open_ports` — seules les trois redirections de B partent, et `ports_opening.A` reste neutre."""
@@ -3104,6 +3105,7 @@ def test_p9f14_referee_opens_six_mappings_and_two_invitations(referee, upnp_rig,
     engine = lobby.engine
     state = lobby.state()
     assert state["config"]["mode"] == "referee"
+    # P9F18 : le code est une option du `start`, cochée ici par `launcher_checked`.
     assert set(state["invite"]["A"]) >= {"launcher_code", "password", "port", "link"}
     assert state["invite"]["launcher_code"] != state["invite"]["A"]["launcher_code"]
     assert engine.open_ports()[0]

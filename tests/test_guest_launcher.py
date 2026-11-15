@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import os
 import shutil
@@ -60,6 +61,13 @@ def port(runtime):
 
 @pytest.fixture
 def launcher(port):
+    """Le lanceur à code (P9F18 : une option). Tout test qui parle du code le prend ici."""
+    return build_launcher(ADDRESS, port, PASSWORD, MOD_SRC, check=True)
+
+
+@pytest.fixture
+def direct(port):
+    """Le lanceur par défaut (P9F18) : sans code, il ne demande rien."""
     return build_launcher(ADDRESS, port, PASSWORD, MOD_SRC)
 
 
@@ -114,13 +122,13 @@ def test_launcher_respects_line_and_size_limits(launcher):
 
 
 def test_two_generations_are_identical(launcher, port):
-    assert build_launcher(ADDRESS, port, PASSWORD, MOD_SRC) == launcher
+    assert build_launcher(ADDRESS, port, PASSWORD, MOD_SRC, check=True) == launcher
 
 
 def test_generation_ignores_where_the_mod_lies(launcher, port, tmp_path):
     copy = tmp_path / "elsewhere" / "copy"
     shutil.copytree(MOD_SRC, copy)
-    assert build_launcher(ADDRESS, port, PASSWORD, copy) == launcher
+    assert build_launcher(ADDRESS, port, PASSWORD, copy, check=True) == launcher
 
 
 def test_payload_rebuilds_the_exact_mod(launcher, tmp_path):
@@ -205,7 +213,7 @@ def test_batch_never_finds_powershell_in_the_current_folder(launcher):
 
 
 def test_script_text_is_the_same_for_every_duel(launcher, port):
-    other = build_launcher("example.org", port + 1, "autre", MOD_SRC)
+    other = build_launcher("example.org", port + 1, "autre", MOD_SRC, check=True)
     head = launcher[: launcher.index(JOIN_MARK.encode())]
     assert other[: other.index(JOIN_MARK.encode())] == head
     assert PASSWORD.encode() not in head
@@ -250,14 +258,14 @@ def test_code_is_stable_over_two_generations_and_follows_each_input(launcher, po
     mod = tmp_path / "mod"
     shutil.copytree(MOD_SRC, mod)
     code = launcher_code(launcher)
-    assert launcher_code(build_launcher(ADDRESS, port, PASSWORD, mod)) == code
+    assert launcher_code(build_launcher(ADDRESS, port, PASSWORD, mod, check=True)) == code
 
     (mod / "ajout.txt").write_bytes(b"x")
     others = (
-        build_launcher("192.168.1.21", port, PASSWORD, MOD_SRC),
-        build_launcher(ADDRESS, port + 1, PASSWORD, MOD_SRC),
-        build_launcher(ADDRESS, port, PASSWORD + "0", MOD_SRC),
-        build_launcher(ADDRESS, port, PASSWORD, mod),
+        build_launcher("192.168.1.21", port, PASSWORD, MOD_SRC, check=True),
+        build_launcher(ADDRESS, port + 1, PASSWORD, MOD_SRC, check=True),
+        build_launcher(ADDRESS, port, PASSWORD + "0", MOD_SRC, check=True),
+        build_launcher(ADDRESS, port, PASSWORD, mod, check=True),
     )
     assert code not in map(launcher_code, others)
 
@@ -405,6 +413,134 @@ def test_embedded_check_refuses_the_right_code_on_a_changed_byte(launcher, tmp_p
     done = run_embedded_check(alter_payload(launcher), launcher_code(launcher), tmp_path)
     assert done.returncode == 1
     assert CODE_REFUSED in done.stdout
+
+
+# P9F18 : le code est une option, éteinte par défaut -----------------------------------------
+
+# Les textes du lanceur à code, tels qu'ils étaient avant P9F18 : l'option ne les a pas touchés.
+CHECKED_BATCH_SHA256 = "ac3decfdede1e297cdd52fa21d3caac1c8ec17773fc9d6a3ddca52efacd79ab4"
+CHECKED_SCRIPT_SHA256 = "6a8e46ce8b9f50ae529e3f117f6f212e2d210fda6995b40e13df972bb36df91d"
+CODE_WORDS = (b"certutil", b"set /p", b"PZDUEL_TYPED", b"Test-Code", b"CodeChars", b"CodeRefused")
+
+
+def script_of(launcher: bytes) -> list[bytes]:
+    lines = lines_of(launcher)
+    start = lines.index(guest_launcher.SCRIPT_MARK.encode())
+    return lines[start + 1 : lines.index(guest_launcher.DATA_MARK.encode())]
+
+
+def test_p9f18_default_launcher_asks_nothing_and_ends_on_the_launch(direct, port):
+    """Par défaut, le `.bat` ne demande rien : ni saisie, ni `pause`, ni `certutil`, et il finit
+    par le lancement du jeu.
+
+    Mutation : `check: bool = True` dans `build_launcher`, ou `BATCH_DIRECT = BATCH` — la saisie
+    du code, `certutil` et `pause` reviennent dans le fichier par défaut.
+    """
+    assert direct == build_launcher(ADDRESS, port, PASSWORD, MOD_SRC, check=False)
+    header = batch_header(direct)
+    for word in (*CODE_WORDS, b"pause", b"choice"):
+        assert not any(word in line.lower() for line in map(bytes.lower, header)), word
+    for word in CODE_WORDS:
+        assert word not in direct, word
+    # Rien avant PowerShell que la mise en place : aucune ligne n'écrit ni ne lit.
+    call = next(i for i, line in enumerate(header) if b"powershell.exe" in line)
+    assert header[:call] == [
+        b"@echo off",
+        b"setlocal EnableExtensions DisableDelayedExpansion",
+        b'set "PZDUEL_SELF=%~f0"',
+    ]
+    assert header[-1] == b"exit /b %PZDUEL_CODE%"
+    # Le script : ses fonctions, puis l'installation et le lancement, sans contrôle devant.
+    script = script_of(direct)
+    body = script[script.index(b"$stage = $null") :]
+    assert script[script.index(b"$stage = $null") - 2] == b"}"
+    start = body.index(b"        Start-Client $client $join")
+    assert body.index(b"    Write-Mod $Lines $data $staged") < start
+    assert not any(line.startswith(b"if (-not (Test-") for line in script)
+    assert body[-1] == b"exit $code"
+
+
+def test_p9f18_failure_of_the_default_launcher_waits_without_asking(direct):
+    """Un échec reste lisible quelques secondes, puis la fenêtre se ferme seule : `timeout`, pas
+    `pause`. Mutation : retirer la ligne `timeout` de `BATCH_DIRECT` — l'erreur disparaît avec
+    la fenêtre, sans avoir pu être lue."""
+    header = batch_header(direct)
+    wait = f'if not "%PZDUEL_CODE%"=="0" timeout /t {guest_launcher.FAILURE_READ_S}'.encode()
+    assert header[-2] == wait
+    assert 0 < guest_launcher.FAILURE_READ_S <= 60
+    assert sum(b"timeout" in line for line in header) == 1
+
+
+def test_p9f18_check_gives_back_the_launcher_of_before(launcher):
+    """`check=True` rend l'ancien lanceur, texte pour texte : saisie obligatoire, `certutil`,
+    refus avant tout le reste.
+
+    Mutation : toute retouche de `BATCH` ou de `POWERSHELL` (retirer `set /p`, le bloc
+    `Test-Code`, ou y glisser le texte du lanceur direct) change ces empreintes.
+    """
+    assert hashlib.sha256(guest_launcher.BATCH.encode()).hexdigest() == CHECKED_BATCH_SHA256
+    assert hashlib.sha256(guest_launcher.POWERSHELL.encode()).hexdigest() == CHECKED_SCRIPT_SHA256
+    lines = lines_of(launcher)
+    data = lines.index(guest_launcher.DATA_MARK.encode())
+    expected = [
+        *guest_launcher.BATCH.splitlines(),
+        guest_launcher.SCRIPT_MARK,
+        *guest_launcher.POWERSHELL.splitlines(),
+    ]
+    assert lines[:data] == [line.encode() for line in expected]
+    header = batch_header(launcher)
+    assert sum(line.startswith(b'set /p "PZDUEL_TYPED=') for line in header) == 1
+    assert any(b"certutil -hashfile" in line for line in header)
+    assert b'if not "%PZDUEL_CODE%"=="0" pause' in header
+    script = script_of(launcher)
+    gate = script.index(b"if (-not (Test-Code $env:PZDUEL_SELF $env:PZDUEL_TYPED)) {")
+    assert script[gate + 3] == b"    exit 1"
+    assert gate < script.index(b"$stage = $null")
+
+
+def test_p9f18_the_code_is_the_only_difference_between_the_two_launchers(launcher, direct):
+    """Le lanceur direct est l'autre, moins le code : même recherche du jeu, même installation,
+    même restauration du mod précédent. Mutation : écrire un `POWERSHELL_DIRECT` à part, qui
+    oublierait `Save-Previous` ou le retour de l'ancien mod."""
+    checked, plain = script_of(launcher), script_of(direct)
+    moves = difflib.SequenceMatcher(None, checked, plain, autojunk=False).get_opcodes()
+    assert {tag for tag, *_ in moves} == {"equal", "delete"}
+    removed = [line for tag, i, j, _, _ in moves if tag == "delete" for line in checked[i:j]]
+    assert len(removed) == len(checked) - len(plain) == 15
+    assert sum(b"Code" in line for line in removed) == 6
+    for kept in (b"function Save-Previous", b"function Wait-Client", b"function Find-Client"):
+        assert any(line.startswith(kept) for line in plain)
+    assert b"            if ($replacing) { Move-Item -LiteralPath $previous -Destination $target }" in plain
+    # Les données, elles, sont les mêmes octets.
+    mark = CRLF + guest_launcher.DATA_MARK.encode() + CRLF
+    assert direct[direct.index(mark) :] == launcher[launcher.index(mark) :]
+
+
+@pytest.mark.parametrize("check", [False, True], ids=["direct", "code"])
+def test_p9f18_join_line_carries_its_three_values_in_both_modes(port, check):
+    """`::PZDUEL-JOIN <ip> <port> <mdp>` : c'est là que le lanceur retrouve ses paramètres, avec
+    ou sans code. Mutation : `f"{JOIN_MARK} {address} {port}"` quand `check` est faux — le
+    lanceur direct n'a plus de mot de passe à donner au jeu."""
+    built = build_launcher(ADDRESS, port, PASSWORD, MOD_SRC, check=check)
+    lines = lines_of(built)
+    data = lines.index(guest_launcher.DATA_MARK.encode())
+    assert lines[data + 1] == f"{JOIN_MARK} {ADDRESS} {port} {PASSWORD}".encode()
+    assert sum(line.startswith(JOIN_MARK.encode() + b" ") for line in lines) == 1
+    assert built.count(PASSWORD.encode()) == 1
+    script = script_of(built)
+    assert b"    if ($join.Count -ne 4 -or $join[0] -cne '::PZDUEL-JOIN') { throw $Damaged }" in script
+    assert any(b"' +password ' + $Join[3]" in line for line in script)
+
+
+def test_p9f18_default_launcher_keeps_the_format_and_the_mod(direct, tmp_path):
+    assert direct.isascii()
+    assert direct.count(b"\n") == direct.count(b"\r") == direct.count(CRLF)
+    assert max(map(len, lines_of(direct))) <= MAX_LINE_BYTES
+    assert len(direct) < MAX_LAUNCHER_BYTES
+    assert guest_launcher.BATCH_DIRECT.isascii() and guest_launcher.POWERSHELL_DIRECT.isascii()
+    assert unpack_mod(direct, tmp_path / "mod") > 0
+    assert mod_fingerprint(tmp_path / "mod") == mod_fingerprint(MOD_SRC)
+    assert_policy_only_on_the_process_line(direct)
 
 
 # Le jeu doit tourner, et le mod remplacé reste (P19F6) ---------------------------------------
@@ -925,3 +1061,30 @@ if sys.platform == "win32":
         assert done.returncode != 0
         assert time.monotonic() - started < RUN_TIMEOUT_S
         assert b"launcher failed" in done.stdout
+
+    # P9F18 : le lanceur par défaut, sans code.
+
+    def test_windows_default_launcher_installs_and_connects_without_any_input(
+        guest, direct, port
+    ):
+        """Rien à saisir : l'entrée est vide, et le jeu part quand même."""
+        guest.install_game()
+        before = guest.old_mod()
+
+        done = guest.run(direct, typed=b"")
+
+        assert done.returncode == 0, done.stdout
+        assert CODE_REFUSED not in done.stdout
+        assert b"Type the code" not in done.stdout
+        assert mod_fingerprint(guest.mod) == mod_fingerprint(MOD_SRC) != before
+        assert guest.client_args() == expected_args(port)
+        assert staging_left(guest) == []
+
+    def test_windows_default_launcher_fails_without_hanging_on_a_closed_input(guest, direct):
+        """`timeout` sur une entrée redirigée rend aussitôt : un échec ne bloque aucun automate."""
+        started = time.monotonic()
+        done = guest.run(direct, typed=b"")
+        assert done.returncode != 0
+        assert time.monotonic() - started < RUN_TIMEOUT_S
+        assert b"launcher failed" in done.stdout
+        assert not guest.args_file.exists()

@@ -20,6 +20,10 @@ le fichier, qui le ferait changer. Il est en hexadécimal pour que l'invité le 
 le fichier, avec `certutil` : c'est le seul contrôle qui tienne contre un attaquant. Celui du `.bat`
 s'exécute dans le fichier contrôlé, et un `.bat` substitué n'a qu'à l'omettre ; il n'arrête qu'un
 fichier altéré qui garde ce contrôle, et le code n'est jamais affiché par le lanceur.
+
+P9F18 : ce code est une option, éteinte par défaut (`check=False`). Le `.bat` direct ne demande
+rien : ni saisie, ni comparaison, ni `pause`. Il ne protège donc de rien : un fichier remplacé
+s'exécute. Avec `check=True`, les octets sont ceux d'avant, à l'identique.
 """
 
 from __future__ import annotations
@@ -75,10 +79,11 @@ FILE_MARK = "::PZDUEL-FILE"
 # Il ne protège ni n'expose rien ici : la stratégie vise les fichiers de script, pas `-Command`.
 # `PZDUEL_TYPED` est vidé d'abord (`set /p` garderait sinon une valeur héritée sur une ligne vide),
 # et jamais développé par `cmd` : la saisie est libre, seul PowerShell la lit, comme une donnée.
-BATCH = rf"""@echo off
+_BATCH_HEAD = r"""@echo off
 setlocal EnableExtensions DisableDelayedExpansion
 set "PZDUEL_SELF=%~f0"
-echo pz-duel: this invitation is meant for a trusted network.
+"""
+_BATCH_ASK = r"""echo pz-duel: this invitation is meant for a trusted network.
 echo The code the host reads to you is the only protection against a replaced file.
 echo It must be compared before this file is run: certutil -hashfile "this file" SHA256
 echo must print a value that starts with that code. If it was not, close this window now.
@@ -86,11 +91,23 @@ echo This launcher asks for that code below. A launcher that does not ask for a 
 echo never run one, and ask the host for a new file.
 set "PZDUEL_TYPED="
 set /p "PZDUEL_TYPED=Type the code the host read to you, then press Enter: "
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$l=[IO.File]::ReadAllLines($env:PZDUEL_SELF,[Text.Encoding]::ASCII);$b=[Array]::IndexOf($l,'{SCRIPT_MARK}');$e=[Array]::IndexOf($l,'{DATA_MARK}');& ([ScriptBlock]::Create($l[($b+1)..($e-1)] -join [Environment]::NewLine)) $l"
+"""
+_BATCH_RUN = rf""""%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$l=[IO.File]::ReadAllLines($env:PZDUEL_SELF,[Text.Encoding]::ASCII);$b=[Array]::IndexOf($l,'{SCRIPT_MARK}');$e=[Array]::IndexOf($l,'{DATA_MARK}');& ([ScriptBlock]::Create($l[($b+1)..($e-1)] -join [Environment]::NewLine)) $l"
 set "PZDUEL_CODE=%ERRORLEVEL%"
 if not "%PZDUEL_CODE%"=="0" echo pz-duel: the launcher failed. If no cause is shown above, PowerShell is probably blocked on this PC.
-if not "%PZDUEL_CODE%"=="0" pause
-exit /b %PZDUEL_CODE%"""
+"""
+_BATCH_EXIT = "exit /b %PZDUEL_CODE%"
+# Avec le code : celui d'avant P9F18, à l'octet près.
+BATCH = _BATCH_HEAD + _BATCH_ASK + _BATCH_RUN + 'if not "%PZDUEL_CODE%"=="0" pause\n' + _BATCH_EXIT
+# Sans le code (P9F18, le défaut) : ni question, ni `pause`. Après un échec seulement, `timeout`
+# laisse `FAILURE_READ_S` secondes pour lire la cause, puis la fenêtre se ferme d'elle-même.
+FAILURE_READ_S = 30
+BATCH_DIRECT = (
+    _BATCH_HEAD
+    + _BATCH_RUN
+    + f'if not "%PZDUEL_CODE%"=="0" timeout /t {FAILURE_READ_S}\n'
+    + _BATCH_EXIT
+)
 
 # PowerShell 5.1. `[IO.Path]::Combine` plutôt que `Join-Path`, qui lève sur un disque absent.
 # Les chemins restent sans séparateur écrit en dur.
@@ -362,6 +379,40 @@ try {
 exit $code"""
 
 
+# Ce que le code ajoute au script, et rien d'autre : le lanceur direct est le même script sans ces
+# quatre morceaux (P9F18). Chacun doit s'y trouver une fois, sinon l'import échoue.
+_CODE_PARTS = (
+    "$CodeChars = 16\n",
+    "$CodeRefused = 'This is not the code of this file. Do not use it: ask the host for a new launcher.'\n",
+    r"""function Test-Code([string]$Path, [string]$Typed) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Path)))
+    $code = $hash.Replace('-', '').Substring(0, $CodeChars).ToLowerInvariant()
+    ($Typed -replace '\s', '').ToLowerInvariant() -ceq $code
+}
+
+""",
+    r"""if (-not (Test-Code $env:PZDUEL_SELF $env:PZDUEL_TYPED)) {
+    Write-Host ('ERROR: ' + $CodeRefused) -ForegroundColor Red
+    Write-Host 'The game was not started and the installed mod was not changed.'
+    exit 1
+}
+
+""",
+)
+
+
+def _without_code(script: str) -> str:
+    for part in _CODE_PARTS:
+        if script.count(part) != 1:
+            raise AssertionError(f"launcher script: code part not found once: {part[:30]!r}")
+        script = script.replace(part, "")
+    return script
+
+
+POWERSHELL_DIRECT = _without_code(POWERSHELL)
+
+
 class LauncherRefused(ValueError):
     """Valeur que le `.bat` ne peut pas porter. Le message ne la cite jamais : secret possible."""
 
@@ -438,6 +489,8 @@ def build_launcher(
     port: int,
     password: str,
     mod: str | os.PathLike[str] | tuple[str, ...] | LauncherRefused,
+    *,
+    check: bool = False,
 ) -> bytes:
     """Rend les octets du `.bat`, ou lève `LauncherRefused`. Rien n'est écrit (R6).
 
@@ -446,14 +499,17 @@ def build_launcher(
     passe qu'après ceux de l'adresse, du port et du mot de passe.
 
     Les mêmes entrées rendent les mêmes octets : ni date, ni tirage, ni chemin de l'hôte.
+
+    `check` (P9F18) : faux, le défaut, rend le lanceur direct, qui ne demande rien ; vrai, celui
+    qui exige le code de `launcher_code`. La ligne `JOIN_MARK` est la même dans les deux.
     """
     _check_join(address, port, password)
     if isinstance(mod, LauncherRefused):
         raise mod
     lines = [
-        *BATCH.splitlines(),
+        *(BATCH if check else BATCH_DIRECT).splitlines(),
         SCRIPT_MARK,
-        *POWERSHELL.splitlines(),
+        *(POWERSHELL if check else POWERSHELL_DIRECT).splitlines(),
         DATA_MARK,
         f"{JOIN_MARK} {address} {port} {password}",
         *(mod if isinstance(mod, tuple) else read_mod(mod)),

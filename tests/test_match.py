@@ -3984,6 +3984,20 @@ REFEREE_ADDRESS = "192.168.1.20"
 
 
 @pytest.fixture
+def launcher_checked(monkeypatch):
+    """Tout `start` de ce test coche le code du lanceur (P9F18) : `Lobby` ne passe que preset et
+    mot de passe. À demander par `usefixtures`, pour passer avant le lobby du test."""
+    original = engine_module.Engine.action
+
+    def action(self, name, payload=None):
+        if name == "start":
+            payload = {"launcher_check": True, **(payload or {})}
+        return original(self, name, payload)
+
+    monkeypatch.setattr(engine_module.Engine, "action", action)
+
+
+@pytest.fixture
 def referee_lobby(engine_rig, monkeypatch):
     """Un lobby réel lancé en mode arbitre : `Lobby` ne passe que preset et mot de passe."""
     monkeypatch.setattr(engine_module, "local_ip", lambda: REFEREE_ADDRESS)
@@ -4037,6 +4051,7 @@ def test_p9f14_open_game_is_refused_in_referee_mode_and_opens_nothing(referee_lo
     assert launched == []
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_p9f14_each_invitation_carries_the_password_of_its_own_side(referee_lobby, engine_rig):
     """L'invitation de A porte `host_password`, celle de B le mot de passe de B, et chaque `.bat`
     ouvre son propre serveur.
@@ -4060,6 +4075,7 @@ def test_p9f14_each_invitation_carries_the_password_of_its_own_side(referee_lobb
     assert _join(engine.guest_launcher()) == (REFEREE_ADDRESS, ports["B"]["game"], PLAYER_PASSWORD)
     assert engine.side_launcher("B") == engine.guest_launcher()
     # Deux codes de lanceur, deux jetons de partage : un camp ne reçoit jamais l'autre.
+    assert state["config"]["launcher_check"] is True
     assert invite["launcher_code"] != invite["A"]["launcher_code"]
     server_dir = engine_rig.zomboid / "Server"
     assert read_ini(server_dir / "duelA.ini")["Password"] == host_password

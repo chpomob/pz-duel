@@ -584,3 +584,81 @@ par `read_bytes().decode()`, il tombe (rendu à `read_text` brut, il passe : le 
 - La preuve finale est la CI Windows verte sur ce commit, à relire après le push.
 - La garde d'encodage repose sur `subprocess._text_encoding`, nom privé de CPython (3.11+) : s'il
   change, le `monkeypatch.setattr` lève et le test le dit, il ne passe pas en silence.
+
+## P9F18 — code du lanceur en option, éteint par défaut (2026-11-15)
+
+**Cause :** retour du propriétaire après usage. Dicter seize caractères hexadécimaux, les faire
+recopier, et un lanceur qui refuse de démarrer à la moindre faute : le coût dépasse le risque couru
+sur le mot de passe d'un serveur qui ne vit qu'une partie. Le code protège d'un fichier
+**remplacé**, pas d'un lien intercepté.
+
+**Fait :**
+
+- `POST /api/action {"action":"start", …}` accepte `launcher_check`, booléen, **faux par défaut** ;
+  toute autre valeur est refusée avant le premier effet. `/api/state` dit ce qui a été retenu sous
+  `config.launcher_check`, et la revanche le garde.
+- Éteint (le défaut) : `build_launcher(..., check=False)` rend un `.bat` qui ne demande rien — ni
+  saisie, ni `certutil`, ni comparaison, ni `pause`. L'invitation ne porte ni `launcher_code` ni
+  `launcher_code_text` ; le lobby montre le lien, `Copy link`, `Save launcher`, le mot de passe
+  serveur, et une seule phrase : « This file contains the server password: send it through a
+  private channel, and delete it after the game. »
+- Allumé : le lanceur d'avant, à l'octet près (`BATCH` et `POWERSHELL` ne sont pas touchés ; le
+  lanceur direct est le même script, moins les quinze lignes du code).
+- La ligne `::PZDUEL-JOIN <ip> <port> <mdp>` est la même dans les deux modes.
+
+**Ce qui n'est plus protégé, code éteint :**
+
+- **Un fichier remplacé s'exécute.** Le lien est en `http://` : un intermédiaire qui substitue le
+  `.bat` fait tourner ce qu'il veut sur le PC de l'invité, avec ses droits. Rien ne compare plus le
+  fichier à celui de l'hôte, ni avant de l'ouvrir ni dedans, et ni le lobby ni le lanceur ne le
+  signalent. C'est le prix du défaut, pas un résidu.
+- Allumé ou éteint, **un lien ou un fichier intercepté reste utilisable** : il porte l'adresse et le
+  mot de passe du serveur, et suffit à lancer le jeu et à se connecter à la place de l'invité. Le
+  code n'a jamais protégé de cela.
+- Allumé, seul `certutil -hashfile`, fait avant d'ouvrir le fichier, arrête un attaquant : la
+  question posée par le lanceur est dans le fichier, qu'un remplaçant n'a qu'à omettre.
+
+**Tests et mutations :**
+
+- `tests/test_guest_launcher.py` —
+  `test_p9f18_default_launcher_asks_nothing_and_ends_on_the_launch` (`check: bool = True`, ou
+  `BATCH_DIRECT = BATCH`) ; `test_p9f18_check_gives_back_the_launcher_of_before` (toute retouche de
+  `BATCH` ou `POWERSHELL` : leurs empreintes SHA-256 sont figées) ;
+  `test_p9f18_the_code_is_the_only_difference_between_the_two_launchers` (un script direct écrit à
+  part) ; `test_p9f18_join_line_carries_its_three_values_in_both_modes` (mot de passe retiré de la
+  ligne) ; `test_p9f18_failure_of_the_default_launcher_waits_without_asking` (ligne `timeout`
+  retirée).
+- `tests/test_share.py` —
+  `test_p9f18_default_invitation_has_no_code_and_its_launcher_asks_nothing` (`check = True` dans
+  `_side_invite`, ou défaut à `True` dans `_begin`) ;
+  `test_p9f18_option_gives_back_the_code_and_the_same_join_line` (`check=False` en dur) ;
+  `test_p9f18_option_that_is_not_a_boolean_is_refused_before_any_effect` (`bool(...)` au lieu du
+  contrôle de type) ; `test_p9f18_state_route_says_what_the_start_body_asked` (`launcher_check`
+  retiré de `config`).
+- `tests/test_setup_flow.py` —
+  `test_p9f18_start_screen_sends_launcher_check_unchecked_by_default` (champ retiré du corps du
+  `start`, ou case cochée par défaut) ;
+  `test_p9f18_lobby_without_code_shows_one_sentence_and_no_big_code` et
+  `test_p9f18_referee_lobby_without_code_warns_once_per_side` (bloc du code sans condition, phrase
+  retirée) ; `test_p9f18_docs_say_the_code_is_off_and_what_is_lost`.
+- Les tests existants sur le code affiché ne sont pas retirés : ils demandent le fixture
+  `launcher_checked` (`tests/test_match.py`), qui coche l'option à chaque `start`.
+
+**Ouvert :**
+
+- `/api/state` expose l'option sous `config.launcher_check`, pas à la racine :
+  `tests/test_modes.py::test_api_backward_compatible` fige la liste exacte des clés de la racine, et
+  ce fichier est hors de l'étape.
+- `tests/test_upnp.py` est hors de la liste des fichiers de l'étape, mais
+  `test_p9f14_referee_opens_six_mappings_and_two_invitations` exigeait `launcher_code` dans une
+  invitation lancée sans option : il demande désormais `launcher_checked` (un import, un décorateur,
+  un commentaire). Sans cette retouche, la suite ne pouvait pas être verte avec le défaut demandé.
+- Le lanceur direct n'a jamais tourné : ses deux tests d'exécution sont dans le bloc `win32` de
+  `tests/test_guest_launcher.py`, à lire sur la première CI `windows-latest`. Aucun test `pwsh`
+  n'a été ajouté pour lui (il aurait été sauté ici, où `pwsh` manque).
+- Après un échec, le lanceur direct attend par `timeout /t 30` au lieu de `pause` : la cause reste
+  lisible trente secondes, puis la fenêtre se ferme seule. Hypothèse tirée du comportement connu de
+  `timeout` (il rend aussitôt sur une entrée redirigée), non prouvée sur un vrai Windows.
+- La case (« Check the launcher code (paranoid) ») et la phrase du lobby sont en anglais, traduites
+  des libellés français de l'étape : `test_phase3_ac29_added_ui_lines_are_english` refuse toute
+  ligne française ajoutée à `ui/app.js`, et le reste du lobby est déjà en anglais.

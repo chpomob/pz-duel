@@ -18,7 +18,7 @@ import pytest
 
 from doubles.launcher_check import CODE_REFUSED, run_embedded_check
 from test_contract import Lobby
-from test_match import Duel
+from test_match import Duel, launcher_checked  # noqa: F401
 from test_modes import FastClock, settle, wait_phase
 from test_snapshots import PLAYER_PASSWORD, engine_rig, free_port  # noqa: F401
 from service import engine as engine_module
@@ -490,6 +490,7 @@ def test_unlisted_password_gives_a_reason_and_no_launcher(engine_rig, monkeypatc
 
 # -- AC38 --------------------------------------------------------------------
 @pytest.mark.parametrize("entered", [None, PUBLIC_ADDRESS])
+@pytest.mark.usefixtures("launcher_checked")
 def test_ac38_rematch_keeps_the_launcher_and_changes_the_token(engine_rig, monkeypatch, entered):
     detect(monkeypatch, LAN_ADDRESS)
     rig = engine_rig
@@ -528,6 +529,7 @@ def served_by_the_link(invite: dict) -> bytes:
     return launcher
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_changed_byte_no_longer_matches_the_code_and_the_check_refuses(lobby, api_port, tmp_path):
     shown = json.loads(request(api_port(lobby.engine), "GET", "/api/state")[2])["invite"]
     served = served_by_the_link(shown)
@@ -543,13 +545,14 @@ def test_changed_byte_no_longer_matches_the_code_and_the_check_refuses(lobby, ap
     assert CODE_REFUSED in done.stdout
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_shown_code_comes_from_the_very_bytes_served(engine_rig, monkeypatch, api_port):
     """Chaque génération diffère ici : une seconde génération ne donnerait plus le même code."""
     detect(monkeypatch, LAN_ADDRESS)
     generated = []
 
-    def unique_generation(*args) -> bytes:
-        generated.append(build_launcher(*args) + b"%d" % len(generated))
+    def unique_generation(*args, **options) -> bytes:
+        generated.append(build_launcher(*args, **options) + b"%d" % len(generated))
         return generated[-1]
 
     monkeypatch.setattr(engine_module, "build_launcher", unique_generation)
@@ -565,6 +568,7 @@ def test_shown_code_comes_from_the_very_bytes_served(engine_rig, monkeypatch, ap
     assert launcher_code(from_ui) == shown["launcher_code"]
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_code_is_stable_in_a_lobby_and_follows_the_address(lobby):
     engine = lobby.engine
     first = lobby.state()["invite"]["launcher_code"]
@@ -579,28 +583,35 @@ def test_code_is_stable_in_a_lobby_and_follows_the_address(lobby):
     assert launcher_code(engine.guest_launcher()) == second
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_no_launcher_means_no_code(engine_rig, monkeypatch):
     detect(monkeypatch, LOOPBACK)
-    invite = Lobby(engine_rig, PRESET).state()["invite"]
+    state = Lobby(engine_rig, PRESET).state()
+    invite = state["invite"]
+    assert state["config"]["launcher_check"] is True
     assert invite["needs_address"]
     assert "launcher_code" not in invite
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_mock_invite_has_no_code(mock_lobby):
+    assert mock_lobby.snapshot()["config"]["launcher_check"] is True
     assert "launcher_code" not in mock_lobby.snapshot()["invite"]
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_unreadable_mod_keeps_the_lobby_and_refuses_with_a_reason(
     engine_rig, monkeypatch, api_port
 ):
     detect(monkeypatch, LAN_ADDRESS)
 
-    def refused(*args) -> bytes:
+    def refused(*args, **options) -> bytes:
         raise LauncherRefused(MOD_UNREADABLE)
 
     monkeypatch.setattr(engine_module, "build_launcher", refused)
     lobby = Lobby(engine_rig, PRESET)
 
+    assert lobby.state()["config"]["launcher_check"] is True
     assert "launcher_code" not in lobby.state()["invite"]
     status, _, body = request(api_port(lobby.engine), "GET", LAUNCHER_ROUTE)
     assert status == 409
@@ -623,6 +634,7 @@ def lock_is_free(engine: Engine) -> bool:
     return taken == [True]
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_lobby_hashes_the_mod_outside_the_lock(engine_rig, monkeypatch):
     """A5 : le mod se lit et se hache avant `self.lock`, à l'ouverture du lobby comme ailleurs."""
     detect(monkeypatch, LAN_ADDRESS)
@@ -646,6 +658,7 @@ def test_lobby_hashes_the_mod_outside_the_lock(engine_rig, monkeypatch):
     assert "launcher_code" in lobby.state()["invite"]
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_state_answers_while_the_invitation_hashes_a_slow_mod(lobby, monkeypatch, api_port):
     """A5 : un mod lent ne fige pas `/api/state` pendant qu'une invitation se construit."""
     engine = lobby.engine
@@ -683,6 +696,7 @@ def test_state_answers_while_the_invitation_hashes_a_slow_mod(lobby, monkeypatch
     assert launcher_code(engine.guest_launcher()) == engine.snapshot()["invite"]["launcher_code"]
 
 
+@pytest.mark.usefixtures("launcher_checked")
 def test_code_text_says_who_compares_what(lobby):
     text = lobby.state()["invite"]["launcher_code_text"]
     assert "asks them to type it" in text
@@ -697,6 +711,113 @@ def test_ui_shows_the_code_next_to_the_invitation():
     card = invite_card()
     assert "esc(inv.launcher_code)" in card
     assert "esc(inv.launcher_code_text)" in card
+
+
+# -- P9F18 : le code du lanceur est une option du `start`, éteinte par défaut ------------------
+
+ASKING = (b"set /p", b"certutil", b"PZDUEL_TYPED", b"Test-Code")
+
+
+def test_p9f18_default_invitation_has_no_code_and_its_launcher_asks_nothing(lobby, api_port):
+    """Sans l'option : ni `launcher_code` ni `launcher_code_text`, et le `.bat` servi ne demande
+    rien. Le marqueur garde ses trois valeurs.
+
+    Mutation : `launcher_check = payload.get(LAUNCHER_CHECK, True)` dans `_begin`, ou
+    `check = True` dans `_side_invite` — le code revient dans l'invitation et la saisie dans
+    le `.bat`, pour tout le monde.
+    """
+    body = request(api_port(lobby.engine), "GET", "/api/state")[2]
+    state = json.loads(body)
+    invite = state["invite"]
+
+    assert state["config"]["launcher_check"] is False
+    assert "launcher_code" not in invite and "launcher_code_text" not in invite
+    assert b"launcher_code" not in body
+    served = served_by_the_link(invite)
+    assert served == lobby.engine.guest_launcher()
+    for word in ASKING:
+        assert word not in served, word
+    assert b"pause" not in served.split(b"::PZDUEL-SCRIPT\r\n")[0]
+    game = lobby.rig.runtime["ports"]["B"]["game"]
+    assert join_line(served) == (LAN_ADDRESS, game, PLAYER_PASSWORD)
+    # Le lien, le `.bat` à enregistrer et le mot de passe pour un ajout manuel restent.
+    assert invite["link"] and invite["password"] == PLAYER_PASSWORD
+    assert request(api_port(lobby.engine), "GET", LAUNCHER_ROUTE)[2] == served
+
+
+def test_p9f18_option_gives_back_the_code_and_the_same_join_line(engine_rig, monkeypatch):
+    """`launcher_check: true` : le code est dans l'invitation, le `.bat` l'exige, et il porte
+    la même ligne `::PZDUEL-JOIN` que le lanceur direct du même duel.
+
+    Mutation : `build_launcher(..., check=False)` en dur dans `_side_invite` — le code affiché
+    ne correspond plus à aucune saisie ; ou `if check:` retiré — vu par le test du défaut.
+    """
+    detect(monkeypatch, LAN_ADDRESS)
+    rig = engine_rig
+    engine = rig.build()
+
+    state = start_lobby(rig, password=PLAYER_PASSWORD, launcher_check=True)
+    checked = engine.guest_launcher()
+    assert state["config"]["launcher_check"] is True
+    assert state["invite"]["launcher_code"] == launcher_code(checked)
+    assert LAUNCHER_NAME in state["invite"]["launcher_code_text"]
+    for word in ASKING:
+        assert word in checked, word
+    leave_lobby(rig)
+
+    state = start_lobby(rig, password=PLAYER_PASSWORD, launcher_check=False)
+    direct = engine.guest_launcher()
+    assert state["config"]["launcher_check"] is False
+    assert "launcher_code" not in state["invite"]
+    assert direct != checked
+    game = rig.runtime["ports"]["B"]["game"]
+    assert join_line(direct) == join_line(checked) == (LAN_ADDRESS, game, PLAYER_PASSWORD)
+    # Les données sont les mêmes octets : l'option n'est qu'un contrôle en plus.
+    data = b"\r\n::PZDUEL-DATA\r\n"
+    assert direct[direct.index(data) :] == checked[checked.index(data) :]
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None, [True]])
+def test_p9f18_option_that_is_not_a_boolean_is_refused_before_any_effect(engine_rig, value):
+    """Mutation : `launcher_check = bool(payload.get(...))` — `"false"` allumerait le code."""
+    engine = engine_rig.build()
+
+    ok, message = engine.action("start", {"preset": PRESET, "launcher_check": value})
+
+    assert not ok and "launcher_check" in message
+    assert engine.snapshot()["phase"] == "idle"
+    assert engine.snapshot()["config"] == {}
+
+
+@pytest.mark.parametrize("chosen", [None, False, True])
+def test_p9f18_state_route_says_what_the_start_body_asked(runtime, tmp_path, api_port, chosen):
+    """Le corps de `POST /api/action` porte l'option, `/api/state` dit ce qui a été retenu.
+
+    Mutation : retirer `LAUNCHER_CHECK: launcher_check` de `cfg` — l'interface ne sait plus
+    ce qui a été retenu, et la revanche perd l'option.
+    """
+    engine = Engine("mock", runtime=runtime, clock=FastClock(), matches_dir=tmp_path / "matches")
+    port = api_port(engine)
+    body = {"action": "start", "preset": PRESET}
+    if chosen is not None:
+        body["launcher_check"] = chosen
+
+    status, _, answer = request(port, "POST", "/api/action", body)
+
+    assert status == 200, answer
+    assert json.loads(answer)["state"]["config"]["launcher_check"] is bool(chosen)
+    wait_phase(engine, "lobby")
+    assert json.loads(request(port, "GET", "/api/state")[2])["config"]["launcher_check"] is bool(chosen)
+    assert engine.action("simulate_join")[0]
+    wait_phase(engine, "over")
+    settle(engine)
+    # La revanche relit l'option du duel d'avant.
+    assert engine.action("rematch")[0]
+    wait_phase(engine, "lobby")
+    assert engine.snapshot()["config"]["launcher_check"] is bool(chosen)
+    assert engine.action("simulate_join")[0]
+    wait_phase(engine, "over")
+    settle(engine)
 
 
 # -- AC59 --------------------------------------------------------------------

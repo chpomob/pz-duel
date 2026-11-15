@@ -217,6 +217,7 @@ function newDraft() {
     settings: catalogDefaults(),
     pseudo: localStorage.getItem('pzduel.pseudo') || 'hôte',
     password: '',
+    launcherCheck: false,       // P9F18: the launcher code is an option, off by default
     mode: 'host',
   };
 }
@@ -447,7 +448,7 @@ function renderConfig() {
     ${canLaunch(setup) ? '' : setupCard()}
     <section class="card">
       <h2>Nouveau duel</h2>
-      <p class="sub">You host both servers. Your opponent gets the launcher from you, and types the code you read aloud.</p>
+      <p class="sub">You host both servers. Your opponent gets the launcher from you: they run it, and the game opens on the duel.</p>
 
       <label class="field"><span>Preset</span>
         <select id="f-preset">
@@ -465,6 +466,12 @@ function renderConfig() {
           <option value="host" ${draft.mode !== 'referee' ? 'selected' : ''}>Me and a guest</option>
           <option value="referee" ${draft.mode === 'referee' ? 'selected' : ''}>Two guests: this computer only hosts and referees</option>
         </select>
+      </label>
+
+      <label class="field check" id="launcher-check">
+        <input type="checkbox" id="f-launcher-check" ${draft.launcherCheck ? 'checked' : ''}>
+        <span>Check the launcher code (paranoid)</span>
+        <small class="help">${esc(LAUNCHER_CHECK_HELP)}</small>
       </label>
 
       <div class="grid two">
@@ -496,6 +503,7 @@ function renderConfig() {
     renderConfig();
   };
   $('#f-players').onchange = (e) => { draft.mode = e.target.value; };
+  $('#f-launcher-check').onchange = (e) => { draft.launcherCheck = e.target.checked; };
   bindSettings();
   $('#f-pseudo').oninput = (e) => { draft.pseudo = e.target.value; };
   $('#f-password').oninput = (e) => { draft.password = e.target.value; };
@@ -639,6 +647,13 @@ const OPEN_GAME_WAIT = 'The game button unlocks as soon as your opponent is conn
 // P9F13: what the big code is for, and what it is not.
 const LAUNCHER_CODE_IS_NOT = 'Click the code to copy it. It is not a password, and not something to send with the file.';
 const SEND_LABEL = 'Send the link to your opponent (or the saved launcher), never in the same message as the code.';
+// P9F18: the launcher code is an option of the start, off by default. Without it the invitation
+// carries no `launcher_code`: no big code, and one sentence instead of the warnings about it.
+const LAUNCHER_CHECK_HELP = 'Guards against a file replaced on the way: your guest will have to type a code you read aloud. Unticked, the launcher asks nothing.';
+const SEND_LABEL_DIRECT = 'Send the link to your opponent (or the saved launcher): they run it, and it asks nothing.';
+const LAUNCHER_FILE_WARNING = 'This file contains the server password: send it through a private channel, and delete it after the game.';
+const sendZone = (inv, canSave, id) => `<p class="hint">${esc(inv.launcher_code ? SEND_LABEL : SEND_LABEL_DIRECT)}</p>
+            ${!inv.launcher_code && (inv.link || canSave) ? `<p class="notice" id="${id}">${esc(LAUNCHER_FILE_WARNING)}</p>` : ''}`;
 
 // Tout vient de `invite` : le service décide de ce qui existe et le dit en anglais.
 // P9F10: while a player is missing, the service freezes both worlds; the lobby says when a side
@@ -709,7 +724,7 @@ function inviteCard() {
             <p class="hint">${esc(LAUNCHER_CODE_IS_NOT)}</p>
           </div>` : ''}
           <div class="zone send" id="zone-send">
-            <p class="hint">${esc(SEND_LABEL)}</p>
+            ${sendZone(inv, canSave, 'launcher-file-warning')}
             ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
             <div class="actions">
               ${inv.link ? '<button class="ghost" data-action="copy-link">Copy link</button>' : ''}
@@ -809,7 +824,7 @@ function refereeSide(inv, side) {
           <p class="hint">${esc(LAUNCHER_CODE_IS_NOT)}</p>
         </div>` : ''}
         <div class="zone send" id="zone-send-${side}">
-          <p class="hint">${esc(SEND_LABEL)}</p>
+          ${sendZone(inv, canSave, `launcher-file-warning-${side}`)}
           ${inv.link ? `<div class="line link">${esc(inv.link)}</div>` : ''}
           <div class="actions">
             ${inv.link ? `<button class="ghost" data-action="copy-link" data-side="${side}">Copy link</button>` : ''}
@@ -842,7 +857,7 @@ function refereeCard() {
         <p class="notice" id="referee-wait">${esc(REFEREE_WAIT)}</p>
         ${S.mode === 'mock' ? '<div class="actions"><button class="ghost" data-action="simulate">Simulate a guest</button></div>' : ''}
       </div>
-      <p class="notice">${esc(TWO_SECRETS_TEXT)}</p>
+      ${inv.launcher_code || (inv.A || {}).launcher_code ? `<p class="notice" id="two-secrets">${esc(TWO_SECRETS_TEXT)}</p>` : ''}
       <div class="grid two">
         ${refereeSide(inv.A || {}, 'A')}
         ${refereeSide(inv, 'B')}
@@ -1039,6 +1054,7 @@ document.addEventListener('click', async (ev) => {
       pseudo: draft.pseudo,
       password: draft.password,
       mode: draft.mode,
+      launcher_check: draft.launcherCheck === true,
     });
     // A refusal names the faulty setting: the panel stays open, values kept, to fix it.
     if (!out.ok) { view = 'config'; render(); }

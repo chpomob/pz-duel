@@ -68,16 +68,22 @@ ships (`jre64\bin\java.exe`) and uses `StartServer64.bat` when that script is pr
    your guest will not get in: open *Windows Security*, *Firewall & network protection*, *Allow an app
    through firewall*.
 6. **Invite your opponent** from the lobby: `Copy link`, or `Save launcher` to get
-   `pz-duel-join.bat`. The lobby also shows a **verification code**: **read it aloud** to your guest,
-   by voice, **separately from the link**, never in the same message as the link or the file. It is
-   the only protection against a file replaced on the way. The lobby shows two different secrets,
-   each in its own block: the **launcher code** (the start of the `.bat`'s SHA-256), that the guest
-   types when their launcher asks for it, and the **server password**, only for a guest who types
-   the address by hand in Project Zomboid. **The launcher code is not the server password**: typed
-   into the launcher, the password is refused (`This is not the code of this file`).
+   `pz-duel-join.bat`. By default the launcher asks nothing: your guest runs it, it installs the mod
+   and opens the game on the duel. **That file contains the server password**: send it through a
+   private channel, and delete it after the game. Nothing checks it either: see
+   [The launcher code](#the-launcher-code-optional-off-by-default) for what that leaves unprotected.
+   If you ticked *Check the launcher code (paranoid)* before launching, the lobby also shows a
+   **verification code**: **read it aloud** to your guest, by voice, **separately from the link**,
+   never in the same message as the link or the file. It is the only protection against a file
+   replaced on the way. The lobby then shows two different secrets, each in its own block: the
+   **launcher code** (the start of the `.bat`'s SHA-256), that the guest types when their launcher
+   asks for it, and the **server password**, only for a guest who types the address by hand in
+   Project Zomboid. **The launcher code is not the server password**: typed into the launcher, the
+   password is refused (`This is not the code of this file`).
    The lobby card reads top to bottom in the order you use it: **one primary button** (what you do
-   now), then the **launcher code** in large type (what you read aloud — click it to copy it), then
-   the link with `Copy link` and `Save launcher` (what you send). The QR code is folded away behind
+   now), then, when the option is on, the **launcher code** in large type (what you read aloud —
+   click it to copy it), then the link with `Copy link` and `Save launcher` (what you send). The QR
+   code is folded away behind
    *Show the QR code (phone)*: it only helps a phone. The invitation token is no longer shown.
    The primary button reads `Waiting for your opponent…` (greyed out) until your opponent is
    connected: each world is frozen while nobody plays in it (`PauseEmpty=true`), and joining yours
@@ -115,19 +121,47 @@ single-instance lock (with the port it listens on).
 1. **Get the `.bat`** on the Windows PC that has the game: open the host's link there, or save the file
    the host sent. The link only works while the host is in the lobby. Scanning the QR code with a phone
    puts the file on the phone, where it is no use.
-2. **Check the file before opening it.** Ask the host for the verification code they read aloud. In
-   the folder that holds the file, right-click an empty spot, choose **Open in Terminal** (on Windows 10,
+2. **If the host announced a launcher code, check the file before opening it.** The code is an
+   option, off by default: without one there is nothing to compare, nothing proves the file is the
+   one the host made, and you go to step 3. With one, ask the host for the verification code they
+   read aloud. In the folder that holds the file, right-click an empty spot, choose **Open in Terminal** (on Windows 10,
    hold Shift while right-clicking to get the same kind of window), and type
    `certutil -hashfile pz-duel-join.bat SHA256`. **Do not open the file if the result does not start
    with that code**: it was replaced on the way. Delete it and ask the host for a new one.
 3. **Only then, double-click `pz-duel-join.bat`.** **SmartScreen** may warn here too: **More info**,
-   then **Run anyway**. Only do this for a file from someone you trust, checked at step 2. It asks for
-   the code again: type it, then press Enter. A launcher that does not ask for it was replaced.
+   then **Run anyway**. Only do this for a file from someone you trust. By default it asks nothing.
+   If the host announced a code, it asks for the code again: type it, then press Enter; in that
+   case, a launcher that does not ask for it was replaced.
 4. It installs the mod, starts the game connected to the host, and waits a few seconds to check that
    the game keeps running. If it cannot find the game, it asks for the folder. If anything fails, or
-   the game closes at once, your existing mod is put back as it was and the window stays open. When
+   the game closes at once, your existing mod is put back as it was and the window stays open long
+   enough to read why: 30 seconds by default, until you press a key when the code is on. When
    it succeeds, the `duelcore` mod it replaced is not deleted: it is kept in
    `Zomboid\duelcore.previous`, in your user folder, and the window says how to go back to it.
+5. **Delete `pz-duel-join.bat` after the game**: it contains the server password.
+
+### The launcher code (optional, off by default)
+
+The launcher code is the start of the SHA-256 of the `.bat`, read aloud by the host and compared by
+the guest. It is **off by default**: for a one-off duel between two people who talk to each other,
+dictating sixteen hexadecimal characters costs more than the server password of a single game is
+worth.
+
+- **To turn it on:** tick *Check the launcher code (paranoid)* on the start screen, next to
+  *Who plays*. Through the API: `"launcher_check": true` in the body of
+  `POST /api/action {"action":"start", …}` (`false` when absent). `/api/state` reports what was
+  kept under `config.launcher_check`, and a rematch keeps it.
+- **What it protects, when on:** a file **replaced** on the way (the link is plain `http://`). Only
+  the `certutil` comparison made *before* opening the file stops an attacker; the question the
+  launcher asks is inside the file, and a replaced file simply leaves it out.
+- **What it never protects, on or off:** an **intercepted** link or file. Whoever gets it holds the
+  address and the server password: they can start the game and connect in the guest's place. The
+  code does nothing about that; only a private channel does.
+- **What is lost when it is off:** everything above. Nothing compares the file to the one the host
+  made. **A replaced file runs**, on the guest's PC, with the guest's rights, and nothing in the
+  lobby or in the launcher will say so. The lobby shows no code, only the link, `Copy link`,
+  `Save launcher`, the server password for a manual join, and one sentence: the file contains the
+  server password, send it through a private channel and delete it after the game.
 
 ### What the player sees in the game
 
@@ -170,9 +204,10 @@ keeps it.
 
 In referee mode:
 
-- the lobby shows **two complete invitations**, *Player A* and *Player B*, each with its own launcher
-  code, link, `Save launcher` (`GET /api/invite/launcher?side=A` or `?side=B`; without `side`, B) and
-  server password. Send each one to its player, and read each code aloud to its own player only;
+- the lobby shows **two complete invitations**, *Player A* and *Player B*, each with its own link,
+  `Save launcher` (`GET /api/invite/launcher?side=A` or `?side=B`; without `side`, B), server
+  password and, when [the launcher code](#the-launcher-code-optional-off-by-default) is on, its own
+  launcher code. Send each one to its player, and read each code aloud to its own player only;
 - there is **no game button**: nobody plays on this computer, and `open_game` answers
   `refused, reason: no_local_player`;
 - `Open ports` opens **six** mappings, three per side, all described `PZ Duel`: B's as before

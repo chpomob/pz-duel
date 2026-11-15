@@ -71,16 +71,22 @@ sert de `StartServer64.bat` quand ce script existe.
    votre place. Si vous avez refermé l'invite, votre invité n'entrera pas : ouvrez *Sécurité Windows*,
    *Pare-feu et protection du réseau*, *Autoriser une application via le pare-feu*.
 6. **Invitez votre adversaire** depuis le lobby : `Copy link`, ou `Save launcher` pour obtenir
-   `pz-duel-join.bat`. Le lobby affiche aussi un **code de vérification** : **lisez-le à voix haute** à
+   `pz-duel-join.bat`. Par défaut, le lanceur ne demande rien : votre invité le lance, il installe le
+   mod et ouvre le jeu sur le duel. **Ce fichier contient le mot de passe du serveur** : envoyez-le
+   par un canal privé, et supprimez-le après la partie. Rien ne le vérifie non plus : voir
+   [Le code du lanceur](#le-code-du-lanceur-en-option-éteint-par-défaut) pour ce que cela laisse sans
+   protection.
+   Si vous avez coché *Check the launcher code (paranoid)* (vérifier le code du lanceur) avant de lancer, le lobby affiche
+   aussi un **code de vérification** : **lisez-le à voix haute** à
    votre invité, **séparément du lien**, jamais dans le même message que le lien ou le fichier. C'est la
-   seule protection contre un fichier remplacé en route. Le lobby montre deux secrets différents,
+   seule protection contre un fichier remplacé en route. Le lobby montre alors deux secrets différents,
    chacun dans son bloc : le **code du lanceur** (le début du SHA-256 du `.bat`), que l'invité tape
    quand son lanceur le lui demande, et le **mot de passe du serveur**, seulement pour un invité qui
    saisit l'adresse à la main dans Project Zomboid. **Le code du lanceur n'est pas le mot de passe du
    serveur** ; le lobby le dit en anglais : « The launcher code is not the server password ». Tapé
    dans le lanceur, le mot de passe est refusé (`This is not the code of this file`).
    La carte du lobby se lit de haut en bas dans l'ordre où l'on s'en sert : **un seul bouton
-   principal** (ce que vous faites maintenant), puis le **code du lanceur** en gros (ce que vous
+   principal** (ce que vous faites maintenant), puis, option cochée, le **code du lanceur** en gros (ce que vous
    dictez — un clic le copie), puis le lien avec `Copy link` et `Save launcher` (ce que vous envoyez).
    Le QR est replié derrière *Show the QR code (phone)* : il ne sert qu'à un téléphone. Le jeton
    d'invitation n'est plus affiché.
@@ -122,21 +128,50 @@ dossier `matches` et le verrou d'instance unique (avec le port où il écoute).
 1. **Récupérez le `.bat`** sur le PC Windows qui a le jeu : ouvrez-y le lien de l'hôte, ou enregistrez
    le fichier qu'il vous a envoyé. Le lien ne marche que pendant que l'hôte est dans le lobby. Scanner
    le QR avec un téléphone met le fichier sur le téléphone, où il ne sert à rien.
-2. **Vérifiez le fichier avant de l'ouvrir.** Demandez à l'hôte le code de vérification qu'il lit à
-   voix haute. Dans le dossier qui contient le fichier, faites un clic droit sur un espace vide,
+2. **Si l'hôte vous a annoncé un code du lanceur, vérifiez le fichier avant de l'ouvrir.** Le code
+   est une option, éteinte par défaut : sans lui il n'y a rien à comparer, rien ne prouve que le
+   fichier est celui que l'hôte a fabriqué, et vous passez à l'étape 3. Avec lui, demandez à l'hôte
+   le code de vérification qu'il lit à voix haute. Dans le dossier qui contient le fichier, faites un clic droit sur un espace vide,
    choisissez **Ouvrir dans le Terminal** (sous Windows 10, maintenez Maj pendant le clic droit pour
    obtenir une fenêtre du même genre), et tapez `certutil -hashfile pz-duel-join.bat SHA256`.
    **N'ouvrez pas le fichier si le résultat ne commence pas par ce code** : il a été remplacé en route.
    Supprimez-le et demandez-en un nouveau à l'hôte.
 3. **Seulement ensuite, double-cliquez sur `pz-duel-join.bat`.** **SmartScreen** peut aussi prévenir
    ici : **Informations complémentaires**, puis **Exécuter quand même**. Ne le faites que pour un
-   fichier reçu d'une personne de confiance, vérifié à l'étape 2. Il redemande le code : tapez-le, puis
-   Entrée. Un lanceur qui ne le demande pas a été remplacé.
+   fichier reçu d'une personne de confiance. Par défaut, il ne demande rien. Si l'hôte a annoncé un
+   code, il redemande le code : tapez-le, puis Entrée ; dans ce cas, un lanceur qui ne le demande pas
+   a été remplacé.
 4. Il installe le mod, lance le jeu connecté à l'hôte, et attend quelques secondes pour vérifier que le
    jeu tourne toujours. S'il ne trouve pas le jeu, il demande le dossier. En cas d'échec, ou si le jeu
-   se ferme aussitôt, votre mod existant est remis tel quel et la fenêtre reste ouverte. En cas de
-   succès, le mod `duelcore` qu'il a remplacé n'est pas supprimé : il est gardé dans
+   se ferme aussitôt, votre mod existant est remis tel quel et la fenêtre reste ouverte le temps de
+   lire pourquoi : 30 secondes par défaut, jusqu'à l'appui sur une touche quand le code est allumé.
+   En cas de succès, le mod `duelcore` qu'il a remplacé n'est pas supprimé : il est gardé dans
    `Zomboid\duelcore.previous`, dans votre dossier utilisateur, et la fenêtre dit comment y revenir.
+5. **Supprimez `pz-duel-join.bat` après la partie** : il contient le mot de passe du serveur.
+
+### Le code du lanceur (en option, éteint par défaut)
+
+Le code du lanceur est le début du SHA-256 du `.bat`, lu à voix haute par l'hôte et comparé par
+l'invité. Il est **éteint par défaut** : pour un duel d'un soir entre deux personnes qui se parlent,
+dicter seize caractères hexadécimaux coûte plus que ne vaut le mot de passe d'un serveur qui ne vit
+qu'une partie.
+
+- **Pour l'allumer :** cochez *Check the launcher code (paranoid)* sur l'écran de lancement, à
+  côté de *Who plays*. Par l'API : `"launcher_check": true` dans le corps de
+  `POST /api/action {"action":"start", …}` (`false` s'il est absent). `/api/state` dit ce qui a été
+  retenu sous `config.launcher_check`, et une revanche le garde.
+- **Ce qu'il protège, allumé :** un fichier **remplacé** en route (le lien est en `http://`). Seule la
+  comparaison par `certutil`, faite *avant* d'ouvrir le fichier, arrête un attaquant ; la question
+  que pose le lanceur est dans le fichier, et un fichier remplacé n'a qu'à l'omettre.
+- **Ce qu'il ne protège jamais, allumé ou éteint :** un lien ou un fichier **intercepté**. Qui
+  l'obtient tient l'adresse et le mot de passe du serveur : il peut lancer le jeu et se connecter à la
+  place de l'invité. Le code n'y change rien ; seul un canal privé le fait.
+- **Ce qui est perdu quand il est éteint :** tout ce qui précède. Rien ne compare le fichier à celui
+  que l'hôte a fabriqué. **Un fichier remplacé s'exécute**, sur le PC de l'invité, avec ses droits, et
+  rien dans le lobby ni dans le lanceur ne le dira. Le lobby n'affiche aucun code : seulement le lien,
+  `Copy link`, `Save launcher`, le mot de passe serveur pour un ajout manuel, et une phrase, en anglais : ce
+  fichier contient le mot de passe du serveur, envoyez-le par un canal privé et supprimez-le après la
+  partie.
 
 ### Ce que le joueur voit en jeu
 
@@ -179,10 +214,11 @@ revanche le garde.
 
 En mode arbitre :
 
-- le lobby montre **deux invitations complètes**, *Player A* et *Player B*, chacune avec son code de
-  lanceur, son lien, son `Save launcher` (`GET /api/invite/launcher?side=A` ou `?side=B` ; sans
-  `side`, B) et son mot de passe serveur. Envoyez chacune à son joueur, et lisez chaque code à voix
-  haute à son seul joueur ;
+- le lobby montre **deux invitations complètes**, *Player A* et *Player B*, chacune avec son lien, son
+  `Save launcher` (`GET /api/invite/launcher?side=A` ou `?side=B` ; sans `side`, B), son mot de passe
+  serveur et, quand [le code du lanceur](#le-code-du-lanceur-en-option-éteint-par-défaut) est allumé,
+  son code de lanceur. Envoyez chacune à son joueur, et lisez chaque code à voix haute à son seul
+  joueur ;
 - **pas de bouton de jeu** : personne ne joue sur cette machine, et `open_game` répond
   `refused, reason: no_local_player` ;
 - `Open ports` ouvre **six** redirections, trois par camp, toutes décrites `PZ Duel` : celles de B
