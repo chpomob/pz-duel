@@ -19,6 +19,10 @@ code wins and `docs/campaigns/` records the change.
 | 08 | [Smooth launcher and QR flow](en/08-smooth-launcher-qr-flow.md) | [Flow fluide, lanceur et QR](fr/08-flow-fluide-lanceur-qr.md) |
 | 09 | [In-game UI](en/09-in-game-ui.md) | [UI full in-game](fr/09-ui-full-ingame.md) |
 
+Written after the code, and in French only: [10 — Chacun son serveur](fr/10-chacun-son-serveur.md), a
+feasibility study with measured spikes (`spikes/chacun_son_serveur/`) for a version where each player
+hosts their own server.
+
 The binding documents for the code that shipped are elsewhere: the acceptance spec
 (`docs/campaigns/phase1/spec.md`), the 24-step plan (`docs/campaigns/phase1/plan.md`), the four branch
 reviews and the fifteen fix steps (`docs/campaigns/phase1/review*/`, `scaffolding/fixes/`), and the
