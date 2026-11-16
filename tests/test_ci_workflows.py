@@ -1011,3 +1011,147 @@ def test_p9f17_gitattributes_forces_lf_for_every_file():
     rules = [line.split() for line in attributes.read_text("utf-8").splitlines()]
     star = [rule[1:] for rule in rules if rule and rule[0] == "*"]
     assert star and "eol=lf" in star[0] and "text=auto" in star[0]
+
+
+# -- P9F23 : la sortie de Node se lit en UTF-8, dans tout `tests/` -------------------------------
+
+TESTS_DIR = REPO / "tests"
+SUBPROCESS_CALLS = ("run", "Popen", "check_output")
+# `node`, `nodejs`, `NODE`, `node_bin` ; pas `inode` ni `nodes`.
+NODE_WORD = re.compile(r"(?<![A-Za-z])node(?:js)?(?![A-Za-z])", re.IGNORECASE)
+UTF8_NAMES = {"utf-8", "utf8"}
+# Le cas légitime se déclare sur une ligne de l'appel, raison à l'appui ; il ne se contourne pas.
+LOCAL_ENCODING_WAIVER = re.compile(r"#\s*encodage-local\s*:\s*\S")
+
+
+def _is_false(value: ast.expr) -> bool:
+    return isinstance(value, ast.Constant) and value.value in (False, None)
+
+
+def node_decoding_problems(paths: list[Path], root: Path) -> list[str]:
+    """Les appels `subprocess` qui décodent la sortie de Node avec l'encodage de la machine.
+
+    Un appel est en cause s'il nomme `node`, capture (`capture_output`, `PIPE`, `check_output`),
+    décode en texte (`text`, `universal_newlines`, `encoding`, `errors`) et ne porte pas
+    `encoding="utf-8"`. Qui lit des octets ou ne capture rien n'est pas concerné.
+    """
+    problems = []
+    for path in sorted(paths):
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        for call in ast.walk(ast.parse(source)):
+            if not isinstance(call, ast.Call):
+                continue
+            name = ast.unparse(call.func)
+            leaf = name.split(".")[-1]
+            if leaf not in SUBPROCESS_CALLS or name not in (leaf, f"subprocess.{leaf}"):
+                continue
+            options = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+            segment = "\n".join(lines[call.lineno - 1 : call.end_lineno])
+            if not NODE_WORD.search(ast.get_source_segment(source, call) or segment):
+                continue
+            captures = leaf == "check_output" or any(
+                (key == "capture_output" and not _is_false(value))
+                or (key in ("stdout", "stderr") and ast.unparse(value).endswith("PIPE"))
+                for key, value in options.items()
+            )
+            decodes = any(
+                key in options and not _is_false(options[key])
+                for key in ("text", "universal_newlines", "encoding", "errors")
+            )
+            encoding = options.get("encoding")
+            utf8 = (
+                isinstance(encoding, ast.Constant)
+                and isinstance(encoding.value, str)
+                and encoding.value.lower().replace("_", "-") in UTF8_NAMES
+            )
+            if not captures or not decodes or utf8 or LOCAL_ENCODING_WAIVER.search(segment):
+                continue
+            where = path.relative_to(root).as_posix()
+            problems.append(
+                f'{where}:{call.lineno}: {name} reads the output of node without encoding="utf-8"'
+            )
+    return problems
+
+
+def node_call_problems(tmp_path: Path, call: str) -> list[str]:
+    """La garde sur un fichier fabriqué : l'appel y est à la ligne 5."""
+    path = tmp_path / "test_fabricated.py"
+    path.write_text(f"import subprocess\n\n\ndef render(node, js):\n    {call}\n", encoding="utf-8")
+    return node_decoding_problems([path], tmp_path)
+
+
+def test_p9f23_no_test_decodes_node_output_with_the_local_encoding():
+    """Aucun `subprocess` de `tests/` ne lit la sortie de Node dans l'encodage de la machine.
+
+    Mutation : `encoding="utf-8"` rendu à `text=True` dans un appel à Node de
+    `tests/test_phase3_p9f21.py`, `tests/test_phase3_p9f22.py` ou `tests/test_setup_flow.py` —
+    la garde nomme le fichier et la ligne.
+    """
+    assert node_decoding_problems(list(TESTS_DIR.rglob("*.py")), REPO) == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'done = subprocess.run([node, "-e", js], capture_output=True, text=True, check=True)',
+        'done = subprocess.run(\n        [node, "-e", js],\n        capture_output=True,\n        text=True,\n    )',
+        'done = subprocess.run(["node", "-e", js], capture_output=True, universal_newlines=True)',
+        'done = subprocess.run([node, "-e", js], capture_output=True, encoding="cp1252")',
+        'done = subprocess.run([node, "-e", js], stdout=subprocess.PIPE, errors="replace")',
+        'done = subprocess.Popen([node, "-e", js], stdout=subprocess.PIPE, text=True)',
+        'done = Popen([NODE_BIN, "-e", js], stderr=PIPE, text=True)',
+        'done = subprocess.check_output([node, "-e", js], text=True)',
+    ],
+)
+def test_p9f23_fabricated_node_call_is_named_with_file_and_line(tmp_path, call):
+    """L'occurrence fabriquée est vue, avec son fichier et la ligne où l'appel commence.
+
+    Mutation : la garde ne regardant que `subprocess.run`, ou que `text=True`, ou ne donnant
+    plus la ligne, un de ces cas tombe.
+    """
+    problems = node_call_problems(tmp_path, call)
+
+    assert len(problems) == 1
+    assert problems[0].startswith("test_fabricated.py:5: ")
+    assert problems[0].endswith(' reads the output of node without encoding="utf-8"')
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        # Lit en UTF-8 : la correction elle-même.
+        'done = subprocess.run([node, "-e", js], capture_output=True, encoding="utf-8", check=True)',
+        'done = subprocess.run([node, "-e", js], capture_output=True, text=True, encoding="UTF-8")',
+        # Lit des octets.
+        'done = subprocess.run([node, "-e", js], capture_output=True, check=True)',
+        'done = subprocess.run([node, "-e", js], capture_output=True, text=False)',
+        'done = subprocess.Popen([node, "-e", js], stdout=subprocess.PIPE).stdout.read()',
+        # Ne capture rien.
+        'subprocess.run([node, "-e", js], check=True)',
+        'subprocess.run([node, "-e", js], check=True, text=True, stdout=subprocess.DEVNULL)',
+        # Ne lance pas Node : hors de la classe.
+        'done = subprocess.run(["git", "status"], capture_output=True, text=True)',
+        'done = subprocess.run([inode, nodes], capture_output=True, text=True)',
+        # Cas légitime, déclaré.
+        'done = subprocess.run([node, js], capture_output=True, text=True)  # encodage-local: voulu',
+    ],
+)
+def test_p9f23_bytes_uncaptured_and_declared_calls_are_left_alone(tmp_path, call):
+    """Octets, absence de capture, autre outil, cas déclaré : la garde se tait.
+
+    Mutation : la garde signalant tout appel qui nomme `node` sans `encoding="utf-8"`, les
+    appels en octets et sans capture tombent ; le commentaire `encodage-local:` ignoré, le
+    dernier tombe.
+    """
+    assert node_call_problems(tmp_path, call) == []
+
+
+def test_p9f23_waiver_needs_a_reason(tmp_path):
+    """Le commentaire d'exemption sans raison ne vaut rien.
+
+    Mutation : `\\S` retiré de `LOCAL_ENCODING_WAIVER`, l'appel passe sans s'expliquer.
+    """
+    call = "done = subprocess.run([node, js], capture_output=True, text=True)  # encodage-local:"
+
+    assert len(node_call_problems(tmp_path, call)) == 1

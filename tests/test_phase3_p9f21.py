@@ -15,6 +15,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+import pytest
 from doubles.mini_lua import LuaError
 from test_match import (  # noqa: F401
     WAIT_S,
@@ -398,11 +399,26 @@ def test_lobby_shows_the_sentence_of_each_held_player():
         + f"\nconsole.log(JSON.stringify(heldPlayersNotice({json.dumps(hold)})"
         + ".split('</p>').filter(Boolean)));\n"
     )
+    # Node écrit en UTF-8 ; `text=True` seul décoderait avec l'encodage local (cp1252 sous Windows).
     done = subprocess.run(
-        [node, "-e", harness], capture_output=True, text=True, timeout=30, check=True
+        [node, "-e", harness], capture_output=True, encoding="utf-8", timeout=30, check=True
     )
     assert json.loads(done.stdout) == [
         '<p class="notice">tenu : hote (4/4)',
         '<p class="err">tenu : &lt;invite&gt; (3/4, setInvisible en échec)',
         '<p class="err">tenu : vu (2/4, setInvisible en échec)',
     ]
+
+
+def test_p9f23_held_players_notice_survives_a_windows_locale(monkeypatch):
+    """Sous un encodage local cp1252 (runner Windows), la phrase rendue par Node garde son « é ».
+
+    Mutation : `encoding="utf-8"` retiré de l'appel à Node (retour à `text=True`) fait décoder la
+    sortie en cp1252, « en échec » devient « en Ã©chec » et l'égalité tombe — l'erreur de la CI
+    Windows sur P9F21.
+    """
+    if (shutil.which("node") or shutil.which("nodejs")) is None:
+        pytest.skip("node absent")
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "cp1252")
+
+    test_lobby_shows_the_sentence_of_each_held_player()

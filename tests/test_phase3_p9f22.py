@@ -854,7 +854,10 @@ def test_lobby_says_when_announcements_only_reach_the_chat():
         + f"\nconsole.log(JSON.stringify({json.dumps(views)}.map(announceNotice)"
         + ".map((html) => html.replace(/\\s+/g, ' '))));\n"
     )
-    done = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30, check=True)
+    # Node écrit en UTF-8 ; `text=True` seul décoderait avec l'encodage local (cp1252 sous Windows).
+    done = subprocess.run(
+        [node, "-e", harness], capture_output=True, encoding="utf-8", timeout=30, check=True
+    )
     quiet_a, quiet_b, one, two = json.loads(done.stdout)
     assert quiet_a == quiet_b == ""
     assert one.startswith('<p class="err" id="announce-chat">In-game announcements on side B (its game')

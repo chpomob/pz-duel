@@ -883,3 +883,46 @@ compteur à part ; client : aucun appel au chargement (statique et dynamique), c
 `HaloTextHelper` absent ou d'une autre signature ; chaîne entière du service à l'écran ; page :
 avertissement du lobby (bloc exécuté par `node` s'il est présent). `tests/test_announce.py` :
 longueur ramenée à 80, phrases courtes.
+
+## P9F23 — sorties de Node lues en UTF-8 dans tout `tests/`, et une garde sur la classe (2026-11-16)
+
+**Cause :** CI rouge sur `5f8fc6f` (P9F21), les trois jobs Windows seulement :
+`tests\test_phase3_p9f21.py:404`, « en échec » relu « en �chec ».
+`test_lobby_shows_the_sentence_of_each_held_player` lisait la sortie de Node par
+`subprocess.run(..., text=True)` : Node écrit en UTF-8, Windows décode en cp1252. Le produit n'y
+est pour rien. C'est le défaut de P9F17, revenu dans un test neuf : le correctif ponctuel ne
+protégeait que `tests/test_setup_flow.py`.
+
+**Fait :**
+
+- Deux occurrences, toutes deux passées à `encoding="utf-8"` : `tests/test_phase3_p9f21.py`
+  (celle qui a rougi) et `tests/test_phase3_p9f22.py` (`announceNotice` ; elle n'assertait que de
+  l'ASCII, donc passait). Les neuf appels de `tests/test_setup_flow.py` l'avaient déjà.
+- `node_decoding_problems`, dans `tests/test_ci_workflows.py`, lit par `ast` tous les `*.py` de
+  `tests/` : un appel à `subprocess.run`, `Popen` ou `check_output` qui nomme `node`, capture
+  (`capture_output`, `PIPE`), décode en texte (`text`, `universal_newlines`, `encoding`, `errors`)
+  et ne porte pas `encoding="utf-8"` est signalé, `fichier:ligne` en tête.
+- Ne sont pas signalés : l'appel qui lit des octets, celui qui ne capture rien, celui qui ne nomme
+  pas Node. Un cas légitime se déclare par `# encodage-local: <raison>` sur une ligne de l'appel ;
+  sans raison, le commentaire ne vaut rien. Aucun appel du dépôt n'en a besoin aujourd'hui.
+
+**Tests et mutations :** `tests/test_phase3_p9f21.py` —
+`test_p9f23_held_players_notice_survives_a_windows_locale` force `subprocess._text_encoding` à
+cp1252 et rejoue le test du lobby : `text=True` remis, il tombe sur « en Ã©chec », comme la CI.
+`tests/test_ci_workflows.py` — `test_p9f23_no_test_decodes_node_output_with_the_local_encoding`
+(la même mutation y est nommée `tests/test_phase3_p9f21.py:403`),
+`test_p9f23_fabricated_node_call_is_named_with_file_and_line`,
+`test_p9f23_bytes_uncaptured_and_declared_calls_are_left_alone`,
+`test_p9f23_waiver_needs_a_reason`.
+
+**Ouvert :**
+
+- La preuve finale est la CI Windows verte sur ce commit, à relire après le push : sous Linux,
+  l'encodage local est déjà UTF-8, seul le cp1252 simulé y tient lieu de Windows.
+- La garde lit l'expression de l'appel, pas ce qui y entre : une commande montée ailleurs
+  (`command = [node, ...]` puis `subprocess.run(command, text=True)`), des options passées par
+  `**options`, ou un `subprocess.run` renommé à l'import lui échappent.
+- Les autres `text=True` de `tests/` lancent Python, git ou des outils du système, pas Node : ils
+  ne sont pas dans la classe et restent en l'état. `tests/test_campaign_gate.py` impose déjà
+  l'UTF-8 à git sous Windows.
+- Comme en P9F17, le test de locale repose sur `subprocess._text_encoding`, nom privé de CPython.
