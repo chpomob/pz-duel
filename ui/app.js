@@ -663,6 +663,21 @@ const sendZone = (inv, canSave, id) => `<p class="hint">${esc(inv.launcher_code 
 // P9F11: "frozen" is only shown for a side whose game answered `applied` (status `held`): a hold
 // merely sent proves nothing. A release not yet confirmed blocks the duel, and says so.
 const HOLD_FAILED = { unsupported: true, refused: true };
+// P9F21: the game reports, player by player, which hold calls it really made. One line each,
+// written by the service (`label`: the count, and the first missing call), so a visible
+// character can be told from a call that never happened. On a side whose hold failed, only
+// the incomplete players are listed.
+function heldPlayersNotice(hold) {
+  const lines = [];
+  for (const side of ['A', 'B']) {
+    const view = hold[side] || {};
+    for (const entry of view.players || []) {
+      if (HOLD_FAILED[view.status] && entry.complete) continue;
+      lines.push(`<p class="${entry.complete ? 'notice' : 'err'}">${esc(entry.label)}</p>`);
+    }
+  }
+  return lines.join('');
+}
 function holdNotice() {
   const hold = (S.capabilities && S.capabilities.hold) || {};
   const status = (side) => hold[side] && hold[side].status;
@@ -685,6 +700,7 @@ function holdNotice() {
   } else if (['A', 'B'].some((side) => status(side) === 'sent')) {
     parts.push('<p class="notice">Freeze requested: waiting for the game to confirm it.</p>');
   }
+  parts.push(heldPlayersNotice(hold));
   return parts.join('');
 }
 

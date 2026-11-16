@@ -3262,7 +3262,8 @@ class PausedServer:
         self.fire("OnTickEvenPaused")
 
     def lines(self, kind: str) -> list[dict]:
-        catalog = load_effects()
+        # Le catalogue des lecteurs du moteur : `hold_applied` (P9F21) y est admis, comme en vrai.
+        catalog = engine_module._reader_catalog(load_effects())
         events = [parse_event(line, catalog) for line in "".join(self.out).splitlines()]
         return [event for event in events if event["kind"] == kind]
 
@@ -3587,7 +3588,7 @@ def test_held_player_loses_no_health_and_released_player_does():
 
     assert server.result(1)["status"] == "applied"
     assert host.invulnerable and host.blocked
-    # Réappliqués à chaque passe, toujours dans cet ordre : protégé, caché (P9F12), puis figé.
+    # Posés une fois (P9F21), toujours dans cet ordre : protégé, caché (P9F12), puis figé.
     assert host.calls[:3] == [
         ("setInvulnerable", True),
         ("setInvisible", True),

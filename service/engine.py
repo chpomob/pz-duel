@@ -99,7 +99,7 @@ from .snapshots import (
     SnapshotStore,
     prepare_worlds,
 )
-from .state import MatchState
+from .state import HOLD_CALLS, MatchState, held_player
 from .transport import Anomaly, CommandChannel, OutReader, PollResult
 from .verdict import (
     APPLIED,
@@ -176,6 +176,10 @@ RELEASE_KIND = "release_time"
 # Journalisées sous leur propre type : le rejeu ne connaît que les `command` du cœur et les
 # sondes. Elles prennent leur `seq` avant toute sonde, donc sous la réserve du cœur.
 HOLD_RECORD = "hold_command"
+# P9F21 : le mod rapporte, une fois par joueur et par tenue, les appels qu'il a posés. Ce n'est
+# ni un atome ni un intrant du match : la ligne se journalise sous son propre type, que le rejeu
+# ignore, et nourrit `hold.players`.
+HOLD_APPLIED = "hold_applied"
 HOLD_OFF = "off"
 HOLD_UNSUPPORTED = "unsupported"
 HOLD_SENT = "sent"
@@ -293,6 +297,17 @@ class _SideShare:
 
     def guest_launcher(self) -> bytes:
         return self._engine.side_launcher(self._side)
+
+
+def _reader_catalog(effects: Mapping[str, Any]) -> dict[str, Any]:
+    """Le catalogue donné aux lecteurs de `out` : celui du match, plus `hold_applied`.
+
+    Le contrat de lecture n'admet que les lignes de contrôle et les atomes ; ce rapport du mod
+    n'est ni l'un ni l'autre. Il n'est admis qu'ici, à la lecture : le cœur, la table et le
+    rejeu gardent le catalogue du match, où il n'existe pas.
+    """
+    atoms = {**effects["atoms"], HOLD_APPLIED: {"source": "server"}}
+    return {**effects, "atoms": atoms}
 
 
 def _ipv4_literal(value: object) -> bool:
@@ -714,6 +729,8 @@ class RealMatch:
         self._hold_view: dict[str, dict[str, Any]] = {
             side: {"status": HOLD_OFF, "reason": None} for side in SIDES
         }
+        # P9F21 : par camp, les joueurs dont le mod a rapporté la tenue, avec leurs appels.
+        self._hold_players: dict[str, list[dict[str, Any]]] = {side: [] for side in SIDES}
         self._threats: deque[float] = deque()
         # Commandes écrites sans `cmd_result` lu : ce qu'un redémarrage rendrait perdu.
         self._unresolved: dict[str, set[int]] = {side: set() for side in SIDES}
@@ -745,7 +762,7 @@ class RealMatch:
             side: CommandChannel(side, lua_dir, clock=monotonic, policy=runtime) for side in SIDES
         }
         self._readers = {
-            side: OutReader(channel.out_path, side, effects)
+            side: OutReader(channel.out_path, side, _reader_catalog(effects))
             for side, channel in self._channels.items()
         }
         self._journal: Journal | None = None
@@ -1447,6 +1464,9 @@ class RealMatch:
     def _take_event(self, side: str, event: Mapping[str, Any], now_ms: int) -> None:
         """Avant le match, l'événement se journalise ici ; ensuite, le cœur l'écrit à son tick."""
         kind, data = event["kind"], event["data"]
+        if kind == HOLD_APPLIED:
+            self._take_hold_applied(side, data)
+            return
         if not self._admitted(side, event):
             refused = {
                 "kind": kind,
@@ -1764,7 +1784,28 @@ class RealMatch:
         if kind == HOLD_KIND:
             self._held_sides.append(side)
             self._hold_view[side] = {"status": HOLD_SENT, "reason": None}
+            # Une tenue nouvelle : le mod rapportera de nouveau chacun de ses joueurs.
+            self._hold_players[side] = []
         return True
+
+    def _take_hold_applied(self, side: str, data: Mapping[str, Any]) -> None:
+        """Retient ce que le mod dit avoir posé pour un joueur, et le journalise tel quel.
+
+        `calls` est réduit aux appels connus, sans doublon, dans l'ordre reçu. Le même joueur
+        rapporté de nouveau (tenue reposée) remplace sa ligne. Une ligne sans joueur ne dit
+        rien et s'écarte.
+        """
+        player, calls = data.get("player"), data.get("calls")
+        if not isinstance(player, str) or not player or not isinstance(calls, list):
+            return
+        kept: list[str] = []
+        for call in calls:
+            if call in HOLD_CALLS and call not in kept:
+                kept.append(call)
+        report = {"player": player, "calls": kept}
+        self._write_safely(HOLD_APPLIED, report, side, None)
+        others = [entry for entry in self._hold_players[side] if entry["player"] != player]
+        self._hold_players[side] = [*others, held_player(player, kept)]
 
     def _take_hold_result(self, side: str, result: Mapping[str, Any], now_ms: int) -> None:
         """Lit le résultat d'une commande de monde : un refus s'annonce, et rien n'attend.
@@ -2006,7 +2047,10 @@ class RealMatch:
             "table": self._announced_table(),
             "attribution": self._attribution,
             "spawn": spawn,
-            "hold": copy.deepcopy(self._hold_view),
+            "hold": {
+                side: {**view, "players": copy.deepcopy(self._hold_players[side])}
+                for side, view in self._hold_view.items()
+            },
             # L'attribution ne se mesure qu'en fin de match : rien à en conclure avant.
             "fallback": fallback(combined_spawn(spawn), self._attribution or INSUFFICIENT),
         }

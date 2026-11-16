@@ -22,6 +22,26 @@ PHASE_LABELS = {
 HOST_SECRET_PHASE = "lobby"
 HOST_SECRET = "host_password"
 
+# P9F21 : les quatre appels de la tenue, dans l'ordre où le mod les pose pour chaque joueur.
+HOLD_CALLS = ("setInvulnerable", "setZombiesDontAttack", "setInvisible", "setBlockMovement")
+
+
+def held_player(player: str, calls: list[str]) -> dict:
+    """Un joueur tenu tel que `/api/state` le publie dans `hold.players`, phrase du lobby comprise.
+
+    « tenu : <pseudo> (4/4) », ou « tenu : <pseudo> (3/4, setInvisible en échec) » : le compte,
+    et le premier appel de la séquence qui manque. La page affiche `label` sans rien calculer.
+    """
+    missing = next((call for call in HOLD_CALLS if call not in calls), None)
+    count = f"{len(calls)}/{len(HOLD_CALLS)}"
+    detail = count if missing is None else f"{count}, {missing} en échec"
+    return {
+        "player": player,
+        "calls": list(calls),
+        "complete": missing is None,
+        "label": f"tenu : {player} ({detail})",
+    }
+
 LAUNCH_STEPS = [
     ("preflight", "Préflight"),
     ("serverA", "Serveur A"),

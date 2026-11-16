@@ -720,3 +720,73 @@ sprinter portant `outfit` ; `random` journalisé au départ réglé, rien pour u
 `outfit` sur une caisse de soin ; mod : nom passé tel quel, `nil` pour `random` ou clé absente ;
 page : pas de `Number()` sur un `choice`. `SpawnGame` (`tests/test_rules_load.py`) relève le
 cinquième argument ; `SPEC_DEFAULTS` (`tests/test_settings.py`) reçoit la nouvelle clé.
+
+## P9F21 — la tenue du joueur arrivé après, rapportée joueur par joueur (2026-11-16)
+
+Constat de session réelle (15/11, « moi et un invité ») : tenue demandée serveurs vides, l'invité
+arrive ensuite ; horloge figée, PV à 100, mais **personnage visible à l'écran**. Deux lectures :
+la séquence n'est pas posée pour l'arrivant, ou elle l'est et le client affiche quand même son
+propre personnage. L'étape ne tranche pas par le raisonnement : elle rend le fait lisible.
+
+**Ce que fait la tenue à chaque passe.** Pour chaque joueur en ligne, dans l'ordre :
+`setInvulnerable`, `setZombiesDontAttack`, `setInvisible`, `setBlockMovement`, chacun sous `pcall`.
+Un appel déjà posé pour ce joueur n'est pas reposé, sauf si le jeu dit l'avoir perdu
+(`isInvulnerable`, `isZombiesDontAttack`, `isInvisible` rendent `false`) ; `setBlockMovement`, que
+le mod ne relit pas, n'est posé qu'une fois par objet joueur. Un joueur revenu sous un nouvel objet
+(même pseudo) reçoit la séquence entière. Hors du jeu (`mini_lua`), l'arrivant recevait déjà les
+quatre appels avant cette étape : la première lecture n'est donc pas confirmée par les tests, et
+seul le journal d'une vraie session peut l'écarter ou la retenir.
+
+**Le rapport.** Une fois par joueur et par tenue, le mod écrit dans `out` une ligne `hold_applied`
+(`side`, et dans `data` : `player`, `calls`, la liste ordonnée des appels réussis). Après un échec,
+`calls` s'arrête à l'appel manquant, que `no_hold_api` nomme comme avant ; la passe s'arrête à ce
+joueur et la tenue tombe. Le service journalise la ligne sous le type `hold_applied` (`mt` nul,
+ignoré du rejeu) et la publie dans `/api/state`, par camp, sous `capabilities.hold.<camp>.players`
+— là où la tenue est déjà publiée ; les clés de premier niveau de l'état sont figées par
+`test_api_backward_compatible`. Chaque joueur y porte `player`, `calls`, `complete` et `label`, la
+phrase que le lobby affiche telle quelle : « tenu : <pseudo> (4/4) » ou
+« tenu : <pseudo> (3/4, setInvisible en échec) » (le compte, et le premier appel manquant de la
+séquence). La phrase vient du service (`service/state.py`) : la page n'ajoute que des lignes en
+anglais et ne nomme aucun appel du jeu. Sur un camp dont la tenue est tombée, seuls les joueurs
+incomplets restent affichés.
+
+**Le relâchement.** Chaque appel posé est défait, dans cet ordre : `setInvisible`,
+`setBlockMovement`, `setZombiesDontAttack`, `setInvulnerable`. Un joueur qui n'est plus en ligne est rendu au mieux par son objet gardé, et
+un échec sur cet objet ne retient plus le relâchement. Un joueur en ligne qu'on ne peut rendre
+mobile garde sa protection et le relâchement rend `refused`, comme avant.
+
+**Limites.**
+
+- **`4/4` dit que le serveur a posé les appels sans erreur, pas que l'écran obéit.** Si le journal
+  porte `setInvisible` pour l'invité et que son personnage reste visible **sur son propre écran**,
+  c'est la seconde lecture : le client dessine toujours son joueur. Ce qui compte alors est ce que
+  voient les zombies et l'autre joueur, pas lui-même — à constater.
+- **Le rapport est unique par tenue.** Un appel reposé plus tard (état perdu par le jeu, joueur
+  revenu sous un nouvel objet) n'émet pas de seconde ligne : le journal ne dit pas combien de fois
+  `setInvisible` a dû être reposé. Si le jeu défait l'invisibilité à chaque passe, on lira `4/4`
+  et un personnage visible par intermittence.
+- **L'heure du rapport est celle de la première passe où le joueur figure dans
+  `getOnlinePlayers`.** Si le jeu réinitialise l'état du personnage plus tard dans la connexion,
+  seule la relecture par `isInvisible` le rattrape ; rien ne le prouve en jeu.
+- **Un joueur parti sous tenue** est rendu par un objet qui n'est peut-être plus le sien : si le
+  jeu a sauvegardé son personnage invisible ou invulnérable à la déconnexion, il reviendra ainsi,
+  et une tenue suivante lirait cet état comme « d'avant ». Non vérifié (déjà ouvert en P9F11).
+- **`hold_applied` n'est pas au catalogue du protocole.** Le moteur l'admet pour ses seuls
+  lecteurs de `out` (`_reader_catalog`) ; le cœur, la table et le rejeu ne le connaissent pas. Un
+  service d'avant P9F21 devant un mod P9F21 l'écarterait en `bad_line`, sans autre effet.
+- **Le mode simulé ne rapporte rien** : `hold.players` y reste vide.
+
+**À vérifier en jeu.** Rejouer le scénario du 15/11 (tenue posée serveurs vides, l'invité arrive
+ensuite) et lire : le journal porte-t-il `hold_applied` pour l'invité avec les quatre appels, et à
+quelle heure par rapport à son premier battement ; le lobby dit-il « tenu : <invité> (4/4) » ; son
+personnage est-il invisible sur son écran, et sur celui d'un tiers.
+
+**Tests (mutation citée dans chaque docstring) :** `tests/test_phase3_p9f21.py` — l'arrivant
+reçoit les quatre appels dans l'ordre à la passe suivante ; rien n'est reposé sans raison, un état
+perdu l'est ; nouvel objet, séquence entière ; `hold_applied` une fois par joueur et par tenue,
+liste exacte ; appel manquant nommé une fois, rapport arrêté avant lui ; liste vide encodée en
+liste ; relâchement qui défait tout, joueur parti sans effet, joueur en ligne non rendu toujours
+refusé ; service : journal, `hold.players`, `/api/state`, aucune `bad_line` ; phrase du lobby
+(4/4, 3/4 et appel manquant) ; page : une ligne par joueur, phrase échappée (bloc exécuté par
+`node` s'il est présent, sinon lu dans le source).
+`PausedServer.lines` (`tests/test_match.py`) lit `out` avec le catalogue des lecteurs du moteur.

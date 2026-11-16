@@ -873,6 +873,8 @@ end
 --     de bruit de monde), puis figé (`setBlockMovement`). Protégé d'abord, caché ensuite, figé
 --     en dernier ; au relâchement, l'ordre inverse : visible, mobile, puis vulnérable. Si la
 --     mobilité ne revient pas, la protection reste. Jamais un joueur figé et exposé.
+--     P9F21 : chaque joueur en ligne reçoit la séquence à chaque passe, sans reposer ce qui
+--     l'est déjà, et le mod rapporte une fois par joueur ce qu'il a posé (`hold_applied`).
 -- Best-effort en plus : ses besoins (faim, soif, fatigue, endurance) sont reposés à chaque
 -- passe à leur valeur d'entrée en tenue (`Stats:set` : `CharacterStat` peut manquer à Lua).
 local function holdRefused(call)
@@ -944,9 +946,46 @@ local function callPlayer(player, setter, value)
     return pcall(PLAYER_SETTERS[setter], player, value)
 end
 
--- Protège puis fige un joueur, à chaque passe : un joueur arrivé après la commande l'est à sa
--- première passe. Rend faux et le nom de l'appel manquant ; ce qui a été posé est noté dans
--- l'entrée, pour être rendu tel quel.
+-- Les quatre appels de la tenue, dans l'ordre où ils sont posés (P9F21) : protégé, hors
+-- d'atteinte, caché, puis figé. C'est aussi l'ordre de la liste `calls` de `hold_applied`.
+local HOLD_CALLS = { "setInvulnerable", "setZombiesDontAttack", "setInvisible", "setBlockMovement" }
+-- Ce que le jeu sait relire : un état qu'il dit perdu est reposé, les autres ne le sont pas.
+local HOLD_GETTERS = {
+    setInvulnerable = "isInvulnerable",
+    setZombiesDontAttack = "isZombiesDontAttack",
+    setInvisible = "isInvisible",
+}
+-- Joueurs (nom) dont la tenue en cours a déjà été rapportée : un `hold_applied` par joueur et
+-- par tenue. Vidé quand la tenue tombe (`dropHold`).
+local heldReported = {}
+
+-- Vrai si l'appel est déjà posé sur ce joueur et que le jeu ne dit pas le contraire : il n'est
+-- alors pas reposé. Sans lecture possible (`setBlockMovement`, ou getter absent), la note fait foi.
+local function stillSet(player, entry, call)
+    if not entry.set[call] then return false end
+    local getter = HOLD_GETTERS[call]
+    if getter == nil then return true end
+    local ok, value = pcall(PLAYER_GETTERS[getter], player)
+    return not (ok and value == false)
+end
+
+-- Rapporte, une fois par joueur et par tenue, les appels réellement posés, dans l'ordre : le
+-- journal dit ainsi si `setInvisible` a été posé pour ce joueur, et quand. Après un échec, la
+-- liste s'arrête à l'appel manquant, que `no_hold_api` nomme.
+local function reportHold(key, entry)
+    if heldReported[key] then return end
+    heldReported[key] = true
+    local calls = {}
+    for _, call in ipairs(HOLD_CALLS) do
+        if entry.set[call] then calls[#calls + 1] = call end
+    end
+    emit("hold_applied", { player = key, calls = { [ARRAY] = calls } }, side)
+end
+
+-- Protège, cache puis fige un joueur, à chaque passe : un joueur arrivé après la commande reçoit
+-- la séquence entière à sa première passe, et ce qui est déjà posé n'est pas reposé. Rend faux
+-- et le nom de l'appel manquant ; ce qui a été posé est noté dans l'entrée, pour être rendu tel
+-- quel. Protégé d'abord : un joueur n'est jamais figé sans être hors d'atteinte.
 local function freezePlayer(player)
     local key = playerKey(player)
     local entry = heldPlayers[key]
@@ -960,69 +999,86 @@ local function freezePlayer(player)
             set = {},
         }
         heldPlayers[key] = entry
+    elseif entry.player ~= player then
+        -- Revenu sous un nouvel objet : rien n'y est encore posé, la séquence repart entière.
+        entry.player = player
+        entry.set = {}
     end
-    entry.player = player
-    -- Protégé d'abord : un joueur n'est jamais figé sans être hors d'atteinte.
-    if not callPlayer(player, "setInvulnerable", true) then return false, "setInvulnerable" end
-    entry.set.setInvulnerable = true
-    if not callPlayer(player, "setZombiesDontAttack", true) then
-        return false, "setZombiesDontAttack"
+    local missing = nil
+    for _, call in ipairs(HOLD_CALLS) do
+        if not stillSet(player, entry, call) then
+            if not callPlayer(player, call, true) then
+                missing = call
+                break
+            end
+            entry.set[call] = true
+        end
     end
-    entry.set.setZombiesDontAttack = true
-    -- Caché ensuite : ni vu ni entendu, il n'attire plus personne vers l'endroit où il attend.
-    if not callPlayer(player, "setInvisible", true) then return false, "setInvisible" end
-    entry.set.setInvisible = true
-    if not callPlayer(player, "setBlockMovement", true) then return false, "setBlockMovement" end
-    entry.set.setBlockMovement = true
+    reportHold(key, entry)
+    if missing ~= nil then return false, missing end
     restoreStats(player, entry.stats)
+    return true
+end
+
+-- Défait un appel posé. Pour un joueur parti (`gone`), l'échec ne retient rien : son objet
+-- n'est plus celui de personne, et il n'y a plus de joueur figé à protéger.
+local function undo(entry, call, value, gone)
+    if not entry.set[call] then return true end
+    if not callPlayer(entry.player, call, value) and not gone then return false end
+    entry.set[call] = nil
     return true
 end
 
 -- Rend un joueur dans l'ordre inverse : visible, mobile, puis vulnérable. Si la mobilité ne
 -- revient pas, la protection reste et l'entrée aussi : un prochain `release_time` réessaie.
-local function thawPlayer(key, entry)
-    local player = entry.player
-    if entry.set.setInvisible then
-        if not callPlayer(player, "setInvisible", entry.invisible) then
-            return false, "setInvisible"
-        end
-        entry.set.setInvisible = nil
+-- Un joueur parti entre-temps est rendu au mieux et n'empêche jamais le relâchement (P9F21).
+local function thawPlayer(key, entry, gone)
+    if not undo(entry, "setInvisible", entry.invisible, gone) then return false, "setInvisible" end
+    if not undo(entry, "setBlockMovement", false, gone) then return false, "setBlockMovement" end
+    if not undo(entry, "setZombiesDontAttack", entry.shielded, gone) then
+        return false, "setZombiesDontAttack"
     end
-    if entry.set.setBlockMovement then
-        if not callPlayer(player, "setBlockMovement", false) then return false, "setBlockMovement" end
-        entry.set.setBlockMovement = nil
-    end
-    if entry.set.setZombiesDontAttack then
-        if not callPlayer(player, "setZombiesDontAttack", entry.shielded) then
-            return false, "setZombiesDontAttack"
-        end
-        entry.set.setZombiesDontAttack = nil
-    end
-    if entry.set.setInvulnerable then
-        if not callPlayer(player, "setInvulnerable", entry.invulnerable) then
-            return false, "setInvulnerable"
-        end
-        entry.set.setInvulnerable = nil
+    if not undo(entry, "setInvulnerable", entry.invulnerable, gone) then
+        return false, "setInvulnerable"
     end
     heldPlayers[key] = nil
     return true
 end
 
--- Fige les joueurs en ligne, ou rend tous ceux que la tenue a touchés, en ligne ou non. Rend
--- faux et le premier appel manquant si un seul joueur n'a pu être figé ou rendu.
+-- Noms des joueurs en ligne ; nil si le jeu ne sait pas le dire : personne n'est alors tenu
+-- pour parti.
+local function onlineKeys()
+    local ok, keys = pcall(function()
+        local found = {}
+        local players = onlinePlayers()
+        for i = 1, #players do found[playerKey(players[i])] = true end
+        return found
+    end)
+    if ok then return keys end
+    return nil
+end
+
+-- Tient les joueurs en ligne, ou rend tous ceux que la tenue a touchés, en ligne ou non. Rend
+-- faux et le premier appel manquant si un seul joueur n'a pu être tenu ou rendu. Une passe de
+-- tenue s'arrête au premier joueur qu'elle ne peut tenir : la tenue tombe de toute façon.
 local function blockPlayers(blocked)
     local missing = nil
     if blocked then
         local players = onlinePlayers()
         for i = 1, #players do
             local ok, call = freezePlayer(players[i])
-            if not ok and missing == nil then missing = call end
+            if not ok then
+                missing = call
+                break
+            end
         end
     else
+        local online = onlineKeys()
         local keys = {}
         for key in pairs(heldPlayers) do keys[#keys + 1] = key end
         for _, key in ipairs(keys) do
-            local ok, call = thawPlayer(key, heldPlayers[key])
+            local gone = online ~= nil and not online[key]
+            local ok, call = thawPlayer(key, heldPlayers[key], gone)
             if not ok and missing == nil then missing = call end
         end
     end
@@ -1072,6 +1128,7 @@ local function dropHold()
         end
     end
     showPaused(false)
+    heldReported = {}
     local thawed, call = blockPlayers(false)
     if not thawed and missing == nil then missing = call end
     return missing == nil, missing
