@@ -319,9 +319,18 @@ les défauts de ce preset), et `Valeurs par défaut` les remet.
   résistance (défaut *Normaux*), intelligence, mémoire des zombies, infection (inchangée : sang et
   salive), heure de départ (9 h), mois de départ (juillet), durée du jour (4 h, de 15 min à 4 h), et **Monde neuf**
   (coché par défaut).
-- **Règles** : zombies par kill (10, jusqu'à 30), % de sprinters (1), distance des pops (12–20 cases),
-  agressivité (0,6), espacement (4), préavis (6 s), caisse de soin sur blessure (oui), durée du
-  match (25 min).
+- **Règles** : zombies par kill (10, jusqu'à 30), type de zombie envoyé (*Aléatoire* par défaut), % de
+  sprinters (1), distance des pops (12–20 cases), agressivité (0,6), espacement (4), préavis (6 s),
+  caisse de soin sur blessure (oui), durée du match (25 min).
+- **Type de zombie envoyé** (`zombie_outfit`) : une liste d'uniformes pour les zombies envoyés chez
+  l'adversaire — combinaisons colorées (rose, bleue, verte, turquoise, noire), combinaison hazmat,
+  détenu, pompier, policier, médecin, infirmière, gardien de prison, puis les déguisements de
+  strip-teaseuse (le dernier, *nue*, est libellé « déconseillé en stream »). *Aléatoire* garde le
+  tirage du jeu, exactement comme avant. Les sprinters portent le même uniforme. La valeur doit être
+  exactement une de la liste : toute autre refuse le départ, et le message donne la clé et la liste
+  acceptée. Le nom demandé est écrit dans chaque commande de pop du journal (`outfit`). Un nom
+  d'uniforme que le jeu installé ne connaît pas ne lève **aucune erreur** : les zombies sortent
+  habillés au hasard — lire le journal pour distinguer ce cas d'un réglage non appliqué.
 - **Refus** : une valeur hors bornes, d'un type faux ou une clé inconnue refuse le départ avant tout
   effet, avec un message qui nomme la clé, la borne et la valeur reçue. Rien n'est écrêté en silence.
 - **Monde neuf** efface `Saves/Multiplayer/duelA|duelB`, `db/duelA|duelB.db` et leurs snapshots

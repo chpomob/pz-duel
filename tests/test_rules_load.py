@@ -994,13 +994,16 @@ class SpawnGame:
 
         rng = random.Random(seed)
         self.spawns: list[tuple[int, int, int]] = []
+        # Cinquième argument de chaque appel à `addZombiesInOutfit` (P9F19) : `None` pour `nil`.
+        self.outfits: list = []
         self.zombies: list = []
 
         def zomb_rand(low, high=None):
             return rng.randrange(int(low)) if high is None else rng.randrange(int(low), int(high))
 
-        def add_zombies(x, y, _z, count, _outfit, _female):
+        def add_zombies(x, y, _z, count, outfit, _female):
             self.spawns.append((int(x), int(y), int(count)))
+            self.outfits.append(outfit)
             made = [spawned_zombie(missing) for _ in range(int(count))]
             self.zombies += made
             return ZombieList(made)

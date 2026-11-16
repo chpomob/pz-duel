@@ -264,7 +264,7 @@ function settingControl(f) {
   let control;
   if (f.choices) {
     control = `<select id="${id}">${f.choices.map((c) =>
-      `<option value="${c.value}" ${c.value === v ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select>`;
+      `<option value="${esc(String(c.value))}" ${c.value === v ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select>`;
   } else if (f.type === 'range') {
     const pair = Array.isArray(v) ? v : [null, null];
     control = `<span class="pair">${numberInput(f, fieldId(f, '-0'), pair[0], 1)}
@@ -298,6 +298,8 @@ function bindSettings() {
     const el = document.getElementById(fieldId(f));
     if (!el) continue;
     if (f.type === 'bool') el.onchange = (e) => { draft.settings[f.key] = e.target.checked; };
+    // A text choice is sent as it is: the service accepts the exact string or refuses it.
+    else if (f.type === 'choice') el.onchange = (e) => { draft.settings[f.key] = e.target.value; };
     else if (f.choices) el.onchange = (e) => { draft.settings[f.key] = Number(e.target.value); };
     else el.oninput = (e) => { draft.settings[f.key] = readNumber(e.target.value); };
   }

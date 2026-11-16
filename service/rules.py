@@ -56,7 +56,12 @@ SPRINTER_KIND = "spawn_sprinter"
 SPACING = "spacing"
 MAX_SPACING = 20
 AGGRO = "aggro"
-POP_SETTINGS = (SPACING, AGGRO)
+# Uniforme des zombies de pop (P9F19) : nom recopié tel quel jusqu'à `addZombiesInOutfit`.
+# `random`, ou la clé absente (journal d'avant P9F19), laisse le tirage du jeu. La liste
+# proposée vit dans `service/settings.py` ; ici, seule la forme du nom est contrôlée.
+OUTFIT = "outfit"
+OUTFIT_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+POP_SETTINGS = (SPACING, AGGRO, OUTFIT)
 POP_KINDS = (POP_KIND, SPRINTER_KIND)
 # Règle directe (P9F9) : « quand on reçoit kill, on fait pop 10, direct ». Chaque atome reçu
 # la déclenche, zombie du duel compris, et ses lots partent au tick même, hors de tout budget
@@ -283,6 +288,8 @@ def load_table(
         _check_int(raw[SPACING], where, SPACING, 0, MAX_SPACING)
     if AGGRO in raw:
         _check_unit(raw[AGGRO], where, AGGRO)
+    if OUTFIT in raw:
+        _check_outfit(raw[OUTFIT], where, OUTFIT)
     atoms = _check_atoms(raw["atoms"], catalog, active_atoms)
     _check_budget(raw["budget"], limits)
     narrowed = active_atoms is not None
@@ -368,6 +375,11 @@ def _check_unit(value: Any, where: str, field: str) -> None:
         _fail(where, field, f"nombre fini de 0 à 1 attendu, reçu {value!r}")
     if not 0 <= value <= 1:
         _fail(where, field, f"nombre de 0 à 1 attendu, reçu {value}")
+
+
+def _check_outfit(value: Any, where: str, field: str) -> None:
+    if not isinstance(value, str) or OUTFIT_RE.fullmatch(value) is None:
+        _fail(where, field, f"nom d'uniforme [A-Za-z0-9_]{{1,64}} attendu, reçu {value!r}")
 
 
 def _check_text(value: Any, where: str, field: str) -> None:
@@ -867,7 +879,7 @@ class MatchCore:
         self._sprinter_percent: int | None = table.get(SPRINTER_PERCENT)
         # Zombies de pop admis par camp visé depuis le début du match : le dernier `k` donné.
         self._popped = {side: 0 for side in SIDES}
-        # Réglages de pop (P9F8), ajoutés aux seules commandes de pop, hors des clés de lot.
+        # Réglages de pop (P9F8, P9F19), ajoutés aux seules commandes de pop, hors des clés de lot.
         self._pop_settings = {key: table[key] for key in POP_SETTINGS if key in table}
         self._tick = -1
         self._events: list[Mapping[str, Any]] = []

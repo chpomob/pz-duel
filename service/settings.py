@@ -1,7 +1,7 @@
 """Réglages du monde et des règles, choisis avant le départ (P9F15).
 
 Le catalogue est déclaratif : chaque champ dit sa clé, son libellé, son groupe (`monde` ou
-`regles`), son type (`int`, `float`, `bool`, `range`), ses bornes, son défaut, son unité et son
+`regles`), son type (`int`, `float`, `bool`, `range`, `choice`), ses bornes, son défaut, son unité et son
 aide. La page le reçoit par `GET /api/settings` et ne connaît aucun champ.
 
 Les clés `monde` vont dans `SandboxVars`, sauf `DayLength`, que `write_sandbox` porte déjà, et
@@ -15,6 +15,9 @@ sprinters (`floor(k × pct / 100)`) : un second mécanisme fausserait `sprinter_
 Les options énumérées de PZ (`Zombies`, `ZombieLore.*`, `StartTime`, `DayLength`) sont des
 indices, pas des grandeurs : leurs bornes et leurs libellés viennent du `SandboxVars` qu'écrit
 PZ 42, et `choices` les donne à la page.
+
+Un champ `choice` (P9F19) est un choix **textuel** : ses valeurs sont des chaînes, sans borne,
+et la valeur reçue doit être exactement l'une d'elles — ni casse corrigée, ni valeur approchante.
 """
 
 from __future__ import annotations
@@ -84,12 +87,12 @@ def _day_label(index: int) -> str:
     return f"{hours} h {rest:02d}" if rest else f"{hours} h"
 
 
-def _choices(labels: Mapping[int, str]) -> list[dict[str, Any]]:
+def _choices(labels: Mapping[Any, str]) -> list[dict[str, Any]]:
     return [{"value": value, "label": label} for value, label in labels.items()]
 
 
 def _field(key: str, label: str, group: str, type_: str, low: Any, high: Any, default: Any,
-           unit: str = "", help_: str = "", labels: Mapping[int, str] | None = None) -> dict:
+           unit: str = "", help_: str = "", labels: Mapping[Any, str] | None = None) -> dict:
     field = {
         "key": key,
         "label": label,
@@ -105,6 +108,36 @@ def _field(key: str, label: str, group: str, type_: str, low: Any, high: Any, de
         field["choices"] = _choices(labels)
     return field
 
+
+# Uniforme des zombies envoyés (P9F19). `random` laisse le tirage du jeu : le mod passe `nil`.
+# Les autres valeurs sont des noms d'uniformes de PZ, recopiés tels quels jusqu'à
+# `addZombiesInOutfit` : d'abord les combinaisons colorées, puis les tenues repérables, puis les
+# déguisements. Un nom absent d'une version du jeu ne produit aucune erreur (limites-connues.md).
+OUTFIT_RANDOM = "random"
+OUTFITS = {
+    OUTFIT_RANDOM: "Aléatoire (comme aujourd'hui)",
+    "ShellSuit_Pink": "Combinaison rose",
+    "ShellSuit_Blue": "Combinaison bleue",
+    "ShellSuit_Green": "Combinaison verte",
+    "ShellSuit_Teal": "Combinaison turquoise",
+    "ShellSuit_Black": "Combinaison noire",
+    "HazardSuit": "Combinaison hazmat (jaune fluo)",
+    "Inmate": "Détenu (orange)",
+    "Fireman": "Pompier",
+    "Police": "Policier",
+    "Doctor": "Médecin",
+    "Nurse": "Infirmière",
+    "PrisonGuard": "Gardien de prison",
+    "StripperWhite": "Strip-teaseuse, tenue blanche",
+    "StripperBlack": "Strip-teaseuse, tenue noire",
+    "CowboyStripper": "Strip-teaseuse cow-girl",
+    "PoliceStripper": "Strip-teaseuse policière",
+    "FiremanStripper": "Strip-teaseuse pompière",
+    "WaiterStripper": "Strip-teaseuse serveuse",
+    "StripperNaked": "Strip-teaseuse nue — déconseillé en stream",
+}
+# La clé du preset effectif, recopiée dans chaque commande de pop (`service/rules.py`).
+OUTFIT_TABLE_KEY = "outfit"
 
 WORLD_ONLY_NEW = "Ne compte qu'avec un monde neuf : un monde gardé a déjà sa date et sa population."
 
@@ -137,6 +170,10 @@ FIELDS: tuple[dict[str, Any], ...] = (
            help_="Efface les deux mondes et leurs snapshots avant le lancement : PZ les recrée."),
     _field("zombies_par_kill", "Zombies par kill", GROUP_RULES, "int", 1, 30, 10,
            unit="zombies", help_="Envoyés chez l'adversaire à chaque zombie tué."),
+    _field("zombie_outfit", "Type de zombie envoyé", GROUP_RULES, "choice", None, None,
+           OUTFIT_RANDOM,
+           help_="L'uniforme des zombies envoyés. Aléatoire garde le tirage du jeu.",
+           labels=OUTFITS),
     _field("sprinter_percent", "Sprinters", GROUP_RULES, "int", 0, 100, 1, unit="%",
            help_="Le mod compte les zombies envoyés : le 100e, le 200e… à 1 %."),
     _field("pop_distance", "Distance des pops", GROUP_RULES, "range", 10, 100, [12, 20],
@@ -208,6 +245,8 @@ def defaults(preset: Mapping[str, Any] | None = None) -> dict[str, Any]:
         found["zombies_par_kill"] = effect.get("n")
         found["pop_distance"] = effect.get("distance")
         found["warn_s"] = effect.get("warn_s")
+    # Sans la clé, le mod laisse le jeu tirer la tenue : le défaut du catalogue, `random`.
+    found["zombie_outfit"] = preset.get(OUTFIT_TABLE_KEY)
     found["soin_sur_blessure"] = any(rule.get("id") == CARE_RULE for rule in preset["rules"])
     for key, value in found.items():
         if value is None:
@@ -263,6 +302,12 @@ def _check(field: Mapping[str, Any], value: Any) -> Any:
         if low >= high:
             raise _refuse(key, "minimum strictement inférieur au maximum attendu", value)
         return [low, high]
+    if kind == "choice":
+        # Égalité stricte sur des chaînes : `"police"` n'est pas `"Police"`, et rien n'est deviné.
+        accepted = [choice["value"] for choice in field["choices"]]
+        if not isinstance(value, str) or value not in accepted:
+            raise _refuse(key, f"une valeur parmi {', '.join(accepted)} attendue", value)
+        return value
     number = _number(key, value, kind == "int")
     _bounded(field, number, value)
     if "choices" in field and number not in {choice["value"] for choice in field["choices"]}:
@@ -306,6 +351,9 @@ def _summary_lines(table: Mapping[str, Any], settings: Mapping[str, Any]) -> lis
             f"{pct} % des zombies envoyés sont des rôdeurs rapides, à la place d'un zombie, "
             "jamais en plus"
         )
+    if settings["zombie_outfit"] != OUTFIT_RANDOM:
+        outfit = _choice_label("zombie_outfit", settings["zombie_outfit"])
+        lines.append(f"Les zombies envoyés portent l'uniforme : {outfit}")
     if settings["soin_sur_blessure"]:
         lines.append("1 blessure reçue → caisse de soin à proximité")
     others = [rule["id"] for rule in table["rules"] if rule["id"] not in (KILL_RULE, CARE_RULE)]
@@ -331,6 +379,7 @@ def effective_table(preset: Mapping[str, Any], settings: Mapping[str, Any]) -> d
     for key in ("sprinter_percent", "aggro", "spacing", "duration_s"):
         table[key] = settings[key]
     table["day_length"] = settings["DayLength"]
+    table[OUTFIT_TABLE_KEY] = settings["zombie_outfit"]
     has_care = any(rule["id"] == CARE_RULE for rule in table["rules"])
     if settings["soin_sur_blessure"] and not has_care:
         table["rules"].append(copy.deepcopy(CARE_RULE_BODY))
@@ -365,6 +414,11 @@ def summary(settings: Mapping[str, Any]) -> str:
         f"{settings['zombies_par_kill']} z par kill",
         f"{settings['sprinter_percent']} % sprinter",
         f"pops à {low}–{high} cases",
+        *(
+            [f"uniforme : {_choice_label('zombie_outfit', settings['zombie_outfit'])}"]
+            if settings["zombie_outfit"] != OUTFIT_RANDOM
+            else []
+        ),
         "monde neuf" if settings["monde_neuf"] else "monde gardé",
         _minutes(settings["duration_s"]),
     ]

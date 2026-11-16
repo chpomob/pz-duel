@@ -662,3 +662,61 @@ sur le mot de passe d'un serveur qui ne vit qu'une partie. Le code protège d'un
 - La case (« Check the launcher code (paranoid) ») et la phrase du lobby sont en anglais, traduites
   des libellés français de l'étape : `test_phase3_ac29_added_ui_lines_are_english` refuse toute
   ligne française ajoutée à `ui/app.js`, et le reste du lobby est déjà en anglais.
+
+## P9F19 — type de zombie envoyé réglable, aléatoire par défaut (2026-11-16)
+
+**Cause :** demande du propriétaire. Les zombies envoyés arrivaient habillés au hasard ; un uniforme
+choisi permettra de reconnaître d'un coup d'œil ceux de l'adversaire.
+
+**Fait :**
+
+- Le catalogue a un type `choice`, textuel : `choices` porte des chaînes, la valeur reçue doit être
+  **exactement** l'une d'elles. Le refus nomme la clé et toute la liste acceptée ; ni casse corrigée
+  (`police` est refusé), ni valeur approchante. Les choix numériques (`Zombies`, `ZombieLore.*`…)
+  se valident comme avant.
+- Champ `zombie_outfit`, groupe Règles, après `zombies_par_kill` : `random` (« Aléatoire (comme
+  aujourd'hui) », défaut) et dix-neuf uniformes — cinq combinaisons colorées `ShellSuit_*`,
+  `HazardSuit`, `Inmate`, `Fireman`, `Police`, `Doctor`, `Nurse`, `PrisonGuard`, et sept tenues
+  `*Stripper*`.
+- `effective_table` écrit le choix sous `outfit` dans le preset effectif ; l'arbitre le recopie dans
+  chaque commande `spawn_pop` et `spawn_sprinter` (même uniforme pour les deux), donc dans le
+  journal. Le chargeur de table n'accepte sous `outfit` qu'un nom `[A-Za-z0-9_]{1,64}`.
+- Le mod lit `cmd.outfit` et appelle `addZombiesInOutfit(x, y, 0, count, outfit, nil)`. `random`,
+  une clé absente, une chaîne vide ou une valeur qui n'est pas une chaîne donnent `nil` : le tirage
+  du jeu, l'appel d'avant à l'octet. `horde_area` n'est pas touché et reste en tirage du jeu.
+- Un départ **réglé** écrit désormais `"outfit": "random"` dans ses commandes de pop : le journal
+  dit ce qui a été demandé. Un preset joué sans réglages, ou un journal d'avant P9F19, n'a pas la
+  clé et se rejoue en aléatoire.
+- La page envoie la valeur d'un champ `choice` telle quelle, sans `Number()`.
+
+**Le risque, écrit plutôt que caché :**
+
+- **Un nom d'uniforme absent de la version du jeu installée ne produit aucune erreur.** Le jeu ne
+  refuse rien, le mod répond `applied` avec le bon nombre de zombies, et ceux-ci sortent habillés
+  au hasard : on croirait le réglage inopérant. Pour trancher, lire le journal : la commande de pop
+  y porte le nom demandé (`outfit`). S'il y est et que les zombies sont quelconques, c'est le nom
+  qui manque au jeu, pas le réglage qui s'est perdu.
+- **Aucun uniforme de la liste n'a encore été regardé en jeu.** Les noms viennent d'un relevé dans
+  les fichiers du jeu, pas d'une partie. La mention à porter ici, nom par nom, une fois le zombie vu
+  habillé comme annoncé, est « vérifié à l'écran sur 42.22.2 » ; **à ce jour aucun nom ne la
+  porte**, et cette section ne l'affirme pour aucun. Sont à constater, pour chacun des dix-neuf :
+  que le nom existe dans la 42.22.2, et que la tenue se distingue vraiment d'un zombie ordinaire à
+  la distance d'un pop (12–20 cases), de jour comme de nuit.
+- **Tenues `*Stripper*` et zombies masculins : inconnu.** Elles sont définies à part de la liste des
+  uniformes ; aucune restriction de sexe n'apparaît dans `ZombiesZoneDefinition.lua`, et
+  `FiremanStripper` y pointe vers `StripperWhite`. On ne sait pas si un pop masculin les porte ou
+  retombe sur autre chose, ni si `FiremanStripper` se distingue de `StripperWhite`. À constater à
+  l'écran, puis à écrire ici.
+- `StripperNaked` est à éviter pour une session diffusée (règles de la plateforme) : son libellé le
+  dit, rien ne l'empêche.
+- Le mini-interprète Lua des tests prouve que le nom arrive en cinquième argument
+  d'`addZombiesInOutfit` ; il ne prouve rien de ce que le vrai jeu en fait.
+- Le résumé d'une ligne (`settings_summary`) ne mentionne l'uniforme que s'il n'est pas `random`.
+
+**Tests (mutation citée dans chaque docstring) :** `tests/test_phase3_p9f19.py` — catalogue et
+défaut ; choix numériques inchangés ; refus nommant la clé et la liste ; refus d'un `outfit` mal
+formé par le chargeur de table ; preset effectif et réglages journalisés ; commande de pop et de
+sprinter portant `outfit` ; `random` journalisé au départ réglé, rien pour un preset brut ; aucun
+`outfit` sur une caisse de soin ; mod : nom passé tel quel, `nil` pour `random` ou clé absente ;
+page : pas de `Number()` sur un `choice`. `SpawnGame` (`tests/test_rules_load.py`) relève le
+cinquième argument ; `SPEC_DEFAULTS` (`tests/test_settings.py`) reçoit la nouvelle clé.

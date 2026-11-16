@@ -54,6 +54,8 @@ local PLACE_ATTEMPTS = 32
 local MAX_SPACING = 20
 local RAIN_INTENSITY = 1.0
 local SPRINT_WALK_TYPE = "sprint1"
+-- Valeur de `outfit` qui laisse le jeu tirer la tenue (P9F19).
+local RANDOM_OUTFIT = "random"
 local DUEL_MARK = "duelOrigin"
 
 -- Au-delà, un `seq` ne vient pas du compteur du service : l'accepter bloquerait les suivants.
@@ -678,9 +680,18 @@ local function pickAround(player, center, radius)
     return nil
 end
 
+-- Uniforme demandé par la commande (P9F19) : `random`, une clé absente ou une valeur qui
+-- n'est pas un nom rendent `nil`, c'est-à-dire le tirage du jeu, comme avant le réglage.
+local function outfitOf(cmd)
+    local outfit = cmd.outfit
+    if type(outfit) ~= "string" or outfit == "" or outfit == RANDOM_OUTFIT then return nil end
+    return outfit
+end
+
 -- Crée `count` zombies sur `square` et les ajoute à `created` ; rend le nombre créé.
-local function spawnAt(square, count, prepare, created)
-    local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, nil, nil)
+-- `outfit` nul laisse le jeu tirer la tenue. Un nom que le jeu ne connaît pas ne lève rien.
+local function spawnAt(square, count, prepare, created, outfit)
+    local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, outfit, nil)
     if not zombies then return 0 end
     local spawned = zombies:size()
     for i = 0, spawned - 1 do
@@ -755,6 +766,7 @@ local function spawnGroup(cmd, player, prepare)
     local count = needNumber(cmd, "n")
     local spacing = math.floor(optionalNumber(cmd, "spacing", 0, MAX_SPACING))
     local aggro = optionalNumber(cmd, "aggro", 0, 1)
+    local outfit = outfitOf(cmd)
     local squares = pickSpread(player, cmd.distance, count, spacing)
     if not squares then return NO_SQUARE end
     local perSquare = {}
@@ -764,7 +776,7 @@ local function spawnGroup(cmd, player, prepare)
     end
     local created, spawned, spread = {}, 0, 0
     for slot, square in ipairs(squares) do
-        local made = spawnAt(square, perSquare[slot], prepare, created)
+        local made = spawnAt(square, perSquare[slot], prepare, created, outfit)
         spawned = spawned + made
         if made > 0 then spread = spread + 1 end
     end

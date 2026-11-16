@@ -304,8 +304,17 @@ defaults), and `Valeurs par défaut` puts them back.
   `ZombieConfig` multipliers, the ones a dedicated server reads), zombie sight, hearing, strength,
   toughness (default *Normaux*), cognition, memory, infection (unchanged: blood and saliva), start
   hour (9 h), start month (July), day length (4 h, 15 min to 4 h), and **Monde neuf** (on by default).
-- **Règles**: zombies per kill (10, up to 30), sprinter % (1), pop distance (12–20 tiles), aggressiveness
-  (0.6), spacing (4), warning (6 s), healing crate on injury (on), match length (25 min).
+- **Règles**: zombies per kill (10, up to 30), type of zombie sent (*Aléatoire* by default), sprinter %
+  (1), pop distance (12–20 tiles), aggressiveness (0.6), spacing (4), warning (6 s), healing crate on
+  injury (on), match length (25 min).
+- **Type of zombie sent** (`zombie_outfit`): a list of outfits for the zombies sent to the opponent —
+  coloured shell suits (pink, blue, green, teal, black), hazmat suit, inmate, fireman, police, doctor,
+  nurse, prison guard, then the stripper costumes (the last one, *nue*, is labelled as not advised on
+  stream). *Aléatoire* keeps the game's own draw, exactly as before. Sprinters wear the same outfit.
+  The value must be exactly one of the list: anything else refuses the start, and the message gives
+  the key and the accepted list. The name asked for is written in every pop command of the journal
+  (`outfit`). An outfit name the installed game does not know raises **no error**: the zombies come
+  out dressed at random — read the journal to tell that case from a setting that was not applied.
 - **Refusals**: a value out of bounds, of the wrong type or an unknown key refuses the start before
   anything happens, with a message naming the key, the bound and the value received. Nothing is
   silently clamped.
