@@ -165,29 +165,48 @@ worth.
 
 ### What the player sees in the game
 
-> ⚠️ **Not yet observed in the game.** The `servermsg` command exists in build 42.22.2 and the
-> announcements are tested against a fake server; nobody has checked on screen yet that they show
-> up, nor how, while the world is frozen.
+> ⚠️ **Not yet observed in the game.** The floating text is tested on the real Lua of the mod,
+> outside the game, against the method signatures read in the game's jar. Nobody has checked on
+> screen yet that it shows up, that it can be read at a glance, nor that it does not hide the
+> action. The earlier channel, `servermsg`, was checked in a real session (15 Nov): the command
+> answers `Message sent.` and **nothing appears on the player's screen**.
 
 During a duel nobody watches the page, and the guest never sees it. So PZ Duel says what matters
-inside each player's game, through the game's server message (`servermsg`, sent over RCON). Each
-server has a single player: what is said there is read by that player only.
+inside each player's game, as **floating text above the character** — the one the game uses for
+experience gains. It shows in the middle of the action, without opening the chat. Each server has
+a single player: what is said there is read by that player only.
 
-- **While waiting for the opponent**: "waiting for your opponent. Your world is frozen until they
-  join, this is expected", said again every 45 s.
-- **At the start**: the opponent, the length, and the basic rule when it is a simple one ("Each
-  zombie you kill sends 10 to naylo").
-- **When zombies are sent to you**: "naylo sends you 30 zombies! Score: you 12 - 9 naylo. 18 min
-  left". Sendings add up: at most one announcement every 10 s per player, sent when the command
-  leaves, so before the spawn warning runs out.
+- **While waiting for the opponent**: "waiting for your opponent. World frozen until then, as
+  expected", said again every 45 s.
+- **At the start**: the opponent, the length, and the basic rule when it is a simple one ("Duel
+  against naylo: 25 min. 1 kill = 10 zombies on them.").
+- **When zombies are sent to you**: "naylo sends you 30 zombies! You 12 - 9. 18 min left".
+  Sendings add up: at most one announcement every 10 s per player, sent when the command leaves,
+  so before the spawn warning runs out.
 - **A medical crate** dropped near you, and **the time left** at 10, 5 and 1 minute.
 - **At the end**: won, lost, draw or void match, with the reason ("naylo died") and the score. If
-  an announcement got through during the duel, the servers wait 8 s before closing, time enough to
+  an announcement was shown during the duel, the servers wait 8 s before closing, time enough to
   read it; `Quit` or `Annuler` cut that wait short.
 
-The texts carry no accent: nothing guarantees how an accent is encoded on its way to the game
-screen. An announcement that cannot be sent (busy server, silent RCON) is lost with no
-consequence: it touches neither the score, nor the journal, nor the replay.
+Each kind of announcement has its colour (waiting, start, zombies received, crate, time mark,
+end). A text is **80 characters at most**, without accents: floating text is read in a second and
+a half, and nothing guarantees how an accent is encoded on its way to the screen. A long nickname
+is cut to 16 characters. The detail stays on the page and in the match journal.
+
+**How it travels.** The service decides each announcement and writes an `announce` command in the
+match's command queue; the mod relays it to the player's game; the client part of the mod
+(`media/lua/client/DuelHud.lua`) shows it and answers. That client file does nothing until such a
+message arrives: outside a duel the mod stays inert.
+
+**If the game cannot show it.** When the mod does not declare the `hud` capability, or when the
+player's game answers that it has no floating-text function (`no_hud_api`), the announcements of
+that side fall back to the game's server message (`servermsg`, over RCON). **That only writes in
+the chat, which nobody reads during a duel**: the lobby says so in red, with the reason, and the
+page logs keep the line. An announcement in the chat beats none, as long as nobody pretends it is
+visible.
+
+An announcement that cannot be delivered (busy server, silent client, silent RCON) is lost with
+no consequence: it touches neither the score, nor the journal, nor the replay.
 
 Settings, in `service/runtime.json`, key `announce`: `enabled` (`false` turns everything off),
 `lang` (`fr` or `en`), `wave_gap_s` (10), `waiting_repeat_s` (45, `0`: said once), `end_notice_s`

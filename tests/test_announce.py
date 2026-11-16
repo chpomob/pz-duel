@@ -37,12 +37,14 @@ class Recorder:
 
     def __init__(self, delivered: bool = True) -> None:
         self.said: list[tuple[str, str]] = []
+        self.tones: list[str] = []
         self.delivered = delivered
         self.flushed: list[float] = []
         self.closed = 0
 
-    def say(self, side: str, text: str) -> None:
+    def say(self, side: str, text: str, tone: str = "wait") -> None:
         self.said.append((side, text))
+        self.tones.append(tone)
 
     def flush(self, timeout_s: float) -> bool:
         self.flushed.append(timeout_s)
@@ -83,7 +85,8 @@ def test_plain_text_cannot_break_out_of_the_command(raw, cleaned):
     Mutation : retirer `.replace('"', "'")` de `plain` — `pseudo" ; quit "` sortirait de l'argument.
     """
     assert plain(raw) == cleaned
-    assert len(plain("x" * 1000)) == 240
+    # P9F22 : un texte flottant se lit d'un coup d'oeil, 80 caractères au plus.
+    assert len(plain("x" * 1000)) == 80
 
 
 def test_every_text_is_ascii_and_both_languages_say_the_same_things():
@@ -170,8 +173,7 @@ def test_start_names_the_opponent_the_length_and_the_rule():
     say.started(PLAYERS, 1500, table)
 
     assert recorder.to("A") == [
-        "PZ Duel: the duel against naylo starts now! Length: 25 min."
-        " Each zombie you kill sends 10 to naylo."
+        "Duel against naylo: 25 min. 1 kill = 10 zombies on them."
     ]
     assert "against durand" in recorder.to("B")[0]
 
@@ -195,7 +197,7 @@ def test_waves_add_up_and_are_said_once_per_gap():
     score = {"A": 3, "B": 1}
 
     say.tick(1_000, [sent("B", n=10)], PLAYERS, score, 1400)
-    assert recorder.to("B") == ["durand sends you 10 zombies! Score: you 1 - 3 durand. 23 min left."]
+    assert recorder.to("B") == ["durand sends you 10 zombies! You 1 - 3. 23 min left."]
     assert recorder.to("A") == []
 
     say.tick(2_000, [sent("B", n=10), sent("B", "spawn_sprinter", n=1)], PLAYERS, score, 1399)
@@ -203,10 +205,10 @@ def test_waves_add_up_and_are_said_once_per_gap():
     assert len(recorder.to("B")) == 1
 
     say.tick(11_000, [], PLAYERS, {"A": 6, "B": 1}, 1390)
-    assert recorder.to("B")[1] == "durand sends you 21 zombies! Score: you 1 - 6 durand. 23 min left."
+    assert recorder.to("B")[1] == "durand sends you 21 zombies! You 1 - 6. 23 min left."
 
     say.tick(30_000, [sent("A", n=1)], PLAYERS, {"A": 6, "B": 2}, 45)
-    assert recorder.to("A") == ["naylo sends you 1 zombie! Score: you 6 - 2 naylo. 45 s left."]
+    assert recorder.to("A") == ["naylo sends you 1 zombie! You 6 - 2. 45 s left."]
 
 
 def test_supply_drop_is_said_to_the_player_who_gets_it():
@@ -242,12 +244,12 @@ def test_time_marks_are_said_once_to_both_players():
     say.tick(0, [], PLAYERS, score, 300)
     say.tick(0, [], PLAYERS, score, 299)
     assert recorder.said == [
-        ("A", "5 min left. Score: you 4 - 9 naylo."),
-        ("B", "5 min left. Score: you 9 - 4 durand."),
+        ("A", "5 min left. You 4 - 9 naylo."),
+        ("B", "5 min left. You 9 - 4 durand."),
     ]
 
     say.tick(0, [], PLAYERS, score, 59)
-    assert recorder.to("A")[-1] == "1 min left. Score: you 4 - 9 naylo."
+    assert recorder.to("A")[-1] == "1 min left. You 4 - 9 naylo."
     assert len(recorder.said) == 4
 
 
@@ -261,8 +263,8 @@ def test_a_match_shorter_than_a_mark_never_says_it():
     assert recorder.said == []
 
     say.tick(0, [], PLAYERS, {"A": 0, "B": 0}, 60)
-    assert [text for _, text in recorder.said] == ["1 min left. Score: you 0 - 0 naylo."] + [
-        "1 min left. Score: you 0 - 0 durand."
+    assert [text for _, text in recorder.said] == ["1 min left. You 0 - 0 naylo."] + [
+        "1 min left. You 0 - 0 durand."
     ]
 
 
@@ -272,16 +274,16 @@ def test_a_match_shorter_than_a_mark_never_says_it():
         (
             {"outcome": "death", "winner": "B"},
             "naylo won. You died.",
-            "you WON against durand. durand died.",
+            "you WON! durand died.",
         ),
         (
             {"outcome": "forfeit", "winner": "A"},
-            "you WON against naylo. naylo was away for too long.",
-            "durand won. You were away for too long.",
+            "you WON! naylo left.",
+            "durand won. You left.",
         ),
         (
             {"outcome": "win", "winner": "A"},
-            "you WON against naylo. Time is up.",
+            "you WON! Time is up.",
             "durand won. Time is up.",
         ),
         ({"outcome": "draw", "winner": None}, "it is a draw. Time is up.", "it is a draw. Time is up."),
@@ -301,9 +303,9 @@ def test_end_is_said_to_each_player_from_their_side(result, to_a, to_b):
 
     (text_a,), (text_b,) = recorder.to("A"), recorder.to("B")
     assert to_a in text_a and to_b in text_b
-    assert text_a.endswith("The server is about to close.")
+    assert text_a.endswith("Server closing.")
     if result["outcome"] != "invalidated":
-        assert "Score: you 7 - 5 naylo." in text_a and "Score: you 5 - 7 durand." in text_b
+        assert "You 7 - 5." in text_a and "You 5 - 7." in text_b
 
 
 def test_nothing_is_said_after_the_end():
@@ -323,9 +325,9 @@ def test_a_missing_or_odd_pseudo_still_gives_a_readable_line():
     say.tick(0, [sent("B", n=1)], {"A": 'Zoé "Z"', "B": "naylo"}, {"A": 0, "B": 1}, 130)
 
     assert recorder.to("A") == [
-        "ton adversaire t'envoie 2 zombies ! Score : toi 0 - 1 ton adversaire. Reste 2 min."
+        "ton adversaire t'envoie 2 zombies ! Toi 0 - 1. Reste 2 min."
     ]
-    assert recorder.to("B") == ["Zoe 'Z' t'envoie 1 zombie ! Score : toi 1 - 0 Zoe 'Z'. Reste 2 min."]
+    assert recorder.to("B") == ["Zoe 'Z' t'envoie 1 zombie ! Toi 1 - 0. Reste 2 min."]
 
 
 # -- envoi par RCON ----------------------------------------------------------------------------
@@ -504,23 +506,23 @@ def test_match_tells_both_players_the_start_the_waves_and_the_end(
 
     # Le premier arrivé a d'abord lu qu'il attendait ; puis chacun lit le départ.
     assert any(text.startswith("PZ Duel: waiting for your opponent") for _, text in recorder.said)
-    (start_a,) = [text for text in recorder.to("A") if "starts now" in text]
-    (start_b,) = [text for text in recorder.to("B") if "starts now" in text]
-    assert "the duel against dupont starts now" in start_a
-    assert "the duel against durand starts now" in start_b
+    (start_a,) = [text for text in recorder.to("A") if "Duel against" in text]
+    (start_b,) = [text for text in recorder.to("B") if "Duel against" in text]
+    assert start_a.startswith("Duel against dupont: ")
+    assert start_b.startswith("Duel against durand: ")
 
     duel.at_match(1)
     duel.kills("A", 1)
     engine_rig.until(lambda _: any("sends you" in text for text in recorder.to("B")))
     wave = next(text for text in recorder.to("B") if "sends you" in text)
-    assert wave.startswith("durand sends you ") and "Score: you 0 - " in wave
+    assert wave.startswith("durand sends you ") and "You 0 - " in wave
     assert not any("sends you" in text for text in recorder.to("A"))
 
     duel.at_match(MATCH_S)
     state = duel.finish()
 
     assert state["result"]["winner"] == "A"
-    assert "you WON against dupont" in recorder.to("A")[-1]
+    assert "you WON!" in recorder.to("A")[-1]
     assert "durand won" in recorder.to("B")[-1]
     assert recorder.flushed == [engine_module.END_FLUSH_S]
     assert recorder.closed == 1
@@ -561,7 +563,7 @@ def test_end_notice_waits_only_when_a_player_could_read_it():
 
 def test_broken_announcer_never_breaks_the_match(engine_rig, presets, monkeypatch, caplog):  # noqa: F811
     class Broken(Recorder):
-        def say(self, side, text):
+        def say(self, side, text, tone="wait"):
             raise RuntimeError("canal cassé")
 
     recorded_match(monkeypatch, Broken())

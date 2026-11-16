@@ -1189,6 +1189,80 @@ end
 -- Commandes qui visent le monde, pas un joueur : elles s'appliquent serveur vide.
 local WORLD_COMMANDS = { hold_time = true, release_time = true }
 
+-- Annonces (P9F22) ---------------------------------------------------------------------
+--
+-- Le service décide de chaque annonce et l'écrit dans `in` sous le `kind` `announce`, avec son
+-- texte (`text`, ASCII, 80 caractères au plus) et sa nature (`tone`). Le serveur ne sait rien
+-- afficher : il relaie au client du joueur par `sendServerCommand`, et c'est `DuelHud.lua`,
+-- côté client, qui pose le texte flottant et répond par `sendClientCommand`. Le `cmd_result`
+-- attend donc cette réponse : `applied` si le texte est affiché, `refused`, `no_hud_api` si le
+-- client n'a pas de quoi l'afficher (le service repasse alors à `servermsg`), et `failed`,
+-- `no_reply` si rien ne revient à temps.
+--
+-- Une annonce n'est pas une commande du match : ses `seq` ont leur propre compteur
+-- (`lastAnnounceSeq`), hors de `lastCmdSeq` et de l'acquittement, et son `cmd_result` porte
+-- `announce = true` pour que le service ne le prenne pas pour celui d'une commande.
+local ANNOUNCE_KIND = "announce"
+local ANNOUNCE_RESULT = "announce_result"
+local HUD_MODULE = "duelcore"
+local NO_HUD_API = "no_hud_api"
+local ANNOUNCE_REPLY_MS = 3000
+local lastAnnounceSeq = 0
+-- `seq` d'annonce relayée → échéance de la réponse du client.
+local awaitedAnnounces = {}
+-- Vrai une fois `OnClientCommand` écouté : sans lui, aucune réponse du client ne reviendrait.
+local hudReplies = false
+
+local function canRelay()
+    return hudReplies and sendServerCommand ~= nil
+end
+
+local function emitAnnounceResult(seq, status, reason)
+    emit("cmd_result", { seq = seq, status = status, reason = reason, announce = true }, side)
+end
+
+-- Rend nil quand l'annonce est partie vers le client : le résultat viendra de sa réponse.
+handlers.announce = function(cmd)
+    if not canRelay() then return { status = "refused", reason = NO_HUD_API } end
+    if type(cmd.text) ~= "string" or cmd.text == "" then
+        return { status = "failed", reason = "no_text" }
+    end
+    local player = onlinePlayers()[1]
+    if not player then return { status = "refused", reason = "no_player" } end
+    local args = { seq = cmd.seq, text = cmd.text, tone = cmd.tone }
+    if not pcall(sendServerCommand, player, HUD_MODULE, ANNOUNCE_KIND, args) then
+        return { status = "refused", reason = NO_HUD_API }
+    end
+    awaitedAnnounces[cmd.seq] = getTimestampMs() + ANNOUNCE_REPLY_MS
+    return nil
+end
+
+-- La réponse du client : `shown` vrai, le texte flotte ; sinon son jeu n'a pas `HaloTextHelper`.
+-- Seule une annonce attendue donne un résultat : un client ne peut rien forger d'autre.
+local function onClientCommand(moduleName, command, player, args)
+    if moduleName ~= HUD_MODULE or command ~= ANNOUNCE_RESULT or type(args) ~= "table" then return end
+    local seq = args.seq
+    if type(seq) ~= "number" or not awaitedAnnounces[seq] then return end
+    awaitedAnnounces[seq] = nil
+    if args.shown == true then
+        emitAnnounceResult(seq, "applied", nil)
+    else
+        emitAnnounceResult(seq, "refused", NO_HUD_API)
+    end
+    flushOut()
+end
+
+local function expireAnnounces(now)
+    local late = {}
+    for seq, due in pairs(awaitedAnnounces) do
+        if now >= due then late[#late + 1] = seq end
+    end
+    for i = 1, #late do
+        awaitedAnnounces[late[i]] = nil
+        emitAnnounceResult(late[i], "failed", "no_reply")
+    end
+end
+
 -- Les capacités publiées : un effet n'existe que si sa fonction de jeu existe.
 local EFFECT_FUNCTIONS = {
     spawn_pop = "addZombiesInOutfit",
@@ -1207,6 +1281,9 @@ local function emitCaps()
         functions[name] = _G[name] ~= nil
         if functions[name] then effects[#effects + 1] = effect end
     end
+    -- P9F22 : le mod sait relayer une annonce au client. Ce que le client sait afficher ne se
+    -- lit qu'à sa réponse (`no_hud_api`).
+    functions.hud = canRelay()
 
     local atoms = {}
     local function addAtom(atom, available)
@@ -1260,6 +1337,14 @@ local function readCommandLines()
     return lines
 end
 
+-- Une annonce (P9F22) a son compteur à part : elle n'avance ni `lastCmdSeq` ni l'acquittement,
+-- et la même ligne, relue chaque seconde tant que `in` n'est pas vidé, n'est prise qu'une fois.
+local function acceptAnnounce(cmd)
+    if cmd.seq <= lastAnnounceSeq then return end
+    lastAnnounceSeq = cmd.seq
+    pending[#pending + 1] = { cmd = cmd, due = getTimestampMs() }
+end
+
 -- `lastCmdSeq` avance à la prise en charge, avant l'attente et avant le pcall : `in`
 -- est relu toutes les secondes, et une avance à l'application rejouerait la commande.
 local function acceptCommandLine(line)
@@ -1270,6 +1355,7 @@ local function acceptCommandLine(line)
         return
     end
     if type(cmd.kind) ~= "string" then return end
+    if cmd.kind == ANNOUNCE_KIND then return acceptAnnounce(cmd) end
     if cmd.seq <= lastCmdSeq or cmd.seq <= session.cmd_floor then return end
     lastCmdSeq = cmd.seq
     local warn = type(cmd.warn_s) == "number" and cmd.warn_s or 0
@@ -1289,7 +1375,8 @@ local function applyCommand(cmd)
     if not handler then
         return { status = "failed", reason = "unknown_kind" }
     end
-    if WORLD_COMMANDS[cmd.kind] then return handler(cmd) end
+    -- Une annonce se dit au joueur endormi ou au volant comme aux autres.
+    if WORLD_COMMANDS[cmd.kind] or cmd.kind == ANNOUNCE_KIND then return handler(cmd) end
     local player = onlinePlayers()[1]
     local reason = refusalReason(player, cmd)
     if reason then
@@ -1308,6 +1395,8 @@ emitResult = function(seq, result)
         targeted = result.targeted,
         -- P9F11 : l'appel du jeu qui manque, pour `no_hold_api`.
         call = result.call,
+        -- P9F22 : vrai pour une annonce, dont le `seq` n'est pas celui d'une commande.
+        announce = result.announce,
     }, side)
 end
 
@@ -1318,15 +1407,22 @@ local function applyDueCommands(now)
         local entry = pending[index]
         if entry.due <= now then
             table.remove(pending, index)
+            local announced = entry.cmd.kind == ANNOUNCE_KIND
             local ok, result = pcall(applyCommand, entry.cmd)
-            if ok then
-                emitResult(entry.cmd.seq, result)
-            else
+            if not ok then
                 logError(result)
-                emitResult(entry.cmd.seq, { status = "failed", reason = "lua_error" })
+                result = { status = "failed", reason = "lua_error" }
             end
-            -- Le service attend ce résultat au lobby pour annoncer un départ non figé.
-            if WORLD_COMMANDS[entry.cmd.kind] then flushOut() end
+            -- Sans résultat, c'est une annonce relayée : la réponse du client le donnera.
+            if result then
+                if announced then
+                    result = { status = result.status, reason = result.reason, announce = true }
+                end
+                emitResult(entry.cmd.seq, result)
+            end
+            -- Le service attend ce résultat au lobby pour annoncer un départ non figé ; et un
+            -- refus d'annonce (`no_hud_api`) pour repasser à `servermsg` sans tarder.
+            if WORLD_COMMANDS[entry.cmd.kind] or (announced and result) then flushOut() end
         else
             index = index + 1
         end
@@ -1392,6 +1488,9 @@ local function absorbClockStep(now)
     for i = 1, #pending do
         pending[i].due = pending[i].due - back
     end
+    for seq, due in pairs(awaitedAnnounces) do
+        awaitedAnnounces[seq] = due - back
+    end
     for _, hit in pairs(lastAttacker) do
         hit.at = hit.at - back
     end
@@ -1426,6 +1525,7 @@ local function step()
     end
 
     applyDueCommands(now)
+    expireAnnounces(now)
     stopRainIfDue(now)
 
     if now >= nextBeat then
@@ -1462,6 +1562,15 @@ local function startSession()
     if session then return end
     openSession(getTimestampMs())
     if session then flushOut() end
+end
+
+-- Réponses du client aux annonces (P9F22). Hors de `register` : ce n'est pas une sonde de jeu,
+-- et `hooks` ne doit pas en parler. `canRelay` en dépend, et `caps` part après ce chargement.
+if Events.OnClientCommand and Events.OnClientCommand.Add then
+    hudReplies = pcall(Events.OnClientCommand.Add, function(moduleName, command, player, args)
+        local ok, err = pcall(onClientCommand, moduleName, command, player, args)
+        if not ok then logError(err) end
+    end)
 end
 
 if Events.OnServerStarted and Events.OnServerStarted.Add then

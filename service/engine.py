@@ -32,7 +32,7 @@ from secrets import token_hex
 from typing import Any, NamedTuple
 
 from . import paths, upnp
-from .announce import AnnounceError, MatchAnnouncer
+from .announce import ANNOUNCE_KIND, AnnounceError, MatchAnnouncer
 from .guest_launcher import (
     ADDRESS_REFUSED,
     PASSWORD_ALLOWED,
@@ -58,7 +58,7 @@ from .preflight import (
     run_preflight,
 )
 from .proofs import PROOFS_NAME, HookProofs
-from .protocol import PROTOCOL_VERSION, SIDES
+from .protocol import PROTOCOL_VERSION, SIDES, dump_line, parse_command
 from .rules import (
     MS_PER_S,
     PLAYER_DEATH,
@@ -768,6 +768,10 @@ class RealMatch:
         self._journal: Journal | None = None
         self._shutdown_lock = threading.Lock()
         self._stopped: bool | None = None
+        # P9F22 : l'annonceur écrit ses commandes `announce` dans `in`, et parle au lobby.
+        self._announce(
+            lambda announcer: announcer.attach(self._queue_announce, self._announce_in_chat)
+        )
 
     @property
     def rules_hash(self) -> str:
@@ -920,6 +924,7 @@ class RealMatch:
         for side in exited:
             self._readers[side].aim_at_end()
         self._poll_out(now_ms)
+        self._announce(lambda announcer: announcer.poll())
         if self._core is not None:
             self._settle_conclusion(now_ms)
             self._pump_match(now_ms, exited)
@@ -983,21 +988,93 @@ class RealMatch:
         except Exception as exc:
             LOGGER.warning("annonce en jeu : %s", self.redactor.redact_exception(exc))
 
+    def _queue_announce(self, side: str, command: Mapping[str, Any]) -> None:
+        """Ajoute une commande `announce` à `in`, la file de commandes du camp (P9F22).
+
+        Elle passe à côté de `CommandChannel.write` : son `seq` vient du compteur des annonces,
+        pas de celui du match, et rien ne l'attend — ni acquittement, ni `cmd_timeout`, ni
+        ligne de journal. Même fil que les autres écritures de `in`, donc aucune ligne mêlée.
+        Si `in` est vidé avant que le mod ne la lise, elle est perdue : l'annonceur la réécrit
+        une fois. Un camp en relance ne reçoit rien : son `in` va être vidé.
+        """
+        if side in self._unavailable:
+            return
+        line = dump_line(parse_command(command, self.effects))
+        with open(self._channels[side].in_path, "ab") as handle:
+            handle.write(line)
+
+    def _announce_in_chat(self, side: str, reason: str) -> None:
+        """Dit au lobby que les annonces d'un camp n'iront que dans le chat, et pourquoi."""
+        message = (
+            f"camp {side} : annonces en jeu dans le chat seulement ({self.redactor.redact(reason)}) "
+            "— pas de texte à l'écran, le joueur ne les verra qu'en ouvrant le chat"
+        )
+        self._on_state(lambda state: state.log(message, "warn"))
+
+    def _announce_channels(self) -> dict[str, Any]:
+        """Par camp, le canal des annonces (`hud` ou `chat`) et sa raison ; vide sans annonces."""
+        if self._announcer is None:
+            return {}
+        try:
+            return self._announcer.channels()
+        except Exception as exc:
+            LOGGER.warning("annonce en jeu : %s", self.redactor.redact_exception(exc))
+            return {}
+
     def end_notice(self, wait: Callable[[float], Any]) -> None:
         """Laisse au joueur le temps de lire la fin avant que son serveur ne s'arrête.
 
         Sans match jugé, ou si aucune annonce n'est jamais arrivée, personne ne lit : rien
         n'attend. `wait` est celui de l'annulation : `Quit` ou `cancel` coupent court.
+
+        `pump` ne tourne plus une fois le match jugé. Tant qu'une annonce en texte flottant
+        attend sa réponse, le préavis la suit donc lui-même, passe par passe : la fin, effacée
+        de `in` par la troncature de la passe qui a conclu, est réécrite à son échéance, et un
+        `no_hud_api` la renvoie par le secours. Ce suivi tient dans le préavis, jamais au-delà.
         """
         if self._announcer is None or self.result is None:
             return
         notice_s = self._announcer.end_notice_s
 
-        def flush(announcer: MatchAnnouncer) -> None:
-            if announcer.flush(END_FLUSH_S) and notice_s > 0:
-                wait(notice_s)
+        def notice(announcer: MatchAnnouncer) -> None:
+            read = announcer.flush(END_FLUSH_S)
+            left = notice_s
+            followed = False
+            while left > 0 and announcer.pending():
+                step = min(self.poll_s, left)
+                if wait(step):
+                    return
+                left -= step
+                self._follow_announces()
+                followed = True
+            if followed:
+                # Une annonce a pu repartir par le secours, ou être enfin lue.
+                read = announcer.flush(END_FLUSH_S)
+            if read and left > 0:
+                wait(left)
 
-        self._announce(flush)
+        self._announce(notice)
+
+    def _follow_announces(self) -> None:
+        """Une passe d'annonces après la fin : lit leurs réponses dans `out`, puis réécrit le dû.
+
+        Le match est jugé et son journal clos par `match_end` : de `out`, seuls les
+        `cmd_result` d'annonce sont pris. Le reste n'a plus de lecteur, comme avant ce suivi —
+        ni journal, ni cœur, ni anomalie. Une panne de lecture se tait : une annonce perdue
+        n'est jamais une panne.
+        """
+        for side, reader in self._readers.items():
+            try:
+                passes = list(reader.drain())
+            except OSError as exc:
+                LOGGER.warning("annonce en jeu : %s", self.redactor.redact_exception(exc))
+                continue
+            for events, _anomalies in passes:
+                for event in events:
+                    data = event["data"]
+                    if event["kind"] == CMD_RESULT and data.get(ANNOUNCE_KIND) is True:
+                        self._announcer.on_result(side, _redacted(self.redactor, data))
+        self._announcer.poll()
 
     def _settle_conclusion(self, now_ms: int) -> None:
         """Laisse retomber le tampon du mod, puis relit `out` à sa fin, une seule fois par fin due.
@@ -1467,6 +1544,11 @@ class RealMatch:
         if kind == HOLD_APPLIED:
             self._take_hold_applied(side, data)
             return
+        if kind == CMD_RESULT and data.get(ANNOUNCE_KIND) is True:
+            # P9F22 : le résultat d'une annonce a son propre compteur de `seq`. Il ne va ni au
+            # journal, ni au cœur, ni aux commandes en attente : une annonce n'est pas du match.
+            self._announce(lambda announcer: announcer.on_result(side, data))
+            return
         if not self._admitted(side, event):
             refused = {
                 "kind": kind,
@@ -1486,6 +1568,7 @@ class RealMatch:
             )
         if kind == CAPS:
             self.window.on_caps(side, data)
+            self._announce(lambda announcer: announcer.on_caps(side, data))
         elif kind == HOOK_SEEN:
             self.window.on_hook_seen(side, data["hook"])
             if data["hook"] in self.window.proofs.values():
@@ -2051,6 +2134,8 @@ class RealMatch:
                 side: {**view, "players": copy.deepcopy(self._hold_players[side])}
                 for side, view in self._hold_view.items()
             },
+            # P9F22 : `hud`, texte flottant ; `chat`, `servermsg` seul, que le lobby signale.
+            "announce": self._announce_channels(),
             # L'attribution ne se mesure qu'en fin de match : rien à en conclure avant.
             "fallback": fallback(combined_spawn(spawn), self._attribution or INSUFFICIENT),
         }

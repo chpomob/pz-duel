@@ -47,6 +47,8 @@ def table_body(name: str) -> str:
 def test_layout_and_forbidden_calls() -> None:
     files = sorted(path.relative_to(MOD).as_posix() for path in MOD.rglob("*") if path.is_file())
     assert files == [
+        # P9F22 : premier fichier client, il affiche les annonces et rien d'autre.
+        "42.21/media/lua/client/DuelHud.lua",
         "42.21/media/lua/server/DuelCore.lua",
         "42.21/mod.info",
         "mod.info",

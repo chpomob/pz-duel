@@ -790,3 +790,96 @@ refusé ; service : journal, `hold.players`, `/api/state`, aucune `bad_line` ; p
 (4/4, 3/4 et appel manquant) ; page : une ligne par joueur, phrase échappée (bloc exécuté par
 `node` s'il est présent, sinon lu dans le source).
 `PausedServer.lines` (`tests/test_match.py`) lit `out` avec le catalogue des lecteurs du moteur.
+
+## P9F22 — annonces visibles en jeu par texte flottant, `servermsg` en secours (2026-11-16)
+
+Constat de session réelle (15/11) : `servermsg` répond `Message sent.` et rien n'apparaît à
+l'écran du joueur. Les annonces existaient, invisibles. L'étape change leur **transport** ; ce qui
+se dit et quand reste décidé par `MatchAnnouncer`.
+
+**Le chemin.** `HudSender` (`service/announce.py`) écrit une commande `announce` (`text`, `side`,
+`tone`) dans `in`, la file de commandes du camp. Le mod (`DuelCore.lua`) la relaie au joueur par
+`sendServerCommand(player, "duelcore", "announce", {seq, text, tone})`. Le client
+(`media/lua/client/DuelHud.lua`, premier fichier client du mod) appelle
+`HaloTextHelper.addText(player, text, "[br/]", r, g, b)` sous `pcall` et répond par
+`sendClientCommand(player, "duelcore", "announce_result", {seq, shown})`. Le mod écrit alors le
+`cmd_result` : `applied`, ou `refused`, `no_hud_api`.
+
+**Le secours.** Un camp passe par le mod quand ses `caps` portent `functions.hud = true`
+(`sendServerCommand` existe et `OnClientCommand` est écouté). Sinon, ou dès un `no_hud_api`, ou
+après deux `no_reply` de suite, ses annonces repartent par `RconSender` (`servermsg`). Le lobby le
+dit : `capabilities.announce.<camp>` vaut `{channel: "chat", reason}`, la page l'affiche en rouge,
+et les logs portent « camp X : annonces en jeu dans le chat seulement (raison) ». Un refus
+`no_hud_api` tient jusqu'à la fin du match, même si le serveur, relancé, republie `hud`.
+L'annonce refusée repart elle-même par le secours.
+
+**Écarts à la spécification, et pourquoi.**
+
+- **`HaloTextHelper.addText(player, text, couleur)` n'existe pas.** Lu dans le jar installé
+  (build 42.22) : la forme à trois arguments est `addText(IsoPlayer, String, String)`, et son
+  troisième argument est un **séparateur**. Les formes à couleur sont
+  `addText(player, text, separator, ColorRGB)` et `addText(player, text, separator, r, g, b)`.
+  Le client emploie la seconde, avec le séparateur `[br/]` qu'emploie le Lua du jeu. Le mod vise
+  42.21 : la signature y est supposée identique, non relue dans un jar 42.21.
+- **`tests/test_mod_package.py` est modifié** (une ligne), bien qu'il soit hors de la liste des
+  fichiers autorisés : il fige la liste exacte des fichiers du mod, et le fichier client exigé
+  par l'étape la change.
+- **`service/main.py` n'est pas modifié.** La fabrique garde son nom, `rcon_announcer`, que
+  `tests/test_modes.py` (hors périmètre) désigne ; elle rend maintenant un `HudSender` posé sur un
+  `RconSender`.
+- **Le `cmd_result` d'une annonce porte `announce: true`, et ses `seq` ont leur propre
+  compteur.** Les `seq` de commande appartiennent au cœur et au rejeu : en prendre un pour une
+  annonce décalerait les commandes rejouées. Le mod tient donc `lastAnnounceSeq` à part de
+  `lastCmdSeq`, hors acquittement, et le moteur écarte ce `cmd_result` avant le journal, le cœur
+  et les commandes en attente. La commande passe à côté de `CommandChannel.write`, qui refuse un
+  `seq` non croissant.
+- **Tous les textes sont raccourcis**, pas seulement coupés : `plain` plafonne à 80, et une
+  phrase de 150 caractères coupée à 80 ne dit plus rien. Les phrases livrées tiennent en 80 avec
+  un pseudo de 16 caractères et des nombres à quatre chiffres. `servermsg`, en secours, dit donc
+  aussi les textes courts.
+
+**Limites.**
+
+- **Rien n'est constaté en jeu.** Les tests exécutent le vrai Lua du mod et du client dans
+  `mini_lua`, avec des objets du jeu simulés. Que `sendServerCommand` atteigne le client, que
+  `OnServerCommand` y tire, que Kahlua choisisse la surcharge à six arguments de `addText`, que
+  `sendClientCommand` revienne à `OnClientCommand` : rien de cela n'est prouvé hors du jeu.
+- **`applied` dit que `addText` n'a pas levé d'erreur, pas que le joueur a lu.** Le jeu écarte en
+  silence un texte déjà à l'écran ou déjà en file (`overheadContains`, `queuedLines`) : deux
+  annonces identiques coup sur coup n'en montrent qu'une, et le mod répond `applied` aux deux.
+- **Durée et empilement à l'écran inconnus.** Les textes d'un joueur se suivent dans une file,
+  joints par `[br/]`. Combien de temps une ligne reste, combien tiennent à la fois, si 80
+  caractères tiennent sur une ligne à toutes les résolutions : non mesuré.
+- **Une annonce peut encore se perdre.** `in` est vidé quand le mod a acquitté toutes les
+  commandes du match ; une annonce écrite entre la lecture du mod et cette troncature disparaît.
+  `HudSender` la réécrit une fois après 4 s sans réponse, sous un `seq` neuf, puis l'oublie après
+  12 s. Si la première avait été affichée et que seule sa réponse a tardé, le texte peut passer
+  deux fois (le jeu écarte le doublon s'il est encore à l'écran).
+- **Un client muet coûte deux annonces.** Sans réponse en 3 s, le mod rend `failed`, `no_reply` ;
+  le service ne repasse au chat qu'au second de suite. La première des deux est perdue.
+- **Le joueur absent ne reçoit rien** : `refused`, `no_player`, sans repli — personne ne lirait
+  le chat non plus.
+- **Le fichier client est chargé par tout jeu qui a le mod actif**, y compris en solo. Il s'y
+  inscrit à `OnServerCommand` et rien d'autre ; un test statique le tient.
+- **Un service d'avant P9F22 devant un mod P9F22** n'écrit jamais `announce` : rien ne change.
+  **Un mod d'avant P9F22** ne publie pas `functions.hud` : le service reste sur `servermsg` et le
+  dit.
+- **Le mode simulé n'annonce rien** : `capabilities.announce` y reste vide.
+
+**À vérifier en jeu.** Le texte flottant apparaît-il au-dessus du joueur, pour l'hôte et pour
+l'invité ; est-il lisible sans masquer l'action, en plein combat et de nuit ; les couleurs se
+distinguent-elles ; deux annonces rapprochées (vague puis repère de temps) se lisent-elles toutes
+deux ; l'annonce d'attente s'affiche-t-elle sous tenue, monde figé ; l'annonce de fin est-elle à
+l'écran avant la fermeture du serveur ; le journal du service ne porte-t-il aucune ligne
+`announce`. Et, en retirant `HaloTextHelper` (ou sur un build où la signature diffère) : le lobby
+dit-il « chat seulement », et `servermsg` écrit-il bien dans le chat.
+
+**Tests (mutation citée dans chaque docstring) :** `tests/test_phase3_p9f22.py` — commande
+`announce` avec `hud`, `servermsg` sans ; `no_hud_api` bascule les suivantes ; client muet ;
+réécriture unique ; textes livrés et texte envoyé plafonnés à 80, ASCII, sans guillemet ; nature
+portée jusqu'à la commande ; moteur : file de commandes, lobby, `seq` de sonde intact, journal et
+rejeu sans trace ; mod : `functions.hud`, relais, réponse du client, `no_hud_api`, `no_reply`,
+compteur à part ; client : aucun appel au chargement (statique et dynamique), couleur par nature,
+`HaloTextHelper` absent ou d'une autre signature ; chaîne entière du service à l'écran ; page :
+avertissement du lobby (bloc exécuté par `node` s'il est présent). `tests/test_announce.py` :
+longueur ramenée à 80, phrases courtes.

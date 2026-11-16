@@ -704,6 +704,22 @@ function holdNotice() {
   return parts.join('');
 }
 
+// P9F22: in-game announcements float above the character, sent through the mod. When a side
+// cannot show them (`channel: chat`), they only reach the game chat through `servermsg`, which
+// nobody reads during a duel: the lobby says so instead of pretending they are visible.
+const ANNOUNCE_WHY = {
+  no_hud_caps: 'its mod cannot relay them',
+  no_hud_api: 'its game cannot show floating text',
+  no_reply: 'its game does not answer',
+};
+function announceNotice(view) {
+  const chat = ['A', 'B'].filter((side) => view[side] && view[side].channel === 'chat');
+  if (!chat.length) return '';
+  const why = (side) => `${side} (${ANNOUNCE_WHY[view[side].reason] || view[side].reason || 'chat only'})`;
+  return `<p class="err" id="announce-chat">In-game announcements on side ${esc(chat.map(why).join(', '))}
+      only go to the chat: nothing shows on screen, the player has to open the chat to read them.</p>`;
+}
+
 // P9F13: one primary action, its label follows the lobby. Disabled when it can do nothing, and
 // then it says why. The duel itself starts on its own once both players are in.
 const DUEL_STARTING = 'Both players are in: the duel starts by itself.';
@@ -803,7 +819,7 @@ function renderLive() {
 
   if (phase === 'lobby') {
     body = inviteCard();
-    shell(`<section class="card"><h2>Lancement</h2>${stepsList()}${holdNotice()}</section>` + body +
+    shell(`<section class="card"><h2>Lancement</h2>${stepsList()}${holdNotice()}${announceNotice((S.capabilities && S.capabilities.announce) || {})}</section>` + body +
       `<section class="card"><div class="actions"><button class="danger" data-action="cancel">Annuler le duel</button></div></section>`);
     renderQr();
     return;

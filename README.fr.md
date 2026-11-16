@@ -175,29 +175,48 @@ qu'une partie.
 
 ### Ce que le joueur voit en jeu
 
-> ⚠️ **Pas encore constaté en jeu.** La commande `servermsg` existe dans le build 42.22.2 et les
-> annonces sont testées contre un faux serveur ; personne n'a encore vérifié à l'écran qu'elles
-> s'affichent, ni comment, pendant que le monde est figé.
+> ⚠️ **Pas encore constaté en jeu.** Le texte flottant est testé sur le vrai Lua du mod, hors du
+> jeu, contre les signatures lues dans le jar du jeu. Personne n'a encore vérifié à l'écran qu'il
+> s'affiche, qu'il se lit d'un coup d'œil, ni qu'il ne masque pas l'action. L'ancien canal,
+> `servermsg`, a été vérifié en session réelle (15/11) : la commande répond `Message sent.` et
+> **rien n'apparaît à l'écran du joueur**.
 
 Pendant un duel, personne ne regarde la page, et l'invité ne la voit jamais. PZ Duel dit donc
-l'essentiel dans la partie de chaque joueur, par le message serveur du jeu (`servermsg`, envoyé par
-RCON). Chaque serveur n'a qu'un joueur : ce qu'on lui dit n'est lu que par lui.
+l'essentiel dans la partie de chaque joueur, en **texte flottant au-dessus du personnage** — celui
+des gains d'expérience. Il se voit en plein jeu, sans ouvrir le chat. Chaque serveur n'a qu'un
+joueur : ce qu'on lui dit n'est lu que par lui.
 
-- **En attendant l'adversaire** : « en attente de ton adversaire. Ton monde est fige jusqu'a son
-  arrivee, c'est normal », redit toutes les 45 s.
-- **Au départ** : l'adversaire, la durée, et la règle de base quand elle est simple (« Chaque zombie
-  que tu tues en envoie 10 chez naylo »).
-- **Quand on t'envoie des zombies** : « naylo t'envoie 30 zombies ! Score : toi 12 - 9 naylo. Reste
-  18 min ». Les envois se cumulent : au plus une annonce toutes les 10 s par joueur, qui part au
-  moment où la commande part, donc avant le préavis des pops.
+- **En attendant l'adversaire** : « attente de ton adversaire. Monde fige d'ici la, c'est
+  normal », redit toutes les 45 s.
+- **Au départ** : l'adversaire, la durée, et la règle de base quand elle est simple (« Duel contre
+  naylo : 25 min. 1 kill = 10 zombies chez lui. »).
+- **Quand on t'envoie des zombies** : « naylo t'envoie 30 zombies ! Toi 12 - 9. Reste 18 min ».
+  Les envois se cumulent : au plus une annonce toutes les 10 s par joueur, qui part au moment où
+  la commande part, donc avant le préavis des pops.
 - **Une caisse de soin** larguée près de toi, et **le temps restant** à 10, 5 et 1 minute.
 - **À la fin** : gagné, perdu, égalité ou match annulé, avec la raison (« naylo est mort ») et le
-  score. Si une annonce est arrivée pendant le duel, les serveurs attendent 8 s avant de se fermer,
-  le temps de lire ; `Quit` ou `Annuler` coupent cette attente.
+  score. Si une annonce a été affichée pendant le duel, les serveurs attendent 8 s avant de se
+  fermer, le temps de lire ; `Quit` ou `Annuler` coupent cette attente.
 
-Les textes sont sans accent : rien ne garantit l'encodage d'un accent jusqu'à l'écran du jeu. Une
-annonce qui ne part pas (serveur occupé, RCON muet) est perdue sans conséquence : elle ne touche ni
-au score, ni au journal, ni au rejeu.
+Chaque nature d'annonce a sa couleur (attente, départ, zombies reçus, caisse, repère de temps,
+fin). Un texte fait **80 caractères au plus**, sans accent : un texte flottant se lit en une
+seconde et demie, et rien ne garantit l'encodage d'un accent jusqu'à l'écran. Un pseudo long est
+coupé à 16 caractères. Le détail reste sur la page et dans le journal du match.
+
+**Le chemin d'une annonce.** Le service décide de chaque annonce et écrit une commande `announce`
+dans la file de commandes du match ; le mod la relaie au jeu du joueur ; la partie client du mod
+(`media/lua/client/DuelHud.lua`) l'affiche et répond. Ce fichier client ne fait rien tant qu'un tel
+message n'est pas arrivé : hors duel, le mod reste inerte.
+
+**Si le jeu ne sait pas l'afficher.** Quand le mod ne déclare pas la capacité `hud`, ou quand le
+jeu du joueur répond qu'il n'a pas de fonction de texte flottant (`no_hud_api`), les annonces de
+ce camp repassent par le message serveur du jeu (`servermsg`, par RCON). **Il n'écrit que dans le
+chat, que personne ne lit pendant un duel** : le lobby le dit en rouge, avec la raison, et les
+logs de la page en gardent la ligne. Une annonce dans le chat vaut mieux que rien, à condition de
+ne pas prétendre qu'elle est visible.
+
+Une annonce qui n'arrive pas (serveur occupé, client muet, RCON muet) est perdue sans
+conséquence : elle ne touche ni au score, ni au journal, ni au rejeu.
 
 Réglages, dans `service/runtime.json`, clé `announce` : `enabled` (`false` coupe tout), `lang`
 (`fr` ou `en`), `wave_gap_s` (10), `waiting_repeat_s` (45, `0` : une seule fois), `end_notice_s`
