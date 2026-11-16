@@ -926,3 +926,82 @@ cp1252 et rejoue le test du lobby : `text=True` remis, il tombe sur « en Ã©ch
   ne sont pas dans la classe et restent en l'état. `tests/test_campaign_gate.py` impose déjà
   l'UTF-8 à git sous Windows.
 - Comme en P9F17, le test de locale repose sur `subprocess._text_encoding`, nom privé de CPython.
+
+## P9F24 — tests de tenue et d'annonces : attendre un état au lieu de le supposer (2026-11-16)
+
+**Cause :** CI rouge sur `9612a57` (P9F23), trois tests, aucun défaut du produit. Les journaux de
+la CI et la reproduction donnent trois causes différentes, dont une seule est une lecture trop
+tôt :
+
+- `test_service_publishes_and_journals_the_players_held` (Windows 3.12) : `hold_time` est dans
+  `in` avant que la passe qui l'a écrit ne publie `sent`. Lu aussitôt, l'état dit encore `off`.
+- `test_announcements_never_reach_the_journal_nor_the_replay` (les trois Windows, à chaque fois) :
+  le match fini, le moteur garde les serveurs debout pendant le préavis (`end_notice_s`, huit
+  vraies secondes), puis les arrête. `finish` accordait `WAIT_S` (10 s) au tout : 8,45 s sous
+  Linux, plus de 10 s sous Windows, où la CI lit `phase: stopping` au délai.
+- `test_p9f14_referee_opens_six_mappings_and_two_invitations` (Linux 3.12) : ce n'est pas
+  `invite["A"]` qui est nul, c'est son `link`, parce que l'écouteur de partage de A n'a pas pu lier
+  `share_port + 1` (« share link of side A unavailable » au journal d'état). Le banc ne tirait que
+  `share_port`. Sous Linux, `bind(0)` ne rend que des ports impairs (400 tirages sur 400) : le
+  suivant est pair, la parité que `connect` donne aux connexions sortantes de toute la machine, et
+  lier par-dessus l'une d'elles échoue même avec `SO_REUSEADDR`. Attendre n'y aurait rien changé :
+  l'état n'arrive jamais.
+
+**Fait :**
+
+- `tests/doubles/waiting.py` — `wait_until(condition, timeout_s=2.0, *, what, observe=None)` :
+  relit la condition toutes les 10 ms, une dernière fois au délai, et rend sa valeur. À
+  l'expiration : `attendu en N s : <what> ; observé : <état>`, l'état venant de `observe()` ou, à
+  défaut, de la dernière valeur de la condition. `what` est obligatoire ; une exception de la
+  condition remonte telle quelle.
+- Tenue : attente de `sent` avec `players`, puis l'égalité exacte, inchangée.
+- Annonces : attente de la fin de l'envoi, bornée par `end_notice_s + WAIT_S`, puis `finish` et les
+  mêmes assertions. La borne suit le préavis du produit ; ce n'est pas un délai allongé au jugé.
+- UPnP : `free_share_pair` tire un port dont le suivant se lie aussi, les deux tenus ensemble le
+  temps de l'essai ; `upnp_rig` s'en sert. Le test attend les deux liens par `wait_until` : un lien
+  absent n'est plus un `TypeError` sur `None`, l'échec cite les liens et le journal d'état.
+
+**Tests et mutations :** `tests/test_phase3_p9f21.py` —
+`test_p9f24_wait_until_returns_the_value_once_a_thread_has_produced_the_state`,
+`…_names_the_condition_and_the_state_seen_when_it_expires`,
+`…_without_observer_shows_the_last_value_of_the_condition`,
+`…_reads_once_more_at_the_deadline_and_never_swallows_a_failure` ; `tests/test_upnp.py` —
+`test_p9f24_share_pair_skips_a_port_whose_successor_is_taken`. Mutations jouées :
+
+- attente de la tenue retirée : 12 échecs sur 240 exécutions sous charge (six en parallèle),
+  0 sur 240 avec l'attente, même charge ;
+- `free_share_pair` sans l'essai de `port + 1` : le test de la paire tombe ;
+- `share_port + 1` tenu exprès : l'attente échoue en 2 s et cite « share link of side A
+  unavailable » ;
+- borne des annonces ramenée à 5 s : l'attente échoue en nommant le préavis, `phase: stopping` ;
+- sept mutations de `wait_until` (un seul relevé, `what` absent du message, `observe` ignoré, rendre
+  au lieu d'échouer, pas de relevé au délai, `what` vide accepté, état non cité) : toutes tuées.
+
+Les trois tests : 30 exécutions de suite, 0 échec.
+
+**Ouvert :**
+
+- La CI Windows verte reste à lire après le push. La mutation des annonces (attente retirée) ne
+  rougit que sous Windows : sous Linux le test tient en 8,5 s dans les 10 s d'origine.
+- Ce test attend huit vraies secondes de préavis. Le raccourcir (`end_notice_s` passé au banc)
+  changerait le scénario ; laissé tel quel.
+- `free_share_pair` rend les ports avant que le moteur ne les lie, comme `free_port` partout
+  ailleurs : une connexion sortante peut encore prendre `port + 1` entre les deux. Fenêtre de
+  quelques millisecondes, non fermée. L'occupant du port n'a pas été saisi sur le fait : la cause
+  repose sur le journal d'état d'un échec reproduit (port pair refusé) et sur la mesure des parités.
+- Le produit, lui, laisse le lobby ouvert sans lien pour A quand `share_port + 1` est pris, et le
+  dit au journal d'état : comportement voulu, inchangé.
+- Autres lectures d'un état produit par un fil, recensées, non modifiées (hors des fichiers
+  permis) :
+  - `wait_command` (`tests/test_match.py`) attend la commande dans `in`, pas l'état publié : tout
+    test qui lirait `state()` juste après referait la faute. Aujourd'hui, les appelants passent par
+    `rig.until` ou `sync_pump` (`test_match.py:3778` est le bon modèle).
+  - `_wait_both` (`tests/test_upnp.py`) et `rig.until` (`tests/test_snapshots.py`) sont deux autres
+    boucles d'attente ; elles nomment déjà ce qu'elles attendent, et ne passent pas par
+    `wait_until`. Trois outils pour un geste.
+  - `tests/test_upnp.py:1444` tire encore `share_port` par `free_port` seul (banc sans mode
+    arbitre : le suivant n'y sert pas). Les tests arbitre de `tests/test_match.py` gardent les
+    ports fixes 17280 et 17281 de `runtime.json`.
+  - Les pauses fixes restantes (`time.sleep(HELD_S)`, `LATE_REQUEST_S`, `2 * SHORT_READ_S` dans
+    `test_setup_flow.py`, `test_share.py`, `test_api_security.py`) attendent une durée, pas une
+    condition. Non relues ici.

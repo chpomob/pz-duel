@@ -13,10 +13,12 @@ import json
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from doubles.mini_lua import LuaError
+from doubles.waiting import wait_until
 from test_match import (  # noqa: F401
     WAIT_S,
     FreezablePlayer,
@@ -286,12 +288,24 @@ def test_service_publishes_and_journals_the_players_held(engine_rig, hold_caps):
     ligne refusée. Un second rapport du même joueur remplace le premier ; un appel inconnu ou
     doublé est écarté. Mutations : donner aux lecteurs le catalogue du match (`effects` au lieu
     de `_reader_catalog`) écarte la ligne en `bad_line` ; ne pas brancher `_take_hold_applied`
-    dans `_take_event` laisse `players` vide ; ne pas publier `players` dans `_capabilities`."""
+    dans `_take_event` laisse `players` vide ; ne pas publier `players` dans `_capabilities`.
+
+    P9F24 : `hold_time` est dans `in` avant que la passe qui l'a écrit ne publie `sent` — lu
+    aussitôt, l'état dit encore `off`. Mutation : remplacer l'attente par `duel.state()` rend
+    le test instable (`off` au lieu de `sent`)."""
     hold_caps()
     duel = HoldDuel(engine_rig)
     holds = duel.wait_holds()
-    state = duel.state()
-    assert state["capabilities"]["hold"]["A"] == {"status": "sent", "reason": None, "players": []}
+
+    def hold_a() -> dict:
+        return duel.state()["capabilities"]["hold"]["A"]
+
+    wait_until(
+        lambda: hold_a()["status"] == "sent" and "players" in hold_a(),
+        what="tenue de A publiée `sent`, avec `players`",
+        observe=hold_a,
+    )
+    assert hold_a() == {"status": "sent", "reason": None, "players": []}
 
     duel.mods["A"].emit("hold_applied", {"player": "invite", "calls": CALLS[:2]})
     duel.mods["A"].emit(
@@ -422,3 +436,67 @@ def test_p9f23_held_players_notice_survives_a_windows_locale(monkeypatch):
     monkeypatch.setattr(subprocess, "_text_encoding", lambda: "cp1252")
 
     test_lobby_shows_the_sentence_of_each_held_player()
+
+
+# -- P9F24 : l'attente bornée -----------------------------------------------------------------
+
+
+def test_p9f24_wait_until_returns_the_value_once_a_thread_has_produced_the_state():
+    """L'état vient d'un fil, après l'appel : l'attente le rend dès qu'il tient, bien avant son
+    délai. Mutation : un seul relevé sans boucle (`return condition()` d'emblée) rend `None`."""
+    produced: list[str] = []
+    timer = threading.Timer(0.05, lambda: produced.append("sent"))
+    timer.start()
+    try:
+        started = time.monotonic()
+        value = wait_until(lambda: produced and produced[0], timeout_s=5.0, what="état produit")
+        elapsed = time.monotonic() - started
+    finally:
+        timer.cancel()
+        timer.join()
+
+    assert value == "sent"
+    assert elapsed < 4.0
+
+
+def test_p9f24_wait_until_names_the_condition_and_the_state_seen_when_it_expires():
+    """Un état jamais atteint n'est pas masqué : l'échec cite `what`, le délai et l'état vu, et
+    ne vient qu'après le délai. Mutations : ôter `what` du message ; citer la valeur de la
+    condition (`False`) au lieu de `observe()` ; rendre la dernière valeur au lieu d'échouer."""
+    state = {"status": "off", "reason": None}
+    started = time.monotonic()
+
+    with pytest.raises(AssertionError) as raised:
+        wait_until(
+            lambda: state["status"] == "sent", timeout_s=0.05, what="tenue `sent`",
+            observe=lambda: state,
+        )  # fmt: skip
+
+    assert time.monotonic() - started >= 0.05
+    assert str(raised.value) == (
+        "attendu en 0.05 s : tenue `sent` ; observé : {'status': 'off', 'reason': None}"
+    )
+
+
+def test_p9f24_wait_until_without_observer_shows_the_last_value_of_the_condition():
+    """Sans `observe`, l'état cité est ce que la condition a rendu en dernier : une condition
+    qui rend la valeur lue (`None`, liste vide) se diagnostique seule.
+    Mutation : ne rien citer après « observé »."""
+    with pytest.raises(AssertionError, match=r"lien de A ; observé : \[\]$"):
+        wait_until(lambda: [], timeout_s=0.02, what="lien de A")
+
+
+def test_p9f24_wait_until_reads_once_more_at_the_deadline_and_never_swallows_a_failure():
+    """Délai nul : la condition est tout de même lue une fois — un état déjà là n'échoue pas.
+    Une exception de la condition remonte telle quelle, et une attente sans nom est refusée.
+    Mutations : sortir de la boucle avant le relevé quand le délai est passé ; envelopper la
+    condition d'un `except Exception` ; accepter `what=""`."""
+    assert wait_until(lambda: "là", timeout_s=0, what="état déjà là") == "là"
+
+    def broken() -> bool:
+        raise KeyError("capabilities")
+
+    with pytest.raises(KeyError, match="capabilities"):
+        wait_until(broken, timeout_s=0.5, what="état lisible")
+    with pytest.raises(ValueError, match="what"):
+        wait_until(lambda: True, what=" ")

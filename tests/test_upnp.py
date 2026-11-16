@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from doubles.fake_igd import FakeIGD
+from doubles.waiting import wait_until
 from service import upnp
 from service.rules import load_runtime
 
@@ -1021,6 +1022,30 @@ def igd():
         yield fake
 
 
+SHARE_PAIR_DRAWS = 50
+
+
+def free_share_pair() -> int:
+    """Port TCP libre dont le suivant l'est aussi : en mode arbitre, le partage de A écoute sur
+    `share_port + 1` (P9F14).
+
+    P9F24 : sous Linux, `bind(0)` ne rend que des ports impairs ; le suivant est donc pair, la
+    parité que `connect` donne aux connexions sortantes de toute la machine. Tiré sans regarder,
+    il était parfois pris : l'écouteur de A ne s'ouvrait pas et son invitation restait sans lien.
+    Les deux ports sont tenus ensemble le temps de l'essai, sans `SO_REUSEADDR`.
+    """
+    for _ in range(SHARE_PAIR_DRAWS):
+        port = free_port(socket.SOCK_STREAM)
+        try:
+            with socket.socket() as first, socket.socket() as second:
+                first.bind(("", port))
+                second.bind(("", port + 1))
+        except (OSError, OverflowError):
+            continue
+        return port
+    raise AssertionError(f"aucune paire de ports libres en {SHARE_PAIR_DRAWS} tirages")
+
+
 @pytest.fixture
 def upnp_rig(igd, engine_rig, monkeypatch):
     """Banc moteur dont chaque `Engine` vise le faux IGD ; délais UPnP courts.
@@ -1030,7 +1055,7 @@ def upnp_rig(igd, engine_rig, monkeypatch):
     il pouvait prendre l'`udp` de B, et le préflight refusait le port « déjà lié ».
     """
     rig = engine_rig
-    rig.runtime["share_port"] = free_port(socket.SOCK_STREAM)
+    rig.runtime["share_port"] = free_share_pair()
     rig.runtime["upnp"] = {**rig.runtime["upnp"], **FAST}
     detect(monkeypatch, LAN_ADDRESS)
     monkeypatch.setattr(test_snapshots, "Engine", _aimed(igd))
@@ -3100,7 +3125,11 @@ def test_p9f14_side_a_couples_follow_b_and_never_cross_it():
 @pytest.mark.usefixtures("launcher_checked")
 def test_p9f14_referee_opens_six_mappings_and_two_invitations(referee, upnp_rig, igd):
     """Mutation : `ports_a = None` au lieu de `self._side_a_opening(cfg) if referee` dans
-    `open_ports` — seules les trois redirections de B partent, et `ports_opening.A` reste neutre."""
+    `open_ports` — seules les trois redirections de B partent, et `ports_opening.A` reste neutre.
+
+    P9F24 : les deux invitations sont attendues avec leur lien avant d'être comparées. Un lien
+    absent n'est plus un `TypeError` sur `None` : l'échec cite l'invitation de A et le journal
+    d'état, où le moteur dit quel port de partage il n'a pas pu ouvrir."""
     lobby = Lobby(upnp_rig, "demo")
     engine = lobby.engine
     state = lobby.state()
@@ -3124,13 +3153,44 @@ def test_p9f14_referee_opens_six_mappings_and_two_invitations(referee, upnp_rig,
     assert [inner[c] for c in _engine_ports_a(upnp_rig)] == [ports["A"]["game"], ports["A"]["udp"], share + 1]
     # L'invitation de A, vers une adresse saisie, porte ses externes à elle.
     assert engine.set_invite_address(ENTERED)[0]
-    invite = lobby.state()["invite"]
+
+    def both_invitations() -> dict | None:
+        invite = lobby.state()["invite"]
+        side_a = invite.get("A")
+        return invite if invite.get("link") and side_a and side_a.get("link") else None
+
+    invite = wait_until(
+        both_invitations,
+        what="invitations de B et de A servies, chacune avec son lien",
+        observe=lambda: {
+            "lien de B": lobby.state()["invite"].get("link"),
+            "lien de A": (lobby.state()["invite"].get("A") or {}).get("link", "pas d'invitation"),
+            "journal": [line["msg"] for line in lobby.state()["logs"]],
+        },
+    )
     assert invite["port"] == _engine_ports(upnp_rig)[0][0]
     assert invite["A"]["port"] == _engine_ports_a(upnp_rig)[0][0]
     assert f"{ENTERED}:{_engine_ports_a(upnp_rig)[2][0]}/" in invite["A"]["link"]
     # L'arrêt retire les six.
     assert engine.shutdown()
     assert igd.mappings == {}
+
+
+def test_p9f24_share_pair_skips_a_port_whose_successor_is_taken(monkeypatch):
+    """Le port tiré est libre, son suivant est tenu : la paire est refusée et le tirage suivant
+    rendu. Mutation : `free_share_pair` qui rend le premier tirage sans lier `port + 1`
+    (l'ancien `free_port` seul) rend le port dont le suivant est pris."""
+    first = free_share_pair()
+    with socket.socket() as holder:
+        holder.bind(("", first + 1))
+        holder.listen()
+        clean = free_share_pair()
+        draws = iter([first, clean])
+        monkeypatch.setattr(sys.modules[__name__], "free_port", lambda kind: next(draws))
+
+        assert free_share_pair() == clean
+    assert clean != first
+    assert list(draws) == []
 
 
 def test_p9f14_failure_on_a_is_reported_apart_and_leaves_b_open(referee, upnp_rig, igd):

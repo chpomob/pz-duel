@@ -20,9 +20,11 @@ import pytest
 import test_lua_attribution as lua_mod
 from doubles.fake_mod import FakeMod
 from doubles.mini_lua import Lua, Table, _Parser
+from doubles.waiting import wait_until
 from test_announce import Recorder
 from test_match import (  # noqa: F401
     PRESET,
+    WAIT_S,
     Duel,
     FreezablePlayer,
     PausedServer,
@@ -449,7 +451,13 @@ def test_announcements_never_reach_the_journal_nor_the_replay(engine_rig, preset
     joue, se conclut et se rejoue, et son journal ne porte ni commande ni résultat d'annonce.
     Les commandes du match gardent leurs `seq` : l'annonce a son propre compteur.
     Mutation : passer l'annonce par `self._channels[side].write` consomme un `seq` du match —
-    la commande suivante du cœur est refusée (`seq` non croissant) et le rejeu diverge."""
+    la commande suivante du cœur est refusée (`seq` non croissant) et le rejeu diverge.
+
+    P9F24 : la fin annoncée, le moteur garde les serveurs debout le temps du préavis
+    (`end_notice_s`, huit vraies secondes) et y suit les annonces sans réponse, puis arrête.
+    `finish` n'accordait que `WAIT_S` au tout : deux secondes pour l'arrêt, que Windows dépasse.
+    L'attente porte donc sur la fin de l'envoi, bornée par le préavis plus le délai d'arrêt.
+    Mutation : ôter l'attente rend au test cette marge de deux secondes (rouge sous Windows)."""
     chat = hud_match(wave_gap_s=0)
     path = presets / "demo.json"
     path.write_text(json.dumps({**json.loads(path.read_text("utf-8")), "duration_s": 60}), "utf-8")
@@ -467,6 +475,14 @@ def test_announcements_never_reach_the_journal_nor_the_replay(engine_rig, preset
     assert match_seqs == sorted(set(match_seqs))
 
     duel.at_match(60)
+    duel.settle_out()
+    notice_s = DEFAULTS["end_notice_s"]
+    wait_until(
+        lambda: duel.state()["phase"] in ("over", "error"),
+        timeout_s=notice_s + WAIT_S,
+        what=f"envoi des annonces terminé : préavis de {notice_s} s écoulé, serveurs arrêtés",
+        observe=lambda: {key: duel.state()[key] for key in ("phase", "servers", "result")},
+    )
     state = duel.finish()
 
     assert state["result"]["winner"] == "A"
