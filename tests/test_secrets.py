@@ -18,6 +18,7 @@ from urllib.request import urlopen
 import pytest
 
 from doubles.fake_server import assert_private, on_host
+from doubles.waiting import WAIT_S
 from test_match import Duel
 from test_snapshots import ENGINE_READY, engine_rig, free_port  # noqa: F401
 from service.api import make_server
@@ -36,7 +37,6 @@ LEAKY_LINES = [
     f"RCONPassword={RCON_MARKER}",
     *ENGINE_READY,
 ]
-HTTP_TIMEOUT_S = 5
 
 
 def assert_clean(text: str, markers: tuple[str, ...] = MARKERS) -> None:
@@ -68,7 +68,7 @@ def served(engine: Engine) -> Iterator[Callable[[], str]]:
     thread.start()
 
     def read_state() -> str:
-        with urlopen(url, timeout=HTTP_TIMEOUT_S) as response:
+        with urlopen(url, timeout=WAIT_S) as response:
             return response.read().decode("utf-8")
 
     try:
@@ -76,7 +76,7 @@ def served(engine: Engine) -> Iterator[Callable[[], str]]:
     finally:
         httpd.shutdown()
         httpd.server_close()
-        thread.join(HTTP_TIMEOUT_S)
+        thread.join(WAIT_S)
 
 
 def play_leaky_match(duel: Duel, read_state: Callable[[], str]) -> list[str]:
@@ -179,7 +179,7 @@ def test_launcher_refusal_never_cites_the_value(runtime, caplog, secret, make_ar
 
 
 def share_answer(port: int, request: bytes) -> bytes:
-    with socket.create_connection(("127.0.0.1", port), timeout=HTTP_TIMEOUT_S) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(request)
         answer = b""
         while chunk := conn.recv(1 << 16):

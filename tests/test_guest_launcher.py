@@ -16,6 +16,7 @@ import pytest
 
 from doubles.fake_server import compile_windows_client, plan_windows_client
 from doubles.launcher_check import CODE_REFUSED, run_embedded_check
+from doubles.waiting import WAIT_S
 from service import guest_launcher
 from service.guest_launcher import (
     CLIENT_SETTLE_S,
@@ -743,7 +744,8 @@ def test_invalid_port_is_refused(value):
 
 if sys.platform == "win32":
     RUN_TIMEOUT_S = 120
-    ARGS_WAIT_S = 20
+    # Deux budgets d'attente : le lanceur compile puis lance le double (20 s en local).
+    ARGS_WAIT_S = 2 * WAIT_S
     POLL_S = 0.05
     GAME_FOLDER = Path("steamapps") / "common" / "ProjectZomboid"
     CLIENT_NAME = "ProjectZomboid64.exe"

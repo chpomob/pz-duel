@@ -651,6 +651,8 @@ def test_wait_for_returns_as_soon_as_the_state_holds(engine_rig):
 def test_wait_for_names_the_expected_event_and_the_observed_state(engine_rig):
     lobby = Lobby(engine_rig, PRESET)
 
+    # Exception P9F29 : des délais qu'on veut voir expirer (l'état n'arrive jamais) ; le message
+    # cite la valeur. Ce ne sont pas des patiences.
     with pytest.raises(AssertionError) as failure:
         lobby.wait_for(lambda s: s["score"]["A"] == 1, timeout_s=0.05, expected="kill de A")
     message = str(failure.value)

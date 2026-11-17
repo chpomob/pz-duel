@@ -31,6 +31,7 @@ import types
 from pathlib import Path
 
 import pytest
+from doubles.waiting import WAIT_S
 from test_preflight import make_install
 from test_stdlib_only import foreign_imports
 
@@ -317,9 +318,11 @@ def test_paths_imports_nothing_from_service():
 
 # Démarrage : `main()` tourne dans un sous-processus, sur son fil principal -------------------
 
-SERVICE_UP_S = 30
+# Trois budgets d'attente : un sous-processus démarre le service (30 s en local, comme avant).
+SERVICE_UP_S = 3 * WAIT_S
 POLL_S = 0.02
 PROBE_S = 0.2
+# Borne affirmée, pas une patience : la sonde doit conclure vite (P9F29 la garde en dur).
 SHORT_WAIT_S = 1
 STOPPERS = 8
 LOG_RELATIVE = Path("pz-duel") / "pz-duel.log"

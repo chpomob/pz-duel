@@ -31,6 +31,7 @@ from doubles.fake_server import (
     on_host,
     windows_pid_alive,
 )
+from doubles.waiting import WAIT_S
 from test_snapshots import PLAYER_PASSWORD, engine_rig, make_world  # noqa: F401
 from service.engine import STOP_INCOMPLETE, Engine
 from service.platforms import TERMINATED_EXIT_CODE, WINDOWS, current
@@ -60,7 +61,8 @@ injected_windows = pytest.mark.skipif(
     reason="POSIX double; replaced by test_windows_stop_ends_a_paused_tree_at_the_sigkill_stage",
 )
 
-PROCESS_TIMEOUT_S = 10
+# Patience pour un double de processus (démarrage, fin) : le budget commun (P9F29).
+PROCESS_TIMEOUT_S = WAIT_S
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_SERVICE = REPO_ROOT / "tests" / "doubles" / "run_service.py"
 SERVICE_URL_PREFIX = "interface : "

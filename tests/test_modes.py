@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from doubles.fake_server import compile_windows_client, plan_windows_client, write_script
+from doubles.waiting import WAIT_S
 from test_preflight import free_ports, make_install, zomboid_home  # noqa: F401
 
 from service import engine as engine_module
@@ -49,7 +50,6 @@ STATE_KEYS = {
 }
 NEW_STATE_KEYS = {"match_id", "capabilities", "result", "ports_opening", "idle_quit"}
 PRESET_KEYS = {"id", "label", "tagline", "summary", "duration_s", "day_length"}
-WAIT_S = 10
 JSON_HEADERS = {"Content-Type": "application/json"}
 
 

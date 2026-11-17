@@ -43,6 +43,7 @@ from doubles.fake_server import (
     plan_windows_client,
     windows_pid_alive,
 )
+from doubles.waiting import WAIT_S as TEST_WAIT_S
 from test_contract import Lobby
 from test_share import (  # noqa: F401
     LAN_ADDRESS,
@@ -1859,7 +1860,8 @@ if sys.platform == "win32":
     REPO_SERVICE = REPO / "tests" / "doubles" / "run_service.py"
     SERVICE_URL_PREFIX = "interface : "
     FAST_STOP = {"tick_ms": 10, "stop_timeout_s": 1, "kill_grace_s": 2, "rcon_timeout_s": 1}
-    WAIT_S = 30
+    # Trois budgets d'attente : une console Windows et un arbre de processus (30 s en local).
+    WAIT_S = 3 * TEST_WAIT_S
     POLL_S = 0.05
     SERVICE_GONE_S = 5
     CREATE_NEW_CONSOLE = 0x00000010

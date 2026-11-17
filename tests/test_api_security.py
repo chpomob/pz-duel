@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
+from doubles.waiting import WAIT_S
 
 from service.api import (
     BODY_MAX,
@@ -25,6 +26,7 @@ from service.api import (
     make_server,
 )
 from service.engine import ACTIONS, Engine, load_presets
+from service.http_kit import REQUEST_READ_S
 from service.share import ShareServer
 from test_contract import Lobby
 from test_snapshots import engine_rig  # noqa: F401 - fixture du banc moteur
@@ -34,8 +36,10 @@ SECRET = "mot-de-passe-joueur"
 JSON_TYPE = "application/json"
 # `shutdown` attend un tour de `serve_forever` : la valeur par défaut coûte 0,5 s par test.
 POLL_S = 0.01
-WAIT_S = 3.0
 SHORT_READ_S = 0.1
+# Borne affirmée, pas une patience : sous la moitié du délai d'en-tête par défaut, une fermeture
+# prouve que le délai court posé par le test a servi, et non le défaut du service.
+CLOSED_IN_TIME_S = REQUEST_READ_S / 2
 HELD = 3
 ACTION_BODY = json.dumps({"action": "start", "preset": "demo"}).encode()
 OTHER_PORT = 1
@@ -110,7 +114,7 @@ def api():
 
 def send(port: int, path: str, headers: dict, body: bytes | None = None) -> tuple[int, bytes]:
     """Envoie exactement `headers` : `http.client` n'ajoute ni Host ni Accept-Encoding."""
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT_S)
     try:
         conn.putrequest("GET" if body is None else "POST", path, skip_host=True,
                         skip_accept_encoding=True)  # fmt: skip
@@ -284,7 +288,7 @@ def serve(engine):
 
 def raw_answer(port: int, request: bytes) -> bytes:
     """Passe par le socket : `http.client` refuserait d'émettre ces requêtes."""
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(request)
         answer = b""
         while chunk := conn.recv(4096):
@@ -507,7 +511,7 @@ def test_body_at_the_cap_is_read(api):
 def test_body_shorter_than_announced_is_refused(api):
     """Le client ferme son sens d'envoi : `{}` seul serait un JSON valide pour le moteur."""
     engine, port = api
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(framed(port, "Content-Length: 10", body=b"{}"))
         conn.shutdown(socket.SHUT_WR)
         answer = conn.makefile("rb").read()
@@ -542,10 +546,10 @@ def assert_timed_out(answer: bytes) -> None:
 def test_partial_body_gets_a_json_timeout_and_frees_the_handler(api, released):
     """Le client garde sa connexion ouverte : seule l'échéance du service peut répondre."""
     engine, port = api
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(framed(port, "Content-Length: 10", body=b"{}"))
         answer = conn.makefile("rb").read()
-        assert released.wait(5), "le fil reste pris alors que le client est encore là"
+        assert released.wait(WAIT_S), "le fil reste pris alors que le client est encore là"
     assert_timed_out(answer)
     assert engine.actions == []
 
@@ -553,8 +557,8 @@ def test_partial_body_gets_a_json_timeout_and_frees_the_handler(api, released):
 def test_dripped_body_cannot_renew_the_deadline(api, released):
     """Un octet par intervalle renouvellerait un délai compté par `recv`."""
     engine, port = api
-    deadline = time.monotonic() + 5
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    deadline = time.monotonic() + WAIT_S
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(framed(port, "Content-Length: 100000"))
         conn.settimeout(0.02)
         answer = b""
@@ -564,9 +568,9 @@ def test_dripped_body_cannot_renew_the_deadline(api, released):
                 answer = conn.recv(1 << 16)
             except TimeoutError:
                 continue
-        conn.settimeout(5)
+        conn.settimeout(WAIT_S)
         answer += conn.makefile("rb").read()
-        assert released.wait(5)
+        assert released.wait(WAIT_S)
     assert_timed_out(answer)
     assert engine.actions == []
 
@@ -584,7 +588,7 @@ def test_foreign_request_is_refused_before_any_body_read(api, body_reads, header
         f"POST /api/action HTTP/1.1\r\n{host}{header}\r\n"
         f"Content-Type: {JSON_TYPE}\r\nContent-Length: 10\r\n\r\n{{}}"
     )
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(request.encode("ascii"))
         answer = conn.makefile("rb").read()
     code, _, body = split_answer(answer)
@@ -794,7 +798,7 @@ def test_every_post_route_refuses_before_any_body_read(api, body_reads, path, he
         f"POST {path} HTTP/1.1\r\n{host}{header}\r\n"
         f"Content-Type: {JSON_TYPE}\r\nContent-Length: 10\r\n\r\n{{}}"
     )
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=WAIT_S) as conn:
         conn.sendall(request.encode("ascii"))
         answer = conn.makefile("rb").read()
     code, _, body = split_answer(answer)
@@ -1085,7 +1089,7 @@ def test_http_client_reads_the_refusal_of_a_long_header(api):
 
 def test_head_gets_the_refusal_headers_without_a_body(api):
     _, port = api
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT_S)
     try:
         conn.request("HEAD", "/")
         response = conn.getresponse()
@@ -1227,7 +1231,7 @@ def test_incomplete_request_is_closed_in_time_and_frees_its_thread(short_read, s
             conn.sendall(sent)
             started = time.monotonic()
             assert closed_by_the_server(conn)
-            assert time.monotonic() - started < WAIT_S
+            assert time.monotonic() - started < CLOSED_IN_TIME_S
         eventually(lambda: server._slots._value == CONNECTIONS_MAX)
     finally:
         server.shutdown()
@@ -1241,7 +1245,8 @@ def test_dripping_client_does_not_renew_the_delay(short_read):
         with socket.create_connection(("127.0.0.1", server.server_address[1])) as conn:
             conn.sendall(b"GET / HTTP/1.1\r\n")
             conn.settimeout(SHORT_READ_S / 10)
-            deadline = time.monotonic() + WAIT_S
+            started = time.monotonic()
+            deadline = started + WAIT_S
             closed = False
             while not closed and time.monotonic() < deadline:
                 try:
@@ -1252,6 +1257,7 @@ def test_dripping_client_does_not_renew_the_delay(short_read):
                 except OSError:
                     closed = True
             assert closed
+            assert time.monotonic() - started < CLOSED_IN_TIME_S
     finally:
         server.shutdown()
         server.server_close()

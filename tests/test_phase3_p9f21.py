@@ -456,6 +456,8 @@ def test_p9f24_wait_until_returns_the_value_once_a_thread_has_produced_the_state
     timer.start()
     try:
         started = time.monotonic()
+        # Exception P9F29 : 5 s est un délai qu'on affirme ne pas atteindre (`elapsed < 4.0`),
+        # pas une patience ; `WAIT_S` réglé bas le ferait tomber à tort.
         value = wait_until(lambda: produced and produced[0], timeout_s=5.0, what="état produit")
         elapsed = time.monotonic() - started
     finally:
@@ -473,6 +475,7 @@ def test_p9f24_wait_until_names_the_condition_and_the_state_seen_when_it_expires
     state = {"status": "off", "reason": None}
     started = time.monotonic()
 
+    # Exception P9F29 : un délai qu'on veut voir expirer ; le message en cite la valeur.
     with pytest.raises(AssertionError) as raised:
         wait_until(
             lambda: state["status"] == "sent", timeout_s=0.05, what="tenue `sent`",
@@ -489,6 +492,7 @@ def test_p9f24_wait_until_without_observer_shows_the_last_value_of_the_condition
     """Sans `observe`, l'état cité est ce que la condition a rendu en dernier : une condition
     qui rend la valeur lue (`None`, liste vide) se diagnostique seule.
     Mutation : ne rien citer après « observé »."""
+    # Exception P9F29 : un délai qu'on veut voir expirer, aussi court que possible.
     with pytest.raises(AssertionError, match=r"lien de A ; observé : \[\]$"):
         wait_until(lambda: [], timeout_s=0.02, what="lien de A")
 
@@ -498,6 +502,8 @@ def test_p9f24_wait_until_reads_once_more_at_the_deadline_and_never_swallows_a_f
     Une exception de la condition remonte telle quelle, et une attente sans nom est refusée.
     Mutations : sortir de la boucle avant le relevé quand le délai est passé ; envelopper la
     condition d'un `except Exception` ; accepter `what=""`."""
+    # Exceptions P9F29 : le délai nul est l'objet du test ; 0,5 s n'est jamais atteint, la
+    # condition lève au premier relevé.
     assert wait_until(lambda: "là", timeout_s=0, what="état déjà là") == "là"
 
     def broken() -> bool:

@@ -21,6 +21,7 @@ import pytest
 
 from doubles.fake_mod import FakeMod
 from doubles.fake_server import install_fake_server, kill_tree, on_host, write_script
+from doubles.waiting import WAIT_S
 from test_preflight import (  # noqa: F401
     GIVING_UP,
     RETRYING,
@@ -42,7 +43,8 @@ from service.transport import CommandChannel
 
 SIDES = ("A", "B")
 FAST_TIMEOUTS = {
-    "server_start_timeout_s": 10,
+    # Patience pour le démarrage du double, pas une durée voulue (P9F28 l'a vu expirer) : P9F29.
+    "server_start_timeout_s": WAIT_S,
     "stop_timeout_s": 5,
     "kill_grace_s": 2,
     "rcon_timeout_s": 0.5,
@@ -143,11 +145,12 @@ ENGINE_SANDBOX = (
 )
 BUILD = "42.21.0"
 ENGINE_READY = [f"version={BUILD}", *READY_LINES]
-WAIT_S = 10
-# `wait` compte aussi le lancement : une fenêtre égale à l'attente n'y laisserait rien voir.
-CONTRACT_WINDOW_S = WAIT_S / 4
-# Ce que la fenêtre peut consommer de l'attente, retard du fil compris.
-CONTRACT_WINDOW_MAX_S = WAIT_S / 2
+# Durées voulues, pas des patiences : la fenêtre de contrat est mesurée (`span`), elle ne suit
+# donc pas `WAIT_S`. Leurs valeurs sont celles d'avant P9F29 (un quart et une moitié de 10 s).
+# `wait` compte aussi le lancement : la fenêtre doit rester bien en deçà de l'attente.
+CONTRACT_WINDOW_S = 2.5
+# Ce que la fenêtre peut consommer, retard du fil compris.
+CONTRACT_WINDOW_MAX_S = 5.0
 WAIT_POLL_S = 0.01
 OBSERVED_KEYS = ("phase", "score", "clock", "players", "servers", "result", "error")
 PLAYER_PASSWORD = "player-marker"

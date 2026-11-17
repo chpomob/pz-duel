@@ -10,6 +10,7 @@ import time
 import pytest
 
 from doubles.fake_server import FakeRcon
+from doubles.waiting import WAIT_S
 from test_match import KILL, Duel, presets  # noqa: F401
 from test_snapshots import engine_rig  # noqa: F401
 from service import engine as engine_module
@@ -333,7 +334,7 @@ def test_a_missing_or_odd_pseudo_still_gives_a_readable_line():
 # -- envoi par RCON ----------------------------------------------------------------------------
 
 
-def wait_for(check, timeout_s: float = 5.0) -> None:
+def wait_for(check, timeout_s: float = WAIT_S) -> None:
     deadline = time.monotonic() + timeout_s
     while not check():
         assert time.monotonic() < deadline, "condition jamais atteinte"
@@ -397,7 +398,7 @@ def test_full_queue_drops_the_oldest_lines_not_the_caller():
             pass
 
         def __enter__(self):
-            release.wait(5)
+            release.wait(WAIT_S)
             return self
 
         def __exit__(self, *exc_info):

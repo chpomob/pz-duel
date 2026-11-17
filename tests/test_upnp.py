@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from doubles.fake_igd import FakeIGD
-from doubles.waiting import wait_until
+from doubles.waiting import WAIT_S, wait_until
 from service import upnp
 from service.rules import load_runtime
 
@@ -198,7 +198,7 @@ def test_fake_igd_answers_msearch():
         assert reply.startswith("HTTP/1.1 200 OK")
         assert f"LOCATION: http://127.0.0.1:{igd.http_port}/desc.xml" in reply
         assert len(igd.msearches) == 1
-        conn = http.client.HTTPConnection("127.0.0.1", igd.http_port, timeout=2)
+        conn = http.client.HTTPConnection("127.0.0.1", igd.http_port, timeout=WAIT_S)
         conn.request("GET", "/desc.xml")
         body = conn.getresponse().read()
         conn.close()
@@ -239,7 +239,7 @@ def test_fake_igd_close_releases_silent_handler():
 
         thread = threading.Thread(target=call, daemon=True)
         thread.start()
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + WAIT_S
         while len(igd.calls) < 2 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert [c.silent for c in igd.calls] == [False, True]
@@ -1012,7 +1012,6 @@ from service.engine import Engine  # noqa: E402
 
 PUBLIC = "5.6.7.8"
 ENTERED = "198.51.100.9"
-ENGINE_WAIT_S = 10
 SHUTDOWN_BOUND_S = 3 * FAST["request_timeout_s"] + 1
 
 
@@ -1088,7 +1087,7 @@ def _edicts(rig, couples) -> list[dict]:
     return [{"port": p, "protocol": t, "internal": inner[(p, t)]} for p, t in couples]
 
 
-def _wait_opening(engine: Engine, timeout_s: float = ENGINE_WAIT_S) -> dict:
+def _wait_opening(engine: Engine, timeout_s: float = WAIT_S) -> dict:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         opening = engine.snapshot()["ports_opening"]
@@ -1671,7 +1670,7 @@ class UpnpService:
             return json.load(response)
 
     def until(self, condition) -> dict:
-        deadline = time.monotonic() + ENGINE_WAIT_S
+        deadline = time.monotonic() + WAIT_S
         while time.monotonic() < deadline:
             state = self.state()
             if condition(state):
@@ -1728,7 +1727,7 @@ NOT_IGD = f"{DEVICE}MediaServer:1"
 SECOND_BOX = "127.0.0.2"
 
 
-def _wait_for(condition, timeout_s: float = ENGINE_WAIT_S) -> None:
+def _wait_for(condition, timeout_s: float = WAIT_S) -> None:
     deadline = time.monotonic() + timeout_s
     while not condition():
         if time.monotonic() > deadline:
@@ -1747,7 +1746,7 @@ def test_c1_opening_merged_after_the_shutdown_copy_removes_its_own_mappings(upnp
     def late_open(cfg, couples, target, cancel, **kwargs):
         # Le réseau est fait, mais la fusion n'arrive qu'après la copie de l'arrêt.
         outcome = real_open(cfg, couples, target, None, **kwargs)
-        gate.wait(ENGINE_WAIT_S)
+        gate.wait(WAIT_S)
         return outcome
 
     monkeypatch.setattr(upnp, "open_ports", late_open)
@@ -1760,7 +1759,7 @@ def test_c1_opening_merged_after_the_shutdown_copy_removes_its_own_mappings(upnp
     _wait_for(lambda: engine._ports_released)
     assert _held(engine) == []
     gate.set()
-    stopper.join(ENGINE_WAIT_S)
+    stopper.join(WAIT_S)
     assert not stopper.is_alive()
     assert sorted(_deletes_after(igd, seen)) == sorted(ports)
     assert igd.mappings == {}
@@ -1989,7 +1988,7 @@ def _gated_open(monkeypatch, gate: threading.Event):
 
     def late_open(cfg, couples, target, cancel, **kwargs):
         outcome = real_open(cfg, couples, target, None, **kwargs)
-        gate.wait(4 * ENGINE_WAIT_S)
+        gate.wait(4 * WAIT_S)
         returned.set()
         return outcome
 
@@ -2029,8 +2028,8 @@ def test_p9f2_c1_merge_delayed_beyond_both_waits_is_abandoned_with_its_couples_n
     assert deletes_at_return == seen
     # La fusion arrive enfin : rien n'est plus fusionné, et rien ne part après l'arrêt.
     gate.set()
-    assert returned.wait(ENGINE_WAIT_S)
-    engine._ports_thread.join(ENGINE_WAIT_S)
+    assert returned.wait(WAIT_S)
+    engine._ports_thread.join(WAIT_S)
     assert not engine._ports_thread.is_alive()
     assert _held(engine) == []
     assert len(igd.actions("DeletePortMapping")) == deletes_at_return
@@ -3099,7 +3098,7 @@ def _engine_ports_a(rig) -> list[tuple[int, str]]:
     return [(port - 10, protocol) for port, protocol in _engine_ports(rig)]
 
 
-def _wait_both(engine: Engine, timeout_s: float = ENGINE_WAIT_S) -> dict:
+def _wait_both(engine: Engine, timeout_s: float = WAIT_S) -> dict:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         opening = engine.snapshot()["ports_opening"]

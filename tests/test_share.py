@@ -17,13 +17,14 @@ from urllib.parse import urlsplit
 import pytest
 
 from doubles.launcher_check import CODE_REFUSED, run_embedded_check
+from doubles.waiting import WAIT_S
 from test_contract import Lobby
 from test_match import Duel, launcher_checked  # noqa: F401
 from test_modes import FastClock, settle, wait_phase
 from test_snapshots import PLAYER_PASSWORD, engine_rig, free_port  # noqa: F401
 from service import engine as engine_module
 from service.api import CONNECTIONS_MAX, LAUNCHER_NAME, make_server
-from service.http_kit import turned_away
+from service.http_kit import REQUEST_READ_S, turned_away
 from service.engine import REMATCH_NOTE_TEXT, Engine
 from service.guest_launcher import (
     JOIN_MARK,
@@ -70,7 +71,6 @@ REFUSED_ADDRESSES = (
 TOKEN = re.compile(r"[0-9a-f]{32}")
 LAUNCHER_ROUTE = "/api/invite/launcher"
 ADDRESS_ROUTE = "/api/invite/address"
-HTTP_TIMEOUT_S = 5
 UNLISTED_PASSWORD = "two words"
 # La limite d'AC40.
 CLOSE_LIMIT_S = 2
@@ -79,7 +79,9 @@ POLL_S = 0.01
 SHORT_READ_S = 0.2
 # Bien plus que les microsecondes où l'ancien refus fermait, et qu'un RST met à revenir.
 LATE_REQUEST_S = 0.1
-WAIT_S = 5
+# Borne affirmée, pas une patience : sous la moitié du délai d'en-tête par défaut, la fermeture
+# prouve que le délai court posé par le test a servi, et non celui du service.
+CLOSED_IN_TIME_S = REQUEST_READ_S / 2
 STUB_TOKEN = "0123456789abcdef0123456789abcdef"
 STUB_PATH = f"/{STUB_TOKEN}/{LAUNCHER_NAME}"
 UI_DIR = Path(engine_module.__file__).parent.parent / "ui"
@@ -155,7 +157,7 @@ def api_port():
 
 
 def request(port: int, method: str, path: str, body: dict | None = None):
-    conn = http.client.HTTPConnection(LOOPBACK, port, timeout=HTTP_TIMEOUT_S)
+    conn = http.client.HTTPConnection(LOOPBACK, port, timeout=WAIT_S)
     try:
         data = None if body is None else json.dumps(body).encode()
         headers = {} if body is None else {"Content-Type": "application/json"}
@@ -933,7 +935,7 @@ def port_of(share: ShareServer) -> int:
 
 def raw(port: int, data: bytes) -> bytes:
     """Rend tout ce que le serveur répond à `data`, jusqu'à ce qu'il ferme."""
-    with socket.create_connection((LOOPBACK, port), timeout=HTTP_TIMEOUT_S) as conn:
+    with socket.create_connection((LOOPBACK, port), timeout=WAIT_S) as conn:
         conn.sendall(data)
         answer = b""
         while chunk := conn.recv(1 << 16):
@@ -960,7 +962,7 @@ def assert_refused(answer: bytes, *secrets: str) -> None:
 
 def is_closed(port: int) -> bool:
     try:
-        socket.create_connection((LOOPBACK, port), timeout=HTTP_TIMEOUT_S).close()
+        socket.create_connection((LOOPBACK, port), timeout=WAIT_S).close()
     except OSError:
         return True
     return False
@@ -1387,7 +1389,7 @@ def test_a1_another_address_keeps_its_place(peer_share):
         wait_free_slots(share, CONNECTIONS_MAX - PEER_MAX)
         assert split_answer(raw(port, get_line(STUB_PATH)))[0] == 503
         with socket.create_connection(
-            (LOOPBACK, port), timeout=HTTP_TIMEOUT_S, source_address=(OTHER_LOOPBACK, 0)
+            (LOOPBACK, port), timeout=WAIT_S, source_address=(OTHER_LOOPBACK, 0)
         ) as guest:
             guest.sendall(get_line(STUB_PATH))
             answer = b""
@@ -1470,7 +1472,7 @@ def test_dripped_request_cannot_renew_the_deadline(stub_share, monkeypatch):
         except OSError:
             pass
 
-    assert time.monotonic() - started < WAIT_S
+    assert time.monotonic() - started < CLOSED_IN_TIME_S
 
 
 def test_connection_accepted_before_closing_gets_a_refusal(stub_share):

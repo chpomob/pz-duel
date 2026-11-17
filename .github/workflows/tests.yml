@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
 
+# P9F29 : la patience des tests d'attente (`tests/doubles/waiting.py`). Un runner partagé est
+# trois à cinq fois plus lent qu'une machine de développement sur les opérations de processus.
+env:
+  PZDUEL_TEST_WAIT_S: "60"
+
 jobs:
   pytest:
     runs-on: ubuntu-latest

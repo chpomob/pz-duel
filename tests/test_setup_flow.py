@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import pytest
 from doubles.fake_server import FakeRcon
+from doubles.waiting import WAIT_S
 from test_match import Duel
 from test_modes import forbidden_factory, settle, step
 from test_preflight import (  # noqa: F401
@@ -59,9 +60,9 @@ WRITE_ROUTES = (INSTALL_ROUTE, FOLDER_ROUTE)
 QUIT_ROUTE = "/api/quit"
 UI_DIR = Path(engine_module.__file__).parent.parent / "ui"
 # Filet d'un test bloqué, au-delà de tout budget d'arrêt : c'est le test qui mesure le budget.
-MAIN_EXIT_S = 30
+# Trois budgets d'attente : 30 s sur la machine de développement, comme avant P9F29.
+MAIN_EXIT_S = 3 * WAIT_S
 POLL_S = 0.01
-WAIT_S = 5
 HELD_S = 0.05
 THREADS = 4
 ENOUGH_RAM_MB = 1 << 20

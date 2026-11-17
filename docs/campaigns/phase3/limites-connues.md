@@ -1289,3 +1289,101 @@ fait tomber que la course « annulation d'abord » : quand le délai expire ou q
 **Ouvert :** à un délai absurde (0,01 s), la seconde passe du test d'annulation, entière, échoue à
 son tour faute de disponibilité : c'est attendu et non visé — le délai de 10 s du service n'est pas
 de cet ordre.
+
+## P9F29 — budgets d'attente des tests pilotés par l'environnement, et recensement des courses (2026-11-17)
+
+**Cause :** run #79 (`04191bc`), deux jobs Windows rouges sur
+`test_ac59_new_start_makes_the_launcher_stale` : `attendu en 10 s : … ; observé : {'phase':
+'stopping', …}` (`tests/test_snapshots.py:253`). L'arrêt du moteur dépassait le budget fixe du
+test sur un runner partagé ; le produit allait bien. Cinquième occurrence de la famille (P9F21,
+P9F24, P9F27, P9F28) : les budgets étaient des littéraux, un par fichier (3, 5 ou 10 s), calibrés
+pour la machine de développement.
+
+**Fait :**
+
+- `tests/doubles/waiting.py` est le seul endroit qui décide : `WAIT_S = wait_budget_s()` lit
+  `PZDUEL_TEST_WAIT_S` (défaut **10 s**, celui de la machine de développement) et refuse une valeur
+  illisible, nulle, négative ou infinie. `wait_until` sans `timeout_s` prend `WAIT_S` (son défaut
+  était 2 s).
+- `.github/workflows/tests.yml` pose `PZDUEL_TEST_WAIT_S: "60"` au niveau du workflow : les trois
+  jobs en héritent, et les jobs `pytest`/`pytest-windows` restent identiques à ceux de
+  `release.yml` (gardé par `test_ci_workflows`).
+- Ramenés à `WAIT_S` : les `WAIT_S` de `test_api_security` (3 s), `test_setup_flow` (5 s),
+  `test_share` (5 s), `test_modes` (10 s), `test_snapshots` (10 s) ; `ENGINE_WAIT_S` de
+  `test_upnp` (10 s) ; `HTTP_TIMEOUT_S` de `test_share` et `test_secrets` (5 s) ;
+  `PROCESS_TIMEOUT_S` de `test_servers` (10 s) ; `server_start_timeout_s` du banc moteur
+  (`FAST_TIMEOUTS` de `test_snapshots`, 10 s — c'est lui qui a expiré en P9F28) ; le défaut de
+  `wait_for` de `test_announce` (5 s) ; les `timeout=5`, `wait(5)` et `+ 5` de
+  `test_api_security` ; le `timeout=2` et le `+ 2` d'attente du faux IGD dans `test_upnp`.
+  En multiples, pour garder la valeur locale d'avant : `MAIN_EXIT_S` de `test_setup_flow`,
+  `SERVICE_UP_S` de `test_frozen` et `WAIT_S` de `test_platform_windows` (3 × `WAIT_S` = 30 s),
+  `ARGS_WAIT_S` de `test_guest_launcher` (2 × = 20 s), le `gate.wait(4 × …)` de `test_upnp`.
+- Ce qui servait à la fois de patience et de **borne affirmée** a été séparé, pour qu'un budget
+  allongé ne rende aucun test plus permissif : dans `test_api_security`
+  (`test_incomplete_request_is_closed_in_time_and_frees_its_thread`,
+  `test_dripping_client_does_not_renew_the_delay`) et `test_share`
+  (`test_dripped_request_cannot_renew_the_deadline`), la fermeture doit arriver sous
+  `CLOSED_IN_TIME_S = REQUEST_READ_S / 2` (2,5 s), ce qui prouve que le délai court posé par le test
+  a servi et non le défaut de 5 s du service — ce que l'ancien `WAIT_S` de 3 s prouvait par accident,
+  et que 10 ou 60 s n'auraient plus prouvé. Dans `test_snapshots`, la fenêtre de contrat
+  (`CONTRACT_WINDOW_S` 2,5 s, `CONTRACT_WINDOW_MAX_S` 5 s) était dérivée de `WAIT_S` ; elle est
+  désormais littérale, à ses valeurs d'avant.
+
+**Exceptions gardées en littéral** (durées voulues, chacune commentée dans le code) :
+les `timeout_s=0.05`, `0.02`, `0`, `0.5` et `5.0` des tests de `wait_until` lui-même
+(`test_phase3_p9f21.py`) et les `timeout_s=0.05` de
+`test_wait_for_names_the_expected_event_and_the_observed_state` (`test_match.py`) — des délais
+qu'on veut voir expirer, ou qu'on affirme ne pas atteindre ; `CONTRACT_WINDOW_S`/`_MAX_S` ;
+`CLOSE_LIMIT_S` (borne d'AC40) ; `SHORT_WAIT_S` de `test_frozen` (la sonde doit conclure en 1 s) ;
+`SHORT_READ_S`, `BODY_READ_S`, `DRAIN_S`, `LATE_REQUEST_S`, `REFUSAL_DRAIN_S` hors AC40 (délais du
+produit raccourcis : c'est leur expiration qu'on teste) ; dans `test_servers`,
+`SHORT_START_TIMEOUT_S` (0,4 s, expiration voulue), `RACE_WINDOW_S`, `RCON_TIMEOUT_S`,
+`MUTE_TIMEOUT_S`, `stop_timeout_s`/`kill_grace_s` ; dans `test_upnp`, les bornes `elapsed <= 1 + 1`,
+`< 1`, `0.5 + 0.5`, `0.5 + 1`, `SHUTDOWN_BOUND_S` et les délais `timeout_s=1`/`discovery_timeout_s=1`
+passés au produit ; `cmd_result_timeout_s=1` de `test_budget` (temps simulé du cœur, aucun fil) ;
+`CANCEL_DELAY_S` de `test_snapshots` (P9F28, invariant valable dans les deux courses) ;
+`TRANSIENT_HOLD_S` de `test_preflight`. Les filets de sous-processus (`timeout=30` des appels à
+Node, `SUBPROCESS_TIMEOUT_S = 60`, `RUN_TIMEOUT_S = 120`, `PROBE_TIMEOUT_S = 30`) ne bornent qu'un
+test bloqué et sont déjà au niveau du budget de CI ; ils ne sont pas convertis.
+
+### Recensement : tests qui attendent un état produit par un fil, un processus ou un double
+
+`W` = `WAIT_S` (10 s en local, 60 s en CI). « Suffit » se juge contre un runner trois à cinq fois
+plus lent que la machine de développement : chaque attente couvre **une** transition, pas le test
+entier.
+
+| Tests | Ce qu'ils attendent | Budget | Pourquoi il suffit (ou non) sur un runner lent |
+|---|---|---|---|
+| Banc moteur réel (`EngineRig.until`/`wait`, `Lobby.wait_for`, `Duel.start_match`/`finish`/`arrive`/`wait_holds`) : `test_snapshots`, `test_match`, `test_contract`, `test_share` (dont `test_ac59_new_start_makes_the_launcher_stale`), `test_upnp`, `test_settings`, `test_secrets`, `test_phase3_p9f21`, `_p9f22`, `_p9f26` | une phase (`lobby`, `running`, `over`, `idle`…), un score, une capacité, une tenue, publiés par le fil du moteur après démarrage ou arrêt des doubles de serveur | `W` | Le pire observé est l'arrêt sous Windows, au-delà de 10 s (run #79) mais de l'ordre de 10 s : 60 s laissent un facteur 5 au moins. Le démarrage du double est borné côté produit par `server_start_timeout_s = W`, donc jamais plus court que l'attente du test. |
+| `test_announcements_never_reach_the_journal_nor_the_replay` (`test_phase3_p9f22`) | fin de l'envoi des annonces : préavis du produit puis arrêt des serveurs | `end_notice_s + W` | Le préavis (8 s) est une durée du produit, ajoutée telle quelle ; seul l'arrêt est une patience. |
+| `EngineRig.cleanup`, `settle`/`interrupt` (`test_modes`), `thread.join(WAIT_S)` des tests à fils (`test_match`, `test_setup_flow`, `test_share`, `test_phase3_p9f21`) | fin d'un fil après `_stop` | `W` | Le fil s'arrête à sa prochaine passe (10 ms) ; `settle` affirme ensuite `not is_alive()`, qui dirait un fil bloqué. |
+| `test_modes` : `wait_phase`, `test_mock_never_claims_real`, `test_default_client_launcher_accepts_a_client_that_stays_up` (marqueur), `CLIENT_START_GRACE_S = W` | phase du moteur simulé ; le double client écrit ses arguments | `W` | Moteur simulé sur horloge rapide : millisecondes. Le marqueur dépend d'un `sh` lancé ; une seconde suffit en pratique. |
+| `test_setup_flow` : `request`, `MainRun.port`, fils `installing`/`stopping`, `MAIN_EXIT_S` | réponse HTTP du service, port d'écoute de `main()`, fil d'installation | `W`, filet `3 W` | Service en fil dans le même processus ; `MAIN_EXIT_S` n'est qu'un filet, le budget d'arrêt est mesuré par le test dédié. |
+| `test_share` : `test_ac40_connections_are_capped`, `…_request_sent_after_the_refusal_does_not_reset_it`, lecture de l'invitation (`reading`/`release`) | saturation des emplacements par le fil d'acceptation ; refus encore lisible | `W` (dont `REFUSAL_DRAIN_S = W`) | Le fil d'acceptation prend ses connexions en millisecondes. |
+| `test_share::test_dripped_request_cannot_renew_the_deadline`, `test_api_security::test_dripping_client_does_not_renew_the_delay`, `…_incomplete_request_is_closed_in_time…` | fermeture par le serveur après le délai court (0,1 ou 0,2 s) | patience `W`, **borne affirmée 2,5 s** | La borne laisse 12 à 25 fois le délai court. **Fragile au-delà** : un runner qui retarde un fil de plus de 2 s ferait tomber ces trois tests ; on ne peut pas l'allonger sans perdre la preuve (le défaut du service est 5 s). |
+| `test_api_security` : `api`/`quit_api` (événements `received`/`called`, `released`), `eventually`, `closed_by_the_server`, `share_answer` | réponse ou fermeture du serveur HTTP en fil ; libération d'un emplacement | `W` | Fil local, millisecondes ; `BODY_READ_S` est réduit à 0,2 s par le test. |
+| `test_snapshots::test_contract_window_closes_after_its_term_and_inside_the_wait` (`span` de `wait_caps`) | expiration de la fenêtre de contrat | 2,5 s ≤ `span` ≤ 5 s, puis `W` pour l'erreur | Durée voulue. `span` mesure un délai qui expire : un retard de plus de 2,5 s du fil la ferait sortir de la borne haute — **fragile** sur un runner très chargé, jamais vu tomber. |
+| `test_snapshots` : passes de création et d'annulation (P9F28) | serveurs prêts, capture, monde invalidé | `server_start_timeout_s = W`, `CANCEL_DELAY_S` 0,2 s | L'invariant tient dans les deux courses (P9F28) ; la disponibilité attend désormais le budget commun. |
+| `test_servers` : doubles de processus (`communicate`/`wait`/`join(PROCESS_TIMEOUT_S)`, démarrage réussi) | fin ou disponibilité d'un double | `W` | Un script `sh` ou `.bat` : quelques secondes au pire. Les délais voulus (`SHORT_START_TIMEOUT_S`, `stop_timeout_s` 0,3 s, `kill_grace_s`) restent courts : leur expiration est l'objet du test. |
+| `test_upnp` : `_wait_opening`, `_wait_both`, `_wait_for`, `gate.wait(4 W)`, `wait_until` des invitations, faux IGD | ouverture et relâchement des ports par le fil UPnP ; appels reçus par le faux IGD | `W` (`4 W` pour un fil volontairement retenu) | Faux IGD local ; les délais SOAP sont réduits par `FAST`. Les bornes d'expiration (`elapsed <= 1 + 1`, etc.) sont des contrats et restent fixes. |
+| `test_announce` : `wait_for`, `SlowClient` | envoi RCON par le fil d'annonces | `W` | Faux RCON local. |
+| `test_frozen` : `wait_for`, connexions HTTP (`SERVICE_UP_S = 3 W`) | `main()` dans un sous-processus qui démarre le service | `3 W` (30 s / 180 s) | Démarrage d'un interpréteur ; la sonde (`SHORT_WAIT_S` 1 s, `PROBE_S` 0,2 s) est une borne affirmée et reste fixe — **à surveiller** si un runner met plus d'une seconde à sonder un port local. |
+| `test_platform_windows` (win32) : `wait_until` local (`3 W`), `SERVICE_GONE_S` 5 s | arbre de processus prêt, fin de l'arbre après le service | `3 W` ; 5 s | `SERVICE_GONE_S` borne la fin de l'arbre après celle du service (Job fermé) : c'est un contrat, gardé ; mesuré sur vrai Windows en P18F2. |
+| `test_guest_launcher` (win32) : `client_args` (`ARGS_WAIT_S = 2 W`) | le lanceur `.bat` a lancé le double client | `2 W` | Le lanceur compile puis lance : 20 s locales, 120 s en CI. |
+| `test_phase3_p9f21` (tests de `wait_until`), `test_match::test_wait_for_names_the_expected_event_and_the_observed_state` | une expiration voulue, ou un état produit par un `Timer` de 50 ms | littéraux (0, 0,02, 0,05, 0,5, 5 s) | Durées voulues. `elapsed < 4.0` suppose qu'un `Timer` de 50 ms part en moins de 4 s : sûr. |
+
+**Ce qui reste fragile malgré tout :** les trois bornes `CLOSED_IN_TIME_S` (2,5 s) et la fenêtre de
+contrat (`span` ≤ 5 s) mesurent une durée et ne peuvent pas suivre la machine ; `release.yml`
+n'est pas dans les fichiers de l'étape et ne pose pas la variable : une release rejoue les suites
+avec le défaut de 10 s (le test de parité des jobs reste vert, la variable étant au niveau du
+workflow) ; `test_integration_pz` (vrai jeu, hors CI) garde ses propres budgets.
+
+**Preuves :** suite complète verte deux fois de suite sur l'état final (3180 verts, 16 skips, 7 min 15 chacune).
+Les cinq fichiers (`test_api_security`, `test_setup_flow`, `test_share`, `test_modes`,
+`test_snapshots`) : avec `PZDUEL_TEST_WAIT_S=60`, 815 verts ; avec `=3`, un rouge,
+`test_a_stop_engaged_in_the_mock_lobby_never_opens_a_duel` (`phase ('lobby',) non atteinte :
+starting`) — le budget est bien lu. Mutations jouées : `wait_budget_s` rend `DEFAULT_WAIT_S` sans
+lire la variable → 7 tests de `tests/test_wait_budget.py` tombent, dont
+`test_budget_follows_the_environment` et `test_every_waiting_file_takes_its_budget_from_the_environment` ;
+`WAIT_S = 5` remis en dur dans `test_share` → ce dernier tombe (`{'test_share': 5} !=
+{'test_share': 42.5}`).
