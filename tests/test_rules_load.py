@@ -979,7 +979,10 @@ def spawned_zombie(missing: tuple[str, ...]):
         setWalkType=lambda self, walk: calls.append(("setWalkType", walk)),
         setSpeedTypeFromWalkType=lambda self: None,
     )
+    if "isFemale" not in missing:
+        methods["isFemale"] = lambda self: self.female
     zombie = type("SpawnedZombie", (), methods)()
+    zombie.female = False
     zombie.mod_data = Table()
     zombie.calls = calls
     return zombie
@@ -996,15 +999,26 @@ class SpawnGame:
         self.spawns: list[tuple[int, int, int]] = []
         # Cinquième argument de chaque appel à `addZombiesInOutfit` (P9F19) : `None` pour `nil`.
         self.outfits: list = []
+        # Sixième argument de chaque appel (P9F25) : le pourcentage de femelles, `None` pour `nil`.
+        self.sexes: list = []
+        # Faux : le jeu ignore le sixième argument, comme si `setFemaleEtc` n'était pas appelé.
+        self.obeys_sex = True
         self.zombies: list = []
+        # Tirage du sexe à part : celui des cases garde sa suite, quel que soit le sexe demandé.
+        sex_rng = random.Random(seed)
 
         def zomb_rand(low, high=None):
             return rng.randrange(int(low)) if high is None else rng.randrange(int(low), int(high))
 
-        def add_zombies(x, y, _z, count, outfit, _female):
+        def add_zombies(x, y, _z, count, outfit, female):
             self.spawns.append((int(x), int(y), int(count)))
             self.outfits.append(outfit)
+            self.sexes.append(female)
             made = [spawned_zombie(missing) for _ in range(int(count))]
+            for zombie in made:
+                # Le jeu : `Rand.Next(100) < sex` quand le sexe est dit, son propre tirage sinon.
+                percent = 50 if female is None or not self.obeys_sex else female
+                zombie.female = sex_rng.randrange(100) < percent
             self.zombies += made
             return ZombieList(made)
 

@@ -1005,3 +1005,103 @@ Les trois tests : 30 exécutions de suite, 0 échec.
   - Les pauses fixes restantes (`time.sleep(HELD_S)`, `LATE_REQUEST_S`, `2 * SHORT_READ_S` dans
     `test_setup_flow.py`, `test_share.py`, `test_api_security.py`) attendent une durée, pas une
     condition. Non relues ici.
+
+## P9F25 — le sexe des zombies envoyés suit la tenue, et la liste vient du registre du jeu (2026-11-17)
+
+**Cause :** session du 16/11, « y a peut-être un souci de sexe des z ». Exact, pour trois raisons :
+le mod passait `nil` en sixième argument d'`addZombiesInOutfit` (le sexe n'était jamais dit) ; le
+registre des tenues, `media/clothing/clothing.xml`, a deux listes, `m_FemaleOutfits` (170 noms) et
+`m_MaleOutfits` (239), et un nom absent de la liste du sexe tiré laisse le zombie sans tenue ; et
+`StripperWhite` n'est dans aucune des deux.
+
+**Fait :**
+
+- `service/paths.py` — `clothing_registry()` rend le chemin du registre : `--pz-dir`, puis
+  `PZ_INSTALL_DIR`, puis les dossiers connus de Steam ; sous `projectzomboid/` (Linux) ou à la
+  racine du jeu (Windows).
+  `game_clothing_registry(dossier)` rend celui d'un dossier du jeu déjà accepté par le préflight.
+- `service/settings.py` — la table est devenue `OUTFIT_SELECTION`, une sélection de noms et de
+  libellés. À l'import, `use_outfit_registry()` lit le registre et ne garde que les noms qu'il
+  porte, avec leur sexe : `female`, `male` ou `both`. Une tenue d'un seul sexe le dit dans son
+  libellé (« — femmes seulement », « — hommes seulement »).
+- Sélection : `StripperWhite` retiré ; `StripperPink` et `Stripper` (le masculin générique)
+  ajoutés ; `CowboyStripper`, `PoliceStripper` et `FiremanStripper` renommés au masculin, ce qu'ils
+  sont dans le jeu. Relevé sur le jeu installé (42, Linux) : féminin seul — `StripperPink`,
+  `StripperBlack`, `StripperNaked` ; masculin seul — `Inmate`, `PrisonGuard`, `Stripper`,
+  `CowboyStripper`, `PoliceStripper`, `FiremanStripper` ; les deux — les cinq `ShellSuit_*`,
+  `HazardSuit`, `Fireman`, `Police`, `Doctor`, `Nurse`, `WaiterStripper`.
+- Un nom de la sélection absent du registre quitte l'offre, et le champ servi par
+  `GET /api/settings` porte `notice`, qui le nomme ; la page l'affiche sous le champ. Un registre
+  illisible (absent, XML cassé, vide) réduit l'offre à `random`, `notice` dit le chemin et la
+  cause, et le démarrage n'en souffre pas. Les deux cas sont aussi écrits au journal du service.
+- Champ `zombie_sex`, après `zombie_outfit` : `auto` (défaut), `female`, `male`, `random`. `auto` :
+  100 pour une tenue féminine seule, 0 pour une masculine seule, rien sinon. `female` / `male` :
+  100 / 0, et **refus au réglage**, uniforme nommé, si la tenue n'existe que pour l'autre sexe.
+  `random` : rien, le comportement d'avant.
+- Le preset effectif porte `sex` (entier 0–100) ou pas de clé ; `service/rules.py` le contrôle et
+  le recopie dans chaque commande `spawn_pop` et `spawn_sprinter`, juste après `outfit`.
+- Le mod passe `cmd.sex` en sixième argument (`nil` sans la clé ou hors 0–100) et rapporte dans
+  `cmd_result` le sexe lu sur les zombies créés : `sex = { female = n, male = m }`. Pas de nouvelle
+  capacité : un service plus ancien n'envoie pas `sex` et obtient l'appel d'avant.
+
+**Le risque, écrit plutôt que caché :**
+
+- **`random` avec une tenue d'un seul sexe reste possible, et refait le défaut d'avant** : un
+  zombie sur deux naît sans la tenue. C'est le choix « conservé pour comparer » ; son libellé le
+  dit. La règle « la tenue impose le sexe » vaut pour `auto`, et par refus pour `female` / `male`.
+- **Le registre des serveurs n'est suivi que par le dossier que le préflight retient** (revue 1,
+  A1). À l'import, `use_outfit_registry()` ne connaît que `--pz-dir`, `PZ_INSTALL_DIR` et le Steam
+  par défaut. Ensuite `Engine._measure` (chaque contrôle de `/api/setup`, chaque préflight de
+  départ) et `Engine.set_pz_dir` (le dossier choisi dans le lobby, dès la réponse) passent le
+  dossier accepté à `settings.follow_game_dir`, qui relit `media/clothing/clothing.xml` de ce
+  dossier : le registre Windows et une bibliothèque Steam secondaire sont donc suivis aussi. Un
+  registre déjà en place et lu sans erreur n'est pas relu ; une lecture en échec est réessayée à
+  chaque contrôle. Reste vrai : en mode simulé rien n'est mesuré, l'offre est celle de l'import ;
+  et un `GET /api/settings` servi avant le premier `/api/setup` porte encore l'offre de l'import.
+  La page recharge donc le catalogue après chaque contrôle mesuré (`refreshSetup`) ; un autre
+  client de l'API doit en faire autant.
+- **Un uniforme choisi avant un changement de dossier peut ne plus être offert** : le brouillon
+  de la page garde sa valeur, et le départ est refusé en nommant `zombie_outfit`.
+- **L'avis du registre n'est pas un défaut du préflight** (revue 1, A2). `/api/setup` le porte
+  dans `notices` (liste de textes, le même que `notice` sur le champ), la carte « Setup » l'affiche
+  sous ses lignes, et le moteur l'écrit une fois au journal du lobby (`warn`). `ok` n'en dépend
+  pas : on lance avec `random` seul. La carte ne s'affiche qu'en mode réel, une fois mesurée, et
+  sur l'écran de configuration seulement tant qu'un défaut empêche de lancer — là, l'avis reste
+  visible sous le champ.
+- La relecture se fait sous un verrou du module, mais `catalog()` et `validate()` lisent le champ
+  sans lui : une requête servie pendant la relecture peut voir l'offre neuve et l'avis ancien,
+  le temps d'une affectation.
+- **Le registre lu est celui du client installé sur la machine de l'arbitre**, supposé le même
+  que celui des serveurs. Un mod qui ajoute des tenues ailleurs que dans ce fichier n'est pas vu.
+- **L'aspect à l'écran n'a pas été regardé.** Le registre dit qu'un nom existe pour un sexe ; il
+  ne dit pas que la tenue s'applique sans défaut, ni qu'elle se reconnaît à 12–20 cases. La
+  mention « vérifié à l'écran » de P9F19 n'est toujours portée par aucun nom. À constater dans une
+  partie : `StripperPink` en `auto` donne-t-il bien dix femmes habillées, et le `cmd_result` du
+  journal dit-il `female = 10, male = 0`.
+- **La conversion du sixième argument n'est prouvée que par le tutoriel du jeu**, qui passe `100`
+  et `0` depuis Lua. Le mod envoie un entier (`math.floor`). `isFemale()` est lu sous `pcall` : s'il
+  manquait, `female + male` serait inférieur à `spawned`, sans échec.
+- Un `sex` demandé et non obtenu n'est signalé nulle part ailleurs que dans le journal : la
+  commande y porte `sex`, son `cmd_result` le décompte obtenu. Aucune alerte dans le lobby.
+- Le double `fake_mod` du mode mock ne rapporte pas `sex`.
+- Des réglages sans `zombie_sex` (écrits avant P9F25) redonnent la table d'alors, sans `sex`.
+- La section P9F19 ci-dessus reste telle qu'écrite ; ses points sur `StripperWhite`, sur les
+  « sept tenues `*Stripper*` » et sur « tenues `*Stripper*` et zombies masculins : inconnu » sont
+  remplacés par celle-ci.
+
+**Tests (mutation citée dans chaque docstring) :** `tests/test_phase3_p9f25.py` — lecture du
+registre ; offre et libellés ; nom absent retiré, signalé, refusé ; registre illisible, offre
+réduite à `random` et départ intact ; chemin du registre ; `auto` + féminin seul → `sex = 100`,
+masculin seul → `0`, deux sexes → pas de `sex` ; sexe imposé ; duo incohérent refusé ; contrôle de
+la table ; mod : sixième argument, `nil` sans clé, `sex = {female, male}` lu sur les zombies,
+demandé et non obtenu, `isFemale` absent ; page : `notice` affiché ; revue 1 : registre d'un
+dossier accepté lu une fois, dossier choisi dans le lobby qui apporte ses tenues, préflight qui
+suit le dossier retenu, `notices` de `/api/setup` (retraits, registre illisible, `ok` intact),
+carte « Setup » et rechargement du catalogue après un contrôle (tests statiques du source : la
+page n'a été ouverte dans aucun navigateur pour cette reprise). `tests/fixtures/clothing.xml`
+est un extrait du registre (mêmes listes que le jeu pour la sélection), posé par la fixture
+`outfit_registry` de `tests/doubles/outfits.py` pour les deux modules qui choisissent un uniforme
+(P9F19 et P9F25) ; `tests/conftest.py` est gelé et n'a pas bougé. Les autres tests ne règlent que
+`random` et passent avec ou sans jeu installé (suite rejouée avec `PZ_INSTALL_DIR` vers un dossier
+vide). `SpawnGame` relève le sixième argument et donne un sexe aux zombies ;
+`tests/test_phase3_p9f19.py` suit la nouvelle offre.

@@ -55,6 +55,7 @@ SPEC_DEFAULTS = {
     "monde_neuf": True,
     "zombies_par_kill": 10,
     "zombie_outfit": "random",
+    "zombie_sex": "auto",
     "sprinter_percent": 1,
     "pop_distance": [12, 20],
     "aggro": 0.6,

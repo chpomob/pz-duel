@@ -2519,7 +2519,22 @@ class Engine:
             with self.lock:
                 self.pz_dir = str(detection.path)
                 self.state.log(f"game folder set: {detection.path}")
+            # Les uniformes offerts se lisent dans ce dossier-là (P9F25) : sans cette relecture,
+            # l'offre resterait celle de l'import, soit `random` seul hors du Steam par défaut.
+            self._follow_outfits(detection.path)
             return True, f"Game folder set: {detection.path}"
+
+    def _follow_outfits(self, game_dir: Any) -> None:
+        """Fait suivre au catalogue les tenues de `game_dir`, et journalise un avis neuf.
+
+        Ne lève rien et ne fait pas échouer le préflight : un registre illisible réduit l'offre
+        à `random`, et l'écran de préparation le dit (`notices`).
+        """
+        before = world_settings.outfit_notice()
+        notice = world_settings.follow_game_dir(game_dir)["notice"]
+        if notice and notice != before:
+            with self.lock:
+                self.state.log(notice, "warn")
 
     def _setup_refusal(self) -> str | None:
         with self.lock:
@@ -2550,6 +2565,10 @@ class Engine:
             zomboid_dir=self.zomboid_dir,
             platform=self._platform,
         )
+        # Le dossier que le préflight retient — choisi dans le lobby, trouvé par le registre
+        # Windows ou dans une bibliothèque Steam secondaire — est celui dont on lit les tenues.
+        if result.values.get("pz_dir"):
+            self._follow_outfits(result.values["pz_dir"])
         with self.lock:
             self._setup_result = result
         return result
@@ -2569,6 +2588,8 @@ class Engine:
             "defects": [] if result is None else [asdict(defect) for defect in result.defects],
             "values": values,
             "expected_mod_fingerprint": expected,
+            # Avis qui n'empêchent pas de lancer (P9F25) : uniformes retirés, registre illisible.
+            "notices": [notice for notice in (world_settings.outfit_notice(),) if notice],
         }
 
     def preset(self, preset_id: str) -> dict:

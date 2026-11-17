@@ -118,6 +118,9 @@ async function refreshSetup() {
   } catch (e) {
     setup = null;
   }
+  // P9F25: the outfits on offer are read in the game folder this check just measured. The
+  // catalogue is fetched after it, and the draft keeps its values: the service refuses one that left.
+  if (setup && setup.measured) await loadCatalog(draft ? draft.preset : null);
   render();
 }
 
@@ -247,7 +250,9 @@ function fieldHint(f) {
   if (f.type !== 'bool' && !f.choices && f.min !== null) bits.push(`${f.min}–${f.max}`);
   if (f.unit) bits.push(f.unit);
   const head = bits.length ? `<span class="hint">${esc(bits.join(' '))}</span>` : '';
-  return head + (f.help ? `<small class="help">${esc(f.help)}</small>` : '');
+  // `notice` is the service's own warning on a field (P9F25): outfits withdrawn from the offer.
+  const notice = f.notice ? `<small class="help notice">${esc(f.notice)}</small>` : '';
+  return head + (f.help ? `<small class="help">${esc(f.help)}</small>` : '') + notice;
 }
 
 function numberInput(f, id, value, step) {
@@ -412,6 +417,7 @@ function setupCard() {
     ${setupRow('RAM', 'ram', `${v.mem_available_mb ?? '?'} MB free, ${v.min_free_ram_mb} MB needed`)}
     ${setupRow('Ports', 'port', `Free: ${v.free_ports.join(', ') || 'none'}`)}
     ${setup.defects.length ? `<ul class="feed">${setup.defects.map((d) => `<li>${esc(d.message)}</li>`).join('')}</ul>` : ''}
+    ${(setup.notices || []).map((n) => `<p class="notice setup-notice">${esc(n)}</p>`).join('')}
     ${setupNextStep()}
   </section>`;
 }

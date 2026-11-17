@@ -61,7 +61,10 @@ AGGRO = "aggro"
 # proposée vit dans `service/settings.py` ; ici, seule la forme du nom est contrôlée.
 OUTFIT = "outfit"
 OUTFIT_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
-POP_SETTINGS = (SPACING, AGGRO, OUTFIT)
+# Sexe des zombies de pop (P9F25) : pourcentage de femelles, sixième argument
+# d'`addZombiesInOutfit`. Sans la clé, la commande n'en porte pas et le jeu tire le sexe.
+SEX = "sex"
+POP_SETTINGS = (SPACING, AGGRO, OUTFIT, SEX)
 POP_KINDS = (POP_KIND, SPRINTER_KIND)
 # Règle directe (P9F9) : « quand on reçoit kill, on fait pop 10, direct ». Chaque atome reçu
 # la déclenche, zombie du duel compris, et ses lots partent au tick même, hors de tout budget
@@ -290,6 +293,8 @@ def load_table(
         _check_unit(raw[AGGRO], where, AGGRO)
     if OUTFIT in raw:
         _check_outfit(raw[OUTFIT], where, OUTFIT)
+    if SEX in raw:
+        _check_int(raw[SEX], where, SEX, 0, PERCENT)
     atoms = _check_atoms(raw["atoms"], catalog, active_atoms)
     _check_budget(raw["budget"], limits)
     narrowed = active_atoms is not None

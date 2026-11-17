@@ -18,14 +18,30 @@ PZ 42, et `choices` les donne à la page.
 
 Un champ `choice` (P9F19) est un choix **textuel** : ses valeurs sont des chaînes, sans borne,
 et la valeur reçue doit être exactement l'une d'elles — ni casse corrigée, ni valeur approchante.
+
+Les uniformes offerts (P9F25) ne sont plus une table écrite à la main : `OUTFIT_SELECTION` est une
+sélection de noms, et chaque nom est contrôlé contre le registre du jeu installé,
+`media/clothing/clothing.xml`, qui dit aussi pour quel sexe la tenue existe. Un nom absent du
+registre quitte l'offre et le champ le signale (`notice`) ; un registre illisible réduit l'offre à
+`random` sans empêcher le démarrage. Le registre est lu à l'import, puis relu par
+`follow_game_dir` dès que le préflight retient un autre dossier du jeu. `zombie_sex` règle le
+sexe des zombies envoyés, et une tenue qui n'existe que pour un sexe impose ce sexe.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 import math
+import os
+import threading
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Mapping
 from typing import Any
+
+from . import paths
+
+LOGGER = logging.getLogger(__name__)
 
 GROUP_WORLD = "monde"
 GROUP_RULES = "regles"
@@ -112,10 +128,11 @@ def _field(key: str, label: str, group: str, type_: str, low: Any, high: Any, de
 # Uniforme des zombies envoyés (P9F19). `random` laisse le tirage du jeu : le mod passe `nil`.
 # Les autres valeurs sont des noms d'uniformes de PZ, recopiés tels quels jusqu'à
 # `addZombiesInOutfit` : d'abord les combinaisons colorées, puis les tenues repérables, puis les
-# déguisements. Un nom absent d'une version du jeu ne produit aucune erreur (limites-connues.md).
+# déguisements. Ce n'est qu'une sélection (P9F25) : seuls les noms que porte le registre du jeu
+# sont offerts, et le libellé reçoit la mention du sexe quand la tenue n'existe que pour un seul.
 OUTFIT_RANDOM = "random"
-OUTFITS = {
-    OUTFIT_RANDOM: "Aléatoire (comme aujourd'hui)",
+OUTFIT_RANDOM_LABEL = "Aléatoire (comme aujourd'hui)"
+OUTFIT_SELECTION = {
     "ShellSuit_Pink": "Combinaison rose",
     "ShellSuit_Blue": "Combinaison bleue",
     "ShellSuit_Green": "Combinaison verte",
@@ -128,16 +145,38 @@ OUTFITS = {
     "Doctor": "Médecin",
     "Nurse": "Infirmière",
     "PrisonGuard": "Gardien de prison",
-    "StripperWhite": "Strip-teaseuse, tenue blanche",
+    "StripperPink": "Strip-teaseuse, tenue rose",
     "StripperBlack": "Strip-teaseuse, tenue noire",
-    "CowboyStripper": "Strip-teaseuse cow-girl",
-    "PoliceStripper": "Strip-teaseuse policière",
-    "FiremanStripper": "Strip-teaseuse pompière",
-    "WaiterStripper": "Strip-teaseuse serveuse",
+    "WaiterStripper": "Strip-tease en tenue de service",
     "StripperNaked": "Strip-teaseuse nue — déconseillé en stream",
+    "Stripper": "Strip-teaseur",
+    "CowboyStripper": "Strip-teaseur cow-boy",
+    "PoliceStripper": "Strip-teaseur policier",
+    "FiremanStripper": "Strip-teaseur pompier",
+}
+# Pour quel sexe une tenue existe : les deux listes du registre, `m_FemaleOutfits` et
+# `m_MaleOutfits`. Un nom absent de la liste du sexe tiré laisse le zombie sans tenue.
+SEX_FEMALE = "female"
+SEX_MALE = "male"
+SEX_BOTH = "both"
+REGISTRY_LISTS = {"m_FemaleOutfits": SEX_FEMALE, "m_MaleOutfits": SEX_MALE}
+REGISTRY_NAME = "m_Name"
+ONLY_SUFFIX = {SEX_FEMALE: " — femmes seulement", SEX_MALE: " — hommes seulement"}
+ONLY_TEXT = {SEX_FEMALE: "n'existe que pour les femmes", SEX_MALE: "n'existe que pour les hommes"}
+# Réglage `zombie_sex` : le sixième argument d'`addZombiesInOutfit`, un pourcentage de femelles.
+SEX_AUTO = "auto"
+SEX_RANDOM = "random"
+SEX_PERCENT = {SEX_FEMALE: 100, SEX_MALE: 0}
+SEXES = {
+    SEX_AUTO: "Selon l'uniforme",
+    SEX_FEMALE: "Femmes",
+    SEX_MALE: "Hommes",
+    SEX_RANDOM: "Aléatoire (comme avant, même si l'uniforme n'existe que pour un sexe)",
 }
 # La clé du preset effectif, recopiée dans chaque commande de pop (`service/rules.py`).
 OUTFIT_TABLE_KEY = "outfit"
+# De même pour le sexe : un entier de 0 à 100, ou pas de clé quand le jeu tire le sexe.
+SEX_TABLE_KEY = "sex"
 
 WORLD_ONLY_NEW = "Ne compte qu'avec un monde neuf : un monde gardé a déjà sa date et sa population."
 
@@ -173,7 +212,11 @@ FIELDS: tuple[dict[str, Any], ...] = (
     _field("zombie_outfit", "Type de zombie envoyé", GROUP_RULES, "choice", None, None,
            OUTFIT_RANDOM,
            help_="L'uniforme des zombies envoyés. Aléatoire garde le tirage du jeu.",
-           labels=OUTFITS),
+           labels={OUTFIT_RANDOM: OUTFIT_RANDOM_LABEL}),
+    _field("zombie_sex", "Sexe des zombies envoyés", GROUP_RULES, "choice", None, None, SEX_AUTO,
+           help_="Un uniforme qui n'existe que pour un sexe impose ce sexe : sans lui, le "
+                 "zombie naîtrait sans tenue.",
+           labels=SEXES),
     _field("sprinter_percent", "Sprinters", GROUP_RULES, "int", 0, 100, 1, unit="%",
            help_="Le mod compte les zombies envoyés : le 100e, le 200e… à 1 %."),
     _field("pop_distance", "Distance des pops", GROUP_RULES, "range", 10, 100, [12, 20],
@@ -194,6 +237,13 @@ SANDBOX_KEYS = tuple(
     if field["group"] == GROUP_WORLD and field["key"] not in ("DayLength", "monde_neuf")
 )
 REPR_MAX = 40
+# Tenues offertes → sexe pour lequel elles existent ; refait par `use_outfit_registry`.
+OUTFIT_SEX: dict[str, str] = {}
+# Dernière lecture du registre : `path`, `error`, `withdrawn`, `notice`. Même objet d'un bout à
+# l'autre du processus, refait sur place par `use_outfit_registry`.
+OUTFIT_REGISTRY: dict[str, Any] = {}
+# Deux relectures ne s'entrelacent pas : le préflight et le choix du dossier viennent de l'API.
+_OUTFIT_LOCK = threading.RLock()
 
 
 class SettingsRefused(ValueError):
@@ -207,6 +257,132 @@ def _shown(value: Any) -> str:
 
 def _refuse(key: str, reason: str, value: Any) -> SettingsRefused:
     return SettingsRefused(f"réglage « {key} » refusé : {reason}, reçu {_shown(value)}")
+
+
+def read_outfit_registry(path: str | os.PathLike[str]) -> dict[str, str]:
+    """Lit le registre des tenues du jeu : nom → `female`, `male` ou `both`.
+
+    Lève `OSError` ou `ValueError` : fichier absent, XML cassé, ou registre sans aucune tenue.
+    """
+    try:
+        root = ElementTree.parse(path).getroot()
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"XML illisible ({exc})") from exc
+    found: dict[str, str] = {}
+    for outfit in root:
+        sex = REGISTRY_LISTS.get(outfit.tag)
+        name = (outfit.findtext(REGISTRY_NAME) or "").strip()
+        if sex is None or not name:
+            continue
+        found[name] = sex if found.get(name, sex) == sex else SEX_BOTH
+    if not found:
+        raise ValueError("aucune tenue dans le registre")
+    return found
+
+
+def use_outfit_registry(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    """Refait l'offre de `zombie_outfit` d'après le registre de `path`, sinon du jeu installé.
+
+    Ne lève rien : un registre illisible réduit l'offre à `random`. Rend ce qui a été lu —
+    `path`, `error` (ou `None`), `withdrawn` (les noms de la sélection absents du registre) et
+    `notice`, le texte que le champ porte pour le lobby, vide quand il n'y a rien à signaler.
+    """
+    registry: dict[str, str] = {}
+    error = None
+    try:
+        path = paths.clothing_registry() if path is None else path
+        if path is None:
+            raise FileNotFoundError("aucun dossier du jeu où chercher")
+        registry = read_outfit_registry(path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        error = str(exc) or type(exc).__name__
+    offered = {name: registry[name] for name in OUTFIT_SELECTION if name in registry}
+    withdrawn = [] if error else [name for name in OUTFIT_SELECTION if name not in registry]
+    labels = {OUTFIT_RANDOM: OUTFIT_RANDOM_LABEL}
+    for name, sex in offered.items():
+        labels[name] = OUTFIT_SELECTION[name] + ONLY_SUFFIX.get(sex, "")
+    if error:
+        notice = (
+            "Registre des tenues du jeu illisible : seul le tirage aléatoire est proposé "
+            f"({path if path is not None else 'media/clothing/clothing.xml'} : {error})."
+        )
+    elif withdrawn:
+        notice = (
+            f"Uniformes retirés de l'offre, absents du registre du jeu : {', '.join(withdrawn)}."
+        )
+    else:
+        notice = ""
+    report = {
+        "path": None if path is None else str(path),
+        "error": error,
+        "withdrawn": withdrawn,
+        "notice": notice,
+    }
+    field = FIELD_BY_KEY["zombie_outfit"]
+    with _OUTFIT_LOCK:
+        field["choices"] = _choices(labels)
+        if notice:
+            field["notice"] = notice
+        else:
+            field.pop("notice", None)
+        # Un même avis ne se réécrit pas au journal à chaque relecture du même registre.
+        if notice and notice != OUTFIT_REGISTRY.get("notice"):
+            LOGGER.warning("%s", notice)
+        OUTFIT_SEX.clear()
+        OUTFIT_SEX.update(offered)
+        OUTFIT_REGISTRY.clear()
+        OUTFIT_REGISTRY.update(report)
+    return dict(report)
+
+
+def _same_file(left: str | os.PathLike[str] | None, right: str | os.PathLike[str]) -> bool:
+    if left is None:
+        return False
+    return os.path.normcase(os.path.realpath(left)) == os.path.normcase(os.path.realpath(right))
+
+
+def follow_game_dir(game_dir: str | os.PathLike[str]) -> dict[str, Any]:
+    """Relit le registre dans `game_dir`, le dossier du jeu que le préflight vient d'accepter.
+
+    Le registre lu à l'import ne connaît que `--pz-dir`, `PZ_INSTALL_DIR` et le Steam par défaut ;
+    le dossier choisi dans le lobby, le registre Windows et une bibliothèque Steam secondaire
+    arrivent par ici. Rien n'est relu quand ce registre est déjà celui en place et qu'il a été
+    lu sans erreur ; après une erreur, chaque appel réessaie. Ne lève rien, rend la lecture.
+    """
+    path = paths.game_clothing_registry(game_dir)
+    with _OUTFIT_LOCK:
+        if OUTFIT_REGISTRY.get("error") is None and _same_file(OUTFIT_REGISTRY.get("path"), path):
+            return dict(OUTFIT_REGISTRY)
+        return use_outfit_registry(path)
+
+
+def outfit_notice() -> str:
+    """L'avis de la dernière lecture du registre, vide quand il n'y a rien à signaler."""
+    return OUTFIT_REGISTRY.get("notice") or ""
+
+
+
+
+# Au démarrage : le registre du jeu installé. Le moteur suit ensuite le dossier que le préflight
+# retient (`follow_game_dir`) ; un test ou un outil relit par `use_outfit_registry`.
+use_outfit_registry()
+
+
+def outfit_sex(outfit: str, sex: str) -> int | None:
+    """Le pourcentage de femelles à demander au jeu, ou `None` pour lui laisser le tirage.
+
+    `auto` suit l'uniforme : 100 s'il n'existe que pour les femmes, 0 que pour les hommes, rien
+    sinon. `female` et `male` s'imposent, sauf à un uniforme de l'autre sexe seul : refus, qui
+    nomme l'uniforme. `random` ne demande rien, comme avant P9F25.
+    """
+    only = OUTFIT_SEX.get(outfit, SEX_BOTH)
+    if sex == SEX_RANDOM:
+        return None
+    if sex == SEX_AUTO:
+        return SEX_PERCENT.get(only)
+    if only not in (SEX_BOTH, sex):
+        raise _refuse("zombie_sex", f"l'uniforme « {outfit} » {ONLY_TEXT[only]}", sex)
+    return SEX_PERCENT[sex]
 
 
 def _kill_effect(table: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -328,6 +504,8 @@ def validate(raw: Any, preset: Mapping[str, Any] | None = None) -> dict[str, Any
         if field is None:
             raise SettingsRefused(f"réglage inconnu « {_shown(key)[1:-1]} » refusé")
         values[key] = _check(field, value)
+    # Un duo incohérent se refuse ici, au réglage : il donnerait des zombies sans tenue.
+    outfit_sex(values["zombie_outfit"], values["zombie_sex"])
     return values
 
 
@@ -354,6 +532,9 @@ def _summary_lines(table: Mapping[str, Any], settings: Mapping[str, Any]) -> lis
     if settings["zombie_outfit"] != OUTFIT_RANDOM:
         outfit = _choice_label("zombie_outfit", settings["zombie_outfit"])
         lines.append(f"Les zombies envoyés portent l'uniforme : {outfit}")
+    sex = _sex_of(settings)
+    if sex is not None:
+        lines.append(f"Les zombies envoyés sont tous des {SEX_WORDS[sex]}")
     if settings["soin_sur_blessure"]:
         lines.append("1 blessure reçue → caisse de soin à proximité")
     others = [rule["id"] for rule in table["rules"] if rule["id"] not in (KILL_RULE, CARE_RULE)]
@@ -380,6 +561,10 @@ def effective_table(preset: Mapping[str, Any], settings: Mapping[str, Any]) -> d
         table[key] = settings[key]
     table["day_length"] = settings["DayLength"]
     table[OUTFIT_TABLE_KEY] = settings["zombie_outfit"]
+    sex = _sex_of(settings)
+    table.pop(SEX_TABLE_KEY, None)
+    if sex is not None:
+        table[SEX_TABLE_KEY] = sex
     has_care = any(rule["id"] == CARE_RULE for rule in table["rules"])
     if settings["soin_sur_blessure"] and not has_care:
         table["rules"].append(copy.deepcopy(CARE_RULE_BODY))
@@ -389,6 +574,16 @@ def effective_table(preset: Mapping[str, Any], settings: Mapping[str, Any]) -> d
         table["rules"] = [rule for rule in table["rules"] if rule["id"] != CARE_RULE]
     table["summary"] = _summary_lines(table, settings)
     return table
+
+
+SEX_WORDS = {100: "femmes", 0: "hommes"}
+
+
+def _sex_of(settings: Mapping[str, Any]) -> int | None:
+    """Le sexe à écrire pour ces réglages. Sans `zombie_sex` (réglages d'avant P9F25), rien."""
+    if "zombie_sex" not in settings:
+        return None
+    return outfit_sex(settings["zombie_outfit"], settings["zombie_sex"])
 
 
 def _choice_label(key: str, value: Any) -> str:
@@ -419,6 +614,7 @@ def summary(settings: Mapping[str, Any]) -> str:
             if settings["zombie_outfit"] != OUTFIT_RANDOM
             else []
         ),
+        *([f"zombies : {SEX_WORDS[sex]}"] if (sex := _sex_of(settings)) is not None else []),
         "monde neuf" if settings["monde_neuf"] else "monde gardé",
         _minutes(settings["duration_s"]),
     ]

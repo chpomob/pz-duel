@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import pytest
+from doubles.outfits import outfit_registry  # noqa: F401
 from test_rules_load import T0_MS, SpawnGame, read_preset
 
 from service import rules
@@ -19,7 +20,9 @@ from service.protocol import parse_event
 
 PRESET = "duel_rapide"
 UI_SCRIPT = Path(__file__).resolve().parent.parent / "ui" / "app.js"
-# La sélection retenue avec le propriétaire, dans l'ordre d'affichage.
+# La sélection retenue avec le propriétaire, dans l'ordre d'affichage. Depuis P9F25, seuls les
+# noms du registre du jeu (`tests/fixtures/clothing.xml`) sont offerts, et une tenue qui
+# n'existe que pour un sexe le dit dans son libellé.
 OUTFITS = [
     ("random", "Aléatoire (comme aujourd'hui)"),
     ("ShellSuit_Pink", "Combinaison rose"),
@@ -28,19 +31,20 @@ OUTFITS = [
     ("ShellSuit_Teal", "Combinaison turquoise"),
     ("ShellSuit_Black", "Combinaison noire"),
     ("HazardSuit", "Combinaison hazmat (jaune fluo)"),
-    ("Inmate", "Détenu (orange)"),
+    ("Inmate", "Détenu (orange) — hommes seulement"),
     ("Fireman", "Pompier"),
     ("Police", "Policier"),
     ("Doctor", "Médecin"),
     ("Nurse", "Infirmière"),
-    ("PrisonGuard", "Gardien de prison"),
-    ("StripperWhite", "Strip-teaseuse, tenue blanche"),
-    ("StripperBlack", "Strip-teaseuse, tenue noire"),
-    ("CowboyStripper", "Strip-teaseuse cow-girl"),
-    ("PoliceStripper", "Strip-teaseuse policière"),
-    ("FiremanStripper", "Strip-teaseuse pompière"),
-    ("WaiterStripper", "Strip-teaseuse serveuse"),
-    ("StripperNaked", "Strip-teaseuse nue — déconseillé en stream"),
+    ("PrisonGuard", "Gardien de prison — hommes seulement"),
+    ("StripperPink", "Strip-teaseuse, tenue rose — femmes seulement"),
+    ("StripperBlack", "Strip-teaseuse, tenue noire — femmes seulement"),
+    ("WaiterStripper", "Strip-tease en tenue de service"),
+    ("StripperNaked", "Strip-teaseuse nue — déconseillé en stream — femmes seulement"),
+    ("Stripper", "Strip-teaseur — hommes seulement"),
+    ("CowboyStripper", "Strip-teaseur cow-boy — hommes seulement"),
+    ("PoliceStripper", "Strip-teaseur policier — hommes seulement"),
+    ("FiremanStripper", "Strip-teaseur pompier — hommes seulement"),
 ]
 
 
@@ -73,7 +77,7 @@ def commands_after_one_kill(runtime: dict, settings: dict | None) -> list[dict]:
 def test_catalog_offers_the_outfit_choice_random_by_default():
     """Un champ `choice` des Règles, juste après `zombies_par_kill`, `random` par défaut, et la
     sélection retenue, valeurs en chaînes. Mutation : champ retiré de `FIELDS`, défaut changé,
-    ou une tenue ôtée de `OUTFITS`."""
+    ou une tenue ôtée de `OUTFIT_SELECTION`."""
     fields = world_settings.catalog()
     keys = [field["key"] for field in fields]
     assert keys[keys.index("zombies_par_kill") + 1] == "zombie_outfit"
@@ -220,14 +224,15 @@ def test_mod_gives_nil_for_random_or_a_missing_key(monkeypatch, settings):
     assert spawn.spawns[0][2] == 2
 
 
-def test_mod_source_calls_the_game_with_the_outfit_and_no_skin():
-    """Lecture du source : un seul appel, `outfit` en cinquième, `nil` en sixième."""
+def test_mod_source_calls_the_game_with_the_outfit_and_the_sex():
+    """Lecture du source : un seul appel, `outfit` en cinquième, `sex` en sixième (P9F25 :
+    c'était `nil`, et le sexe n'était jamais dit au jeu)."""
     lua = Path(rules.__file__).resolve().parent.parent
     lua = lua / "mods" / "duelcore" / "42.21" / "media" / "lua" / "server" / "DuelCore.lua"
     source = lua.read_text(encoding="utf-8")
     calls = [line.strip() for line in source.splitlines() if "addZombiesInOutfit(" in line]
     assert calls == [
-        "local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, outfit, nil)"
+        "local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, outfit, sex)"
     ]
 
 

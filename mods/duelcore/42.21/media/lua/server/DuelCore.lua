@@ -52,6 +52,8 @@ local MIN_DISTANCE = 10
 local PLACE_ATTEMPTS = 32
 -- Borne haute de `spacing`, la même que celle de l'arbitre (`service/rules.py`).
 local MAX_SPACING = 20
+-- Pourcentage de femelles au plus (P9F25) : sixième argument d'`addZombiesInOutfit`.
+local MAX_SEX = 100
 local RAIN_INTENSITY = 1.0
 local SPRINT_WALK_TYPE = "sprint1"
 -- Valeur de `outfit` qui laisse le jeu tirer la tenue (P9F19).
@@ -688,10 +690,34 @@ local function outfitOf(cmd)
     return outfit
 end
 
+-- Sexe demandé par la commande (P9F25) : un pourcentage de femelles, de 0 à 100. Une clé
+-- absente (service d'avant P9F25) ou une valeur hors bornes rendent `nil` : le jeu tire le sexe.
+local function sexOf(cmd)
+    local sex = cmd.sex
+    if type(sex) ~= "number" or sex ~= sex or sex < 0 or sex > MAX_SEX then return nil end
+    return math.floor(sex)
+end
+
+-- Sexe obtenu, lu sur les zombies créés (P9F25). Sous `pcall` : un zombie qui ne répond pas
+-- n'est compté nulle part, et l'écart avec `spawned` le dit.
+local function sexCount(created)
+    local female, male = 0, 0
+    for _, zombie in ipairs(created) do
+        local ok, isFemale = pcall(function() return zombie:isFemale() end)
+        if ok and isFemale == true then
+            female = female + 1
+        elseif ok and isFemale == false then
+            male = male + 1
+        end
+    end
+    return { female = female, male = male }
+end
+
 -- Crée `count` zombies sur `square` et les ajoute à `created` ; rend le nombre créé.
 -- `outfit` nul laisse le jeu tirer la tenue. Un nom que le jeu ne connaît pas ne lève rien.
-local function spawnAt(square, count, prepare, created, outfit)
-    local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, outfit, nil)
+-- `sex` nul laisse le jeu tirer le sexe ; 100 ne crée que des femelles, 0 que des mâles.
+local function spawnAt(square, count, prepare, created, outfit, sex)
+    local zombies = addZombiesInOutfit(square:getX(), square:getY(), 0, count, outfit, sex)
     if not zombies then return 0 end
     local spawned = zombies:size()
     for i = 0, spawned - 1 do
@@ -767,6 +793,7 @@ local function spawnGroup(cmd, player, prepare)
     local spacing = math.floor(optionalNumber(cmd, "spacing", 0, MAX_SPACING))
     local aggro = optionalNumber(cmd, "aggro", 0, 1)
     local outfit = outfitOf(cmd)
+    local sex = sexOf(cmd)
     local squares = pickSpread(player, cmd.distance, count, spacing)
     if not squares then return NO_SQUARE end
     local perSquare = {}
@@ -776,7 +803,7 @@ local function spawnGroup(cmd, player, prepare)
     end
     local created, spawned, spread = {}, 0, 0
     for slot, square in ipairs(squares) do
-        local made = spawnAt(square, perSquare[slot], prepare, created, outfit)
+        local made = spawnAt(square, perSquare[slot], prepare, created, outfit, sex)
         spawned = spawned + made
         if made > 0 then spread = spread + 1 end
     end
@@ -786,7 +813,8 @@ local function spawnGroup(cmd, player, prepare)
             if targetPlayer(zombie, player, aggro) then targeted = targeted + 1 end
         end
     end
-    return spawnResult(spawned, { spread = spread, targeted = targeted })
+    -- Le sexe obtenu est un constat, pas un verdict : demandé et non obtenu reste `applied`.
+    return spawnResult(spawned, { spread = spread, targeted = targeted, sex = sexCount(created) })
 end
 
 local function makeSprinter(zombie)
@@ -1393,6 +1421,7 @@ emitResult = function(seq, result)
         spawned = result.spawned,
         spread = result.spread,
         targeted = result.targeted,
+        sex = result.sex,
         -- P9F11 : l'appel du jeu qui manque, pour `no_hold_api`.
         call = result.call,
         -- P9F22 : vrai pour une annonce, dont le `seq` n'est pas celui d'une commande.
