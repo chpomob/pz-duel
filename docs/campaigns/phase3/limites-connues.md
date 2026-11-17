@@ -1174,3 +1174,73 @@ du lobby ; pas de fuite journalisée après relâchement ; client : verrou à la
 `tests/test_match.py` et `tests/test_phase3_p9f21.py` suivent le nouveau levier (le double
 `FreezablePlayer` a `setIgnoreMovement` et `getIgnoreMovement`) ; `tests/test_phase3_p9f22.py`
 ne compte que les annonces du relais, que la tenue partage désormais.
+
+## P9F27 — test de préflight déterministe : sockets désignés par protocole et par fil (2026-11-17)
+
+**Cause :** CI rouge sur `bab31f4` (P9F25), `test_linux_bind_keeps_its_options` :
+`ValueError: too many values to unpack (expected 2)`. Le double `RecordingSocket` remplace
+`socket.socket` **pour tout le processus** ; sa liste `instances` reçoit donc tout socket ouvert
+pendant la fenêtre, par n'importe quel fil. Le test déballait `udp, tcp = instances` : il supposait
+que les deux seuls sockets étaient les siens. Un fil laissé par un test précédent qui ouvre un
+socket à ce moment en ajoute un troisième. Aucun défaut du produit.
+
+**Fait (`tests/test_preflight.py`) :**
+
+- Chaque `RecordingSocket` retient le fil qui l'a ouvert (`thread`) et se décrit (`repr` : protocole,
+  fil, options). Son constructeur accepte la signature de `socket.socket` : un fil voisin ne casse
+  plus sur un appel à mots-clés.
+- `own(instances)` : les sockets du fil du test, dans l'ordre. `one(instances, kind)` : le seul
+  socket de ce protocole ouvert par ce fil ; sinon `pytest.fail` nommant le protocole cherché, le
+  nombre trouvé, les sockets de ce fil et ceux des autres fils — plus de `ValueError` de déballage.
+- `test_linux_bind_keeps_its_options` et `test_windows_bind_is_exclusive_on_both_protocols`
+  désignent `udp` et `tcp` par `one`, puis vérifient `own(instances) == [udp, tcp]` : exactement
+  deux sockets ouverts par `check_ports`, UDP puis TCP. Rien n'est retiré : le compte et l'ordre
+  que vérifiait la lecture de la liste entière restent vérifiés, sur les sockets du test seulement.
+  Un socket surnuméraire **du même fil** fait toujours tomber le test, en le nommant.
+- Les deux tests sont paramétrés `seul` / `fil-voisin` : dans le second, un vrai fil ouvre des
+  sockets des deux protocoles avant et après `check_ports`.
+
+**Mutations jouées :**
+
+- `udp, tcp = recording_socket.instances` rétabli : `fil-voisin` tombe sur le `ValueError` de la CI ;
+- Windows relu sur la liste entière (`[[-5], [-5]]`) : `fil-voisin` tombe ;
+- `own` sans filtre de fil (désignation par protocole seule) : quatre échecs, dont les deux
+  `fil-voisin` ;
+- `one` qui rend le premier trouvé : `test_one_names_what_it_sought_and_what_it_found[deux]` tombe ;
+- un socket TCP surnuméraire ouvert par le fil du test après `check_ports` : le test tombe, l'échec
+  cite les trois sockets.
+
+`tests/test_preflight.py` : 20 exécutions de suite, 0 échec. Suite complète : 3 168 passés,
+16 ignorés.
+
+**Recensement des autres lectures positionnelles** (`instances`, `calls`, `events` lus par indice
+ou déballés en nombre fixe dans `tests/`) :
+
+- Saines — la liste appartient au test, aucun autre fil ne peut l'atteindre : `guest.calls[-2:]`
+  (`test_phase3_p9f21.py`), `result.events[...]` (`test_transport.py`, résultat d'un `poll`),
+  `rig.events[3:5]` (`test_snapshots.py`, ordre des deux serveurs déjà traité par un ensemble),
+  `zombie.calls[0]` (`test_rules_load.py`), `pad.calls[2:]` (`test_phase3_p9f26.py`),
+  `default.calls[0]`, `compiler.calls[0..1]` (`test_platform_windows.py`, compilateur injecté),
+  `host.calls`, `state.events[0..1]` (`test_match.py`), `igd.calls[1]`, `igd.calls[-1]`
+  (`test_upnp.py` : chaque `FakeIGD` écoute sur son propre port), les listes `calls` locales des
+  doubles de `WindowsKernel`.
+- Même famille, **non modifiées** (hors des fichiers permis), à reprendre à l'étape qui les ouvre :
+  un double posé sur un module global (`os.write`, `os.fsync`, `os.sync`, `os.replace`,
+  `subprocess.Popen`) et lu par position :
+  - `test_transport.py::test_write_is_one_write_then_fsync` — `len(calls) == 2`, `calls[0]`,
+    `calls[1]` sur `os.write`/`os.fsync` remplacés ;
+  - `test_modes.py` — `(options,) = spy.options` sur `subprocess.Popen` remplacé ;
+  - `test_disk_sync.py::test_restore_syncs_before_the_first_rename` — `events[0]` sur
+    `os.sync`/`os.fsync`/`os.replace` remplacés ;
+  - `test_platform_windows.py` — `client, _ = launch.calls[-1]` sur `subprocess.Popen` remplacé
+    (bloc win32).
+
+  Aucun n'a échoué à ce jour ; un fil voisin qui écrirait, synchroniserait ou lancerait un
+  processus dans la fenêtre les ferait mentir de la même façon.
+
+**Ouvert :**
+
+- Le fil qui a ouvert le socket en CI n'est pas identifié. Une suite complète locale, relevant la
+  pile de tout socket du double ouvert hors du fil principal, n'a vu que les fils voulus du
+  nouveau test. Le test ne dépend plus de son voisin ; le voisin, lui, laisse toujours un fil vivant
+  entre deux tests.

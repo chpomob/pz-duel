@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from contextlib import ExitStack, contextmanager
 from functools import partial
@@ -890,15 +891,25 @@ def test_windows_without_kernel_is_a_failed_measure(ready, monkeypatch):
 
 
 class RecordingSocket:
-    """Double de `socket.socket` : retient les options posées, et peut refuser le `bind`."""
+    """Double de `socket.socket` : retient les options posées, et peut refuser le `bind`.
+
+    `socket.socket` est remplacé pour tout le processus : un fil laissé par un test voisin qui
+    ouvre un socket pendant la fenêtre s'inscrit lui aussi dans `instances`. Chaque socket retient
+    donc le fil qui l'a ouvert, et les tests désignent les leurs par `one`, jamais par position.
+    """
 
     instances: list = []
     bind_error: OSError | None = None
 
-    def __init__(self, family, kind):
+    def __init__(self, family=socket.AF_INET, kind=socket.SOCK_STREAM, *args, **kwargs):
         self.kind = kind
+        self.thread = threading.get_ident()
         self.options: list = []
         RecordingSocket.instances.append(self)
+
+    def __repr__(self):
+        kind = getattr(self.kind, "name", self.kind)
+        return f"<socket {kind} fil={self.thread} options={self.options}>"
 
     def __enter__(self):
         return self
@@ -914,6 +925,43 @@ class RecordingSocket:
             raise RecordingSocket.bind_error
 
 
+def own(instances: list) -> list:
+    """Les sockets ouverts par le fil du test, dans l'ordre : ceux d'un autre fil n'en sont pas."""
+    here = threading.get_ident()
+    return [sock for sock in instances if sock.thread == here]
+
+
+def one(instances: list, kind) -> RecordingSocket:
+    """Le seul socket de protocole `kind` ouvert par ce fil ; sinon un échec qui dit ce qu'il a vu."""
+    mine = own(instances)
+    found = [sock for sock in mine if sock.kind == kind]
+    if len(found) != 1:
+        others = [sock for sock in instances if sock not in mine]
+        pytest.fail(
+            f"un socket {getattr(kind, 'name', kind)} attendu dans ce fil, {len(found)} trouvé(s) ;"
+            f" sockets de ce fil : {mine} ; d'autres fils : {others}"
+        )
+    return found[0]
+
+
+def open_from_another_thread(*kinds) -> list:
+    """Ce que fait un fil résiduel : ouvrir des sockets pendant que `socket.socket` est remplacé.
+
+    Rend les sockets ouverts, pour qu'un test les retrouve sans compter ceux d'autres fils."""
+    opened: list = []
+
+    def stray():
+        for kind in kinds:
+            sock = socket.socket(socket.AF_INET, kind)
+            sock.setsockopt(socket.SOL_SOCKET, -99, 1)
+            opened.append(sock)
+
+    thread = threading.Thread(target=stray)
+    thread.start()
+    thread.join()
+    return opened
+
+
 @pytest.fixture
 def recording_socket(monkeypatch):
     monkeypatch.setattr(RecordingSocket, "instances", [])
@@ -926,17 +974,59 @@ def recording_socket(monkeypatch):
 
 PORTS = {"A": {"game": 17261, "rcon": 27015}}
 
+# Aucun voisin, ou un fil résiduel qui ouvre des sockets des deux protocoles avant et après.
+NEIGHBOURS = pytest.mark.parametrize("neighbour", [False, True], ids=["seul", "fil-voisin"])
 
-def test_windows_bind_is_exclusive_on_both_protocols(recording_socket):
+
+@NEIGHBOURS
+def test_windows_bind_is_exclusive_on_both_protocols(recording_socket, neighbour):
+    """Mutation : relire `[sock.options for sock in instances] == [[-5], [-5]]` (la liste
+    entière), ou désigner par protocole sans écarter les autres fils, fait tomber `fil-voisin`."""
+    if neighbour:
+        open_from_another_thread(socket.SOCK_STREAM, socket.SOCK_DGRAM)
     free, failures = check_ports(PORTS, platform=WINDOWS)
+    if neighbour:
+        open_from_another_thread(socket.SOCK_DGRAM)
     assert (free, failures) == (["17261/UDP", "27015/TCP"], [])
-    assert [sock.options for sock in recording_socket.instances] == [[-5], [-5]]
+    udp = one(recording_socket.instances, socket.SOCK_DGRAM)
+    tcp = one(recording_socket.instances, socket.SOCK_STREAM)
+    assert own(recording_socket.instances) == [udp, tcp]
+    assert (udp.options, tcp.options) == ([-5], [-5])
 
 
-def test_linux_bind_keeps_its_options(recording_socket):
+@NEIGHBOURS
+def test_linux_bind_keeps_its_options(recording_socket, neighbour):
+    """Mutation : revenir à `udp, tcp = recording_socket.instances` fait tomber `fil-voisin` sur
+    le `ValueError` de la CI ; désigner par protocole sans écarter les autres fils aussi."""
+    if neighbour:
+        open_from_another_thread(socket.SOCK_STREAM, socket.SOCK_DGRAM)
     check_ports(PORTS, platform=LINUX)
-    udp, tcp = recording_socket.instances
+    if neighbour:
+        open_from_another_thread(socket.SOCK_STREAM)
+    udp = one(recording_socket.instances, socket.SOCK_DGRAM)
+    tcp = one(recording_socket.instances, socket.SOCK_STREAM)
+    assert own(recording_socket.instances) == [udp, tcp]
     assert (udp.options, tcp.options) == ([], [socket.SO_REUSEADDR])
+
+
+@pytest.mark.parametrize(
+    "opened", [[], [socket.SOCK_DGRAM, socket.SOCK_DGRAM]], ids=["aucun", "deux"]
+)
+def test_one_names_what_it_sought_and_what_it_found(recording_socket, opened):
+    """Pas de `ValueError` de déballage : l'échec nomme le protocole cherché et les sockets vus.
+    Mutation : rendre le premier trouvé au lieu d'échouer laisse passer `deux` en silence ;
+    compter aussi les autres fils fait trouver le voisin dans `aucun`."""
+    mine = [socket.socket(socket.AF_INET, kind) for kind in opened]
+    (neighbour,) = open_from_another_thread(socket.SOCK_DGRAM)
+    with pytest.raises(pytest.fail.Exception) as failure:
+        one(recording_socket.instances, socket.SOCK_DGRAM)
+    message = str(failure.value)
+    assert f"SOCK_DGRAM attendu dans ce fil, {len(opened)} trouvé(s)" in message
+    # Un fil résiduel peut ajouter ses propres sockets : on ne compte que ceux de ce fil, et l'on
+    # exige seulement que le voisin délibéré figure parmi les autres fils.
+    this_thread, other_threads = message.split(" ; d'autres fils : ")
+    assert f"sockets de ce fil : {mine}" in this_thread
+    assert repr(neighbour) in other_threads
 
 
 class WinsockError(OSError):
