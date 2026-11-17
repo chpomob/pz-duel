@@ -1246,3 +1246,46 @@ ou déballés en nombre fixe dans `tests/`) :
   pile de tout socket du double ouvert hors du fil principal, n'a vu que les fils voulus du
   nouveau test. Le test ne dépend plus de son voisin ; le voisin, lui, laisse toujours un fil vivant
   entre deux tests.
+
+## P9F28 — test d'annulation de la passe de création : l'invariant, pas la raison (2026-11-17)
+
+**Cause :** CI rouge sur `1a99a49` (P9F27), `pytest-windows (3.12)` seul,
+`test_cancelled_creation_pass_captures_nothing` : attendu `passe de création en échec : interrompue`,
+reçu `… : serveur A : pas de disponibilité après 10 s ; monde partiel invalidé`. Le test programme
+`pair.stop` par un `threading.Timer(CANCEL_DELAY_S)` ; sur un runner lent, le délai de disponibilité
+de 10 s expire avant que l'annulation prenne effet. La passe s'interrompt, rien n'est capturé, le
+monde partiel est invalidé : le produit est juste dans les deux courses, le test exigeait la raison.
+Troisième récidive de la famille de P9F24 et P9F27. Le délai de 10 s du service est inchangé.
+
+**Fait (`tests/test_snapshots.py`) :**
+
+- `assert_creation_refused(refusal, rig, store)` : le message **commence** par
+  `passe de création en échec : ` et finit par `monde partiel invalidé` ; aucun `has`, aucune
+  `capture` dans les événements, aucun serveur en marche, aucun monde ni marqueur de passe restant.
+  La raison n'est pas affirmée ; les deux courses sont décrites en commentaire.
+- `test_cancelled_creation_pass_captures_nothing` l'emploie ; sa seconde moitié (une passe entière
+  remplace le monde annulé) est inchangée.
+- **Recensement** des `match=` à raison complète du fichier : `test_failed_creation_pass_captures_nothing`
+  (`serveur B.*invalidé`) avait le même défaut — si A n'est pas prêt avant le délai, la passe
+  s'arrête sur `serveur A : pas de disponibilité` ; reproduit avec un délai de 0,01 s. Il emploie
+  désormais la même aide. Restent à raison complète, car déterministes (aucune course avec un
+  délai) : `capture refusée : serveur A en marche`, `passe de création interrompue, invalidé`
+  (marqueur laissé), `arrêt des serveurs incomplet` (arrêt remplacé), `monde A incomplet`.
+
+**Preuve.** Délai raccourci par un greffon pytest hors dépôt qui modifie `FAST_TIMEOUTS` avant les
+tests (et, au besoin, `CANCEL_DELAY_S`) :
+
+- ancien test, délai 0,2 s et annulation à 1 s : échec identique à la CI
+  (`Actual message: '… serveur A : pas de disponibilité après 0.2 s ; monde partiel invalidé'`) ;
+- nouveaux tests, 25 exécutions de suite dans chaque configuration — délai normal ; délai 0,2 s
+  (raison `interrompue`) ; délai 0,2 s et annulation à 1 s (raison `pas de disponibilité`) :
+  25/25 verts partout.
+
+**Mutations jouées** (dans les deux courses) : `discard_creation` retiré du chemin d'échec, puis
+remplacé par `store.capture(pair)` : les deux tests tombent. Un `pair.stop` sauté après échec ne
+fait tomber que la course « annulation d'abord » : quand le délai expire ou qu'un serveur meurt,
+`ServerPair` a déjà arrêté la paire.
+
+**Ouvert :** à un délai absurde (0,01 s), la seconde passe du test d'annulation, entière, échoue à
+son tour faute de disponibilité : c'est attendu et non visé — le délai de 10 s du service n'est pas
+de cet ordre.

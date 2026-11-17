@@ -969,18 +969,37 @@ def assert_creation_undone(store: SnapshotStore) -> None:
     assert not store.creation_pending()
 
 
+CREATION_FAILED = "passe de création en échec : "
+
+
+def assert_creation_refused(refusal: pytest.ExceptionInfo, rig: Rig, store: SnapshotStore) -> None:
+    """L'invariant d'une passe de création qui échoue, quelle qu'en soit la raison.
+
+    La raison dépend d'une course avec le délai de disponibilité : sur un runner lent, ce
+    délai expire avant l'événement que le test provoque, et la passe s'arrête sur
+    « serveur X : pas de disponibilité ». Ce qui doit rester vrai ne dépend pas de la course.
+    """
+    message = str(refusal.value)
+    assert message.startswith(CREATION_FAILED), message
+    assert message.endswith("monde partiel invalidé"), message
+    assert not store.has("A") and not store.has("B")
+    assert not any(event[0] == "capture" for event in rig.events if isinstance(event, tuple))
+    assert not any(server.running for server in rig.servers.values())
+    assert_creation_undone(store)
+
+
 def test_failed_creation_pass_captures_nothing(rig):
     crash = {"lines": ["boom"], "exit_code": 3}
     pair = rig.pair({"B": crash}, create_world=CREATE_WORLD)
     store = rig.store()
 
-    with pytest.raises(SnapshotError, match="(?s)passe de création en échec : serveur B.*invalidé"):
+    with pytest.raises(SnapshotError) as refusal:
         prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
 
-    assert not store.has("A") and not store.has("B")
-    assert not any(event[0] == "capture" for event in rig.events if isinstance(event, tuple))
-    assert not any(server.running for server in rig.servers.values())
-    assert_creation_undone(store)
+    # Raison non affirmée : d'ordinaire « serveur B : sortie anticipée », mais si A n'est pas
+    # prêt avant le délai de disponibilité, la passe s'arrête sur
+    # « serveur A : pas de disponibilité ».
+    assert_creation_refused(refusal, rig, store)
 
 
 def test_cancelled_creation_pass_captures_nothing(rig):
@@ -989,13 +1008,14 @@ def test_cancelled_creation_pass_captures_nothing(rig):
     cancel = threading.Timer(CANCEL_DELAY_S, pair.stop)
     cancel.start()
 
-    with pytest.raises(SnapshotError, match="passe de création en échec : interrompue"):
+    with pytest.raises(SnapshotError) as refusal:
         prepare_worlds(pair, store, prepare_launch=rig.prepare_launch)
 
     cancel.join()
-    assert not store.has("A") and not store.has("B")
-    assert not any(server.running for server in rig.servers.values())
-    assert_creation_undone(store)
+    # Raison non affirmée, deux courses pour un même invariant : l'annulation arrive avant le
+    # délai de disponibilité (« interrompue »), ou ce délai expire d'abord sur un runner lent
+    # (« serveur A : pas de disponibilité après 10 s », P9F28, Windows 3.12).
+    assert_creation_refused(refusal, rig, store)
 
     # Le monde de la passe annulée ne devient pas l'origine : une passe entière le remplace.
     rig.events.clear()
