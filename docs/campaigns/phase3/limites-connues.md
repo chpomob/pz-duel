@@ -129,7 +129,9 @@ pour les règles ; il comprimait en revanche les zombies (cooldown de 20 s, `cap
 `n: 10`, sans `cap_per_min` (refusé par le chargeur sur une règle directe). Chaque kill reçu, du
 monde ou du duel, en retard ou au tick de fin, déclenche la règle ; son lot part au tick même,
 hors de `threats_per_minute`, `per_effect_cooldown_s` et `concurrent_effects`, qu'il n'entame
-pas : la caisse de soin garde tout son budget. Le sprinter à 1 % remplace toujours un zombie du
+pas : la caisse de soin garde tout son budget, et réciproquement une caisse qui a épuisé le budget
+de la cible ne retient aucun pop de kill (test ajouté au second passage de P9F9, qui n'a trouvé
+aucune autre perte dans le cœur). Le sprinter à 1 % remplace toujours un zombie du
 lot, jamais en plus. Les autres presets et toute règle sans `direct` gardent le filtre `duel`
 et le budget, inchangés.
 

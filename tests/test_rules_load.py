@@ -1300,6 +1300,34 @@ def test_direct_pops_leave_the_budget_to_the_other_effects(runtime):
     assert pop_units(duel, "A") == 200
 
 
+def test_a_budget_spent_by_other_effects_never_holds_a_kill_pop(runtime):
+    """B blessé : sa caisse de soin prend tout le budget de B (1 menace/min, 1 effet en cours,
+    cooldown de 45 s), sans `cmd_result`. Les kills de A qui suivent font chacun leurs dix
+    zombies chez B au tick même. Le test inverse de celui d'au-dessus : là, les pops laissaient
+    le budget aux autres effets ; ici, les autres effets ne le leur prennent pas.
+
+    Mutation : faire attendre `_serve_direct` sur `_may_send(target, …)` — la file budgétée
+    n'entamant rien, seuls ces effets-là épuisent le budget — retient les lots jusqu'à la fin
+    de la fenêtre de 60 s.
+    """
+    budget = {"threats_per_minute": 1, "concurrent_effects": 1, "per_effect_cooldown_s": 45}
+    duel = Duel(runtime, budget=budget)
+    hurt = {
+        "v": 1, "boot": 1, "seq": 99, "t_ms": T0_MS + 1000, "src": "B", "side": "B",
+        "kind": "damage_taken", "data": {"hp": 80, "delta": -20},
+    }  # fmt: skip
+    duel.to(0.75)
+    duel.core.submit_event(parse_event(hurt, duel.catalog))
+    duel.to(1)
+    sent = [(r["mt"], r["side"], r["data"]["command"]["kind"]) for r in duel.of_type("command")]
+    assert sent == [(1, "B", "supply_drop")]
+    for kill in range(2, 12):
+        duel.kill(kill, "A", "duel" if kill % 2 else "world")
+        assert pop_units_at(duel, kill) == LOT, kill
+    assert len(kill_rules(duel, "A")) == 10
+    assert pop_units(duel, "B") == 10 * LOT
+
+
 def test_the_safety_bound_is_far_above_any_kill_rate(runtime):
     """Borne livrée : 6 000 zombies par camp visé et par minute, soit 10 kills par seconde
     pendant une minute. Deux minutes à un kill par tick (4/s), des deux camps, n'y touchent
