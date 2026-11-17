@@ -22,8 +22,11 @@ PHASE_LABELS = {
 HOST_SECRET_PHASE = "lobby"
 HOST_SECRET = "host_password"
 
-# P9F21 : les quatre appels de la tenue, dans l'ordre où le mod les pose pour chaque joueur.
-HOLD_CALLS = ("setInvulnerable", "setZombiesDontAttack", "setInvisible", "setBlockMovement")
+# P9F21, corrigé en P9F26 : les quatre appels de la tenue, dans l'ordre où le mod les pose pour
+# chaque joueur. **Source unique** : `service/engine.py` importe cette constante, il ne la
+# redéfinit plus. Deux copies de la même liste ont déjà divergé — le lobby annonçait un échec
+# sur un appel que le mod ne posait plus.
+HOLD_CALLS = ("setInvulnerable", "setZombiesDontAttack", "setInvisible", "setIgnoreMovement")
 
 
 def held_player(player: str, calls: list[str]) -> dict:

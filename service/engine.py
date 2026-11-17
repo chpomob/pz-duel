@@ -32,6 +32,7 @@ from secrets import token_hex
 from typing import Any, NamedTuple
 
 from . import paths, upnp
+from .state import HOLD_CALLS as _HOLD_CALLS
 from .announce import ANNOUNCE_KIND, AnnounceError, MatchAnnouncer
 from .guest_launcher import (
     ADDRESS_REFUSED,
@@ -180,10 +181,10 @@ HOLD_RECORD = "hold_command"
 # ni un atome ni un intrant du match : la ligne se journalise sous son propre type, que le rejeu
 # ignore, et nourrit `hold.players`.
 HOLD_APPLIED = "hold_applied"
-# P9F26 : les quatre appels de la tenue, dans l'ordre où le mod les pose. Figer, c'est
-# `setIgnoreMovement` : l'ancien levier n'avait aucun lecteur dans le déplacement du jeu. La
-# liste vit ici, avec la phrase du lobby qu'elle compte (`held_player`).
-HOLD_CALLS = ("setInvulnerable", "setZombiesDontAttack", "setInvisible", "setIgnoreMovement")
+# P9F26 : les quatre appels de la tenue vivent dans `service/state.py`, avec la phrase du lobby
+# qu'ils comptent (`held_player`). Une seule définition, importée ici : deux copies ont déjà
+# divergé, et le lobby annonçait alors un échec sur un appel que le mod ne posait plus.
+HOLD_CALLS = _HOLD_CALLS
 # P9F26 : au-delà d'un quart de case parcouru sous tenue, le verrou fuit, et le journal le dit
 # sous ce type, avec la distance mesurée par le mod. Ni atome ni intrant : le rejeu l'ignore.
 HOLD_LEAKED = "hold_leaked"

@@ -422,3 +422,20 @@ def test_client_without_the_movement_api_breaks_nothing():
     client.update()
     client.hold(False)
     client.update()
+
+
+def test_the_hold_call_list_is_defined_once_and_the_lobby_sentence_agrees():
+    """La liste des quatre appels n'a qu'une définition, et le lobby la compte juste.
+
+    P9F26 a renommé le quatrième appel dans `service/engine.py` seulement : `service/state.py`
+    gardait `setBlockMovement`, et la page annonçait « (4/4, setBlockMovement en échec) » — un
+    compte juste collé à un échec qui n'existait pas. Une seule source, importée des deux côtés.
+    """
+    from service import engine, state
+
+    assert engine.HOLD_CALLS is state.HOLD_CALLS, "la liste est redéfinie au lieu d'être importée"
+    assert "setBlockMovement" not in state.HOLD_CALLS
+    reported = state.held_player("harumate", list(state.HOLD_CALLS))
+    assert reported["complete"] is True
+    assert reported["label"] == "tenu : harumate (4/4)"
+    assert "en échec" not in reported["label"]
