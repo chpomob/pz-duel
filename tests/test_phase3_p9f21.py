@@ -1,7 +1,7 @@
 """P9F21 : la tenue s'applique au joueur qui arrive après, et le mod dit ce qu'il a posé.
 
 Le mod pose, à chaque passe et pour chaque joueur en ligne, `setInvulnerable`,
-`setZombiesDontAttack`, `setInvisible` puis `setBlockMovement`, sans reposer ce qui l'est déjà,
+`setZombiesDontAttack`, `setInvisible` puis `setIgnoreMovement`, sans reposer ce qui l'est déjà,
 et rapporte une fois par joueur et par tenue la liste des appels réussis (`hold_applied`). Le
 service la journalise et la publie (`hold.players`), le lobby affiche le compte.
 Chaque test cite la mutation qui le fait échouer.
@@ -33,11 +33,11 @@ from service import engine as engine_module
 from service.api import make_server
 from service.protocol import parse_event
 from service.rules import load_effects
-from service.state import held_player
+from service.engine import held_player
 from service.transport import BAD_LINE
 
 UI_SCRIPT = Path(__file__).resolve().parent.parent / "ui" / "app.js"
-CALLS = ["setInvulnerable", "setZombiesDontAttack", "setInvisible", "setBlockMovement"]
+CALLS = ["setInvulnerable", "setZombiesDontAttack", "setInvisible", "setIgnoreMovement"]
 SEQUENCE = [(call_, True) for call_ in CALLS]
 
 
@@ -60,7 +60,11 @@ def held_server(*players: FreezablePlayer) -> PausedServer:
 
 
 def reports(server: PausedServer) -> list[dict]:
-    return [line["data"] for line in server.lines("hold_applied")]
+    """Pseudo et appels de chaque `hold_applied` ; la mesure du déplacement (P9F26) à part."""
+    return [
+        {"player": line["data"]["player"], "calls": line["data"]["calls"]}
+        for line in server.lines("hold_applied")
+    ]
 
 
 # -- mod : la séquence, pour l'arrivant comme pour le présent ---------------------------------
@@ -129,7 +133,10 @@ def test_hold_applied_is_emitted_once_per_player_and_per_hold_with_the_exact_lis
     server = held_server(host)
     [line] = server.lines("hold_applied")
     assert (line["src"], line["side"]) == ("A", "A")
-    assert line["data"] == {"player": "hote", "calls": CALLS}
+    # P9F26 : le rapport porte aussi le point d'entrée et la distance parcourue depuis.
+    assert line["data"] == {
+        "player": "hote", "calls": CALLS, "moved_tiles": 0, "anchor": {"x": 10.5, "y": 20.5},
+    }  # fmt: skip
     # La ligne passe le contrat de lecture du moteur, et pas celui du match : ce n'est pas un atome.
     raw = next(text for text in "".join(server.out).splitlines() if "hold_applied" in text)
     assert parse_event(raw, engine_module._reader_catalog(load_effects()))["kind"] == "hold_applied"
@@ -161,7 +168,7 @@ def test_missing_call_is_named_once_and_the_report_carries_the_calls_made_before
     `hold_applied` porte les deux appels réussis avant lui. Le joueur n'est pas figé, et ce qui
     lui a été posé est défait. Mutations : rapporter avant la boucle des appels rend une liste
     vide ; ne rien rapporter après un échec (`reportHold` sous le `return`) tait le joueur ;
-    continuer après l'échec poserait `setBlockMovement` sur un joueur visible."""
+    continuer après l'échec poserait `setIgnoreMovement` sur un joueur visible."""
 
     class Seen(Recorded):
         setInvisible = None
@@ -219,10 +226,10 @@ def test_release_undoes_every_call_and_a_player_who_left_blocks_nothing():
                 raise LuaError("objet d'un joueur parti")
             super().setInvisible(invisible)
 
-        def setBlockMovement(self, blocked: bool) -> None:
+        def setIgnoreMovement(self, blocked: bool) -> None:
             if self.gone:
                 raise LuaError("objet d'un joueur parti")
-            super().setBlockMovement(blocked)
+            super().setIgnoreMovement(blocked)
 
     host, guest = Recorded("hote"), Leaving("invite")
     server = held_server(host, guest)
@@ -237,7 +244,7 @@ def test_release_undoes_every_call_and_a_player_who_left_blocks_nothing():
     assert server.result(2) == {"seq": 2, "status": "applied"}
     assert host.calls == [
         ("setInvisible", False),
-        ("setBlockMovement", False),
+        ("setIgnoreMovement", False),
         ("setZombiesDontAttack", False),
         ("setInvulnerable", False),
     ]
@@ -258,10 +265,10 @@ def test_release_still_refuses_for_an_online_player_who_cannot_be_freed():
     class Stuck(Recorded):
         stuck = False
 
-        def setBlockMovement(self, blocked: bool) -> None:
+        def setIgnoreMovement(self, blocked: bool) -> None:
             if self.stuck:
                 raise LuaError("refusé par le jeu")
-            super().setBlockMovement(blocked)
+            super().setIgnoreMovement(blocked)
 
     player = Stuck("fige")
     server = held_server(player)
@@ -274,7 +281,7 @@ def test_release_still_refuses_for_an_online_player_who_cannot_be_freed():
         "seq": 2,
         "status": "refused",
         "reason": "no_hold_api",
-        "call": "setBlockMovement",
+        "call": "setIgnoreMovement",
     }
     assert player.blocked and player.invulnerable and player.shielded
 

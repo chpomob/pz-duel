@@ -99,7 +99,7 @@ from .snapshots import (
     SnapshotStore,
     prepare_worlds,
 )
-from .state import HOLD_CALLS, MatchState, held_player
+from .state import MatchState
 from .transport import Anomaly, CommandChannel, OutReader, PollResult
 from .verdict import (
     APPLIED,
@@ -180,6 +180,14 @@ HOLD_RECORD = "hold_command"
 # ni un atome ni un intrant du match : la ligne se journalise sous son propre type, que le rejeu
 # ignore, et nourrit `hold.players`.
 HOLD_APPLIED = "hold_applied"
+# P9F26 : les quatre appels de la tenue, dans l'ordre où le mod les pose. Figer, c'est
+# `setIgnoreMovement` : l'ancien levier n'avait aucun lecteur dans le déplacement du jeu. La
+# liste vit ici, avec la phrase du lobby qu'elle compte (`held_player`).
+HOLD_CALLS = ("setInvulnerable", "setZombiesDontAttack", "setInvisible", "setIgnoreMovement")
+# P9F26 : au-delà d'un quart de case parcouru sous tenue, le verrou fuit, et le journal le dit
+# sous ce type, avec la distance mesurée par le mod. Ni atome ni intrant : le rejeu l'ignore.
+HOLD_LEAKED = "hold_leaked"
+HOLD_LEAK_TILES = 0.25
 HOLD_OFF = "off"
 HOLD_UNSUPPORTED = "unsupported"
 HOLD_SENT = "sent"
@@ -297,6 +305,60 @@ class _SideShare:
 
     def guest_launcher(self) -> bytes:
         return self._engine.side_launcher(self._side)
+
+
+def _tiles(value: float) -> str:
+    """« 0,8 case », « 2,25 cases » : au centième, sans zéro inutile, virgule française."""
+    text = f"{value:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+    return f"{text} {'cases' if value >= 2 else 'case'}"
+
+
+def held_player(player: str, calls: Sequence[str], moved: float | None = None) -> dict:
+    """Un joueur tenu tel que `/api/state` le publie dans `hold.players`, phrase du lobby comprise.
+
+    « tenu : <pseudo> (4/4) », ou « tenu : <pseudo> (3/4, setInvisible en échec) » : le compte,
+    et le premier appel de la séquence qui manque. P9F26 : un déplacement mesuré non nul s'y
+    ajoute, « tenu : <pseudo> (4/4, déplacement 0,8 case) » ; à zéro, rien. La page affiche
+    `label` sans rien calculer.
+    """
+    missing = next((call for call in HOLD_CALLS if call not in calls), None)
+    detail = f"{len(calls)}/{len(HOLD_CALLS)}"
+    if missing is not None:
+        detail = f"{detail}, {missing} en échec"
+    if moved:
+        detail = f"{detail}, déplacement {_tiles(moved)}"
+    held = {
+        "player": player,
+        "calls": list(calls),
+        "complete": missing is None,
+        "label": f"tenu : {player} ({detail})",
+    }
+    if moved is not None:
+        held["moved_tiles"] = moved
+    return held
+
+
+def _distance(value: Any) -> float | None:
+    """Un nombre de cases fini et positif, ou None : un booléen n'est pas une distance."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _anchor(value: Any) -> dict[str, float] | None:
+    """Le point d'entrée en tenue `{x, y}`, ou None s'il n'est pas lisible."""
+    if not isinstance(value, Mapping):
+        return None
+    point = {}
+    for axis in ("x", "y"):
+        coordinate = value.get(axis)
+        if isinstance(coordinate, bool) or not isinstance(coordinate, (int, float)):
+            return None
+        if not math.isfinite(coordinate):
+            return None
+        point[axis] = float(coordinate)
+    return point
 
 
 def _reader_catalog(effects: Mapping[str, Any]) -> dict[str, Any]:
@@ -1875,8 +1937,12 @@ class RealMatch:
         """Retient ce que le mod dit avoir posé pour un joueur, et le journalise tel quel.
 
         `calls` est réduit aux appels connus, sans doublon, dans l'ordre reçu. Le même joueur
-        rapporté de nouveau (tenue reposée) remplace sa ligne. Une ligne sans joueur ne dit
-        rien et s'écarte.
+        rapporté de nouveau (tenue reposée, ou déplacement) remplace sa ligne. Une ligne sans
+        joueur ne dit rien et s'écarte.
+
+        P9F26 : `moved_tiles`, la distance parcourue depuis l'entrée en tenue, et `anchor`, ce
+        point d'entrée, suivent dans le journal. Au-delà de `HOLD_LEAK_TILES` sous une tenue
+        encore active, une ligne `hold_leaked` donne la valeur mesurée : le verrou fuit.
         """
         player, calls = data.get("player"), data.get("calls")
         if not isinstance(player, str) or not player or not isinstance(calls, list):
@@ -1885,10 +1951,33 @@ class RealMatch:
         for call in calls:
             if call in HOLD_CALLS and call not in kept:
                 kept.append(call)
-        report = {"player": player, "calls": kept}
+        report: dict[str, Any] = {"player": player, "calls": kept}
+        moved = _distance(data.get("moved_tiles"))
+        if moved is not None:
+            report["moved_tiles"] = moved
+        anchor = _anchor(data.get("anchor"))
+        if anchor is not None:
+            report["anchor"] = anchor
         self._write_safely(HOLD_APPLIED, report, side, None)
+        if moved is not None and moved > HOLD_LEAK_TILES and self._hold_active(side):
+            leak = {"player": player, "moved_tiles": moved}
+            if anchor is not None:
+                leak["anchor"] = anchor
+            self._write_safely(HOLD_LEAKED, leak, side, None)
+            LOGGER.warning(
+                "tenue %s : %s a bougé de %.2f case sous la tenue",
+                side,
+                self.redactor.redact(player),
+                moved,
+            )
         others = [entry for entry in self._hold_players[side] if entry["player"] != player]
-        self._hold_players[side] = [*others, held_player(player, kept)]
+        self._hold_players[side] = [*others, held_player(player, kept, moved)]
+
+    def _hold_active(self, side: str) -> bool:
+        """Vrai tant que la tenue de ce camp tient : posée, et ni tombée ni relâchée."""
+        if side not in self._held_sides or self._released_ms is not None:
+            return False
+        return self._hold_view[side]["status"] in (HOLD_SENT, HOLD_HELD)
 
     def _take_hold_result(self, side: str, result: Mapping[str, Any], now_ms: int) -> None:
         """Lit le résultat d'une commande de monde : un refus s'annonce, et rien n'attend.

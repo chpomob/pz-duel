@@ -898,16 +898,28 @@ end
 --   * le joueur : invulnérable (`setInvulnerable`, P9F11 : aucun coup ne lui ôte de vie), hors
 --     d'atteinte des zombies (`setZombiesDontAttack`), caché (`setInvisible`, P9F12 : un
 --     personnage invisible n'est ni vu ni entendu, `addWorldSoundUnlessInvisible` ne fait plus
---     de bruit de monde), puis figé (`setBlockMovement`). Protégé d'abord, caché ensuite, figé
+--     de bruit de monde), puis figé (`setIgnoreMovement`, P9F26). Protégé d'abord, caché ensuite, figé
 --     en dernier ; au relâchement, l'ordre inverse : visible, mobile, puis vulnérable. Si la
 --     mobilité ne revient pas, la protection reste. Jamais un joueur figé et exposé.
 --     P9F21 : chaque joueur en ligne reçoit la séquence à chaque passe, sans reposer ce qui
 --     l'est déjà, et le mod rapporte une fois par joueur ce qu'il a posé (`hold_applied`).
+--     P9F26 : figer, c'est `setIgnoreMovement`. L'ancien levier, posé en P9F11, n'avait aucun
+--     lecteur dans le déplacement (seules la caméra et les véhicules lisaient son champ) : le
+--     joueur semblait figé tant qu'il ne touchait à rien. `IsoPlayer.updateInternal2` rend la
+--     main dès `getIgnoreMovement()`, sans lire une seule entrée ; ce getter relit l'état, que
+--     le mod repose s'il est perdu. Le déplacement d'un joueur se calcule sur son propre
+--     client : le mod lui dit donc aussi qu'il est tenu (`hold`, canal de P9F22), et
+--     `DuelHud.lua` y pose le même verrou. Enfin la position d'entrée en tenue est retenue, et
+--     la distance parcourue depuis rapportée (`moved_tiles`) : le verrou se mesure.
 -- Best-effort en plus : ses besoins (faim, soif, fatigue, endurance) sont reposés à chaque
 -- passe à leur valeur d'entrée en tenue (`Stats:set` : `CharacterStat` peut manquer à Lua).
 local function holdRefused(call)
     return { status = "refused", reason = "no_hold_api", call = call }
 end
+-- P9F26 : message `hold` du canal client de P9F22, redit au joueur tenu toutes les cinq
+-- secondes ; et le quart de case au-delà duquel un déplacement se rapporte de nouveau.
+-- Une seule table : le fichier approche la limite de 200 locales d'un bloc.
+local HOLD_WATCH = { channel = "duelcore", message = "hold", tell_ms = 5000, leak_tiles = 0.25 }
 -- Pas de temps du monde sous tenue : dix mille fois plus lent, trois minutes y durent 18 ms.
 local HOLD_MULTIPLIER = 0.0001
 -- Pas d'avant la tenue, rendu au relâchement ; nil hors tenue.
@@ -957,12 +969,13 @@ local PLAYER_SETTERS = {
     setInvulnerable = function(player, value) player:setInvulnerable(value) end,
     setZombiesDontAttack = function(player, value) player:setZombiesDontAttack(value) end,
     setInvisible = function(player, value) player:setInvisible(value) end,
-    setBlockMovement = function(player, value) player:setBlockMovement(value) end,
+    setIgnoreMovement = function(player, value) player:setIgnoreMovement(value) end,
 }
 local PLAYER_GETTERS = {
     isInvulnerable = function(player) return player:isInvulnerable() end,
     isZombiesDontAttack = function(player) return player:isZombiesDontAttack() end,
     isInvisible = function(player) return player:isInvisible() end,
+    getIgnoreMovement = function(player) return player:getIgnoreMovement() end,
 }
 
 local function readFlag(player, getter)
@@ -976,19 +989,25 @@ end
 
 -- Les quatre appels de la tenue, dans l'ordre où ils sont posés (P9F21) : protégé, hors
 -- d'atteinte, caché, puis figé. C'est aussi l'ordre de la liste `calls` de `hold_applied`.
-local HOLD_CALLS = { "setInvulnerable", "setZombiesDontAttack", "setInvisible", "setBlockMovement" }
+local HOLD_CALLS = { "setInvulnerable", "setZombiesDontAttack", "setInvisible", "setIgnoreMovement" }
 -- Ce que le jeu sait relire : un état qu'il dit perdu est reposé, les autres ne le sont pas.
 local HOLD_GETTERS = {
     setInvulnerable = "isInvulnerable",
     setZombiesDontAttack = "isZombiesDontAttack",
     setInvisible = "isInvisible",
+    setIgnoreMovement = "getIgnoreMovement",
 }
--- Joueurs (nom) dont la tenue en cours a déjà été rapportée : un `hold_applied` par joueur et
--- par tenue. Vidé quand la tenue tombe (`dropHold`).
+-- P9F26 : les appels relus aussitôt posés. Le verrou de déplacement n'est compté que si le jeu
+-- dit l'avoir pris : un getter absent ou qui le dément rend `no_hold_api` en le nommant, et
+-- l'appel est défait sur-le-champ. C'est ce qui manquait à l'ancien levier, sans lecteur.
+local HOLD_VERIFIED = { setIgnoreMovement = "getIgnoreMovement" }
+-- Joueurs (nom) dont la tenue en cours a déjà été rapportée, avec la distance rapportée : un
+-- `hold_applied` par joueur et par tenue, plus un par quart de case de fuite (P9F26). Vidé
+-- quand la tenue tombe (`dropHold`).
 local heldReported = {}
 
 -- Vrai si l'appel est déjà posé sur ce joueur et que le jeu ne dit pas le contraire : il n'est
--- alors pas reposé. Sans lecture possible (`setBlockMovement`, ou getter absent), la note fait foi.
+-- alors pas reposé. Sans lecture possible (getter absent), la note fait foi.
 local function stillSet(player, entry, call)
     if not entry.set[call] then return false end
     local getter = HOLD_GETTERS[call]
@@ -997,17 +1016,62 @@ local function stillSet(player, entry, call)
     return not (ok and value == false)
 end
 
+-- Au centième de case : assez pour juger le quart de case, sans bruit de virgule flottante.
+local function hundredths(value)
+    return math.floor(value * 100 + 0.5) / 100
+end
+
 -- Rapporte, une fois par joueur et par tenue, les appels réellement posés, dans l'ordre : le
 -- journal dit ainsi si `setInvisible` a été posé pour ce joueur, et quand. Après un échec, la
 -- liste s'arrête à l'appel manquant, que `no_hold_api` nomme.
+-- P9F26 : le rapport porte aussi la distance parcourue depuis l'entrée en tenue
+-- (`moved_tiles`, en cases) et ce point d'entrée (`anchor`). Il repart, pour le même joueur,
+-- chaque fois que cette distance dépasse d'un quart de case (`HOLD_WATCH.leak_tiles`) celle
+-- déjà rapportée : un verrou qui fuit se lit dans le journal, un joueur qui tient fait une ligne.
 local function reportHold(key, entry)
-    if heldReported[key] then return end
-    heldReported[key] = true
+    local reported = heldReported[key]
+    local moved = entry.moved
+    if reported then
+        if moved == nil or moved <= reported.moved + HOLD_WATCH.leak_tiles then return end
+    end
+    heldReported[key] = { moved = moved or 0 }
     local calls = {}
     for _, call in ipairs(HOLD_CALLS) do
         if entry.set[call] then calls[#calls + 1] = call end
     end
-    emit("hold_applied", { player = key, calls = { [ARRAY] = calls } }, side)
+    local anchor = nil
+    if entry.anchor then
+        anchor = { x = hundredths(entry.anchor.x), y = hundredths(entry.anchor.y) }
+    end
+    emit("hold_applied", {
+        player = key, calls = { [ARRAY] = calls }, moved_tiles = moved, anchor = anchor,
+    }, side)
+end
+
+-- Position au sol du joueur ; nil si le jeu ne sait pas la dire (rien n'est alors mesuré).
+local function readPosition(player)
+    local ok, x, y = pcall(function() return player:getX(), player:getY() end)
+    if ok and type(x) == "number" and type(y) == "number" then return { x = x, y = y } end
+    return nil
+end
+
+-- Distance en cases entre le point d'entrée en tenue et la position du moment.
+local function measureMoved(player, entry)
+    if not entry.anchor then return nil end
+    local here = readPosition(player)
+    if not here then return entry.moved end
+    local dx, dy = here.x - entry.anchor.x, here.y - entry.anchor.y
+    return hundredths(math.sqrt(dx * dx + dy * dy))
+end
+
+-- Dit au client du joueur s'il est tenu, par le canal des annonces (P9F22). Best-effort : sans
+-- `sendServerCommand`, le verrou du serveur reste seul, et la mesure dit s'il suffit. Le client
+-- se relâche de lui-même après `30 s` sans nouvelle : tenu, il est redit toutes les
+-- `HOLD_WATCH.tell_ms`. Rend faux si l'envoi a échoué : sans `sendServerCommand`, le client n'a
+-- jamais été dit tenu, il n'y a rien à lui faire relâcher.
+local function tellHold(player, held)
+    if sendServerCommand == nil then return true end
+    return (pcall(sendServerCommand, player, HOLD_WATCH.channel, HOLD_WATCH.message, { held = held }))
 end
 
 -- Protège, cache puis fige un joueur, à chaque passe : un joueur arrivé après la commande reçoit
@@ -1025,13 +1089,17 @@ local function freezePlayer(player)
             invisible = readFlag(player, "isInvisible"),
             stats = captureStats(player),
             set = {},
+            -- Position exacte : la distance se mesure depuis elle ; seul le rapport l'arrondit.
+            anchor = readPosition(player),
         }
         heldPlayers[key] = entry
     elseif entry.player ~= player then
         -- Revenu sous un nouvel objet : rien n'y est encore posé, la séquence repart entière.
         entry.player = player
         entry.set = {}
+        entry.toldAt = nil
     end
+    entry.moved = measureMoved(player, entry)
     local missing = nil
     for _, call in ipairs(HOLD_CALLS) do
         if not stillSet(player, entry, call) then
@@ -1039,11 +1107,23 @@ local function freezePlayer(player)
                 missing = call
                 break
             end
+            local getter = HOLD_VERIFIED[call]
+            if getter ~= nil and not readFlag(player, getter) then
+                callPlayer(player, call, false)
+                missing = getter
+                break
+            end
             entry.set[call] = true
         end
     end
     reportHold(key, entry)
     if missing ~= nil then return false, missing end
+    -- Le client n'est dit tenu qu'une fois le joueur protégé : jamais figé et exposé.
+    local now = getTimestampMs()
+    if entry.toldAt == nil or now - entry.toldAt >= HOLD_WATCH.tell_ms then
+        entry.toldAt = now
+        tellHold(player, true)
+    end
     restoreStats(player, entry.stats)
     return true
 end
@@ -1059,10 +1139,14 @@ end
 
 -- Rend un joueur dans l'ordre inverse : visible, mobile, puis vulnérable. Si la mobilité ne
 -- revient pas, la protection reste et l'entrée aussi : un prochain `release_time` réessaie.
+-- De même si le client n'a pu être dit libre : il se croirait encore tenu jusqu'à son délai de
+-- 30 s, immobile ; il reste donc protégé, et le relâchement rend `refused` nommant
+-- `sendServerCommand` jusqu'à ce que l'envoi passe.
 -- Un joueur parti entre-temps est rendu au mieux et n'empêche jamais le relâchement (P9F21).
 local function thawPlayer(key, entry, gone)
     if not undo(entry, "setInvisible", entry.invisible, gone) then return false, "setInvisible" end
-    if not undo(entry, "setBlockMovement", false, gone) then return false, "setBlockMovement" end
+    if not undo(entry, "setIgnoreMovement", false, gone) then return false, "setIgnoreMovement" end
+    if not gone and not tellHold(entry.player, false) then return false, "sendServerCommand" end
     if not undo(entry, "setZombiesDontAttack", entry.shielded, gone) then
         return false, "setZombiesDontAttack"
     end

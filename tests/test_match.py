@@ -3182,9 +3182,12 @@ class FreezablePlayer(lua_mod.Player):
     def isInvulnerable(self) -> bool:
         return self.invulnerable
 
-    def setBlockMovement(self, blocked: bool) -> None:
-        self.calls.append(("setBlockMovement", blocked))
+    def setIgnoreMovement(self, blocked: bool) -> None:
+        self.calls.append(("setIgnoreMovement", blocked))
         self.blocked = blocked
+
+    def getIgnoreMovement(self) -> bool:
+        return self.blocked
 
     def setZombiesDontAttack(self, shielded: bool) -> None:
         self.shielded = shielded
@@ -3351,14 +3354,14 @@ def test_hold_freezes_players_and_time_until_release():
 
 
 def test_missing_freeze_api_refuses_the_hold():
-    """Sans `setBlockMovement`, `hold_time` rend `refused`, `no_hold_api`, et ne tient rien.
+    """Sans `setIgnoreMovement`, `hold_time` rend `refused`, `no_hold_api`, et ne tient rien.
 
     Mutation : ignorer l'échec de `blockPlayers` rend `applied` et fige l'heure quand même.
     """
 
 
     class StiffPlayer(FreezablePlayer):
-        setBlockMovement = None
+        setIgnoreMovement = None
 
     server = PausedServer()
     server.online.append(StiffPlayer("ancien"))
@@ -3370,7 +3373,7 @@ def test_missing_freeze_api_refuses_the_hold():
         "seq": 1,
         "status": "refused",
         "reason": "no_hold_api",
-        "call": "setBlockMovement",
+        "call": "setIgnoreMovement",
     }
     server.time.time = 9.5
     server.paused_pass()
@@ -3445,7 +3448,7 @@ def test_late_player_that_cannot_be_frozen_drops_the_hold():
     """
 
     class StiffPlayer(FreezablePlayer):
-        setBlockMovement = None
+        setIgnoreMovement = None
 
     server = PausedServer()
     server.fire("OnServerStarted")
@@ -3459,7 +3462,7 @@ def test_late_player_that_cannot_be_frozen_drops_the_hold():
     results = [r["data"] for r in server.lines("cmd_result") if r["data"]["seq"] == 1]
     assert results == [
         {"seq": 1, "status": "applied"},
-        {"seq": 1, "status": "refused", "reason": "no_hold_api", "call": "setBlockMovement"},
+        {"seq": 1, "status": "refused", "reason": "no_hold_api", "call": "setIgnoreMovement"},
     ]
     assert server.paused_message[-1] is False
     server.time.time = 9.5
@@ -3592,12 +3595,12 @@ def test_held_player_loses_no_health_and_released_player_does():
     assert host.calls[:3] == [
         ("setInvulnerable", True),
         ("setInvisible", True),
-        ("setBlockMovement", True),
+        ("setIgnoreMovement", True),
     ]
     assert set(host.calls) == {
         ("setInvulnerable", True),
         ("setInvisible", True),
-        ("setBlockMovement", True),
+        ("setIgnoreMovement", True),
     }
     for _ in range(20):
         host.bitten()
@@ -3610,7 +3613,7 @@ def test_held_player_loses_no_health_and_released_player_does():
     assert server.result(2)["status"] == "applied"
     assert host.calls == [
         ("setInvisible", False),
-        ("setBlockMovement", False),
+        ("setIgnoreMovement", False),
         ("setInvulnerable", False),
     ]
     assert not host.invulnerable and not host.blocked
@@ -3679,18 +3682,18 @@ def test_player_that_cannot_move_again_keeps_its_protection():
             raise LuaError("bloqué")
         host.blocked = blocked
 
-    host.setBlockMovement = stuck
+    host.setIgnoreMovement = stuck
     server.send(2, "release_time")
     server.paused_pass()
     assert server.result(2) == {
         "seq": 2,
         "status": "refused",
         "reason": "no_hold_api",
-        "call": "setBlockMovement",
+        "call": "setIgnoreMovement",
     }
     assert host.blocked and host.invulnerable
 
-    del host.setBlockMovement
+    del host.setIgnoreMovement
     server.send(3, "release_time")
     server.paused_pass()
     assert server.result(3)["status"] == "applied"
@@ -3700,11 +3703,11 @@ def test_player_that_cannot_move_again_keeps_its_protection():
 def test_release_with_nothing_held_is_applied():
     """Tenue refusée plus tôt (API absente) : le relâchement n'a rien à rendre, `applied`.
 
-    Sans cela, un camp sans `setBlockMovement` bloquerait le duel au lobby pour toujours.
+    Sans cela, un camp sans `setIgnoreMovement` bloquerait le duel au lobby pour toujours.
     """
 
     class StiffPlayer(FreezablePlayer):
-        setBlockMovement = None
+        setIgnoreMovement = None
 
     server = PausedServer()
     player = StiffPlayer("raide")
@@ -3805,11 +3808,11 @@ def test_refused_release_is_retried_then_the_match_starts(engine_rig, hold_caps)
     duel.arrive("A")
     duel.arrive("B")
     duel.confirm_release("B")
-    first = duel.confirm_release("A", "refused", reason="no_hold_api", call="setBlockMovement")
+    first = duel.confirm_release("A", "refused", reason="no_hold_api", call="setIgnoreMovement")
     state = engine_rig.until(
         lambda s: s["capabilities"]["hold"]["A"]["status"] == "release_refused"
     )
-    assert "setBlockMovement" in state["capabilities"]["hold"]["A"]["reason"]
+    assert "setIgnoreMovement" in state["capabilities"]["hold"]["A"]["reason"]
     duel.sync_pump()
     assert kinds(duel.mods["A"]) == ["hold_time", "release_time"]
     assert "probe_spawn" not in kinds(duel.mods["B"])
@@ -3841,12 +3844,12 @@ def test_release_never_confirmed_refuses_the_match_and_names_the_side(engine_rig
     duel.arrive("A")
     duel.arrive("B")
     duel.confirm_release("B")
-    duel.confirm_release("A", "refused", reason="no_hold_api", call="setBlockMovement")
+    duel.confirm_release("A", "refused", reason="no_hold_api", call="setIgnoreMovement")
     retry_s = engine_rig.runtime["probe_retry_s"]
     for count in (2, 3):
         duel.at(retry_s * (count - 1))
         engine_rig.until(lambda _, n=count: kinds(duel.mods["A"]).count("release_time") == n)
-        duel.confirm_release("A", "refused", reason="no_hold_api", call="setBlockMovement")
+        duel.confirm_release("A", "refused", reason="no_hold_api", call="setIgnoreMovement")
     assert duel.state()["phase"] == "lobby"
 
     duel.at(PROBE_TIMEOUT_S)
@@ -3889,7 +3892,7 @@ def test_held_player_is_invisible_before_frozen_and_visible_after_release():
     """Tenu : invisible, posé après la protection et avant le gel ; relâché : visible d'abord.
 
     Mutations : retirer `setInvisible(true)` de `freezePlayer` laisse le joueur attirer les
-    zombies ; le poser après `setBlockMovement` échoue sur l'ordre ; ne pas le défaire dans
+    zombies ; le poser après `setIgnoreMovement` échoue sur l'ordre ; ne pas le défaire dans
     `thawPlayer` laisse un joueur invisible pendant le duel.
     """
     server = PausedServer()
@@ -3902,7 +3905,7 @@ def test_held_player_is_invisible_before_frozen_and_visible_after_release():
     assert server.result(1)["status"] == "applied"
     assert host.invisible and not host.attracts_zombies()
     order = [call for call, value in host.calls if value]
-    assert order[:3] == ["setInvulnerable", "setInvisible", "setBlockMovement"]
+    assert order[:3] == ["setInvulnerable", "setInvisible", "setIgnoreMovement"]
 
     host.calls.clear()
     server.send(2, "release_time")

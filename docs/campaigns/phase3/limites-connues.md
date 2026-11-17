@@ -1105,3 +1105,72 @@ est un extrait du registre (mêmes listes que le jeu pour la sélection), posé 
 `random` et passent avec ou sans jeu installé (suite rejouée avec `PZ_INSTALL_DIR` vers un dossier
 vide). `SpawnGame` relève le sixième argument et donne un sexe aux zombies ;
 `tests/test_phase3_p9f19.py` suit la nouvelle offre.
+
+## P9F26 — le verrou du départ par `setIgnoreMovement`, côté client, et mesuré (2026-11-17)
+
+**Constat (16/11) :** « il semble marcher tant que le joueur n'essaie pas de se déplacer ». Dans
+`projectzomboid.jar`, le champ de `setBlockMovement` n'est lu que par `PlayerCamera` et
+`BaseVehicle` : aucun chemin de déplacement de l'`IsoPlayer` ne le consulte. La caméra cessait
+de suivre, le personnage n'était pas retenu. Les tests d'alors prouvaient que l'appel était fait,
+pas qu'il retenait quoi que ce soit.
+
+**Ce qui change :**
+
+- Figer, c'est `setIgnoreMovement(true)` : `IsoPlayer.updateInternal2` rend la main dès
+  `getIgnoreMovement()`, avant toute lecture des touches. Côté serveur, il remplace
+  `setBlockMovement` dans `HOLD_CALLS`, `HOLD_GETTERS` (relu par `getIgnoreMovement`) et le
+  relâchement ; un jeu sans lui rend `no_hold_api` (`setIgnoreMovement`). Il est **relu aussitôt
+  posé** : un getter absent ou qui le dément rend `no_hold_api` (`getIgnoreMovement`), l'appel est
+  défait, la tenue tombe et le lobby le dit. Plus aucune référence à `setBlockMovement` dans le mod.
+- Le déplacement d'un joueur se calcule sur **son propre client** : le mod lui envoie `hold`
+  (`held = true`, puis redit toutes les 5 s ; `held = false` au relâchement) par le canal
+  `sendServerCommand` de P9F22, et `DuelHud.lua` repose à chaque `OnPlayerUpdate`
+  `setIgnoreMovement(true)` puis `stopMoving()`. Libéré : `setIgnoreMovement(false)`, rien
+  d'autre. Sans nouvelle depuis plus de 30 s (ou sans horloge lisible), le client se relâche de
+  lui-même. `OnPlayerUpdate` n'est écouté qu'au premier `hold` reçu : hors duel, inerte.
+- Le client n'est dit tenu qu'une fois le joueur protégé (invulnérable, hors d'atteinte, caché).
+  À l'inverse, il reste protégé tant que `held = false` n'a pu partir : un envoi en échec garde
+  invulnérabilité et `setZombiesDontAttack`, et `release_time` rend `refused`, `no_hold_api`,
+  nommant `sendServerCommand`, jusqu'à ce qu'il passe. Le mod ne sait que l'envoi a été fait,
+  pas que le client l'a reçu : aucun accusé de réception n'existe sur ce canal.
+- **Mesure :** à l'entrée en tenue, le mod retient la position exacte (`anchor`, publiée au
+  centième de case, mesurée sans arrondi) ; à chaque passe il calcule la distance parcourue. `hold_applied` porte `moved_tiles` et
+  `anchor`, et repart pour le même joueur chaque fois que la distance dépasse d'un quart de case
+  celle déjà rapportée. Au-delà de 0,25 case sous tenue active, le service journalise
+  `hold_leaked` (`player`, `moved_tiles`, `anchor`) et le dit au log. Le lobby écrit
+  « tenu : harumate (4/4, déplacement 0,8 case) » quand le déplacement est non nul.
+
+**Comment vérifier en jeu :** un joueur entre seul, la tenue tombe ; il presse et garde une touche
+de déplacement (et clique pour marcher) une dizaine de secondes. Le personnage ne doit pas
+bouger, et le journal du match (`hold_applied`) doit lire `"moved_tiles": 0.0`, sans aucune ligne
+`hold_leaked`. Une ligne `hold_leaked` donne la distance réelle : le verrou fuit, preuve chiffrée.
+
+**Ouvert :**
+
+- **Rien de ceci n'a tourné dans le vrai jeu.** Prouvé sur le vrai Lua exécuté par `mini_lua`
+  (serveur et client) et sur le moteur. Que `getTimestampMs`, `setIgnoreMovement`, `stopMoving`
+  et `OnPlayerUpdate` existent tels quels côté client 42.21 est lu dans le jar, pas observé.
+- `setIgnoreMovement` est aussi utilisé par le jeu lui-même (actions, animations) : le client le
+  rend à `false` au relâchement, ce qui pourrait couper une action du jeu en cours à cet instant.
+- Côté serveur, rien ne dit que le serveur garde `ignoreMovement` d'un joueur distant entre deux
+  passes : il est reposé si le getter le dit perdu ; la preuve que le joueur ne bouge pas est
+  désormais `moved_tiles`, mesurée sur la position que le serveur reçoit du client.
+- Le mod mesure, il ne ramène pas le joueur à son point d'entrée.
+- `service/state.py` (hors des fichiers autorisés de l'étape) garde un `HOLD_CALLS` et un
+  `held_player` d'avant P9F26, qui nomment encore `setBlockMovement`. Plus rien ne les importe :
+  la liste et la phrase du lobby vivent désormais dans `service/engine.py`. À retirer à la
+  prochaine étape qui ouvre `state.py`.
+- `DuelCore.lua` compte 185 locales de premier niveau, sous la limite de 200 d'un bloc Lua ; les
+  constantes de l'étape sont regroupées dans une seule table (`HOLD_WATCH`) pour cela.
+- Les sections P9F10, P9F11 et P9F12 ci-dessus restent telles qu'écrites ; leurs mentions de
+  `setBlockMovement` et le point ouvert « que le client s'y plie » sont remplacés par celle-ci.
+
+**Tests (mutation citée dans chaque docstring) :** `tests/test_phase3_p9f26.py` — liste des
+appels sans `setBlockMovement` et jeu d'avant refusé ; `getIgnoreMovement` relu, échec nommé,
+état perdu reposé ; `hold` dit au client et redit, `false` au relâchement ; `moved_tiles` mesuré
+depuis l'ancre et nouveau rapport à 0,8 case ; `hold_leaked` à 0,8 et pas à 0,0 ni à 0,25, phrase
+du lobby ; pas de fuite journalisée après relâchement ; client : verrou à la réception, à chaque
+`OnPlayerUpdate`, `false` à la libération, relâché seul après 30 s, sans API rien ne casse.
+`tests/test_match.py` et `tests/test_phase3_p9f21.py` suivent le nouveau levier (le double
+`FreezablePlayer` a `setIgnoreMovement` et `getIgnoreMovement`) ; `tests/test_phase3_p9f22.py`
+ne compte que les annonces du relais, que la tenue partage désormais.

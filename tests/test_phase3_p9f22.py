@@ -669,7 +669,9 @@ def test_announcement_seq_is_apart_from_the_command_seq():
 
     assert server.result(1)["status"] == "applied"
     assert "announce" not in server.result(1)
-    assert [args["seq"] for *_, args in server.relayed] == [50, 51]
+    # P9F26 : la tenue passe aussi par ce canal (`hold`) ; seules les annonces comptent ici.
+    announced = [args for _, _, command, args in server.relayed if command == "announce"]
+    assert [args["seq"] for args in announced] == [50, 51]
     assert json.loads(server.acks[-1])["seq"] == 1
 
 
