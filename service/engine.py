@@ -79,6 +79,7 @@ from .servers import (
     STATUS_UP,
     Redactor,
     ServerPair,
+    AntiCheatNotice,
     ServerProcess,
     apply_status,
     gen_player_password,
@@ -495,6 +496,17 @@ def _duration_of(payload: Mapping[str, Any], preset: Mapping[str, Any]) -> int:
     return value
 
 
+def anticheat_message(side: str, notice: AntiCheatNotice) -> str:
+    """La phrase que lit le propriétaire : qui, quelle distance, et que personne n'est exclu."""
+    where = f"désynchronisation détectée sur {notice.connection}"
+    if notice.distance is not None:
+        where += f", distance {notice.distance:.1f}".replace(".", ",")
+    return (
+        f"anti-triche {notice.check} (serveur {side}) : {where} — journalisé, "
+        "personne n'est exclu"
+    )
+
+
 def _redacted(redactor: Redactor, value: Any) -> Any:
     """Copie une valeur JSON sans aucun secret, à toute profondeur."""
     if isinstance(value, str):
@@ -798,6 +810,8 @@ class RealMatch:
         # Commandes écrites sans `cmd_result` lu : ce qu'un redémarrage rendrait perdu.
         self._unresolved: dict[str, set[int]] = {side: set() for side in SIDES}
         self._restarts = dict.fromkeys(SIDES, 0)
+        # P9F32 : connexions dont une détection anti-triche journalisée a déjà été reprise.
+        self._anticheat_seen: set[str] = set()
         # Camps en relance ou perdus : ni sortie, ni silence, ni absence n'y sont jugés.
         self._unavailable: set[str] = set()
         self._exits_held: set[str] = set()
@@ -1569,11 +1583,26 @@ class RealMatch:
 
     def _poll_out(self, now_ms: int) -> None:
         """Lit `out` dans le budget d'une passe : `_reading_behind` dit s'il en reste."""
+        self._relay_anticheat()
         for side, reader in self._readers.items():
             for events, anomalies in self._read_passes(side, reader):
                 self._record_anomalies(anomalies)
                 for event in events:
                     self._take_event(side, _redacted(self.redactor, event), now_ms)
+
+    def _relay_anticheat(self) -> None:
+        """Reprend dans le journal du service les détections `action="Log"` des serveurs.
+
+        Une fois par match et par connexion : la désynchronisation se répète à chaque coup,
+        le propriétaire n'a besoin que de savoir qu'elle a lieu, et sur qui (P9F32).
+        """
+        for side, server in self.pair.servers.items():
+            for notice in server.take_anticheat():
+                if notice.connection in self._anticheat_seen:
+                    continue
+                self._anticheat_seen.add(notice.connection)
+                message = anticheat_message(side, notice)
+                self._on_state(lambda state, message=message: state.log(message, "warn"))
 
     def _read_passes(self, side: str, reader: OutReader) -> Iterator[PollResult]:
         """Isole les pannes de lecture : celles du journal ne sont pas des pannes de transport."""

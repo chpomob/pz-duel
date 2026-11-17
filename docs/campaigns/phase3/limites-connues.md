@@ -1514,3 +1514,58 @@ neutralisé fait tomber les trois tests `--version` ; `"build"` retiré de `to_d
 les tests d'état ; la lecture de `needs` et de la condition retirée du garde-fou laisse passer
 11 mutants.
 Suite complète : 3252 verts (3204 avant l'étape), 16 skips inchangés (7 min 13).
+
+## P9F32 — l'anti-triche des coups journalise au lieu de bannir, réglage écrit par le service (2026-11-18)
+
+**Constat.** Session réelle du 17/11 : les deux joueurs bannis par `Anti-cheat="HitWeapon"`
+(`server-option="AntiCheatHit"`, `action="Ban"`, distances 6,3 à 9,4 cases). Le jeu définit, dans
+`zombie/network/anticheats/AntiCheat$Policy` :
+
+| Valeur | Politique |
+|---|---|
+| 1 | Ban |
+| 2 | Kick |
+| 3 | Log |
+| 4 | Disabled |
+
+La note interne qui appelait 1 « désactivé » était fausse. Le service n'écrivait pas la clé : le
+serveur reprenait son défaut, 1, c'est-à-dire Ban. Aucun bannissement n'a été conservé (`bannedid`
+et `bannedip` vides dans `db/duelA.db` et `db/duelB.db`).
+
+**Ce qui est fait.**
+
+- `managed_ini` (`service/runtime.json`) porte `AntiCheatHit: "3"` (Log) ; la table des valeurs
+  est rappelée à côté, sous `managed_ini_comment`. `Disabled` (4) est écarté : il ferait taire le
+  signal de désynchronisation.
+- `_check_ini_contract` (`service/servers.py`) exige `AntiCheatHit` : une ini qui porte autre chose
+  est refusée au démarrage, avec la clé, la valeur trouvée et la valeur attendue.
+- `ServerProcess._scan` lit les lignes `Anti-cheat=… action="Log"` de la sortie du serveur ;
+  `Match._relay_anticheat` (`service/engine.py`) les reprend dans le journal du service, une fois
+  par match et par connexion, tous serveurs confondus, en `warn` :
+  « anti-triche HitWeapon (serveur A) : désynchronisation détectée sur chpo, distance 6,7 —
+  journalisé, personne n'est exclu ».
+- `AntiCheatSafety`, `Speed`, `NoClip`, `PacketException` ne sont pas touchés : ils gardent la
+  valeur du serveur.
+
+**Ce qui reste.**
+
+- **La désynchronisation n'est pas corrigée**, elle est rendue visible et inoffensive. Les zombies
+  naissent à 12–20 cases ; le serveur, dont la position date d'un battement, voit le zombie frappé
+  à 6,3–9,4 cases, au-delà de la portée de l'arme. La réduire touche au protocole de pop et
+  demande sa propre mesure : fréquence des détections par match, distance relevée en fonction de
+  la distance d'apparition et du ping, et si elle survient seulement sur les zombies du mod.
+- **Seules les lignes `action="Log"` sont reprises.** Une ligne `Kick` ou `Ban` d'un autre
+  contrôle (non géré par le service) n'apparaît que dans `server_X.log`.
+- **Non éprouvé sur un vrai serveur** : la forme des lignes vient de `server-console.txt` du 17/11
+  avec `action="Ban"` ; qu'un serveur à `AntiCheatHit=3` écrive bien `action="Log"` sur la même
+  ligne, et sur sa sortie standard (que lit `ServerProcess`) et pas seulement dans
+  `server-console.txt`, reste à constater à la prochaine session réelle.
+- Une seule reprise par connexion et par match : une deuxième désynchronisation, même plus
+  grande, n'est pas répétée dans le journal du service (elle reste dans `server_X.log`).
+
+**Preuves.** `tests/test_phase3_p9f32.py` : `test_generated_inis_carry_anticheat_hit_log`
+(mutation : clé retirée de `managed_ini`), `test_contract_refuses_anticheat_hit_ban` (mutation :
+clé retirée de `_check_ini_contract`), `test_log_line_relayed_once_per_connection` (mutations :
+test de `_anticheat_seen` neutralisé → ligne de `chpo` répétée ; appel à `_relay_anticheat` retiré
+→ aucune ligne), `test_parse_reads_log_lines_only`. Les quatre mutations ont été vérifiées à la main.
+Suite complète : 3260 verts (3256 avant l'étape), 16 skips inchangés (7 min 13).

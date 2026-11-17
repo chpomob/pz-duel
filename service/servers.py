@@ -31,6 +31,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -52,6 +53,36 @@ LINE_BREAK = re.compile(r"[\r\n]")
 
 STARTED_MARKER = "*** SERVER STARTED ****"
 BUILD_LINE = re.compile(r"version=(\S+)")
+# P9F32 : détection anti-triche que le serveur journalise sans exclure (`action="Log"`).
+# Forme lue dans `server-console.txt` le 17/11 :
+# `Anti-cheat="HitWeapon" is triggered for connection="chpo" server-option="AntiCheatHit"
+#  reason="PlayerHitZombiePacket: distance=6.687416 is greater than weapon range" … action="Log"`
+ANTICHEAT_LOG_LINE = re.compile(
+    r'Anti-cheat="(?P<check>[^"]*)"[^\n]*?connection="(?P<connection>[^"]*)"'
+    r'[^\n]*?action="Log"'
+)
+ANTICHEAT_DISTANCE = re.compile(r"distance=(\d+(?:\.\d+)?)")
+
+
+@dataclass(frozen=True)
+class AntiCheatNotice:
+    """Une détection journalisée par le serveur : le contrôle, la connexion, la distance lue."""
+
+    check: str
+    connection: str
+    distance: float | None
+
+
+def parse_anticheat(line: str) -> AntiCheatNotice | None:
+    """Rend la détection d'une ligne `Anti-cheat=… action="Log"`, ou `None`."""
+    match = ANTICHEAT_LOG_LINE.search(line)
+    if match is None:
+        return None
+    found = ANTICHEAT_DISTANCE.search(line)
+    distance = float(found[1]) if found else None
+    return AntiCheatNotice(match["check"], match["connection"], distance)
+
+
 QUIT_LINE = b"quit\n"
 
 STATUS_STARTING = "starting"
@@ -337,6 +368,8 @@ class ServerProcess:
         port = cfg["ports"][side]["game"]
         self._listening = re.compile(rf"server is listening on port {port}\b")
         self._tail: deque[str] = deque(maxlen=cfg["log_tail_lines"])
+        # Détections anti-triche lues, que le moteur reprend (P9F32). `deque` : fil sûr.
+        self._anticheat: deque[AntiCheatNotice] = deque()
         self._process: subprocess.Popen[bytes] | None = None
         self._tree: ProcessTree | None = None
         self._reader: threading.Thread | None = None
@@ -529,7 +562,16 @@ class ServerProcess:
                     self.log_error = self.redactor.redact_exception(exc)
                 self._scan(line)
 
+    def take_anticheat(self) -> list[AntiCheatNotice]:
+        """Rend et retire les détections anti-triche lues depuis l'appel précédent."""
+        taken = []
+        while self._anticheat:
+            taken.append(self._anticheat.popleft())
+        return taken
+
     def _scan(self, line: str) -> None:
+        if (notice := parse_anticheat(line)) is not None:
+            self._anticheat.append(notice)
         if self.build is None and (match := BUILD_LINE.search(line)):
             self.build = match[1]
         if self.ready:
@@ -716,6 +758,8 @@ def _check_ini_contract(
         "Mods": mods_setting(table),
         "WorkshopItems": runtime["managed_ini"]["WorkshopItems"],
         "PauseEmpty": runtime["managed_ini"]["PauseEmpty"],
+        # P9F32 : réglage de sûreté, jamais laissé au défaut du serveur (1 = Ban).
+        "AntiCheatHit": runtime["managed_ini"]["AntiCheatHit"],
     }
     failures = []
     for side, ini in inis.items():

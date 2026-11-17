@@ -78,7 +78,15 @@
     "external_ports": {"udp_game": 49271, "udp_aux": 49272, "tcp_share": 49280},
     "fallback_range": [49152, 50175]
   },
+  "managed_ini_comment": [
+    "AntiCheatHit (P9F32) : zombie/network/anticheats/AntiCheat$Policy du jeu,",
+    "Ban = 1, Kick = 2, Log = 3, Disabled = 4. Le service écrit 3 (Log) : la détection",
+    "est journalisée, personne n'est exclu. 1 n'est PAS « désactivé », c'est Ban : le défaut",
+    "du serveur, qui a banni les deux joueurs le 17/11. 4 ferait taire le signal de",
+    "désynchronisation (zombies nés à 12–20 cases) : refusé. Le contrat d'ini exige 3."
+  ],
   "managed_ini": {
+    "AntiCheatHit": "3",
     "PauseEmpty": "true",
     "WorkshopItems": "",
     "UPnP": "false",
