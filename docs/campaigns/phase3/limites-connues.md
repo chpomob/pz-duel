@@ -1387,3 +1387,74 @@ lire la variable → 7 tests de `tests/test_wait_budget.py` tombent, dont
 `test_budget_follows_the_environment` et `test_every_waiting_file_takes_its_budget_from_the_environment` ;
 `WAIT_S = 5` remis en dur dans `test_share` → ce dernier tombe (`{'test_share': 5} !=
 {'test_share': 42.5}`).
+
+## P9F30 — les tests posent l'état par l'entrée du produit, pas en écrivant dans l'état (2026-11-17)
+
+**Cause.** `test_missing_client_reveals_no_password[windows]` a échoué sur le runner 3.14 (`733dd79`)
+avec « l'adversaire n'est pas encore connecté ». Le test posait l'invité par
+`engine.state.players["B"] = "invite"`. Or le fil du moteur republie `state.players` depuis les
+joueurs du match à chaque passe (`_publish`, `state.players = players`), et le match ne les apprend
+que par le heartbeat du mod (`_take_beat`, `self.players[side] = self._identify(...)`). Sur une
+machine lente, la publication passait entre l'écriture et `open_game`, et effaçait l'invité. Cause :
+le point d'injection, pas le temps.
+
+**Quelle sonde.** Le moteur n'envoie aucune commande RCON `players` et n'en lit aucune réponse : il
+apprend les joueurs dans le champ `players` du `beat` que `DuelCore.lua` écrit dans
+`duel_<camp>_out.txt` (`getOnlinePlayers`). Donner au double de serveur une réponse RCON
+`Players connected (2): invite` n'aurait été lu par personne et n'aurait rien prouvé. Le double
+étendu est donc celui du mod, `tests/doubles/fake_mod.py` :
+
+- `FakeMod.resuming(lua_dir, side)` : le mod déjà en route, qui reprend au `(boot, seq, t_ms)` de la
+  dernière ligne de `out`, celle que le serveur lancé y a écrite (ni doublon ni trou de `seq`) ;
+- `FakeMod.join(player)` : le heartbeat suivant annonce `players: [player]` ;
+- `FakeMod.leave()` : le heartbeat suivant n'annonce personne.
+
+**Les tests.** Ceux qui passaient par les cinq écritures (`client_engine`,
+`test_open_game_runs_the_client_in_the_detected_game_folder` et les deux écritures de
+`test_open_game_waits_for_the_guest` dans `tests/test_modes.py`, `guest_here` dans
+`tests/test_platform_windows.py`) partent d'un vrai lobby. Le moteur réel est lancé sur le banc
+`engine_rig` (double de serveur, vrai fil). Le mod B annonce l'invité, puis
+`wait_until(..., what="… vu par le moteur sur le camp B")` attend que `snapshot()["players"]["B"]`
+le montre, au budget `PZDUEL_TEST_WAIT_S`. L'action n'est appelée qu'ensuite. Adresse et mot de
+passe sont ceux que le lobby publie, et non plus des constantes posées dans `config`. Le lanceur
+du client se remplace par `engine_module.launch_client`, et l'espion `Popen` n'est posé qu'une fois
+les serveurs lancés.
+
+**La garde.** `tests/test_ci_workflows.py::test_p9f30_no_test_writes_the_engine_state_directly`
+parcourt `tests/` par l'AST, `tests/doubles/` exclu. Elle échoue, avec fichier et ligne, sur toute
+écriture visant un champ de `MatchState` (chaîne passant par `.state`, ou nom `state` suivi d'un
+attribut) ou un `.players` d'objet. Sont couverts l'affectation, l'affectation augmentée, `del`,
+les mutateurs (`update`, `pop`, `clear`, `setdefault`…) et `setattr`/`monkeypatch.setattr`.
+Remplacer une méthode (`monkeypatch.setattr(engine.state, "log", …)` dans `test_upnp`) n'est pas
+une écriture d'état. `players` : aucune tolérance.
+
+**Ce qui reste, et pourquoi.** 16 écritures de `phase` ou de `config` datent d'avant l'étape. Elles
+sont tenues par un plafond par fichier et par cible (`STATE_WRITES_BASELINE`), qui ne peut que
+baisser : une écriture retirée oblige à le diminuer. Toutes visent un moteur **sans fil** : aucune
+publication ne les réécrit, et elles ne courent pas comme l'invité. Mais elles restent des sorties
+écrites à la place d'une entrée :
+
+- `tests/test_modes.py` (9 `phase`, 1 `config`) : `test_open_game_is_refused_outside_the_lobby`,
+  paramétré sur chaque phase, et les tests de l'arrêt à vide (`idle_due`, `claim_idle_stop`,
+  `watch_idle`), qui parcourent `preflight`, `starting`, `contract`, `stopping`, `over`, `error`…
+  Aucune entrée ne mène à coup sûr à chaque phase et l'y tient, en particulier `stopping` et
+  `starting`, qui sont des passages. Les produire demanderait un double capable de figer le moteur
+  dans une phase : non fait ici.
+  `test_open_game_waits_for_the_guest_in_mock_too` pose `lobby` sur le moteur simulé sans fil, sinon
+  il passerait au décompte dès `simulate_join`.
+- `tests/test_share.py` (2 `phase`, 1 `config`) et `tests/test_setup_flow.py` (3 `phase`) : hors des
+  fichiers de l'étape, non touchés.
+
+**Non couvert.** Un joueur qui *disparaît* en cours de lobby se produit désormais par
+`FakeMod.leave()`, mais aucun des cinq tests n'en a besoin. Le délai de heartbeat (`beat_timeout_s`,
+30 s) n'est atteint par aucun de ces tests. Il effacerait l'invité d'un lobby resté muet plus de
+30 s, ce qu'un runner très lent pourrait approcher entre le heartbeat et l'action. Il n'a pas été
+mesuré.
+
+**Preuves.** Les tests concernés (21 de `test_modes` sur `open_game`, 9 de
+`test_platform_windows` sur le lancement et les mots de passe) : 20 passages de suite, 30 verts
+chacun. Contre-épreuve : sans `FakeMod.join`, 14 de ces 30 tombent sur « l'adversaire n'est pas
+encore connecté ». Mutations de la garde : remettre `lobby[0].state.players["B"] = "invite"` dans
+`client_engine` la fait échouer (`tests/test_modes.py:448: writes lobby[0].state.players
+directly…`) ; remettre `rig.engine.state.players["B"] = GUEST` dans `guest_here` aussi
+(`tests/test_platform_windows.py:1652: …`). Suite complète : 3204 verts, 16 skips (7 min 15).

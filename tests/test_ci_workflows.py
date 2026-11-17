@@ -10,12 +10,15 @@ La documentation (R9) se lit de même : `start_problems` pour la section de dém
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import re
 from pathlib import Path
 
 import pytest
 import yaml
+
+from service.state import MatchState
 
 REPO = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO / ".github" / "workflows"
@@ -1155,3 +1158,241 @@ def test_p9f23_waiver_needs_a_reason(tmp_path):
     call = "done = subprocess.run([node, js], capture_output=True, text=True)  # encodage-local:"
 
     assert len(node_call_problems(tmp_path, call)) == 1
+
+
+# -- P9F30 : les tests posent l'état par l'entrée du produit, pas en écrivant dans l'état -------
+
+# Ce que le moteur publie : `engine.state` (le `MatchState` exposé par `/api/state`) et les
+# joueurs que le match tire des heartbeats. Un test qui y écrit simule une entrée par une
+# sortie, et le fil du moteur la réécrit à sa prochaine publication (P9F30, runner 3.14).
+STATE_ATTR = "state"
+PLAYERS_ATTR = "players"
+MUTATORS = ("update", "clear", "pop", "popitem", "setdefault", "__setitem__", "__delitem__")
+SETATTR_CALLS = ("setattr", "monkeypatch.setattr")
+# Les données publiées. Une méthode (`log`, `event`) remplacée pour injecter une panne n'en est
+# pas une : c'est un comportement, pas un état.
+STATE_FIELDS = frozenset(item.name for item in dataclasses.fields(MatchState))
+# Les doubles peuvent tenir un état : c'est par eux qu'un test force ce qu'aucune entrée ne donne.
+DOUBLES_DIR = "doubles"
+# Écritures de phase et de config antérieures à P9F30, sur des moteurs sans fil (aucune
+# publication ne les réécrit) et dans des fichiers que l'étape ne touche pas. Le compte par
+# fichier et par cible est un plafond figé : il ne peut que baisser, et `limites-connues`
+# (phase 3) dit pourquoi chacune reste. `players` n'y figure pas : aucune écriture tolérée.
+STATE_WRITES_BASELINE = {
+    ("tests/test_modes.py", "engine.state.config"): 1,
+    ("tests/test_modes.py", "engine.state.phase"): 9,
+    ("tests/test_setup_flow.py", "engine.state.phase"): 3,
+    ("tests/test_share.py", "engine.state.config"): 1,
+    ("tests/test_share.py", "engine.state.phase"): 2,
+}
+
+
+def _write_chain(node: ast.expr) -> tuple[list[str], ast.expr]:
+    """Les attributs traversés par une cible, du plus proche au plus lointain, et sa racine."""
+    attrs = []
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        if isinstance(node, ast.Attribute):
+            attrs.append(node.attr)
+        node = node.value
+    return attrs, node
+
+
+def _engine_state_target(node: ast.expr) -> str | None:
+    """Rend l'état visé, sous la forme `<objet>.state.<champ>`, ou `None` hors de l'état.
+
+    Visée : toute chaîne qui passe par `.state` (`engine.state.phase`, `rig.engine.state.players`)
+    ou part d'un nom `state` par attribut (`state = engine.state` puis `state.players[...]`), et
+    tout `.players` d'un objet (`match.players[...]`). Un `self.state` ou `self.players` posé par
+    une classe sur elle-même est son propre champ, pas celui du moteur.
+    """
+    attrs, root = _write_chain(node)
+    root_name = root.id if isinstance(root, ast.Name) else None
+    if root_name == "self" and len(attrs) == 1:
+        return None
+    # Du plus lointain au plus proche : `engine.state.players` donne `engine`, `state`, `players`.
+    path = [root_name, *reversed(attrs)]
+    # Un nom seul (`state = ...`) se lie localement : seul un attribut atteint l'objet.
+    touches = len(path) > 1 and (
+        PLAYERS_ATTR in path[1:]
+        or any(
+            name == STATE_ATTR and (index == len(path) - 1 or path[index + 1] in STATE_FIELDS)
+            for index, name in enumerate(path)
+        )
+    )
+    if not touches:
+        return None
+    if isinstance(node, ast.Subscript):
+        while isinstance(node, ast.Subscript):
+            node = node.value
+    return ast.unparse(node)
+
+
+def _written_targets(node: ast.AST) -> list[ast.expr]:
+    """Les expressions qu'un nœud modifie : affectation, suppression, mutateur, `setattr`."""
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+        targets = [node.target]
+    elif isinstance(node, ast.Delete):
+        targets = node.targets
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and (
+        node.func.attr in MUTATORS
+    ):
+        targets = [node.func.value]
+    elif isinstance(node, ast.Call) and ast.unparse(node.func) in SETATTR_CALLS and node.args:
+        first = node.args[0]
+        name = node.args[1] if len(node.args) > 1 else None
+        if isinstance(name, ast.Constant) and isinstance(name.value, str):
+            return [ast.Attribute(value=first, attr=name.value, ctx=ast.Store())]
+        targets = [first]
+    else:
+        return []
+    flat = []
+    for target in targets:
+        flat.extend(target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target])
+    return flat
+
+
+def state_writes(paths: list[Path], root: Path) -> list[tuple[str, int, str]]:
+    """Les écritures directes dans l'état du moteur, `(fichier, ligne, cible)`, doubles exclus."""
+    found = []
+    for path in sorted(paths):
+        where = path.relative_to(root).as_posix()
+        if DOUBLES_DIR in path.relative_to(root).parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            for target in _written_targets(node):
+                state = _engine_state_target(target)
+                if state is not None:
+                    found.append((where, node.lineno, state))
+    return sorted(found)
+
+
+def state_write_problems(
+    paths: list[Path], root: Path, baseline: dict[tuple[str, str], int]
+) -> list[str]:
+    """Chaque écriture hors du plafond, nommée par fichier et ligne ; et tout plafond devenu trop
+    large, pour qu'une écriture retirée ne laisse pas sa place à une autre."""
+    writes = state_writes(paths, root)
+    counts: dict[tuple[str, str], int] = {}
+    for where, _, target in writes:
+        counts[(where, target)] = counts.get((where, target), 0) + 1
+    problems = [
+        f"{where}:{line}: writes {target} directly; drive the state through a double "
+        "(FakeMod heartbeat, fake server) or the product API"
+        for where, line, target in writes
+        if counts[(where, target)] > baseline.get((where, target), 0)
+    ]
+    problems += [
+        f"{where}: baseline allows {allowed} writes to {target}, "
+        f"found {counts.get((where, target), 0)}; lower STATE_WRITES_BASELINE"
+        for (where, target), allowed in sorted(baseline.items())
+        if counts.get((where, target), 0) < allowed
+    ]
+    return problems
+
+
+def state_write_problems_in(
+    tmp_path: Path, body: str, name: str = "test_fabricated.py"
+) -> list[str]:
+    """La garde sur un fichier fabriqué, sans plafond : la ligne fautive est la ligne 5."""
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source = f"import threading\n\n\ndef test_it(engine, rig, monkeypatch):\n    {body}\n"
+    path.write_text(source, encoding="utf-8")
+    return state_write_problems([path], tmp_path, {})
+
+
+def test_p9f30_no_test_writes_the_engine_state_directly():
+    """Aucun test de `tests/` n'écrit dans l'état du moteur au-delà du plafond figé, et aucun
+    n'écrit `players` : un joueur entre par le heartbeat du mod (`FakeMod.join`).
+
+    Mutation : remettre `engine.state.players["B"] = "invite"` dans `client_engine` de
+    `tests/test_modes.py`, ou dans `guest_here` de `tests/test_platform_windows.py` — la garde
+    nomme le fichier et la ligne.
+    """
+    assert state_write_problems(list(TESTS_DIR.rglob("*.py")), REPO, STATE_WRITES_BASELINE) == []
+
+
+def test_p9f30_baseline_never_tolerates_players():
+    """Le plafond ne couvre que `phase` et `config` : `players` ne s'y ajoute pas en silence."""
+    assert all(target.endswith((".phase", ".config")) for _, target in STATE_WRITES_BASELINE)
+
+
+@pytest.mark.parametrize(
+    ("body", "target"),
+    [
+        ('engine.state.players["B"] = "invite"', "engine.state.players"),
+        ('rig.engine.state.players["B"] = None', "rig.engine.state.players"),
+        ('engine.state.phase = "lobby"', "engine.state.phase"),
+        ("engine.state.config = {}", "engine.state.config"),
+        ('engine.state.config["host_password"] = "x"', "engine.state.config"),
+        ('engine.state.players.update(B="invite")', "engine.state.players"),
+        ('del engine.state.players["B"]', "engine.state.players"),
+        ('setattr(engine.state, "phase", "lobby")', "engine.state.phase"),
+        ('monkeypatch.setattr(engine.state, "players", {})', "engine.state.players"),
+        ("engine.state = None", "engine.state"),
+        ('state = engine.state; state.players["B"] = "invite"', "state.players"),
+        ('engine._match.players["B"] = "invite"', "engine._match.players"),
+        ('with engine.lock: engine.state.players["B"] = "invite"', "engine.state.players"),
+    ],
+)
+def test_p9f30_fabricated_state_write_is_named_with_file_and_line(tmp_path, body, target):
+    """Chaque forme d'écriture est vue, avec son fichier, sa ligne et la cible.
+
+    Mutation : la garde ne regardant que `ast.Assign`, ou que `.state`, ou ne suivant pas un
+    `setattr`, une de ces formes passe.
+    """
+    problems = state_write_problems_in(tmp_path, body)
+
+    assert len(problems) == 1, problems
+    assert problems[0].startswith(f"test_fabricated.py:5: writes {target} directly")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Lire l'état n'est pas l'écrire.
+        'assert engine.state.players["B"] == "invite"',
+        'state = engine.snapshot(); assert state["players"]["B"]',
+        # Un instantané est une copie : y écrire ne touche pas le moteur.
+        'state = engine.snapshot(); state["phase"] = "lobby"',
+        # Une classe qui tient son propre champ.
+        "self.state = {}",
+        "self.players = []",
+        # L'entrée du produit.
+        'mod.join("invite")',
+        # Une méthode remplacée pour injecter une panne : un comportement, pas une donnée.
+        'monkeypatch.setattr(engine.state, "log", failing_log)',
+    ],
+)
+def test_p9f30_reads_snapshots_and_own_fields_are_left_alone(tmp_path, body):
+    """Lecture, instantané, champ propre, heartbeat : la garde se tait.
+
+    Mutation : la garde signalant tout nom `state` ou tout `self.<champ>`, ces cas tombent.
+    """
+    assert state_write_problems_in(tmp_path, body) == []
+
+
+def test_p9f30_doubles_may_hold_state(tmp_path):
+    """Un double peut forcer un état : c'est la voie que la garde indique.
+
+    Mutation : `DOUBLES_DIR` ignoré, le double tombe.
+    """
+    body = 'engine.state.phase = "lobby"'
+    assert state_write_problems_in(tmp_path, body, "doubles/fake.py") == []
+
+
+def test_p9f30_a_removed_write_lowers_the_baseline(tmp_path):
+    """Une écriture retirée ne laisse pas sa place : le plafond trop large est signalé.
+
+    Mutation : la seconde liste de `state_write_problems` retirée, le plafond reste à 2.
+    """
+    path = tmp_path / "test_fabricated.py"
+    path.write_text('def test_it(engine):\n    engine.state.phase = "lobby"\n', encoding="utf-8")
+    baseline = {("test_fabricated.py", "engine.state.phase"): 2}
+
+    assert state_write_problems([path], tmp_path, baseline) == [
+        "test_fabricated.py: baseline allows 2 writes to engine.state.phase, found 1"
+        "; lower STATE_WRITES_BASELINE"
+    ]

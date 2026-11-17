@@ -43,7 +43,9 @@ from doubles.fake_server import (
     plan_windows_client,
     windows_pid_alive,
 )
+from doubles.fake_mod import FakeMod
 from doubles.waiting import WAIT_S as TEST_WAIT_S
+from doubles.waiting import wait_until as wait_for_state
 from test_contract import Lobby
 from test_share import (  # noqa: F401
     LAN_ADDRESS,
@@ -1565,7 +1567,7 @@ if sys.platform != "win32":
             assert server._cfg["stop_timeout_s"] == rig.runtime["stop_timeout_s"]
             assert server._cfg["kill_grace_s"] == rig.runtime["kill_grace_s"]
 
-        guest_here(engine)
+        guest_here(rig)
         ok, message = engine.action("open_game")
         assert ok, message
         client, _ = launch.calls[-1]
@@ -1637,17 +1639,28 @@ if sys.platform != "win32":
         assert_no_password(engine, rig, caplog, engine.state.config["host_password"], state["error"])
 
 
-    def guest_here(engine) -> None:
-        """`open_game` attend l'invité (P9F5) : ces tests regardent le client, pas l'invité."""
-        with engine.lock:
-            engine.state.players["B"] = "invite"
+    GUEST = "invite"
+
+
+    def guest_here(rig) -> None:
+        """`open_game` attend l'invité (P9F5) : ces tests regardent le client, pas l'invité.
+
+        P9F30 : l'invité entre par le heartbeat du mod B, l'entrée que le moteur lit. Écrire
+        `state.players` perdait la course contre la publication du moteur, qui le réécrit.
+        """
+        FakeMod.resuming(rig.zomboid / "Lua", "B").join(GUEST)
+        wait_for_state(
+            lambda: rig.engine.snapshot()["players"]["B"] == GUEST,
+            what=f"l'invité {GUEST} vu par le moteur sur le camp B",
+            observe=lambda: rig.engine.snapshot()["players"],
+        )
 
 
     def in_lobby(rig) -> dict:
         rig.start()
         state = rig.wait("lobby", "error")
         assert state["phase"] == "lobby", state["error"]
-        guest_here(rig.engine)
+        guest_here(rig)
         return state
 
 

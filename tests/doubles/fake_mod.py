@@ -8,6 +8,7 @@ porte `player`, le premier nom de son dernier heartbeat, sauf `data` qui le fixe
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,18 @@ class FakeMod:
         self.in_path = lua_dir / f"duel_{side}_in.txt"
         self.ack_path = lua_dir / f"duel_{side}_ack.txt"
         self.session_path = lua_dir / f"duel_{side}_session.txt"
+
+    @classmethod
+    def resuming(cls, lua_dir: str | Path, side: str) -> FakeMod:
+        """Le mod déjà en route sur ce camp : il reprend au `(boot, seq)` de la dernière ligne de
+        `out`, celle que le serveur lancé y a écrite. Ses lignes suivantes sont donc les suivantes
+        du flux, ni doublon ni trou, comme celles du vrai mod au fil du match."""
+        mod = cls(lua_dir, side)
+        lines = mod.out_path.read_bytes().splitlines() if mod.out_path.exists() else []
+        last = next((json.loads(line) for line in reversed(lines) if line.strip()), None)
+        if last is not None:
+            mod.boot, mod.seq, mod.t_ms = last["boot"], last["seq"], last["t_ms"]
+        return mod
 
     def restart(self, boot: int | None = None) -> None:
         """Relance le mod : `seq` repart de 1 au `boot` donné, ou au suivant."""
@@ -105,6 +118,17 @@ class FakeMod:
         if players:
             self.player = players[0]
         return self.emit("beat", {"age": age, "players": list(players), "hp": hp, "kills": kills})
+
+    def join(self, player: str) -> bytes:
+        """Le joueur entre sur ce serveur : le heartbeat suivant l'annonce, comme le vrai mod
+        quand `getOnlinePlayers` le compte. C'est la seule entrée par laquelle le moteur apprend
+        qu'un joueur est là ; un test qui veut un invité passe par ici, pas par
+        `state.players`."""
+        return self.beat(players=(player,))
+
+    def leave(self) -> bytes:
+        """Le serveur ne compte plus personne : le heartbeat suivant n'annonce aucun joueur."""
+        return self.beat(players=())
 
     def hook_seen(self, hook: str = "OnPlayerGetDamage") -> bytes:
         return self.emit("hook_seen", {"hook": hook})

@@ -16,8 +16,10 @@ from pathlib import Path
 
 import pytest
 from doubles.fake_server import compile_windows_client, plan_windows_client, write_script
-from doubles.waiting import WAIT_S
+from doubles.fake_mod import FakeMod
+from doubles.waiting import WAIT_S, wait_until
 from test_preflight import free_ports, make_install, zomboid_home  # noqa: F401
+from test_snapshots import engine_rig  # noqa: F401
 
 from service import engine as engine_module
 from service import main as main_module
@@ -399,12 +401,52 @@ def client_install(root: Path) -> tuple[Path, Path]:
 HOST_CONFIG = {"host_password": "marqueur-hote", "host_address": "127.0.0.1:17261"}
 
 
-def client_engine(zomboid_home, runtime, pz_dir: Path, launcher) -> Engine:
-    engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir, client_launcher=launcher)
-    engine.state.config = dict(HOST_CONFIG)
-    engine.state.phase = "lobby"
-    engine.state.players["B"] = "invite"
-    return engine
+GUEST = "invite"
+
+
+def client_lobby(rig, monkeypatch, launcher=None) -> tuple[Engine, Path, dict]:
+    """Vrai moteur mené au lobby sur le double de serveur, le client de l'hôte installé.
+
+    Rend le moteur, le client et `config` tel que le lobby le publie (adresse et mot de passe
+    tirés par le moteur). `launcher` remplace le lanceur du client, et lui seul : les serveurs
+    partent par leur propre chemin. Personne n'est encore connecté : voir `guest_joins`.
+    """
+    if launcher is not None:
+        monkeypatch.setattr(
+            engine_module,
+            "launch_client",
+            lambda script, args, platform=None, *, cwd: launcher(script, args, cwd=cwd),
+        )
+    engine = rig.build()
+    host = current()
+    client = host.client_file(rig.pz_dir)
+    client.parent.mkdir(parents=True, exist_ok=True)
+    if host.posix_modes:
+        write_script(client, "", "")
+    else:
+        client.write_bytes(b"MZ")
+    rig.start()
+    state = rig.wait("lobby", "error")
+    assert state["phase"] == "lobby", state["error"]
+    return engine, client, state["config"]
+
+
+def guest_joins(rig, player: str = GUEST) -> None:
+    """P9F30 : l'invité entre comme en vrai, par le heartbeat du mod B, et le test attend que
+    le moteur l'ait lu. Écrire `state.players` simulait une sortie, et le moteur la réécrit."""
+    FakeMod.resuming(rig.zomboid / "Lua", "B").join(player)
+    wait_until(
+        lambda: rig.engine.snapshot()["players"]["B"] == player,
+        what=f"le joueur {player} vu par le moteur sur le camp B",
+        observe=lambda: rig.engine.snapshot()["players"],
+    )
+
+
+def client_engine(rig, monkeypatch, launcher) -> tuple[Engine, Path, dict]:
+    """Le lobby de `client_lobby`, invité connecté : l'état où `open_game` lance le client."""
+    lobby = client_lobby(rig, monkeypatch, launcher)
+    guest_joins(rig)
+    return lobby
 
 
 def test_open_game_needs_a_prepared_duel(zomboid_home, tmp_path, runtime):
@@ -416,20 +458,20 @@ def test_open_game_needs_a_prepared_duel(zomboid_home, tmp_path, runtime):
     assert launcher.calls == []
 
 
-def test_open_game_is_direct_and_leaves_steam_mode(zomboid_home, tmp_path, runtime):
+def test_open_game_is_direct_and_leaves_steam_mode(engine_rig, monkeypatch):
     """Les serveurs tournent en `zomboid.steam=0` : un client en mode Steam n'y entrerait pas."""
-    pz_dir, script = client_install(tmp_path)
     launcher = Launcher()
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, script, config = client_engine(engine_rig, monkeypatch, launcher)
+    address, password = config["host_address"], config["host_password"]
 
     ok, message = engine.action("open_game")
 
     assert ok is True
     assert "vérifiez en jeu la connexion" in message, "le lancement ne prouve pas la connexion"
-    assert launcher.calls == [
-        (script.resolve(), ["-nosteam", "+connect", "127.0.0.1:17261", "+password", "marqueur-hote"])
+    assert [(Path(called).resolve(), args) for called, args in launcher.calls] == [
+        (script.resolve(), ["-nosteam", "+connect", address, "+password", password])
     ]
-    assert not any("marqueur-hote" in entry["msg"] for entry in engine.snapshot()["logs"])
+    assert not any(password in entry["msg"] for entry in engine.snapshot()["logs"])
 
 
 class PopenSpy:
@@ -452,29 +494,24 @@ class PopenSpy:
         return None
 
 
-def test_open_game_runs_the_client_in_the_detected_game_folder(
-    zomboid_home, tmp_path, runtime, monkeypatch
-):
+def test_open_game_runs_the_client_in_the_detected_game_folder(engine_rig, tmp_path, monkeypatch):
     """A1 : sans `cwd`, le client hérite du dossier du service, celui du téléchargement.
 
     C'est le dossier détecté, celui des serveurs, et non le parent du client : sous Linux,
     ce parent est un cran au-dessus.
     """
-    pz_dir, _ = client_install(tmp_path)
+    engine, _, _ = client_engine(engine_rig, monkeypatch, None)
     service_folder = tmp_path / "downloads"
     service_folder.mkdir()
     monkeypatch.chdir(service_folder)
+    # Après le lobby : les serveurs déjà lancés, seul le client passe par l'espion.
     spy = PopenSpy()
     monkeypatch.setattr(subprocess, "Popen", spy)
-    engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir)
-    engine.state.config = dict(HOST_CONFIG)
-    engine.state.phase = "lobby"
-    engine.state.players["B"] = "invite"
 
     assert engine.action("open_game")[0] is True
 
     (options,) = spy.options
-    assert options["cwd"] == detect_pz(pz_dir, os.environ, Path.home()).path
+    assert options["cwd"] == detect_pz(engine_rig.pz_dir, os.environ, Path.home()).path
 
 
 def test_every_launch_attempt_keeps_the_game_folder(tmp_path, monkeypatch):
@@ -487,27 +524,25 @@ def test_every_launch_attempt_keeps_the_game_folder(tmp_path, monkeypatch):
     assert [options["cwd"] for options in spy.options] == [tmp_path, tmp_path]
 
 
-def test_open_game_without_the_client_fails_explicitly(zomboid_home, tmp_path, runtime):
+def test_open_game_without_the_client_fails_explicitly(engine_rig, monkeypatch):
     """Binaire absent : aucun lancement, ni de relais qui se dirait réussi sans rien constater."""
-    pz_dir, script = client_install(tmp_path)
-    script.unlink()
     launcher = Launcher()
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, script, config = client_engine(engine_rig, monkeypatch, launcher)
+    script.unlink()
 
     ok, message = engine.action("open_game")
 
     assert ok is False
     assert launcher.calls == []
     assert f"client PZ introuvable ({current().client_program} absent)" in message
-    assert "à la main avec -nosteam, puis rejoignez 127.0.0.1:17261" in message
-    assert "marqueur-hote" not in message
+    assert f"à la main avec -nosteam, puis rejoignez {config['host_address']}" in message
+    assert config["host_password"] not in message
     assert engine.snapshot()["logs"][-1]["level"] == "warn"
 
 
-def test_open_game_reports_a_refused_launch(zomboid_home, tmp_path, runtime):
-    pz_dir, _ = client_install(tmp_path)
+def test_open_game_reports_a_refused_launch(engine_rig, monkeypatch):
     launcher = Launcher("options refusées")
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, _, _ = client_engine(engine_rig, monkeypatch, launcher)
 
     ok, message = engine.action("open_game")
 
@@ -516,9 +551,8 @@ def test_open_game_reports_a_refused_launch(zomboid_home, tmp_path, runtime):
     assert message.startswith("options refusées : lancez PZ à la main")
 
 
-def test_open_game_keeps_the_engine_free_while_launching(zomboid_home, tmp_path, runtime):
+def test_open_game_keeps_the_engine_free_while_launching(engine_rig, monkeypatch):
     """Le lanceur attend le démarrage : ni `/api/state` ni le match n'attendent avec lui."""
-    pz_dir, _ = client_install(tmp_path)
     free: list[bool] = []
 
     def probe():
@@ -533,7 +567,7 @@ def test_open_game_keeps_the_engine_free_while_launching(zomboid_home, tmp_path,
         other.join()
         return FakeClient()
 
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, _, _ = client_engine(engine_rig, monkeypatch, launcher)
 
     assert engine.action("open_game")[0] is True
     assert free == [True]
@@ -543,10 +577,15 @@ def test_open_game_keeps_the_engine_free_while_launching(zomboid_home, tmp_path,
     "phase", sorted(set(PHASE_LABELS) - {"lobby"}), ids=lambda phase: phase
 )
 def test_open_game_is_refused_outside_the_lobby(zomboid_home, tmp_path, runtime, phase):
-    """`config` survit à la fin du duel : sans garde, le client viserait un serveur arrêté."""
+    """`config` survit à la fin du duel : sans garde, le client viserait un serveur arrêté.
+
+    Moteur sans fil, phase posée : aucune entrée ne mène sûrement à chaque phase (P9F30,
+    `limites-connues`). Aucun invité n'est posé : le refus de phase le précède.
+    """
     pz_dir, _ = client_install(tmp_path)
     launcher = Launcher()
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine = real_engine(zomboid_home, runtime, pz_dir=pz_dir, client_launcher=launcher)
+    engine.state.config = dict(HOST_CONFIG)
     engine.state.phase = phase
 
     ok, message = engine.action("open_game")
@@ -556,17 +595,16 @@ def test_open_game_is_refused_outside_the_lobby(zomboid_home, tmp_path, runtime,
     assert launcher.calls == []
 
 
-def test_open_game_waits_for_the_guest(zomboid_home, tmp_path, runtime):
+def test_open_game_waits_for_the_guest(engine_rig, monkeypatch):
     """P9F5 (C2) : sans invité identifié, le client ne part pas, et le message dit pourquoi.
 
     `PauseEmpty=true` fige le monde A tant que l'hôte n'y est pas : l'y connecter avant
     l'invité le ferait tourner seul. Dès que B est identifié, le même appel passe.
     Mutation : retirer le test de `players.B` de `_open_game` lance le client tout de suite.
+    P9F30 : lobby réel, et l'invité entre par le heartbeat du mod B.
     """
-    pz_dir, _ = client_install(tmp_path)
     launcher = Launcher()
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
-    engine.state.players["B"] = None
+    engine, _, _ = client_lobby(engine_rig, monkeypatch, launcher)
 
     ok, message = engine.action("open_game")
 
@@ -574,7 +612,7 @@ def test_open_game_waits_for_the_guest(zomboid_home, tmp_path, runtime):
     assert "l'adversaire n'est pas encore connecté" in message
     assert launcher.calls == []
 
-    engine.state.players["B"] = "dupont"
+    guest_joins(engine_rig, "dupont")
     assert engine.action("open_game")[0] is True
     assert len(launcher.calls) == 1
 
@@ -604,9 +642,8 @@ def test_open_game_is_refused_outside_the_lobby_in_mock_too(runtime):
     assert engine.action("open_game")[0] is False
 
 
-def test_second_open_game_is_refused_while_the_first_is_starting(zomboid_home, tmp_path, runtime):
+def test_second_open_game_is_refused_while_the_first_is_starting(engine_rig, monkeypatch):
     """Deux appels rapprochés : le premier regarde encore le démarrage, hors du verrou."""
-    pz_dir, _ = client_install(tmp_path)
     starting, release = threading.Event(), threading.Event()
     calls: list[list[str]] = []
 
@@ -616,7 +653,7 @@ def test_second_open_game_is_refused_while_the_first_is_starting(zomboid_home, t
         release.wait(WAIT_S)
         return FakeClient()
 
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, _, config = client_engine(engine_rig, monkeypatch, launcher)
     first: list[tuple[bool, str]] = []
     thread = threading.Thread(target=lambda: first.append(engine.action("open_game")))
     thread.start()
@@ -627,15 +664,15 @@ def test_second_open_game_is_refused_while_the_first_is_starting(zomboid_home, t
     thread.join(WAIT_S)
 
     assert ok is False
-    assert message == "client PZ déjà lancé : rejoignez 127.0.0.1:17261 depuis celui-ci"
+    address = config["host_address"]
+    assert message == f"client PZ déjà lancé : rejoignez {address} depuis celui-ci"
     assert first[0][0] is True
     assert len(calls) == 1
 
 
-def test_open_game_waits_for_the_client_to_exit_before_relaunching(zomboid_home, tmp_path, runtime):
-    pz_dir, _ = client_install(tmp_path)
+def test_open_game_waits_for_the_client_to_exit_before_relaunching(engine_rig, monkeypatch):
     launcher = Launcher()
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, _, _ = client_engine(engine_rig, monkeypatch, launcher)
 
     assert engine.action("open_game")[0] is True
     assert engine.action("open_game")[0] is False
@@ -647,10 +684,9 @@ def test_open_game_waits_for_the_client_to_exit_before_relaunching(zomboid_home,
     assert len(launcher.calls) == 2
 
 
-def test_failed_open_game_leaves_the_next_attempt_free(zomboid_home, tmp_path, runtime):
-    pz_dir, _ = client_install(tmp_path)
+def test_failed_open_game_leaves_the_next_attempt_free(engine_rig, monkeypatch):
     launcher = Launcher("options refusées")
-    engine = client_engine(zomboid_home, runtime, pz_dir, launcher)
+    engine, _, _ = client_engine(engine_rig, monkeypatch, launcher)
 
     assert engine.action("open_game")[0] is False
     launcher.failure = None
