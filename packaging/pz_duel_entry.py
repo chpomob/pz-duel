@@ -30,6 +30,11 @@ from service import paths
 from service.main import log_line, main
 
 FORCED_END_CODE = 1
+VERSION_FLAG = "--version"
+# `ATTACH_PARENT_PROCESS` de l'API Win32 : `(DWORD)-1`.
+ATTACH_PARENT_PROCESS = 0xFFFFFFFF
+TH32CS_SNAPPROCESS = 0x2
+INVALID_HANDLE_VALUE = 2**64 - 1 if sys.maxsize > 2**32 else 2**32 - 1
 PARENT_POLL_S = 1
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -101,7 +106,95 @@ def watch_parent() -> None:
     ).start()
 
 
+def parent_pid_windows(pid: int) -> int | None:
+    """Rend le parent de `pid` d'après un instantané des processus, `None` s'il n'y figure pas."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot is None or snapshot == INVALID_HANDLE_VALUE:
+        return None
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.th32ProcessID == pid:
+                return int(entry.th32ParentProcessID)
+            found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        return None
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def console_owners(own_parent: Callable[[], int], parent_of: Callable[[int], int | None]):
+    """Les processus dont la console est à essayer, du plus proche au plus lointain.
+
+    En `--onefile`, ce processus est l'enfant du chargeur, fenêtré lui aussi et donc sans
+    console : `ATTACH_PARENT_PROCESS` y échoue. La console de `cmd` est celle du parent du
+    chargeur. Le grand-parent n'est cherché que si le parent a échoué.
+    """
+    yield ATTACH_PARENT_PROCESS
+    try:
+        grandparent = parent_of(own_parent())
+    except OSError:
+        return
+    if grandparent:
+        yield grandparent
+
+
+def attach_first_console(owners, attach: Callable[[int], bool]) -> bool:
+    """S'attache à la première console qui accepte ; `False` si aucune."""
+    return any(attach(owner) for owner in owners)
+
+
+def attach_parent_console() -> None:
+    """Pour `--version` (P9F31) : sans console (`console=False`), `sys.stdout` vaut `None`.
+
+    Lancé depuis `cmd` ou PowerShell sans redirection, le binaire n'a nulle part où écrire : il
+    s'attache à la console de son parent, ou à défaut de son grand-parent (le chargeur
+    `--onefile` n'en a pas), et écrit sur `CONOUT$`. Redirigé (`> v.txt`, un tube), `sys.stdout`
+    existe déjà et rien ne change. Un échec laisse le log seul témoin.
+    """
+    if sys.platform != "win32" or sys.stdout is not None:
+        return
+    import ctypes
+
+    try:
+        attach = ctypes.windll.kernel32.AttachConsole
+        if not attach_first_console(console_owners(os.getppid, parent_pid_windows), attach):
+            return
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="backslashreplace")
+    except OSError:
+        return
+
+
 if __name__ == "__main__":
+    if VERSION_FLAG in sys.argv[1:]:
+        # Ni attente du parent ni journal : `--version` rend la main tout de suite.
+        attach_parent_console()
+        main()
+        sys.exit(0)
     open_log_file()
     watch_parent()
     main()

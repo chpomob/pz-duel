@@ -1458,3 +1458,59 @@ encore connecté ». Mutations de la garde : remettre `lobby[0].state.players["B
 `client_engine` la fait échouer (`tests/test_modes.py:448: writes lobby[0].state.players
 directly…`) ; remettre `rig.engine.state.players["B"] = GUEST` dans `guest_here` aussi
 (`tests/test_platform_windows.py:1652: …`). Suite complète : 3204 verts, 16 skips (7 min 15).
+
+## P9F31 — release de test roulante depuis `master`, et identité du binaire (2026-11-17)
+
+**Ce qui est fait.** Le job `test-build` de `.github/workflows/tests.yml` construit le binaire après
+`pytest` et `pytest-windows` (`needs`), sur un push de `master` seulement
+(`if: github.ref == 'refs/heads/master' && github.event_name == 'push'`), avec la chaîne de
+`release.yml` (même spec, mêmes empreintes de dépendances, test de fumée, `sha256sum`). Il publie en
+pré-release au tag fixe `test`, avec `--clobber` :
+`https://github.com/chpomob/pz-duel/releases/download/test/pz-duel.exe` (et `pz-duel.exe.sha256`).
+Seul ce job a `contents: write` ; le workflow passe à `contents: read`. Les releases `v*` restent
+publiées à la main, sur tag.
+
+Le binaire porte une empreinte (`packaging/_build_stamp.json`, écrite par la spec sous `workpath`,
+hors du dépôt) : `{id, sha, built_at}`, tirés des seules variables publiques `GITHUB_SHA`,
+`GITHUB_REF_NAME`, `GITHUB_REF_TYPE`. `id` vaut `master-<sha court>` sur `master`, le nom du tag sur
+un tag, `<n>-merge-<sha court>` sur une pull request, `local` hors CI. `pz-duel.exe --version`
+l'imprime (`pz-duel master-53068e1 (commit …, built …Z)`) et sort en 0 sans verrou ni port ;
+`/api/state` la publie sous `build` ; le pied du lobby affiche `version master-53068e1`. Depuis les
+sources, ou si l'empreinte manque ou est mal formée : `dev`.
+
+**Ce qui reste manuel ou non prouvé.**
+
+- **La release roulante n'est pas signée**, comme les `v*` : SmartScreen avertira. Le testeur peut
+  comparer avec `pz-duel.exe.sha256` (`certutil -hashfile pz-duel.exe SHA256`).
+- **Non éprouvé sur la vraie CI** au moment du commit : la première publication n'aura lieu qu'au
+  premier push vert sur `master`. Points à relire dans ce premier journal : le `git push --force` du
+  tag `test` avec le jeton du job (via les identifiants que `actions/checkout` laisse), et
+  `gh release create test --verify-tag`.
+- **`--version` sans console.** Le binaire est construit `console=False`. Redirigé (un tube, comme
+  dans le test de fumée, ou `pz-duel.exe --version > v.txt`), il écrit sur sa sortie ; lancé depuis
+  `cmd` sans redirection, il s'attache à une console (`AttachConsole`) et écrit sur `CONOUT$`. En
+  `--onefile`, son parent est le chargeur PyInstaller, fenêtré et donc sans console : il essaie
+  d'abord le parent, puis le parent du chargeur (le `cmd`), trouvé par un instantané Toolhelp.
+  `cmd` n'attend pas un programme fenêtré : la ligne peut s'afficher après l'invite. L'ordre des
+  essais est testé avec des doubles ; la lecture du parent par Toolhelp a un test win32 ; mais
+  l'affichage réel depuis `cmd` sur le binaire construit n'est éprouvé par aucun test (il faut une
+  vraie console). Le pied du lobby reste la source sûre.
+- **Ordre des publications.** Un passage plus lent qu'un push plus récent ne recule pas `test` : la
+  publication n'a lieu que si le commit de `test` est un ancêtre du sien (`git merge-base
+  --is-ancestor`), et `concurrency` sérialise les passages. Une réécriture de l'historique de
+  `master` bloquerait la publication : il faudrait alors supprimer le tag `test` à la main.
+- La spec lit `workpath` dans l'espace de noms que PyInstaller lui donne ; PyInstaller n'est pas
+  installé sur la machine de développement, et le test de la spec le simule (`read_spec`).
+
+**Preuves.** `tests/test_phase3_p9f31.py` : `test_build_id_reads_the_stamp_of_the_binary`,
+`test_build_id_survives_an_unreadable_stamp` (11 formes), `test_version_prints_the_identity_without_a_port`,
+`test_version_of_the_binary_exits_zero_through_the_entry` (socket qui refuse `bind`/`connect`),
+`test_api_state_publishes_build`, `test_lobby_foot_shows_the_build` (Node),
+`test_test_build_guard_sees_the_drift` (22 mutants : condition `master` ou `push` retirée,
+`needs` retiré ou réduit, autre tag, sans `--clobber`…), `test_test_build_builds_exactly_like_the_release`.
+Le test de fumée (`packaging/smoke_test.py`) vérifie en plus que `--version` sort en 0 et que
+`/api/state` publie le même `build.id`. Mutations vérifiées à la main : `if args.version`
+neutralisé fait tomber les trois tests `--version` ; `"build"` retiré de `to_dict` fait tomber
+les tests d'état ; la lecture de `needs` et de la condition retirée du garde-fou laisse passer
+11 mutants.
+Suite complète : 3252 verts (3204 avant l'étape), 16 skips inchangés (7 min 13).

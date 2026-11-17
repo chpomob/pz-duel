@@ -40,6 +40,10 @@ SMOKE_PATH = "packaging/smoke_test.py"
 # Les suites dont dépend la publication : ce sont celles de `tests.yml`, à l'identique.
 RELEASE_SUITES = ["pytest", "pytest-windows"]
 RELEASE_JOB = "release"
+# P9F31 : la release de test roulante, dans `tests.yml`.
+TEST_BUILD_JOB = "test-build"
+TEST_BUILD_CONDITION = "github.ref == 'refs/heads/master' && github.event_name == 'push'"
+TEST_TAG = "test"
 
 STEP_INDENT = 6
 KEY = re.compile(r"([\w-]+):")
@@ -177,7 +181,11 @@ def ci_problems(text: str) -> list[str]:
     if "pull_request" not in blocks(top.get("on", [])[1:], 2):
         problems.append("tests: no pull_request trigger")
 
-    suites = {name: job for name, job in jobs.items() if any("pytest" in line for line in job)}
+    suites = {
+        name: job
+        for name, job in jobs.items()
+        if name != TEST_BUILD_JOB and any("pytest" in line for line in job)
+    }
     for runner in ("ubuntu-latest", "windows-latest"):
         matching = [
             (name, job) for name, job in suites.items() if job_value(job, "runs-on") == runner
@@ -194,11 +202,100 @@ def ci_problems(text: str) -> list[str]:
         problems += checkout_problems(name, steps, windows=runner == "windows-latest")
 
     builders = [
-        (name, job) for name, job in jobs.items() if any(SPEC_PATH in line for line in job)
+        (name, job)
+        for name, job in jobs.items()
+        if name != TEST_BUILD_JOB and any(SPEC_PATH in line for line in job)
     ]
     if len(builders) != 1:
         return problems + ["tests: expected one build job"]
     problems += build_problems(builders[0][0], builders[0][1], exe_name())[0]
+    return problems + rolling_build_problems(top, jobs)
+
+
+def job_condition(job: list[str]) -> str | None:
+    """Le `if:` du job lui-même (indentation 4), sans les guillemets qui l'entoureraient."""
+    value = job_value(job, "if")
+    return None if value is None else " ".join(value.split())
+
+
+def rolling_build_problems(top: dict[str, list[str]], jobs: dict[str, list[str]]) -> list[str]:
+    """P9F31 : la release roulante ne publie qu'après les deux suites, sur un push de `master`.
+
+    Même chaîne que la construction des pull requests et que `release.yml` ; publication au tag
+    fixe `test`, avec `--clobber` ; `contents: write` pour ce seul job, lecture pour le reste.
+    """
+    name, exe = TEST_BUILD_JOB, exe_name()
+    job = jobs.get(name)
+    if job is None:
+        return [f"tests: no {name} job"]
+    problems = []
+    needs = job_value(job, "needs") or ""
+    if sorted(re.findall(r"[\w-]+", needs)) != RELEASE_SUITES:
+        problems.append(f"{name}: does not need {RELEASE_SUITES}")
+    if job_condition(job) != TEST_BUILD_CONDITION:
+        problems.append(f"{name}: not limited to a push on master ({TEST_BUILD_CONDITION})")
+
+    if [line.strip() for line in top.get("permissions", [])] != ["permissions:", "contents: read"]:
+        problems.append("tests: workflow permissions are not exactly contents: read")
+    if [line.strip() for line in blocks(job[1:], 4).get("permissions", [])] != [
+        "permissions:",
+        "contents: write",
+    ]:
+        problems.append(f"{name}: permissions are not exactly contents: write")
+    writers = sorted(other for other, lines in jobs.items() if any("write" in l for l in lines))
+    if writers != [name]:
+        problems.append(f"tests: jobs that write: {writers}, expected [{name!r}]")
+
+    # La condition du job est la seule permise : toute autre, sur une étape, contournerait la chaîne.
+    own_if = [line for line in job if depth(line) == 4 and line.strip().startswith("if:")]
+    chain_problems, steps = build_problems(name, [line for line in job if line not in own_if], exe)
+    problems += chain_problems
+    if FORBIDDEN.search("\n".join(job)):
+        problems.append(f"{name}: signing, installer or Workshop step")
+
+    smoke = first_step(steps, f"{SMOKE_PATH} ")
+    checksum = first_step(steps, f"sha256sum {exe} > {exe}.sha256")
+    publish = first_step(steps, "gh release")
+    if not in_order([smoke, checksum, publish]):
+        return problems + [f"{name}: expected smoke test, then checksum, then publication"]
+    if publish != len(steps) - 1:
+        problems.append(f"{name}: the publication must be the last step")
+    return problems + rolling_publish_problems(steps[publish], exe)
+
+
+def rolling_publish_problems(step: str, exe: str) -> list[str]:
+    script = step.split("run:", 1)[-1]
+    problems = []
+    if "shell: bash" not in step:
+        problems.append("rolling publish: not in bash")
+    if "GH_TOKEN: ${{ github.token }}" not in step:
+        problems.append("rolling publish: no GH_TOKEN")
+    if "${{" in script:
+        problems.append("rolling publish: expression expanded inside the script")
+    for needle, what in (
+        (f'{exe}" --version', "the notes do not come from the binary's --version"),
+        ('"${GITHUB_SHA:0:7}" "$GITHUB_SHA" "$subject" "${built_at%)}"', "notes without "
+         "short sha, full sha, subject and build time"),
+        ("git log -1 --format=%s", "notes without the commit subject"),
+        (f'git push --force origin "$GITHUB_SHA:refs/tags/{TEST_TAG}"', "the tag does not follow"),
+        (f"gh release view {TEST_TAG} ", "no lookup of the release"),
+        (f'gh release edit {TEST_TAG} ', "the release is not edited once it exists"),
+        (f"gh release create {TEST_TAG} --verify-tag ", "the release is not created"),
+        (f"gh release upload {TEST_TAG} ", f"no upload to the {TEST_TAG} tag"),
+    ):
+        if needle not in script:
+            problems.append(f"rolling publish: {what}")
+    for command in ("edit", "create"):
+        line = script[script.find(f"gh release {command} {TEST_TAG}") :].split("\n  ", 1)[0]
+        for option in ('--notes "$notes"', "--prerelease"):
+            if option not in line:
+                problems.append(f"rolling publish: {command} without {option}")
+    upload = script[script.find(f"gh release upload {TEST_TAG} ") :]
+    for option in (f'{exe}"', f'{exe}.sha256"', "--clobber"):
+        if option not in upload:
+            problems.append(f"rolling publish: upload without {option}")
+    if len(re.findall(r"gh release upload", script)) != 1:
+        problems.append("rolling publish: expected exactly one upload")
     return problems
 
 
@@ -618,9 +715,10 @@ def test_requirement_mutants_are_caught(mutant):
 
 
 def test_build_and_release_install_the_same_hashed_file():
-    for path in (TESTS_YML, RELEASE_YML):
+    # `tests.yml` construit deux fois : pour les pull requests, et pour la release roulante (P9F31).
+    for path, builds in ((TESTS_YML, 2), (RELEASE_YML, 1)):
         text = path.read_text(encoding="utf-8")
-        assert text.count(REQUIREMENTS) == text.count(REQUIREMENTS_INSTALL) == 1, path.name
+        assert text.count(REQUIREMENTS) == text.count(REQUIREMENTS_INSTALL) == builds, path.name
 
 
 # ---------------------------------------------------------------- documentation (R9)

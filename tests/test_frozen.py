@@ -1236,8 +1236,11 @@ def test_log_file_is_not_opened_from_the_sources(entry, monkeypatch):
     assert root.handlers == before
 
 
-def read_spec() -> dict:
-    """Exécute `pz-duel.spec` contre des doubles : ce que PyInstaller recevrait, sans lui."""
+def read_spec(workpath: Path) -> dict:
+    """Exécute `pz-duel.spec` contre des doubles : ce que PyInstaller recevrait, sans lui.
+
+    `workpath` est celui que PyInstaller donne à la spec : l'empreinte (P9F31) s'y écrit.
+    """
     calls: dict = {}
 
     def analysis(scripts, **options):
@@ -1254,7 +1257,13 @@ def read_spec() -> dict:
     source = SPEC.read_text(encoding="utf-8")
     exec(  # noqa: S102 - fichier du dépôt
         compile(source, str(SPEC), "exec"),
-        {"SPECPATH": str(PACKAGING), "Analysis": analysis, "PYZ": pyz, "EXE": exe},
+        {
+            "SPECPATH": str(PACKAGING),
+            "workpath": str(workpath),
+            "Analysis": analysis,
+            "PYZ": pyz,
+            "EXE": exe,
+        },
     )
     return calls
 
@@ -1263,7 +1272,7 @@ def read_spec() -> dict:
 def bundle(tmp_path):
     """Dossier d'extraction que donneraient les `datas` de la spec, ni plus ni moins."""
     root = tmp_path / "_MEI456"
-    for source, destination in read_spec()["analysis"]["datas"]:
+    for source, destination in read_spec(tmp_path / "work")["analysis"]["datas"]:
         target = root / destination
         if Path(source).is_dir():
             shutil.copytree(source, target)
@@ -1331,7 +1340,8 @@ def test_ac46_smoke_passes_on_a_complete_folder(smoke, tmp_path, bundle, loader)
     assert done.returncode == 0, done.stderr
     assert "Smoke test passed" in done.stdout
     assert list(outer.iterdir()) == []
-    assert len(lines(tmp_path / "pids.txt")) == 2
+    # `--version` (P9F31), puis les deux passages.
+    assert len(lines(tmp_path / "pids.txt")) == 3
     assert_none_left(smoke, tmp_path)
 
 
@@ -1393,7 +1403,8 @@ def test_ac46_smoke_fails_on_a_bad_exit_code(tmp_path, bundle):
     done = run_smoke(*simulated_binary(tmp_path, bundle, code_shift=3))
 
     assert done.returncode == 1
-    assert "exit code 3" in done.stderr
+    # Depuis P9F31, `--version` passe le premier : c'est lui qui rend le code décalé.
+    assert "--version exited with code 3" in done.stderr
 
 
 def test_smoke_shows_the_log_of_a_binary_that_stops_at_startup(tmp_path, bundle):
@@ -1579,8 +1590,8 @@ def test_entry_keeps_the_service_when_the_parent_cannot_be_read(entry, thread_sp
     assert len(logged) == 1
 
 
-def test_spec_builds_a_windowed_onefile_without_upx():
-    calls = read_spec()
+def test_spec_builds_a_windowed_onefile_without_upx(tmp_path):
+    calls = read_spec(tmp_path)
 
     assert calls["analysis"]["scripts"] == [str(ENTRY)]
     assert calls["analysis"]["pathex"] == [str(REPO)]
@@ -1590,18 +1601,26 @@ def test_spec_builds_a_windowed_onefile_without_upx():
     assert not calls["exe"].get("exclude_binaries")
 
 
-def test_spec_embeds_every_resource_where_the_service_reads_it():
+def test_spec_embeds_every_resource_where_the_service_reads_it(tmp_path):
+    work = tmp_path / "work"
     datas = {
-        (Path(source).relative_to(REPO).as_posix(), destination)
-        for source, destination in read_spec()["analysis"]["datas"]
+        (
+            Path(source).relative_to(work if Path(source).is_relative_to(work) else REPO)
+            .as_posix(),
+            destination,
+        )
+        for source, destination in read_spec(work)["analysis"]["datas"]
     }
 
+    # P9F31 : l'empreinte s'écrit sous `workpath`, hors du dépôt, et s'embarque où
+    # `service/build_info.py` la relit.
     assert datas == {
         ("ui", "ui"),
         ("mods/duelcore", "mods/duelcore"),
         ("service/presets", "service/presets"),
         ("service/runtime.json", "service"),
         ("service/effects.json", "service"),
+        ("stamp/_build_stamp.json", "packaging"),
     }
 
 

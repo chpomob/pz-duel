@@ -22,6 +22,7 @@ from typing import IO, Any
 from . import paths, platforms
 from .api import BODY_MAX, LOCAL_NAMES, SERVER_TOKEN, claim_address, make_server
 from .announce import rcon_announcer
+from .build_info import build_id, describe
 from .engine import STOP_INCOMPLETE, Engine
 from .preflight import MOD_SRC, detect_pz, install_mod, mod_fingerprint
 from .rules import load_runtime
@@ -339,7 +340,17 @@ def run(
         action="store_true",
         help="installe mods/duelcore dans ~/Zomboid/mods/ puis quitte",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="affiche l'identité du binaire (master-<sha>, tag ou dev) puis quitte",
+    )
     args = parser.parse_args(argv)
+
+    # P9F31 : avant le verrou d'instance et le port, rien ne s'ouvre.
+    if args.version:
+        report(describe(build_id()))
+        return
 
     if args.install_mod:
         run_install_mod()

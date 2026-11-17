@@ -795,6 +795,14 @@ function inviteCard() {
     </section>`;
 }
 
+// P9F31: the identity of the running binary (`master-53068e1`, a tag, or `dev` from the sources),
+// at the foot of the lobby: over the phone, the host reads it out. Same text as `--version`.
+function buildFoot(build) {
+  const id = build && build.id;
+  if (!id) return '';
+  return `<p class="hint build" id="build-id" title="${esc(build.sha || '')}">version ${esc(id)}</p>`;
+}
+
 function renderLive() {
   const phase = S.phase;
   let body = '';
@@ -826,7 +834,7 @@ function renderLive() {
   if (phase === 'lobby') {
     body = inviteCard();
     shell(`<section class="card"><h2>Lancement</h2>${stepsList()}${holdNotice()}${announceNotice((S.capabilities && S.capabilities.announce) || {})}</section>` + body +
-      `<section class="card"><div class="actions"><button class="danger" data-action="cancel">Annuler le duel</button></div></section>`);
+      `<section class="card"><div class="actions"><button class="danger" data-action="cancel">Annuler le duel</button></div>${buildFoot(S.build)}</section>`);
     renderQr();
     return;
   }

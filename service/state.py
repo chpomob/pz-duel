@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field, asdict
 
+from .build_info import build_id
+
 PHASE_LABELS = {
     "idle": "au repos",
     "preflight": "vérifications",
@@ -85,6 +87,8 @@ class MatchState:
     match_id: str | None = None
     capabilities: dict = field(default_factory=dict)
     result: dict | None = None
+    # P9F31 : l'identité du binaire, lue une fois ; `dev` depuis les sources.
+    build: dict = field(default_factory=build_id)
 
     # --- helpers ---------------------------------------------------------
     def log(self, msg: str, level: str = "info") -> None:
@@ -138,4 +142,5 @@ class MatchState:
             "match_id": self.match_id,
             "capabilities": self.capabilities,
             "result": self.result,
+            "build": dict(self.build),
         }

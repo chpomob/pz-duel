@@ -10,6 +10,10 @@ de `TEMP`, sur un port dédié :
    frappe le seul processus parent : aucun de ses descendants ne doit subsister, et le port
    doit se taire.
 
+Avant eux (P9F31), `--version` doit sortir en 0 en imprimant `pz-duel <id> …`, sans laisser de
+processus, et `/api/state` doit publier le même `build.id` : le pied du lobby et la commande
+donnent la même identité.
+
 Stdlib et `mod_fingerprint` du dépôt : rien à installer. Les limites viennent d'AC46 et d'AC10,
 pas de `runtime.json`, dont les valeurs règlent le service que ce script juge.
 """
@@ -44,6 +48,8 @@ LOG_TAIL_LINES = 20
 
 STARTUP_LIMIT_S = 60  # extraction du `--onefile` et analyse antivirus compris
 QUIT_LIMIT_S = 30  # AC46
+VERSION_LIMIT_S = 60  # extraction du `--onefile` comprise, comme au démarrage
+VERSION_PREFIX = "pz-duel "
 SURVIVOR_LIMIT_S = 5  # AC10
 HTTP_TIMEOUT_S = 10
 POLL_S = 0.2
@@ -276,6 +282,37 @@ def launched(command: list[str]) -> Iterator[Session]:
             session.clean_up()
 
 
+def check_version(command: list[str]) -> str:
+    """`--version` sort en 0 et imprime `pz-duel <id> …` : rend `<id>`."""
+    with tempfile.TemporaryDirectory(prefix="pz-duel-smoke-", ignore_cleanup_errors=True) as name:
+        root = Path(name)
+        try:
+            done = subprocess.run(
+                [*command, "--version"],
+                env=sandbox_env(root),
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=VERSION_LIMIT_S,
+            )
+        except subprocess.TimeoutExpired:
+            raise SmokeFailure(f"--version still running after {VERSION_LIMIT_S} s") from None
+        except OSError as exc:
+            raise SmokeFailure(f"could not start {command[0]} --version: {exc}") from exc
+    if done.returncode != 0:
+        raise SmokeFailure(f"--version exited with code {done.returncode}, expected 0")
+    lines = done.stdout.decode("utf-8", "replace").strip().splitlines()
+    if len(lines) != 1 or not lines[0].startswith(VERSION_PREFIX):
+        raise SmokeFailure(f"--version printed {lines!r}, expected one line 'pz-duel <id> ...'")
+    return lines[0][len(VERSION_PREFIX) :].split(" ", 1)[0]
+
+
+def check_build(session: Session, expected: str) -> None:
+    build = session.get_json("/api/state").get("build") or {}
+    if build.get("id") != expected:
+        raise SmokeFailure(f"/api/state reports build {build.get('id')!r}, --version {expected!r}")
+
+
 def check_ui(session: Session) -> None:
     if session.get("/") != (UI_DIR / "index.html").read_bytes():
         raise SmokeFailure("/ does not return ui/index.html")
@@ -339,13 +376,17 @@ def check_forced_end(session: Session) -> None:
 
 
 def run(command: list[str]) -> None:
+    build = check_version(command)
+    print(f"Version passed: {build}")
+
     with launched(command) as session:
         check_ui(session)
         check_state(session)
+        check_build(session, build)
         check_presets(session)
         check_mod(session)
         check_quit(session)
-    print("Normal run passed: UI, real mode, presets, mod fingerprint, exit code 0")
+    print("Normal run passed: UI, real mode, build, presets, mod fingerprint, exit code 0")
 
     with launched(command) as session:
         check_forced_end(session)
